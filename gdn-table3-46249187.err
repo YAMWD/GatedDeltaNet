@@ -1,0 +1,74 @@
+Loading module for CUDA 12.1
+CUDA 12.1 is now loaded
+Cloning into '/tmp/lm-evaluation-harness'...
+2026-03-30:12:46:15 INFO     [_cli.run:378] Selected Tasks: ['wikitext', 'lambada_openai', 'piqa', 'hellaswag', 'winogrande', 'arc_easy', 'arc_challenge', 'social_iqa', 'boolq']
+2026-03-30:12:46:15 INFO     [evaluator:213] Setting random seed to 0 | Setting numpy seed to 1234 | Setting torch manual seed to 1234 | Setting fewshot manual seed to 1234
+2026-03-30:12:46:15 INFO     [evaluator:238] Initializing gdn_hf model, with arguments: {'pretrained': 'm-a-p/1.3B-100B-GatedDeltaNet-pure', 'dtype': 'float16', 'trust_remote_code': True, 'gdn_attn_mode': 'fused_recurrent'}
+2026-03-30:12:46:15 INFO     [models.huggingface:256] Using device 'cuda'
+2026-03-30:12:46:16 INFO     [models.huggingface:659] Model type cannot be determined. Using default model type 'causal'
+2026-03-30:12:46:17 INFO     [models.huggingface:518] Model parallel was set to False, max memory was not set, and device map was set to {'': 'cuda'}
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:43<00:43, 43.18s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:50<00:00, 22.23s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:50<00:00, 25.37s/it]
+Some weights of the model checkpoint at m-a-p/1.3B-100B-GatedDeltaNet-pure were not used when initializing GatedDeltaNetForCausalLM: ['model.layers.0.attn.D', 'model.layers.1.attn.D', 'model.layers.10.attn.D', 'model.layers.11.attn.D', 'model.layers.12.attn.D', 'model.layers.13.attn.D', 'model.layers.14.attn.D', 'model.layers.15.attn.D', 'model.layers.16.attn.D', 'model.layers.17.attn.D', 'model.layers.18.attn.D', 'model.layers.19.attn.D', 'model.layers.2.attn.D', 'model.layers.20.attn.D', 'model.layers.21.attn.D', 'model.layers.22.attn.D', 'model.layers.23.attn.D', 'model.layers.3.attn.D', 'model.layers.4.attn.D', 'model.layers.5.attn.D', 'model.layers.6.attn.D', 'model.layers.7.attn.D', 'model.layers.8.attn.D', 'model.layers.9.attn.D']
+- This IS expected if you are initializing GatedDeltaNetForCausalLM from the checkpoint of a model trained on another task or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).
+- This IS NOT expected if you are initializing GatedDeltaNetForCausalLM from the checkpoint of a model that you expect to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model).
+2026-03-30:12:47:09 WARNING  [api.task:734] [Task: wikitext] metric word_perplexity is defined, but aggregation is not. using default aggregation=weighted_perplexity
+2026-03-30:12:47:09 WARNING  [api.task:746] [Task: wikitext] metric word_perplexity is defined, but higher_is_better is not. using default higher_is_better=False
+2026-03-30:12:47:09 WARNING  [api.task:734] [Task: wikitext] metric byte_perplexity is defined, but aggregation is not. using default aggregation=weighted_perplexity
+2026-03-30:12:47:09 WARNING  [api.task:746] [Task: wikitext] metric byte_perplexity is defined, but higher_is_better is not. using default higher_is_better=False
+2026-03-30:12:47:09 WARNING  [api.task:734] [Task: wikitext] metric bits_per_byte is defined, but aggregation is not. using default aggregation=bits_per_byte
+2026-03-30:12:47:09 WARNING  [api.task:746] [Task: wikitext] metric bits_per_byte is defined, but higher_is_better is not. using default higher_is_better=False
+Generating train split:   0%|          | 0/629 [00:00<?, ? examples/s]Generating train split: 100%|██████████| 629/629 [00:00<00:00, 3458.41 examples/s]
+Generating validation split:   0%|          | 0/60 [00:00<?, ? examples/s]Generating validation split: 100%|██████████| 60/60 [00:00<00:00, 1995.17 examples/s]
+Generating test split:   0%|          | 0/62 [00:00<?, ? examples/s]Generating test split: 100%|██████████| 62/62 [00:00<00:00, 2265.81 examples/s]
+Generating train split:   0%|          | 0/39905 [00:00<?, ? examples/s]Generating train split:   3%|▎         | 1000/39905 [00:00<00:09, 4203.13 examples/s]Generating train split: 100%|██████████| 39905/39905 [00:00<00:00, 57728.27 examples/s]
+Generating test split:   0%|          | 0/10003 [00:00<?, ? examples/s]Generating test split: 100%|██████████| 10003/10003 [00:00<00:00, 58993.14 examples/s]
+Generating validation split:   0%|          | 0/10042 [00:00<?, ? examples/s]Generating validation split: 100%|██████████| 10042/10042 [00:00<00:00, 56392.47 examples/s]
+Map:   0%|          | 0/39905 [00:00<?, ? examples/s]Map:   3%|▎         | 1175/39905 [00:00<00:03, 11652.64 examples/s]Map:   6%|▋         | 2532/39905 [00:00<00:02, 12772.25 examples/s]Map:  10%|▉         | 3978/39905 [00:00<00:05, 6029.75 examples/s] Map:  13%|█▎        | 5080/39905 [00:00<00:04, 7149.56 examples/s]Map:  16%|█▌        | 6380/39905 [00:00<00:03, 8569.51 examples/s]Map:  19%|█▉        | 7714/39905 [00:00<00:03, 9751.28 examples/s]Map:  23%|██▎       | 9000/39905 [00:00<00:02, 10342.73 examples/s]Map:  26%|██▌       | 10263/39905 [00:01<00:02, 10964.87 examples/s]Map:  29%|██▉       | 11701/39905 [00:01<00:02, 11595.13 examples/s]Map:  33%|███▎      | 12989/39905 [00:01<00:02, 11953.32 examples/s]Map:  37%|███▋      | 14825/39905 [00:01<00:02, 12055.53 examples/s]Map:  41%|████      | 16424/39905 [00:01<00:02, 11566.61 examples/s]Map:  44%|████▍     | 17619/39905 [00:01<00:01, 11486.95 examples/s]Map:  48%|████▊     | 19225/39905 [00:01<00:01, 11214.70 examples/s]Map:  53%|█████▎    | 21000/39905 [00:02<00:01, 11128.72 examples/s]Map:  57%|█████▋    | 22745/39905 [00:02<00:01, 11286.44 examples/s]Map:  61%|██████    | 24346/39905 [00:02<00:01, 11094.83 examples/s]Map:  64%|██████▍   | 25615/39905 [00:02<00:01, 11187.72 examples/s]Map:  68%|██████▊   | 27008/39905 [00:02<00:01, 7020.83 examples/s] Map:  70%|███████   | 28106/39905 [00:02<00:01, 7691.49 examples/s]Map:  73%|███████▎  | 29142/39905 [00:03<00:01, 8210.19 examples/s]Map:  76%|███████▌  | 30256/39905 [00:03<00:01, 8847.79 examples/s]Map:  79%|███████▊  | 31386/39905 [00:03<00:00, 9428.35 examples/s]Map:  82%|████████▏ | 32629/39905 [00:03<00:00, 10021.37 examples/s]Map:  85%|████████▍ | 33785/39905 [00:03<00:00, 10423.55 examples/s]Map:  87%|████████▋ | 34916/39905 [00:03<00:00, 10664.23 examples/s]Map:  92%|█████████▏| 36636/39905 [00:03<00:00, 10724.08 examples/s]Map:  95%|█████████▍| 37786/39905 [00:03<00:00, 10919.03 examples/s]Map:  99%|█████████▊| 39358/39905 [00:03<00:00, 10760.38 examples/s]Map: 100%|██████████| 39905/39905 [00:04<00:00, 8477.25 examples/s] 
+Map:   0%|          | 0/10042 [00:00<?, ? examples/s]Map:  12%|█▏        | 1188/10042 [00:00<00:00, 11787.72 examples/s]Map:  25%|██▌       | 2531/10042 [00:00<00:00, 12746.04 examples/s]Map:  42%|████▏     | 4249/10042 [00:00<00:00, 12024.38 examples/s]Map:  60%|█████▉    | 6000/10042 [00:00<00:00, 11605.90 examples/s]Map:  76%|███████▋  | 7675/10042 [00:01<00:00, 3818.01 examples/s] Map:  88%|████████▊ | 8788/10042 [00:01<00:00, 4609.97 examples/s]Map:  99%|█████████▉| 9934/10042 [00:01<00:00, 5527.28 examples/s]Map: 100%|██████████| 10042/10042 [00:01<00:00, 5386.15 examples/s]
+Generating train split:   0%|          | 0/40398 [00:00<?, ? examples/s]Generating train split: 100%|██████████| 40398/40398 [00:00<00:00, 517775.43 examples/s]
+Generating test split:   0%|          | 0/1767 [00:00<?, ? examples/s]Generating test split: 100%|██████████| 1767/1767 [00:00<00:00, 193396.36 examples/s]
+Generating validation split:   0%|          | 0/1267 [00:00<?, ? examples/s]Generating validation split: 100%|██████████| 1267/1267 [00:00<00:00, 181470.54 examples/s]
+Traceback (most recent call last):
+  File "/home/yaoz0b/GatedDeltaNet/scripts/fla_lm_eval.py", line 33, in <module>
+    cli_evaluate()
+  File "/tmp/lm-evaluation-harness/lm_eval/__main__.py", line 10, in cli_evaluate
+    parser.execute(args)
+  File "/tmp/lm-evaluation-harness/lm_eval/_cli/harness.py", line 60, in execute
+    args.func(args)
+  File "/tmp/lm-evaluation-harness/lm_eval/_cli/run.py", line 381, in _execute
+    results = simple_evaluate(
+              ^^^^^^^^^^^^^^^^
+  File "/tmp/lm-evaluation-harness/lm_eval/utils.py", line 575, in _wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/tmp/lm-evaluation-harness/lm_eval/evaluator.py", line 295, in simple_evaluate
+    loaded = task_manager.load(tasks)
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/lm-evaluation-harness/lm_eval/tasks/manager.py", line 208, in load
+    obj = self._load_spec(spec) if not isinstance(spec, (Task, Group)) else spec  # type:ignore[invalid-argument-type]
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/lm-evaluation-harness/lm_eval/tasks/manager.py", line 154, in _load_spec
+    return self._factory.build(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/lm-evaluation-harness/lm_eval/tasks/_factory.py", line 61, in build
+    return self._build_task(entry, overrides)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/lm-evaluation-harness/lm_eval/tasks/_factory.py", line 81, in _build_task
+    obj = ConfigurableTask(config=cfg)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/lm-evaluation-harness/lm_eval/api/task.py", line 753, in __init__
+    self.download(self.config.dataset_kwargs)
+  File "/tmp/lm-evaluation-harness/lm_eval/api/task.py", line 869, in download
+    self.dataset = datasets.load_dataset(
+                   ^^^^^^^^^^^^^^^^^^^^^^
+  File "/ibex/user/yaoz0b/conda-environments/GatedDeltaNet/lib/python3.11/site-packages/datasets/load.py", line 1688, in load_dataset
+    builder_instance = load_dataset_builder(
+                       ^^^^^^^^^^^^^^^^^^^^^
+  File "/ibex/user/yaoz0b/conda-environments/GatedDeltaNet/lib/python3.11/site-packages/datasets/load.py", line 1315, in load_dataset_builder
+    dataset_module = dataset_module_factory(
+                     ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/ibex/user/yaoz0b/conda-environments/GatedDeltaNet/lib/python3.11/site-packages/datasets/load.py", line 1207, in dataset_module_factory
+    raise e1 from None
+  File "/ibex/user/yaoz0b/conda-environments/GatedDeltaNet/lib/python3.11/site-packages/datasets/load.py", line 1167, in dataset_module_factory
+    raise RuntimeError(f"Dataset scripts are no longer supported, but found {filename}")
+RuntimeError: Dataset scripts are no longer supported, but found social_i_qa.py

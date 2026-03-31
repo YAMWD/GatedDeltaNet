@@ -1,0 +1,22 @@
+Loading module for CUDA 12.1
+CUDA 12.1 is now loaded
+Cloning into '/tmp/lm-evaluation-harness'...
+2026-03-30:12:43:09 WARNING  [config.evaluate_config:281] --limit SHOULD ONLY BE USED FOR TESTING. REAL METRICS SHOULD NOT BE COMPUTED USING LIMIT.
+2026-03-30:12:43:14 INFO     [_cli.run:378] Selected Tasks: ['piqa']
+2026-03-30:12:43:14 INFO     [evaluator:213] Setting random seed to 0 | Setting numpy seed to 1234 | Setting torch manual seed to 1234 | Setting fewshot manual seed to 1234
+2026-03-30:12:43:14 INFO     [evaluator:238] Initializing hf model, with arguments: {'pretrained': 'm-a-p/1.3B-100B-GatedDeltaNet-pure', 'dtype': 'float16', 'trust_remote_code': True}
+2026-03-30:12:43:14 INFO     [models.huggingface:256] Using device 'cuda'
+2026-03-30:12:43:15 INFO     [models.huggingface:659] Model type cannot be determined. Using default model type 'causal'
+2026-03-30:12:43:16 INFO     [models.huggingface:518] Model parallel was set to False, max memory was not set, and device map was set to {'': 'cuda'}
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:43<00:43, 43.45s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:51<00:00, 22.44s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:51<00:00, 25.59s/it]
+Some weights of the model checkpoint at m-a-p/1.3B-100B-GatedDeltaNet-pure were not used when initializing GatedDeltaNetForCausalLM: ['model.layers.0.attn.D', 'model.layers.1.attn.D', 'model.layers.10.attn.D', 'model.layers.11.attn.D', 'model.layers.12.attn.D', 'model.layers.13.attn.D', 'model.layers.14.attn.D', 'model.layers.15.attn.D', 'model.layers.16.attn.D', 'model.layers.17.attn.D', 'model.layers.18.attn.D', 'model.layers.19.attn.D', 'model.layers.2.attn.D', 'model.layers.20.attn.D', 'model.layers.21.attn.D', 'model.layers.22.attn.D', 'model.layers.23.attn.D', 'model.layers.3.attn.D', 'model.layers.4.attn.D', 'model.layers.5.attn.D', 'model.layers.6.attn.D', 'model.layers.7.attn.D', 'model.layers.8.attn.D', 'model.layers.9.attn.D']
+- This IS expected if you are initializing GatedDeltaNetForCausalLM from the checkpoint of a model trained on another task or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).
+- This IS NOT expected if you are initializing GatedDeltaNetForCausalLM from the checkpoint of a model that you expect to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model).
+2026-03-30:12:44:12 INFO     [evaluator_utils:446] Selected tasks:
+2026-03-30:12:44:12 INFO     [evaluator_utils:480] Task: piqa (piqa/piqa.yaml)
+2026-03-30:12:44:12 WARNING  [evaluator:326] Overwriting default num_fewshot of piqa from None to 0
+2026-03-30:12:44:12 INFO     [api.task:312] Building contexts for piqa on rank 0...
+  0%|          | 0/10 [00:00<?, ?it/s]100%|██████████| 10/10 [00:00<00:00, 960.50it/s]
+2026-03-30:12:44:12 INFO     [evaluator:575] Running loglikelihood requests
+Tokenizing inputs:   0%|          | 0/20 [00:00<?, ?it/s]Tokenizing inputs: 100%|██████████| 20/20 [00:00<00:00, 4503.71it/s]
+Running loglikelihood requests:   0%|          | 0/20 [00:00<?, ?it/s]Running loglikelihood requests:   5%|▌         | 1/20 [01:41<32:12, 101.73s/it]Running loglikelihood requests:  10%|█         | 2/20 [01:42<12:37, 42.08s/it] slurmstepd: error: *** JOB 46249178 ON gpu201-23-l CANCELLED AT 2026-03-30T12:45:54 ***
