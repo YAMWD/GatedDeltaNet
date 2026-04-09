@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct {
     uint32_t ctx_len;
@@ -39,6 +40,14 @@ enum {
     REQ_KIND_LL = 2,
     REQ_KIND_ROLLING = 3,
 };
+
+typedef struct {
+    time_t start_time;
+    uint32_t total_examples;
+    uint32_t total_windows;
+    uint32_t completed_examples;
+    uint32_t completed_windows;
+} ProgressState;
 
 static void die(const char *message) {
     fprintf(stderr, "%s\n", message);
@@ -242,6 +251,103 @@ static FILE *open_output(const char *path) {
     return file;
 }
 
+static double elapsed_seconds(const ProgressState *progress) {
+    return difftime(time(NULL), progress->start_time);
+}
+
+static void progress_start(ProgressState *progress, const Fixture *fixture) {
+    uint32_t example_index;
+    memset(progress, 0, sizeof(*progress));
+    progress->start_time = time(NULL);
+    progress->total_examples = fixture->num_examples;
+    if (fixture->kind == REQ_KIND_ROLLING && fixture->rolling_examples != NULL) {
+        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
+            progress->total_windows += fixture->rolling_examples[example_index].num_windows;
+        }
+    }
+}
+
+static void log_progress_message(const char *message) {
+    fprintf(stderr, "%s\n", message);
+    fflush(stderr);
+}
+
+static void log_example_progress(
+    const ProgressState *progress,
+    const char *kind_name,
+    uint32_t example_index,
+    uint32_t total_examples
+) {
+    fprintf(
+        stderr,
+        "[progress] %s example %u/%u elapsed=%.0fs\n",
+        kind_name,
+        example_index,
+        total_examples,
+        elapsed_seconds(progress)
+    );
+    fflush(stderr);
+}
+
+static void log_example_start(
+    const ProgressState *progress,
+    const char *kind_name,
+    uint32_t example_index,
+    uint32_t total_examples
+) {
+    fprintf(
+        stderr,
+        "[progress] %s example %u/%u started elapsed=%.0fs\n",
+        kind_name,
+        example_index,
+        total_examples,
+        elapsed_seconds(progress)
+    );
+    fflush(stderr);
+}
+
+static void log_rolling_window_start(
+    const ProgressState *progress,
+    uint32_t example_index,
+    uint32_t total_examples,
+    uint32_t window_index,
+    uint32_t windows_in_example
+) {
+    fprintf(
+        stderr,
+        "[progress] rolling doc %u/%u window %u/%u started total_windows %u/%u elapsed=%.0fs\n",
+        example_index,
+        total_examples,
+        window_index,
+        windows_in_example,
+        progress->completed_windows + 1,
+        progress->total_windows,
+        elapsed_seconds(progress)
+    );
+    fflush(stderr);
+}
+
+static void log_rolling_window_progress(
+    const ProgressState *progress,
+    uint32_t example_index,
+    uint32_t total_examples,
+    uint32_t window_index,
+    uint32_t windows_in_example
+) {
+    fprintf(
+        stderr,
+        "[progress] rolling doc %u/%u window %u/%u total_windows %u/%u elapsed=%.0fs\n",
+        example_index,
+        total_examples,
+        window_index,
+        windows_in_example,
+        progress->completed_windows,
+        progress->total_windows,
+        elapsed_seconds(progress)
+    );
+    fflush(stderr);
+}
+
 static void score_hidden_step(
     const GDNModel *model,
     const float *hidden,
@@ -288,18 +394,24 @@ static void score_pair(
     double *logprob,
     int *greedy
 ) {
-    uint32_t total_tokens = ctx_len + cont_len;
+    uint32_t total_tokens;
     uint32_t hidden = model->config.hidden_size;
     int32_t *tokens;
     uint32_t token_index;
 
-    if (ctx_len == 0 || total_tokens == 0 || total_tokens > model->config.max_seq_len) {
+    if (ctx_len == 0 || cont_len == 0) {
+        die("invalid sequence for scoring");
+    }
+    total_tokens = ctx_len + cont_len - 1;
+    if (total_tokens == 0 || total_tokens > model->config.max_seq_len) {
         die("invalid sequence for scoring");
     }
 
     tokens = (int32_t *)xmalloc((size_t)total_tokens * sizeof(int32_t));
     memcpy(tokens, ctx, (size_t)ctx_len * sizeof(int32_t));
-    memcpy(tokens + ctx_len, cont, (size_t)cont_len * sizeof(int32_t));
+    if (cont_len > 1) {
+        memcpy(tokens + ctx_len, cont, (size_t)(cont_len - 1) * sizeof(int32_t));
+    }
 
     if (gdn_forward(model, run_state, tokens, total_tokens) != 0) {
         free(tokens);
@@ -321,6 +433,7 @@ int main(int argc, char **argv) {
     GDNModel model;
     GDNRunState run_state;
     Fixture fixture;
+    ProgressState progress;
     float *logits;
 
     if (argc < 3 || argc > 4) {
@@ -328,15 +441,27 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    log_progress_message("[progress] loading model weights");
     if (gdn_model_load(&model, argv[1]) != 0) {
         return 1;
     }
+    log_progress_message("[progress] allocating run state");
     if (gdn_run_state_init(&run_state, &model, model.config.max_seq_len) != 0) {
         gdn_model_free(&model);
         return 1;
     }
     logits = (float *)xmalloc((size_t)model.config.vocab_size * sizeof(float));
+    log_progress_message("[progress] loading fixture");
     load_fixture(argv[2], &fixture);
+    progress_start(&progress, &fixture);
+    fprintf(
+        stderr,
+        "[progress] starting evaluation kind=%u examples=%u windows=%u\n",
+        fixture.kind,
+        fixture.num_examples,
+        progress.total_windows
+    );
+    fflush(stderr);
 
     if (fixture.kind == REQ_KIND_MC) {
         double acc = 0.0;
@@ -355,6 +480,7 @@ int main(int argc, char **argv) {
             int pred_norm = 0;
             uint32_t choice_index;
 
+            log_example_start(&progress, "multiple_choice", example_index + 1, fixture.num_examples);
             for (choice_index = 0; choice_index < req->num_choices; ++choice_index) {
                 int greedy;
                 score_pair(
@@ -390,6 +516,8 @@ int main(int argc, char **argv) {
             preds_norm[example_index] = pred_norm;
             scores_all[example_index] = scores;
             scores_norm_all[example_index] = scores_norm;
+            progress.completed_examples = example_index + 1;
+            log_example_progress(&progress, "multiple_choice", progress.completed_examples, fixture.num_examples);
         }
 
         {
@@ -436,12 +564,15 @@ int main(int argc, char **argv) {
 
         for (example_index = 0; example_index < fixture.num_examples; ++example_index) {
             PairReq *req = &fixture.ll_examples[example_index];
+            log_example_start(&progress, "loglikelihood", example_index + 1, fixture.num_examples);
             score_pair(&model, &run_state, logits, req->ctx, req->ctx_len, req->cont, req->cont_len, &lls[example_index], &greedies[example_index]);
             total_logprob += lls[example_index];
             total_tokens += req->cont_len;
             if (greedies[example_index]) {
                 acc += 1.0;
             }
+            progress.completed_examples = example_index + 1;
+            log_example_progress(&progress, "loglikelihood", progress.completed_examples, fixture.num_examples);
         }
 
         {
@@ -476,9 +607,17 @@ int main(int argc, char **argv) {
             RollingReq *req = &fixture.rolling_examples[example_index];
             uint32_t window_index;
             doc_lls[example_index] = 0.0;
+            log_example_start(&progress, "rolling", example_index + 1, fixture.num_examples);
             for (window_index = 0; window_index < req->num_windows; ++window_index) {
                 double ll;
                 int greedy;
+                log_rolling_window_start(
+                    &progress,
+                    example_index + 1,
+                    fixture.num_examples,
+                    window_index + 1,
+                    req->num_windows
+                );
                 score_pair(
                     &model,
                     &run_state,
@@ -492,10 +631,28 @@ int main(int argc, char **argv) {
                 );
                 (void)greedy;
                 doc_lls[example_index] += ll;
+                progress.completed_windows += 1;
+                log_rolling_window_progress(
+                    &progress,
+                    example_index + 1,
+                    fixture.num_examples,
+                    window_index + 1,
+                    req->num_windows
+                );
             }
             total_logprob += doc_lls[example_index];
             total_words += req->word_count;
             total_bytes += req->byte_count;
+            progress.completed_examples = example_index + 1;
+            fprintf(
+                stderr,
+                "[progress] rolling doc %u/%u complete elapsed=%.0fs partial_word_ppl=%.6f\n",
+                progress.completed_examples,
+                fixture.num_examples,
+                elapsed_seconds(&progress),
+                exp(-total_logprob / (double)total_words)
+            );
+            fflush(stderr);
         }
 
         {
@@ -524,6 +681,9 @@ int main(int argc, char **argv) {
     } else {
         die("unsupported fixture kind");
     }
+
+    fprintf(stderr, "[progress] evaluation finished elapsed=%.0fs\n", elapsed_seconds(&progress));
+    fflush(stderr);
 
     free_fixture(&fixture);
     free(logits);
