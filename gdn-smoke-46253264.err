@@ -1,28 +1,0 @@
-Loading module for CUDA 12.1
-CUDA 12.1 is now loaded
-2026-03-30:14:42:00 WARNING  [config.evaluate_config:281] --limit SHOULD ONLY BE USED FOR TESTING. REAL METRICS SHOULD NOT BE COMPUTED USING LIMIT.
-2026-03-30:14:42:53 INFO     [_cli.run:378] Selected Tasks: ['wikitext']
-2026-03-30:14:42:53 INFO     [evaluator:213] Setting random seed to 0 | Setting numpy seed to 1234 | Setting torch manual seed to 1234 | Setting fewshot manual seed to 1234
-2026-03-30:14:42:53 INFO     [evaluator:238] Initializing gdn_hf model, with arguments: {'pretrained': 'm-a-p/1.3B-100B-GatedDeltaNet-pure', 'dtype': 'float16', 'trust_remote_code': True, 'gdn_attn_mode': 'fused_recurrent'}
-2026-03-30:14:42:53 INFO     [models.huggingface:256] Using device 'cuda'
-2026-03-30:14:42:54 INFO     [models.huggingface:659] Model type cannot be determined. Using default model type 'causal'
-2026-03-30:14:42:55 INFO     [models.huggingface:518] Model parallel was set to False, max memory was not set, and device map was set to {'': 'cuda'}
-Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [01:40<01:40, 100.59s/it]Loading checkpoint shards: 100%|██████████| 2/2 [01:58<00:00, 51.96s/it] Loading checkpoint shards: 100%|██████████| 2/2 [01:58<00:00, 59.26s/it]
-Some weights of the model checkpoint at m-a-p/1.3B-100B-GatedDeltaNet-pure were not used when initializing GatedDeltaNetForCausalLM: ['model.layers.0.attn.D', 'model.layers.1.attn.D', 'model.layers.10.attn.D', 'model.layers.11.attn.D', 'model.layers.12.attn.D', 'model.layers.13.attn.D', 'model.layers.14.attn.D', 'model.layers.15.attn.D', 'model.layers.16.attn.D', 'model.layers.17.attn.D', 'model.layers.18.attn.D', 'model.layers.19.attn.D', 'model.layers.2.attn.D', 'model.layers.20.attn.D', 'model.layers.21.attn.D', 'model.layers.22.attn.D', 'model.layers.23.attn.D', 'model.layers.3.attn.D', 'model.layers.4.attn.D', 'model.layers.5.attn.D', 'model.layers.6.attn.D', 'model.layers.7.attn.D', 'model.layers.8.attn.D', 'model.layers.9.attn.D']
-- This IS expected if you are initializing GatedDeltaNetForCausalLM from the checkpoint of a model trained on another task or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).
-- This IS NOT expected if you are initializing GatedDeltaNetForCausalLM from the checkpoint of a model that you expect to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model).
-2026-03-30:14:44:54 WARNING  [api.task:734] [Task: wikitext] metric word_perplexity is defined, but aggregation is not. using default aggregation=weighted_perplexity
-2026-03-30:14:44:54 WARNING  [api.task:746] [Task: wikitext] metric word_perplexity is defined, but higher_is_better is not. using default higher_is_better=False
-2026-03-30:14:44:54 WARNING  [api.task:734] [Task: wikitext] metric byte_perplexity is defined, but aggregation is not. using default aggregation=weighted_perplexity
-2026-03-30:14:44:54 WARNING  [api.task:746] [Task: wikitext] metric byte_perplexity is defined, but higher_is_better is not. using default higher_is_better=False
-2026-03-30:14:44:54 WARNING  [api.task:734] [Task: wikitext] metric bits_per_byte is defined, but aggregation is not. using default aggregation=bits_per_byte
-2026-03-30:14:44:54 WARNING  [api.task:746] [Task: wikitext] metric bits_per_byte is defined, but higher_is_better is not. using default higher_is_better=False
-2026-03-30:14:44:59 INFO     [evaluator_utils:446] Selected tasks:
-2026-03-30:14:44:59 INFO     [evaluator_utils:480] Task: wikitext (wikitext/wikitext.yaml)
-2026-03-30:14:44:59 WARNING  [evaluator:326] Overwriting default num_fewshot of wikitext from None to 0
-2026-03-30:14:44:59 INFO     [api.task:312] Building contexts for wikitext on rank 0...
-  0%|          | 0/1 [00:00<?, ?it/s]100%|██████████| 1/1 [00:00<00:00, 878.02it/s]
-2026-03-30:14:44:59 INFO     [evaluator:575] Running loglikelihood_rolling requests
-  0%|          | 0/1 [00:00<?, ?it/s]100%|██████████| 1/1 [00:00<00:00, 385.54it/s]
-Running loglikelihood requests:   0%|          | 0/1 [00:00<?, ?it/s]Running loglikelihood requests: 100%|██████████| 1/1 [00:19<00:00, 19.28s/it]Running loglikelihood requests: 100%|██████████| 1/1 [00:19<00:00, 19.28s/it]
-2026-03-30:14:45:21 INFO     [loggers.evaluation_tracker:247] Saving results aggregated

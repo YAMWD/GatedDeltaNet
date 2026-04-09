@@ -1,6 +1,0 @@
-Loading module for CUDA 12.1
-CUDA 12.1 is now loaded
-Traceback (most recent call last):
-  File "/home/yaoz0b/GatedDeltaNet/scripts/fla_lm_eval.py", line 5, in <module>
-    from lm_eval.__main__ import cli_evaluate
-ModuleNotFoundError: No module named 'lm_eval'
