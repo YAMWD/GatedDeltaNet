@@ -1,0 +1,12 @@
+{
+  "kind": 1,
+  "num_examples": 2,
+  "metrics": {
+    "acc": 0.500000000,
+    "acc_norm": 0.500000000
+  },
+  "examples": [
+    {"index": 0, "gold": 0, "pred": 0, "pred_norm": 0, "scores": [-93.228401388, -98.499882324], "scores_norm": [-2.330710035, -2.525638008]},
+    {"index": 1, "gold": 1, "pred": 0, "pred_norm": 0, "scores": [-37.894053313, -75.202412064], "scores_norm": [-5.413436188, -6.836582915]}
+  ]
+}

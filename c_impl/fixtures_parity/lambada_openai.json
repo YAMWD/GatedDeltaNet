@@ -1,0 +1,7 @@
+{
+  "task": "lambada_openai",
+  "kind": 2,
+  "num_examples": 2,
+  "limit": 2,
+  "path": "c_impl/fixtures_parity/lambada_openai.gdnreq"
+}

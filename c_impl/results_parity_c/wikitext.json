@@ -1,0 +1,12 @@
+{
+  "kind": 3,
+  "num_examples": 1,
+  "metrics": {
+    "word_perplexity": 15.813881740,
+    "byte_perplexity": 1.703176911,
+    "bits_per_byte": 0.768228298
+  },
+  "examples": [
+    {"index": 0, "logprob": -3017.650742966}
+  ]
+}

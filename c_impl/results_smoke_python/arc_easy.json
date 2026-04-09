@@ -1,0 +1,39 @@
+{
+  "fixture": "c_impl/fixtures_smoke/arc_easy.gdnreq",
+  "kind": 1,
+  "num_examples": 1,
+  "metrics": {
+    "acc": 1.0,
+    "acc_norm": 1.0
+  },
+  "examples": [
+    {
+      "index": 0,
+      "gold": 0,
+      "pred": 0,
+      "pred_norm": 0,
+      "scores": [
+        {
+          "logprob": -18.21237277984619,
+          "logprob_norm": -1.4009517522958608,
+          "greedy": false
+        },
+        {
+          "logprob": -27.439400672912598,
+          "logprob_norm": -2.2866167227427163,
+          "greedy": false
+        },
+        {
+          "logprob": -23.66224479675293,
+          "logprob_norm": -1.8201726766733022,
+          "greedy": false
+        },
+        {
+          "logprob": -21.277503967285156,
+          "logprob_norm": -2.3641671074761286,
+          "greedy": false
+        }
+      ]
+    }
+  ]
+}

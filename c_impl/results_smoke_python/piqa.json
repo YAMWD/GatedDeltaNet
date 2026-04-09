@@ -1,0 +1,29 @@
+{
+  "fixture": "c_impl/fixtures_smoke/piqa.gdnreq",
+  "kind": 1,
+  "num_examples": 1,
+  "metrics": {
+    "acc": 1.0,
+    "acc_norm": 1.0
+  },
+  "examples": [
+    {
+      "index": 0,
+      "gold": 0,
+      "pred": 0,
+      "pred_norm": 0,
+      "scores": [
+        {
+          "logprob": -93.22838163375854,
+          "logprob_norm": -2.3307095408439635,
+          "greedy": false
+        },
+        {
+          "logprob": -98.49986410140991,
+          "logprob_norm": -2.525637541061793,
+          "greedy": false
+        }
+      ]
+    }
+  ]
+}

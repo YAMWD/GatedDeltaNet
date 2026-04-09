@@ -1,0 +1,90 @@
+{
+  "tasks": [
+    {
+      "task": "arc_challenge",
+      "kind": 1,
+      "num_examples": 1,
+      "acc_diff": 0.0,
+      "acc_norm_diff": 0.0,
+      "max_score_diff": 8.23896777291111e-06,
+      "max_score_norm_diff": 1.1774239676576315e-06,
+      "pred_mismatch": 0,
+      "pred_norm_mismatch": 0
+    },
+    {
+      "task": "arc_easy",
+      "kind": 1,
+      "num_examples": 1,
+      "acc_diff": 0.0,
+      "acc_norm_diff": 0.0,
+      "max_score_diff": 1.3070752928001639e-05,
+      "max_score_norm_diff": 1.0056733021901465e-06,
+      "pred_mismatch": 0,
+      "pred_norm_mismatch": 0
+    },
+    {
+      "task": "boolq",
+      "kind": 1,
+      "num_examples": 1,
+      "acc_diff": 0.0,
+      "acc_norm_diff": 0.0,
+      "max_score_diff": 4.536172851565823e-06,
+      "max_score_norm_diff": 4.536172851565823e-06,
+      "pred_mismatch": 0,
+      "pred_norm_mismatch": 0
+    },
+    {
+      "task": "hellaswag",
+      "kind": 1,
+      "num_examples": 1,
+      "acc_diff": 0.0,
+      "acc_norm_diff": 0.0,
+      "max_score_diff": 6.9259355477413465e-06,
+      "max_score_norm_diff": 6.92393554491133e-07,
+      "pred_mismatch": 0,
+      "pred_norm_mismatch": 0
+    },
+    {
+      "task": "lambada_openai",
+      "kind": 2,
+      "num_examples": 1,
+      "acc_diff": 0.0,
+      "perplexity_diff": 0.00020952797157747227,
+      "max_logprob_diff": 1.1179692382956574e-05,
+      "greedy_mismatch": 0
+    },
+    {
+      "task": "piqa",
+      "kind": 1,
+      "num_examples": 1,
+      "acc_diff": 0.0,
+      "acc_norm_diff": 0.0,
+      "max_score_diff": 1.9754241449732035e-05,
+      "max_score_norm_diff": 4.941560365345765e-07,
+      "pred_mismatch": 0,
+      "pred_norm_mismatch": 0
+    },
+    {
+      "task": "social_iqa",
+      "kind": 1,
+      "num_examples": 1,
+      "acc_diff": 0.0,
+      "acc_norm_diff": 0.0,
+      "max_score_diff": 4.900441894051255e-06,
+      "max_score_norm_diff": 1.2246104734714436e-06,
+      "pred_mismatch": 0,
+      "pred_norm_mismatch": 0
+    },
+    {
+      "task": "winogrande",
+      "kind": 1,
+      "num_examples": 1,
+      "acc_diff": 0.0,
+      "acc_norm_diff": 0.0,
+      "max_score_diff": 7.804276854983527e-06,
+      "max_score_norm_diff": 1.301046142376805e-06,
+      "pred_mismatch": 0,
+      "pred_norm_mismatch": 0
+    }
+  ]
+}

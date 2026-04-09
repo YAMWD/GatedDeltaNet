@@ -1,0 +1,29 @@
+{
+  "fixture": "c_impl/fixtures_smoke/mini_mc.gdnreq",
+  "kind": 1,
+  "num_examples": 1,
+  "metrics": {
+    "acc": 1.0,
+    "acc_norm": 1.0
+  },
+  "examples": [
+    {
+      "index": 0,
+      "gold": 0,
+      "pred": 0,
+      "pred_norm": 0,
+      "scores": [
+        {
+          "logprob": -12.968110084533691,
+          "logprob_norm": -12.968110084533691,
+          "greedy": false
+        },
+        {
+          "logprob": -17.896400451660156,
+          "logprob_norm": -17.896400451660156,
+          "greedy": false
+        }
+      ]
+    }
+  ]
+}

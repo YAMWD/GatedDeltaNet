@@ -1,0 +1,11 @@
+{
+  "kind": 2,
+  "num_examples": 1,
+  "metrics": {
+    "acc": 0.000000000,
+    "perplexity": 18.741388564
+  },
+  "examples": [
+    {"index": 0, "logprob": -2.930734370, "greedy": false}
+  ]
+}

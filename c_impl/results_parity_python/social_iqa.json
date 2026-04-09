@@ -1,0 +1,57 @@
+{
+  "fixture": "c_impl/fixtures_parity/social_iqa.gdnreq",
+  "kind": 1,
+  "num_examples": 2,
+  "metrics": {
+    "acc": 0.5,
+    "acc_norm": 0.0
+  },
+  "examples": [
+    {
+      "index": 0,
+      "gold": 2,
+      "pred": 1,
+      "pred_norm": 1,
+      "scores": [
+        {
+          "logprob": -20.582685947418213,
+          "logprob_norm": -5.145671486854553,
+          "greedy": false
+        },
+        {
+          "logprob": -15.735957622528076,
+          "logprob_norm": -2.622659603754679,
+          "greedy": false
+        },
+        {
+          "logprob": -17.3858642578125,
+          "logprob_norm": -4.346466064453125,
+          "greedy": false
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "gold": 0,
+      "pred": 0,
+      "pred_norm": 1,
+      "scores": [
+        {
+          "logprob": -8.603109359741211,
+          "logprob_norm": -4.3015546798706055,
+          "greedy": false
+        },
+        {
+          "logprob": -26.791075706481934,
+          "logprob_norm": -3.3488844633102417,
+          "greedy": false
+        },
+        {
+          "logprob": -13.71253776550293,
+          "logprob_norm": -6.856268882751465,
+          "greedy": false
+        }
+      ]
+    }
+  ]
+}

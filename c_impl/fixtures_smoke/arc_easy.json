@@ -1,0 +1,7 @@
+{
+  "task": "arc_easy",
+  "kind": 1,
+  "num_examples": 1,
+  "limit": 1,
+  "path": "c_impl/fixtures_smoke/arc_easy.gdnreq"
+}

@@ -1,0 +1,39 @@
+{
+  "fixture": "c_impl/fixtures_smoke/hellaswag.gdnreq",
+  "kind": 1,
+  "num_examples": 1,
+  "metrics": {
+    "acc": 0.0,
+    "acc_norm": 0.0
+  },
+  "examples": [
+    {
+      "index": 0,
+      "gold": 3,
+      "pred": 2,
+      "pred_norm": 2,
+      "scores": [
+        {
+          "logprob": -41.047032833099365,
+          "logprob_norm": -3.7315484393726694,
+          "greedy": false
+        },
+        {
+          "logprob": -29.0825777053833,
+          "logprob_norm": -4.1546539579119,
+          "greedy": false
+        },
+        {
+          "logprob": -23.166065216064453,
+          "logprob_norm": -2.3166065216064453,
+          "greedy": false
+        },
+        {
+          "logprob": -30.81257152557373,
+          "logprob_norm": -3.4236190583970814,
+          "greedy": false
+        }
+      ]
+    }
+  ]
+}

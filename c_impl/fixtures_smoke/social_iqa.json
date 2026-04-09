@@ -1,0 +1,7 @@
+{
+  "task": "social_iqa",
+  "kind": 1,
+  "num_examples": 1,
+  "limit": 1,
+  "path": "c_impl/fixtures_smoke/social_iqa.gdnreq"
+}

@@ -1,0 +1,47 @@
+{
+  "fixture": "c_impl/fixtures_parity/piqa.gdnreq",
+  "kind": 1,
+  "num_examples": 2,
+  "metrics": {
+    "acc": 0.5,
+    "acc_norm": 0.5
+  },
+  "examples": [
+    {
+      "index": 0,
+      "gold": 0,
+      "pred": 0,
+      "pred_norm": 0,
+      "scores": [
+        {
+          "logprob": -93.22839069366455,
+          "logprob_norm": -2.330709767341614,
+          "greedy": false
+        },
+        {
+          "logprob": -98.49986934661865,
+          "logprob_norm": -2.5256376755543246,
+          "greedy": false
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "gold": 1,
+      "pred": 0,
+      "pred_norm": 0,
+      "scores": [
+        {
+          "logprob": -37.89405059814453,
+          "logprob_norm": -5.413435799734933,
+          "greedy": false
+        },
+        {
+          "logprob": -75.20241117477417,
+          "logprob_norm": -6.836582834070379,
+          "greedy": false
+        }
+      ]
+    }
+  ]
+}

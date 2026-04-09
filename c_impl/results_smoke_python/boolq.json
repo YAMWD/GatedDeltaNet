@@ -1,0 +1,29 @@
+{
+  "fixture": "c_impl/fixtures_smoke/boolq.gdnreq",
+  "kind": 1,
+  "num_examples": 1,
+  "metrics": {
+    "acc": 0.0,
+    "acc_norm": 0.0
+  },
+  "examples": [
+    {
+      "index": 0,
+      "gold": 0,
+      "pred": 1,
+      "pred_norm": 1,
+      "scores": [
+        {
+          "logprob": -3.7288265228271484,
+          "logprob_norm": -3.7288265228271484,
+          "greedy": false
+        },
+        {
+          "logprob": -3.6904067993164062,
+          "logprob_norm": -3.6904067993164062,
+          "greedy": false
+        }
+      ]
+    }
+  ]
+}

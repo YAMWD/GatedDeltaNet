@@ -1,0 +1,21 @@
+{
+  "fixture": "c_impl/fixtures_parity/lambada_openai.gdnreq",
+  "kind": 2,
+  "num_examples": 2,
+  "metrics": {
+    "acc": 0.0,
+    "perplexity": 5.745282432594675
+  },
+  "examples": [
+    {
+      "index": 0,
+      "logprob": -2.930729866027832,
+      "greedy": false
+    },
+    {
+      "index": 1,
+      "logprob": -2.3144073486328125,
+      "greedy": false
+    }
+  ]
+}
