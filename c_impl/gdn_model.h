@@ -75,7 +75,28 @@ void gdn_model_free(GDNModel *model);
 int gdn_run_state_init(GDNRunState *state, const GDNModel *model, uint32_t max_tokens);
 void gdn_run_state_free(GDNRunState *state);
 
-int gdn_forward(const GDNModel *model, GDNRunState *state, const int32_t *tokens, uint32_t num_tokens);
+int gdn_forward(
+    const GDNWeightHeader *config,
+    const float *weight_data,
+    uint32_t max_tokens,
+    float *x,
+    float *x_norm,
+    float *q,
+    float *k,
+    float *v,
+    float *a,
+    float *b,
+    float *gate,
+    float *attn,
+    float *tmp_hidden,
+    float *mlp_gate,
+    float *mlp_up,
+    float *recurrent_state,
+    float *head_buffer,
+    const int32_t *tokens,
+    uint32_t num_tokens
+);
+int gdn_forward_host(const GDNModel *model, GDNRunState *state, const int32_t *tokens, uint32_t num_tokens);
 void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logits_out);
 
 #endif

@@ -413,7 +413,7 @@ static void score_pair(
         memcpy(tokens + ctx_len, cont, (size_t)(cont_len - 1) * sizeof(int32_t));
     }
 
-    if (gdn_forward(model, run_state, tokens, total_tokens) != 0) {
+    if (gdn_forward_host(model, run_state, tokens, total_tokens) != 0) {
         free(tokens);
         die("forward pass failed");
     }

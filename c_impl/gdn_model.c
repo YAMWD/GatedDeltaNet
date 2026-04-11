@@ -8,7 +8,11 @@
 #define GDN_WEIGHT_HEADER_BYTES 60
 
 static void gdn_print_error(const char *message) {
+#ifdef __SYNTHESIS__
+    (void)message;
+#else
     fprintf(stderr, "%s\n", message);
+#endif
 }
 
 static void *gdn_malloc_bytes(size_t bytes) {
@@ -66,6 +70,42 @@ static size_t gdn_total_weight_floats(const GDNWeightHeader *config) {
     total += hidden;
     total += vocab * hidden;
     return total;
+}
+
+static size_t gdn_layer_weight_stride(const GDNWeightHeader *config) {
+    size_t hidden = config->hidden_size;
+    size_t num_heads = config->num_heads;
+    size_t head_dim = config->head_dim;
+    size_t intermediate = config->intermediate_size;
+    size_t conv = config->conv_size;
+
+    return hidden +
+           num_heads +
+           num_heads +
+           hidden * hidden +
+           hidden * hidden +
+           hidden * hidden +
+           num_heads * hidden +
+           num_heads * hidden +
+           hidden * conv +
+           hidden * conv +
+           hidden * conv +
+           hidden * hidden +
+           head_dim +
+           hidden * hidden +
+           hidden +
+           intermediate * hidden +
+           intermediate * hidden +
+           hidden * intermediate;
+}
+
+static size_t gdn_layer_weight_offset(const GDNWeightHeader *config, uint32_t layer_index) {
+    return (size_t)config->vocab_size * config->hidden_size +
+           (size_t)layer_index * gdn_layer_weight_stride(config);
+}
+
+static size_t gdn_final_norm_offset(const GDNWeightHeader *config) {
+    return gdn_layer_weight_offset(config, config->num_layers);
 }
 
 static int gdn_validate_config(const GDNWeightHeader *config) {
@@ -295,10 +335,15 @@ static float gdn_l2_norm_inv(const float *x, uint32_t length) {
     return 1.0f / sqrtf((float)sum + 1e-6f);
 }
 
-static void gdn_embed_tokens(float *x, const GDNModel *model, const int32_t *tokens, uint32_t num_tokens) {
+static void gdn_embed_tokens(
+    float *x,
+    const float *embeddings,
+    const int32_t *tokens,
+    uint32_t num_tokens,
+    uint32_t hidden,
+    uint32_t vocab
+) {
     uint32_t token_index;
-    uint32_t hidden = model->config.hidden_size;
-    uint32_t vocab = model->config.vocab_size;
 
     for (token_index = 0; token_index < num_tokens; ++token_index) {
         int32_t token = tokens[token_index];
@@ -308,7 +353,7 @@ static void gdn_embed_tokens(float *x, const GDNModel *model, const int32_t *tok
         }
         memcpy(
             x + (size_t)token_index * hidden,
-            model->embeddings + (size_t)token * hidden,
+            embeddings + (size_t)token * hidden,
             (size_t)hidden * sizeof(float)
         );
     }
@@ -393,34 +438,40 @@ static void gdn_depthwise_conv_silu(
 
 static void gdn_recurrent_attention(
     float *attn_out,
-    GDNRunState *state,
-    const GDNModel *model,
-    const GDNLayerWeights *layer,
+    float *recurrent_state,
+    float *head_buffer,
+    const float *q,
+    const float *k,
+    const float *v,
+    const float *a,
+    const float *b,
+    const float *layer_a_log,
+    const float *layer_dt_bias,
+    uint32_t hidden,
+    uint32_t num_heads,
+    uint32_t head_dim,
     uint32_t num_tokens
 ) {
-    uint32_t hidden = model->config.hidden_size;
-    uint32_t num_heads = model->config.num_heads;
-    uint32_t head_dim = model->config.head_dim;
     uint32_t value_dim = hidden / num_heads;
     float q_scale = 1.0f / sqrtf((float)head_dim);
     size_t state_size = (size_t)num_heads * head_dim * value_dim;
     uint32_t token_index;
 
-    memset(state->recurrent_state, 0, state_size * sizeof(float));
+    memset(recurrent_state, 0, state_size * sizeof(float));
 
     for (token_index = 0; token_index < num_tokens; ++token_index) {
         uint32_t head_index;
         for (head_index = 0; head_index < num_heads; ++head_index) {
-            const float *q_head = state->q + (size_t)token_index * hidden + (size_t)head_index * head_dim;
-            const float *k_head = state->k + (size_t)token_index * hidden + (size_t)head_index * head_dim;
-            const float *v_head = state->v + (size_t)token_index * hidden + (size_t)head_index * value_dim;
-            float *state_head = state->recurrent_state + (size_t)head_index * head_dim * value_dim;
+            const float *q_head = q + (size_t)token_index * hidden + (size_t)head_index * head_dim;
+            const float *k_head = k + (size_t)token_index * hidden + (size_t)head_index * head_dim;
+            const float *v_head = v + (size_t)token_index * hidden + (size_t)head_index * value_dim;
+            float *state_head = recurrent_state + (size_t)head_index * head_dim * value_dim;
             float *out_head = attn_out + (size_t)token_index * hidden + (size_t)head_index * value_dim;
             float q_inv = gdn_l2_norm_inv(q_head, head_dim);
             float k_inv = gdn_l2_norm_inv(k_head, head_dim);
-            float beta = gdn_sigmoid(state->b[(size_t)token_index * num_heads + head_index]);
-            float decay_input = state->a[(size_t)token_index * num_heads + head_index] + layer->dt_bias[head_index];
-            float decay_value = -expf(layer->a_log[head_index]) * gdn_softplus(decay_input);
+            float beta = gdn_sigmoid(b[(size_t)token_index * num_heads + head_index]);
+            float decay_input = a[(size_t)token_index * num_heads + head_index] + layer_dt_bias[head_index];
+            float decay_value = -expf(layer_a_log[head_index]) * gdn_softplus(decay_input);
             float decay = expf(decay_value);
             uint32_t index;
             uint32_t value_index;
@@ -436,14 +487,14 @@ static void gdn_recurrent_attention(
                     projection += state_head[(size_t)key_index * value_dim + value_index] *
                                   (k_head[key_index] * k_inv);
                 }
-                state->head_buffer[value_index] = beta * (v_head[value_index] - projection);
+                head_buffer[value_index] = beta * (v_head[value_index] - projection);
             }
 
             for (index = 0; index < head_dim; ++index) {
                 float normalized_k = k_head[index] * k_inv;
                 float *state_row = state_head + (size_t)index * value_dim;
                 for (value_index = 0; value_index < value_dim; ++value_index) {
-                    state_row[value_index] += normalized_k * state->head_buffer[value_index];
+                    state_row[value_index] += normalized_k * head_buffer[value_index];
                 }
             }
 
@@ -498,16 +549,38 @@ static void gdn_swiglu_inplace(float *gate, const float *up, size_t count) {
     }
 }
 
-int gdn_forward(const GDNModel *model, GDNRunState *state, const int32_t *tokens, uint32_t num_tokens) {
-    uint32_t hidden = model->config.hidden_size;
-    uint32_t num_heads = model->config.num_heads;
-    uint32_t head_dim = model->config.head_dim;
-    uint32_t intermediate = model->config.intermediate_size;
+int gdn_forward(
+    const GDNWeightHeader *config,
+    const float *weight_data,
+    uint32_t max_tokens,
+    float *x,
+    float *x_norm,
+    float *q,
+    float *k,
+    float *v,
+    float *a,
+    float *b,
+    float *gate,
+    float *attn,
+    float *tmp_hidden,
+    float *mlp_gate,
+    float *mlp_up,
+    float *recurrent_state,
+    float *head_buffer,
+    const int32_t *tokens,
+    uint32_t num_tokens
+) {
+    uint32_t hidden = config->hidden_size;
+    uint32_t num_heads = config->num_heads;
+    uint32_t head_dim = config->head_dim;
+    uint32_t intermediate = config->intermediate_size;
     uint32_t layer_index;
     size_t hidden_count;
     size_t mlp_count;
+    const float *embeddings = weight_data;
+    const float *final_norm = weight_data + gdn_final_norm_offset(config);
 
-    if (num_tokens == 0 || num_tokens > state->max_tokens) {
+    if (num_tokens == 0 || num_tokens > max_tokens) {
         gdn_print_error("invalid token count for forward pass");
         return -1;
     }
@@ -515,45 +588,137 @@ int gdn_forward(const GDNModel *model, GDNRunState *state, const int32_t *tokens
     hidden_count = (size_t)num_tokens * hidden;
     mlp_count = (size_t)num_tokens * intermediate;
 
-    gdn_embed_tokens(state->x, model, tokens, num_tokens);
-    for (layer_index = 0; layer_index < model->config.num_layers; ++layer_index) {
-        const GDNLayerWeights *layer = &model->layers[layer_index];
+    gdn_embed_tokens(x, embeddings, tokens, num_tokens, hidden, config->vocab_size);
+    for (layer_index = 0; layer_index < config->num_layers; ++layer_index) {
+        size_t layer_offset = gdn_layer_weight_offset(config, layer_index);
+        const float *layer_attn_norm = weight_data + layer_offset;
+        const float *layer_a_log;
+        const float *layer_dt_bias;
+        const float *layer_q_proj;
+        const float *layer_k_proj;
+        const float *layer_v_proj;
+        const float *layer_a_proj;
+        const float *layer_b_proj;
+        const float *layer_q_conv;
+        const float *layer_k_conv;
+        const float *layer_v_conv;
+        const float *layer_g_proj;
+        const float *layer_o_norm;
+        const float *layer_o_proj;
+        const float *layer_mlp_norm;
+        const float *layer_mlp_gate_proj;
+        const float *layer_mlp_up_proj;
+        const float *layer_mlp_down_proj;
         size_t index;
 
-        gdn_rmsnorm_rows(state->x_norm, state->x, layer->attn_norm, num_tokens, hidden, model->config.norm_eps);
-        gdn_matmul(state->q, state->x_norm, layer->q_proj, num_tokens, hidden, hidden);
-        gdn_matmul(state->k, state->x_norm, layer->k_proj, num_tokens, hidden, hidden);
-        gdn_matmul(state->v, state->x_norm, layer->v_proj, num_tokens, hidden, hidden);
-        gdn_matmul(state->a, state->x_norm, layer->a_proj, num_tokens, hidden, num_heads);
-        gdn_matmul(state->b, state->x_norm, layer->b_proj, num_tokens, hidden, num_heads);
-        gdn_matmul(state->gate, state->x_norm, layer->g_proj, num_tokens, hidden, hidden);
+        layer_offset += hidden;
+        layer_a_log = weight_data + layer_offset;
+        layer_offset += num_heads;
+        layer_dt_bias = weight_data + layer_offset;
+        layer_offset += num_heads;
+        layer_q_proj = weight_data + layer_offset;
+        layer_offset += (size_t)hidden * hidden;
+        layer_k_proj = weight_data + layer_offset;
+        layer_offset += (size_t)hidden * hidden;
+        layer_v_proj = weight_data + layer_offset;
+        layer_offset += (size_t)hidden * hidden;
+        layer_a_proj = weight_data + layer_offset;
+        layer_offset += (size_t)num_heads * hidden;
+        layer_b_proj = weight_data + layer_offset;
+        layer_offset += (size_t)num_heads * hidden;
+        layer_q_conv = weight_data + layer_offset;
+        layer_offset += (size_t)hidden * config->conv_size;
+        layer_k_conv = weight_data + layer_offset;
+        layer_offset += (size_t)hidden * config->conv_size;
+        layer_v_conv = weight_data + layer_offset;
+        layer_offset += (size_t)hidden * config->conv_size;
+        layer_g_proj = weight_data + layer_offset;
+        layer_offset += (size_t)hidden * hidden;
+        layer_o_norm = weight_data + layer_offset;
+        layer_offset += head_dim;
+        layer_o_proj = weight_data + layer_offset;
+        layer_offset += (size_t)hidden * hidden;
+        layer_mlp_norm = weight_data + layer_offset;
+        layer_offset += hidden;
+        layer_mlp_gate_proj = weight_data + layer_offset;
+        layer_offset += (size_t)intermediate * hidden;
+        layer_mlp_up_proj = weight_data + layer_offset;
+        layer_offset += (size_t)intermediate * hidden;
+        layer_mlp_down_proj = weight_data + layer_offset;
 
-        gdn_depthwise_conv_silu(state->tmp_hidden, state->q, layer->q_conv, num_tokens, hidden, model->config.conv_size);
-        memcpy(state->q, state->tmp_hidden, hidden_count * sizeof(float));
-        gdn_depthwise_conv_silu(state->tmp_hidden, state->k, layer->k_conv, num_tokens, hidden, model->config.conv_size);
-        memcpy(state->k, state->tmp_hidden, hidden_count * sizeof(float));
-        gdn_depthwise_conv_silu(state->tmp_hidden, state->v, layer->v_conv, num_tokens, hidden, model->config.conv_size);
-        memcpy(state->v, state->tmp_hidden, hidden_count * sizeof(float));
+        gdn_rmsnorm_rows(x_norm, x, layer_attn_norm, num_tokens, hidden, config->norm_eps);
+        gdn_matmul(q, x_norm, layer_q_proj, num_tokens, hidden, hidden);
+        gdn_matmul(k, x_norm, layer_k_proj, num_tokens, hidden, hidden);
+        gdn_matmul(v, x_norm, layer_v_proj, num_tokens, hidden, hidden);
+        gdn_matmul(a, x_norm, layer_a_proj, num_tokens, hidden, num_heads);
+        gdn_matmul(b, x_norm, layer_b_proj, num_tokens, hidden, num_heads);
+        gdn_matmul(gate, x_norm, layer_g_proj, num_tokens, hidden, hidden);
 
-        gdn_recurrent_attention(state->attn, state, model, layer, num_tokens);
-        gdn_output_norm_and_gate(state->attn, state->gate, layer->o_norm, num_tokens, num_heads, head_dim, model->config.norm_eps);
-        gdn_matmul(state->tmp_hidden, state->attn, layer->o_proj, num_tokens, hidden, hidden);
+        gdn_depthwise_conv_silu(tmp_hidden, q, layer_q_conv, num_tokens, hidden, config->conv_size);
+        memcpy(q, tmp_hidden, hidden_count * sizeof(float));
+        gdn_depthwise_conv_silu(tmp_hidden, k, layer_k_conv, num_tokens, hidden, config->conv_size);
+        memcpy(k, tmp_hidden, hidden_count * sizeof(float));
+        gdn_depthwise_conv_silu(tmp_hidden, v, layer_v_conv, num_tokens, hidden, config->conv_size);
+        memcpy(v, tmp_hidden, hidden_count * sizeof(float));
+
+        gdn_recurrent_attention(
+            attn,
+            recurrent_state,
+            head_buffer,
+            q,
+            k,
+            v,
+            a,
+            b,
+            layer_a_log,
+            layer_dt_bias,
+            hidden,
+            num_heads,
+            head_dim,
+            num_tokens
+        );
+        gdn_output_norm_and_gate(attn, gate, layer_o_norm, num_tokens, num_heads, head_dim, config->norm_eps);
+        gdn_matmul(tmp_hidden, attn, layer_o_proj, num_tokens, hidden, hidden);
         for (index = 0; index < hidden_count; ++index) {
-            state->x[index] += state->tmp_hidden[index];
+            x[index] += tmp_hidden[index];
         }
 
-        gdn_rmsnorm_rows(state->x_norm, state->x, layer->mlp_norm, num_tokens, hidden, model->config.norm_eps);
-        gdn_matmul(state->mlp_gate, state->x_norm, layer->mlp_gate_proj, num_tokens, hidden, intermediate);
-        gdn_matmul(state->mlp_up, state->x_norm, layer->mlp_up_proj, num_tokens, hidden, intermediate);
-        gdn_swiglu_inplace(state->mlp_gate, state->mlp_up, mlp_count);
-        gdn_matmul(state->tmp_hidden, state->mlp_gate, layer->mlp_down_proj, num_tokens, intermediate, hidden);
+        gdn_rmsnorm_rows(x_norm, x, layer_mlp_norm, num_tokens, hidden, config->norm_eps);
+        gdn_matmul(mlp_gate, x_norm, layer_mlp_gate_proj, num_tokens, hidden, intermediate);
+        gdn_matmul(mlp_up, x_norm, layer_mlp_up_proj, num_tokens, hidden, intermediate);
+        gdn_swiglu_inplace(mlp_gate, mlp_up, mlp_count);
+        gdn_matmul(tmp_hidden, mlp_gate, layer_mlp_down_proj, num_tokens, intermediate, hidden);
         for (index = 0; index < hidden_count; ++index) {
-            state->x[index] += state->tmp_hidden[index];
+            x[index] += tmp_hidden[index];
         }
     }
 
-    gdn_rmsnorm_rows(state->x_norm, state->x, model->final_norm, num_tokens, hidden, model->config.norm_eps);
+    gdn_rmsnorm_rows(x_norm, x, final_norm, num_tokens, hidden, config->norm_eps);
     return 0;
+}
+
+int gdn_forward_host(const GDNModel *model, GDNRunState *state, const int32_t *tokens, uint32_t num_tokens) {
+    return gdn_forward(
+        &model->config,
+        model->weight_data,
+        state->max_tokens,
+        state->x,
+        state->x_norm,
+        state->q,
+        state->k,
+        state->v,
+        state->a,
+        state->b,
+        state->gate,
+        state->attn,
+        state->tmp_hidden,
+        state->mlp_gate,
+        state->mlp_up,
+        state->recurrent_state,
+        state->head_buffer,
+        tokens,
+        num_tokens
+    );
 }
 
 void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logits_out) {
