@@ -278,7 +278,7 @@ int gdn_run_state_init(GDNRunState *state, const GDNModel *model, uint32_t max_t
     if (gdn_alloc_run_buffer(&state->mlp_gate, (size_t)max_tokens * intermediate) != 0) return -1;
     if (gdn_alloc_run_buffer(&state->mlp_up, (size_t)max_tokens * intermediate) != 0) return -1;
     if (gdn_alloc_run_buffer(&state->recurrent_state, (size_t)num_heads * head_dim * value_dim) != 0) return -1;
-    if (gdn_alloc_run_buffer(&state->head_buffer, value_dim) != 0) return -1;
+    if (gdn_alloc_run_buffer(&state->head_buffer, ((value_dim + 15) / 16) * 16) != 0) return -1;
 
     return 0;
 }
@@ -570,6 +570,29 @@ int gdn_forward(
     const int32_t *tokens,
     uint32_t num_tokens
 ) {
+/* Depths match gdn-1.3b-f32.gdnw: hidden=2048 heads=8 head_dim=256
+   intermediate=5632 layers=24 conv=4 max_seq_len=2048 vocab=32000 */
+#pragma HLS interface m_axi port=config depth=1 offset=slave
+#pragma HLS interface m_axi port=weight_data depth=1466343808 offset=slave
+#pragma HLS interface m_axi port=x depth=4194304 offset=slave
+#pragma HLS interface m_axi port=x_norm depth=4194304 offset=slave
+#pragma HLS interface m_axi port=q depth=4194304 offset=slave
+#pragma HLS interface m_axi port=k depth=4194304 offset=slave
+#pragma HLS interface m_axi port=v depth=4194304 offset=slave
+#pragma HLS interface m_axi port=a depth=16384 offset=slave
+#pragma HLS interface m_axi port=b depth=16384 offset=slave
+#pragma HLS interface m_axi port=gate depth=4194304 offset=slave
+#pragma HLS interface m_axi port=attn depth=4194304 offset=slave
+#pragma HLS interface m_axi port=tmp_hidden depth=4194304 offset=slave
+#pragma HLS interface m_axi port=mlp_gate depth=11534336 offset=slave
+#pragma HLS interface m_axi port=mlp_up depth=11534336 offset=slave
+#pragma HLS interface m_axi port=recurrent_state depth=524288 offset=slave
+#pragma HLS interface m_axi port=head_buffer depth=256 offset=slave
+#pragma HLS interface m_axi port=tokens depth=2048 offset=slave
+#pragma HLS interface s_axilite port=max_tokens
+#pragma HLS interface s_axilite port=num_tokens
+#pragma HLS interface s_axilite port=return
+
     uint32_t hidden = config->hidden_size;
     uint32_t num_heads = config->num_heads;
     uint32_t head_dim = config->head_dim;

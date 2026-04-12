@@ -407,7 +407,7 @@ static void score_pair(
         die("invalid sequence for scoring");
     }
 
-    tokens = (int32_t *)xmalloc((size_t)total_tokens * sizeof(int32_t));
+    tokens = (int32_t *)xmalloc((size_t)model->config.max_seq_len * sizeof(int32_t));
     memcpy(tokens, ctx, (size_t)ctx_len * sizeof(int32_t));
     if (cont_len > 1) {
         memcpy(tokens + ctx_len, cont, (size_t)(cont_len - 1) * sizeof(int32_t));
