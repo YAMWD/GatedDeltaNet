@@ -330,6 +330,7 @@ static float gdn_l2_norm_inv(const float *x, uint32_t length) {
     double sum = 0.0;
     uint32_t index;
     l2_accum: for (index = 0; index < length; ++index) {
+#pragma HLS loop_tripcount min=256 max=256  /* always called with head_dim=256 */
         sum += (double)x[index] * (double)x[index];
     }
     return 1.0f / sqrtf((float)sum + 1e-6f);
@@ -346,16 +347,19 @@ static void gdn_embed_tokens(
     uint32_t token_index;
 
     embed_loop: for (token_index = 0; token_index < num_tokens; ++token_index) {
+#pragma HLS loop_tripcount min=1 max=2048  /* num_tokens: 1..max_seq_len */
         int32_t token = tokens[token_index];
         if (token < 0 || (uint32_t)token >= vocab) {
             gdn_print_error("token id out of range");
             return;
         }
-        memcpy(
-            x + (size_t)token_index * hidden,
-            embeddings + (size_t)token * hidden,
-            (size_t)hidden * sizeof(float)
-        );
+        {
+            uint32_t col;
+            embed_copy: for (col = 0; col < hidden; ++col) {
+#pragma HLS loop_tripcount min=2048 max=2048  /* hidden=2048 */
+                x[(size_t)token_index * hidden + col] = embeddings[(size_t)token * hidden + col];
+            }
+        }
     }
 }
 
@@ -369,16 +373,19 @@ static void gdn_rmsnorm_rows(
 ) {
     uint32_t row;
     rmsnorm_row: for (row = 0; row < num_rows; ++row) {
+#pragma HLS loop_tripcount min=1 max=2048  /* num_tokens: 1..max_seq_len */
         const float *in_row = in + (size_t)row * num_cols;
         float *out_row = out + (size_t)row * num_cols;
         double sum = 0.0;
         uint32_t col;
         float scale;
         rmsnorm_sq: for (col = 0; col < num_cols; ++col) {
+#pragma HLS loop_tripcount min=2048 max=2048  /* always called with hidden=2048 */
             sum += (double)in_row[col] * (double)in_row[col];
         }
         scale = 1.0f / sqrtf((float)(sum / num_cols) + eps);
         rmsnorm_scale: for (col = 0; col < num_cols; ++col) {
+#pragma HLS loop_tripcount min=2048 max=2048  /* always called with hidden=2048 */
             out_row[col] = in_row[col] * scale * weight[col];
         }
     }
@@ -394,14 +401,17 @@ static void gdn_matmul(
 ) {
     uint32_t row;
     matmul_row: for (row = 0; row < num_rows; ++row) {
+#pragma HLS loop_tripcount min=1 max=2048  /* num_tokens: 1..max_seq_len */
         const float *in_row = in + (size_t)row * in_dim;
         float *out_row = out + (size_t)row * out_dim;
         uint32_t out_index;
         matmul_col: for (out_index = 0; out_index < out_dim; ++out_index) {
+#pragma HLS loop_tripcount min=8 max=5632  /* out_dim: num_heads=8 (a/b proj) to intermediate=5632 (MLP) */
             const float *weight_row = weights + (size_t)out_index * in_dim;
             float sum = 0.0f;
             uint32_t in_index;
             matmul_dot: for (in_index = 0; in_index < in_dim; ++in_index) {
+#pragma HLS loop_tripcount min=2048 max=5632  /* in_dim: hidden=2048 (most) to intermediate=5632 (MLP down) */
                 sum += in_row[in_index] * weight_row[in_index];
             }
             out_row[out_index] = sum;
@@ -419,12 +429,15 @@ static void gdn_depthwise_conv_silu(
 ) {
     uint32_t row;
     conv_row: for (row = 0; row < num_rows; ++row) {
+#pragma HLS loop_tripcount min=1 max=2048  /* num_tokens: 1..max_seq_len */
         uint32_t col;
         conv_col: for (col = 0; col < num_cols; ++col) {
+#pragma HLS loop_tripcount min=2048 max=2048  /* always called with hidden=2048 */
             float sum = 0.0f;
             uint32_t kernel_index;
             int32_t start = (int32_t)row - (int32_t)kernel_size + 1;
             conv_kern: for (kernel_index = 0; kernel_index < kernel_size; ++kernel_index) {
+#pragma HLS loop_tripcount min=4 max=4  /* conv_size=4 for all layers */
                 int32_t source_row = start + (int32_t)kernel_index;
                 if (source_row >= 0) {
                     sum += in[(size_t)source_row * num_cols + col] *
@@ -457,11 +470,19 @@ static void gdn_recurrent_attention(
     size_t state_size = (size_t)num_heads * head_dim * value_dim;
     uint32_t token_index;
 
-    memset(recurrent_state, 0, state_size * sizeof(float));
+    {
+        size_t index;
+        state_clear: for (index = 0; index < state_size; ++index) {
+#pragma HLS loop_tripcount min=524288 max=524288  /* num_heads*head_dim*value_dim = 8*256*256 */
+            recurrent_state[index] = 0.0f;
+        }
+    }
 
     recur_token: for (token_index = 0; token_index < num_tokens; ++token_index) {
+#pragma HLS loop_tripcount min=1 max=2048  /* num_tokens: 1..max_seq_len */
         uint32_t head_index;
         recur_head: for (head_index = 0; head_index < num_heads; ++head_index) {
+#pragma HLS loop_tripcount min=8 max=8  /* num_heads=8 */
             const float *q_head = q + (size_t)token_index * hidden + (size_t)head_index * head_dim;
             const float *k_head = k + (size_t)token_index * hidden + (size_t)head_index * head_dim;
             const float *v_head = v + (size_t)token_index * hidden + (size_t)head_index * value_dim;
@@ -477,13 +498,16 @@ static void gdn_recurrent_attention(
             uint32_t value_index;
 
             state_decay: for (index = 0; index < head_dim * value_dim; ++index) {
+#pragma HLS loop_tripcount min=65536 max=65536  /* head_dim*value_dim = 256*256 */
                 state_head[index] *= decay;
             }
 
             delta_proj: for (value_index = 0; value_index < value_dim; ++value_index) {
+#pragma HLS loop_tripcount min=256 max=256  /* value_dim = hidden/num_heads = 2048/8 = 256 */
                 float projection = 0.0f;
                 uint32_t key_index;
                 delta_proj_dot: for (key_index = 0; key_index < head_dim; ++key_index) {
+#pragma HLS loop_tripcount min=256 max=256  /* head_dim=256 */
                     projection += state_head[(size_t)key_index * value_dim + value_index] *
                                   (k_head[key_index] * k_inv);
                 }
@@ -491,17 +515,21 @@ static void gdn_recurrent_attention(
             }
 
             state_update_k: for (index = 0; index < head_dim; ++index) {
+#pragma HLS loop_tripcount min=256 max=256  /* head_dim=256 */
                 float normalized_k = k_head[index] * k_inv;
                 float *state_row = state_head + (size_t)index * value_dim;
                 state_update_v: for (value_index = 0; value_index < value_dim; ++value_index) {
+#pragma HLS loop_tripcount min=256 max=256  /* value_dim = hidden/num_heads = 256 */
                     state_row[value_index] += normalized_k * head_buffer[value_index];
                 }
             }
 
             query_out: for (value_index = 0; value_index < value_dim; ++value_index) {
+#pragma HLS loop_tripcount min=256 max=256  /* value_dim = hidden/num_heads = 256 */
                 float sum = 0.0f;
                 uint32_t key_index;
                 query_out_dot: for (key_index = 0; key_index < head_dim; ++key_index) {
+#pragma HLS loop_tripcount min=256 max=256  /* head_dim=256 */
                     sum += state_head[(size_t)key_index * value_dim + value_index] *
                            (q_head[key_index] * q_inv * q_scale);
                 }
@@ -522,18 +550,22 @@ static void gdn_output_norm_and_gate(
 ) {
     uint32_t token_index;
     onorm_token: for (token_index = 0; token_index < num_tokens; ++token_index) {
+#pragma HLS loop_tripcount min=1 max=2048  /* num_tokens: 1..max_seq_len */
         uint32_t head_index;
         onorm_head: for (head_index = 0; head_index < num_heads; ++head_index) {
+#pragma HLS loop_tripcount min=8 max=8  /* num_heads=8 */
             float *attn_head = attn + (size_t)token_index * num_heads * head_dim + (size_t)head_index * head_dim;
             const float *gate_head = gate + (size_t)token_index * num_heads * head_dim + (size_t)head_index * head_dim;
             double sum = 0.0;
             uint32_t index;
             float scale;
             onorm_sq: for (index = 0; index < head_dim; ++index) {
+#pragma HLS loop_tripcount min=256 max=256  /* head_dim=256 */
                 sum += (double)attn_head[index] * (double)attn_head[index];
             }
             scale = 1.0f / sqrtf((float)(sum / head_dim) + eps);
             onorm_gate: for (index = 0; index < head_dim; ++index) {
+#pragma HLS loop_tripcount min=256 max=256  /* head_dim=256 */
                 float normalized = attn_head[index] * scale * weight[index];
                 float gate_value = gate_head[index];
                 attn_head[index] = normalized * gate_value * gdn_sigmoid(gate_value);
@@ -545,6 +577,7 @@ static void gdn_output_norm_and_gate(
 static void gdn_swiglu_inplace(float *gate, const float *up, size_t count) {
     size_t index;
     swiglu_loop: for (index = 0; index < count; ++index) {
+#pragma HLS loop_tripcount min=5632 max=11534336  /* count = num_tokens*intermediate: 1*5632 to 2048*5632 */
         gate[index] = gdn_silu(gate[index]) * up[index];
     }
 }
@@ -613,6 +646,7 @@ int gdn_forward(
 
     gdn_embed_tokens(x, embeddings, tokens, num_tokens, hidden, config->vocab_size);
     layer_loop: for (layer_index = 0; layer_index < config->num_layers; ++layer_index) {
+#pragma HLS loop_tripcount min=24 max=24  /* num_layers=24 */
         size_t layer_offset = gdn_layer_weight_offset(config, layer_index);
         const float *layer_attn_norm = weight_data + layer_offset;
         const float *layer_a_log;
@@ -678,11 +712,20 @@ int gdn_forward(
         gdn_matmul(gate, x_norm, layer_g_proj, num_tokens, hidden, hidden);
 
         gdn_depthwise_conv_silu(tmp_hidden, q, layer_q_conv, num_tokens, hidden, config->conv_size);
-        memcpy(q, tmp_hidden, hidden_count * sizeof(float));
+        conv_copy_q: for (index = 0; index < hidden_count; ++index) {
+#pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
+            q[index] = tmp_hidden[index];
+        }
         gdn_depthwise_conv_silu(tmp_hidden, k, layer_k_conv, num_tokens, hidden, config->conv_size);
-        memcpy(k, tmp_hidden, hidden_count * sizeof(float));
+        conv_copy_k: for (index = 0; index < hidden_count; ++index) {
+#pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
+            k[index] = tmp_hidden[index];
+        }
         gdn_depthwise_conv_silu(tmp_hidden, v, layer_v_conv, num_tokens, hidden, config->conv_size);
-        memcpy(v, tmp_hidden, hidden_count * sizeof(float));
+        conv_copy_v: for (index = 0; index < hidden_count; ++index) {
+#pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
+            v[index] = tmp_hidden[index];
+        }
 
         gdn_recurrent_attention(
             attn,
@@ -703,6 +746,7 @@ int gdn_forward(
         gdn_output_norm_and_gate(attn, gate, layer_o_norm, num_tokens, num_heads, head_dim, config->norm_eps);
         gdn_matmul(tmp_hidden, attn, layer_o_proj, num_tokens, hidden, hidden);
         attn_residual: for (index = 0; index < hidden_count; ++index) {
+#pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
             x[index] += tmp_hidden[index];
         }
 
@@ -712,6 +756,7 @@ int gdn_forward(
         gdn_swiglu_inplace(mlp_gate, mlp_up, mlp_count);
         gdn_matmul(tmp_hidden, mlp_gate, layer_mlp_down_proj, num_tokens, intermediate, hidden);
         mlp_residual: for (index = 0; index < hidden_count; ++index) {
+#pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
             x[index] += tmp_hidden[index];
         }
     }
