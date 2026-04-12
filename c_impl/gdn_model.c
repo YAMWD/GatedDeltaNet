@@ -329,7 +329,7 @@ static float gdn_softplus(float x) {
 static float gdn_l2_norm_inv(const float *x, uint32_t length) {
     double sum = 0.0;
     uint32_t index;
-    for (index = 0; index < length; ++index) {
+    l2_accum: for (index = 0; index < length; ++index) {
         sum += (double)x[index] * (double)x[index];
     }
     return 1.0f / sqrtf((float)sum + 1e-6f);
@@ -345,7 +345,7 @@ static void gdn_embed_tokens(
 ) {
     uint32_t token_index;
 
-    for (token_index = 0; token_index < num_tokens; ++token_index) {
+    embed_loop: for (token_index = 0; token_index < num_tokens; ++token_index) {
         int32_t token = tokens[token_index];
         if (token < 0 || (uint32_t)token >= vocab) {
             gdn_print_error("token id out of range");
@@ -368,17 +368,17 @@ static void gdn_rmsnorm_rows(
     float eps
 ) {
     uint32_t row;
-    for (row = 0; row < num_rows; ++row) {
+    rmsnorm_row: for (row = 0; row < num_rows; ++row) {
         const float *in_row = in + (size_t)row * num_cols;
         float *out_row = out + (size_t)row * num_cols;
         double sum = 0.0;
         uint32_t col;
         float scale;
-        for (col = 0; col < num_cols; ++col) {
+        rmsnorm_sq: for (col = 0; col < num_cols; ++col) {
             sum += (double)in_row[col] * (double)in_row[col];
         }
         scale = 1.0f / sqrtf((float)(sum / num_cols) + eps);
-        for (col = 0; col < num_cols; ++col) {
+        rmsnorm_scale: for (col = 0; col < num_cols; ++col) {
             out_row[col] = in_row[col] * scale * weight[col];
         }
     }
@@ -393,15 +393,15 @@ static void gdn_matmul(
     uint32_t out_dim
 ) {
     uint32_t row;
-    for (row = 0; row < num_rows; ++row) {
+    matmul_row: for (row = 0; row < num_rows; ++row) {
         const float *in_row = in + (size_t)row * in_dim;
         float *out_row = out + (size_t)row * out_dim;
         uint32_t out_index;
-        for (out_index = 0; out_index < out_dim; ++out_index) {
+        matmul_col: for (out_index = 0; out_index < out_dim; ++out_index) {
             const float *weight_row = weights + (size_t)out_index * in_dim;
             float sum = 0.0f;
             uint32_t in_index;
-            for (in_index = 0; in_index < in_dim; ++in_index) {
+            matmul_dot: for (in_index = 0; in_index < in_dim; ++in_index) {
                 sum += in_row[in_index] * weight_row[in_index];
             }
             out_row[out_index] = sum;
@@ -418,13 +418,13 @@ static void gdn_depthwise_conv_silu(
     uint32_t kernel_size
 ) {
     uint32_t row;
-    for (row = 0; row < num_rows; ++row) {
+    conv_row: for (row = 0; row < num_rows; ++row) {
         uint32_t col;
-        for (col = 0; col < num_cols; ++col) {
+        conv_col: for (col = 0; col < num_cols; ++col) {
             float sum = 0.0f;
             uint32_t kernel_index;
             int32_t start = (int32_t)row - (int32_t)kernel_size + 1;
-            for (kernel_index = 0; kernel_index < kernel_size; ++kernel_index) {
+            conv_kern: for (kernel_index = 0; kernel_index < kernel_size; ++kernel_index) {
                 int32_t source_row = start + (int32_t)kernel_index;
                 if (source_row >= 0) {
                     sum += in[(size_t)source_row * num_cols + col] *
@@ -459,9 +459,9 @@ static void gdn_recurrent_attention(
 
     memset(recurrent_state, 0, state_size * sizeof(float));
 
-    for (token_index = 0; token_index < num_tokens; ++token_index) {
+    recur_token: for (token_index = 0; token_index < num_tokens; ++token_index) {
         uint32_t head_index;
-        for (head_index = 0; head_index < num_heads; ++head_index) {
+        recur_head: for (head_index = 0; head_index < num_heads; ++head_index) {
             const float *q_head = q + (size_t)token_index * hidden + (size_t)head_index * head_dim;
             const float *k_head = k + (size_t)token_index * hidden + (size_t)head_index * head_dim;
             const float *v_head = v + (size_t)token_index * hidden + (size_t)head_index * value_dim;
@@ -476,32 +476,32 @@ static void gdn_recurrent_attention(
             uint32_t index;
             uint32_t value_index;
 
-            for (index = 0; index < head_dim * value_dim; ++index) {
+            state_decay: for (index = 0; index < head_dim * value_dim; ++index) {
                 state_head[index] *= decay;
             }
 
-            for (value_index = 0; value_index < value_dim; ++value_index) {
+            delta_proj: for (value_index = 0; value_index < value_dim; ++value_index) {
                 float projection = 0.0f;
                 uint32_t key_index;
-                for (key_index = 0; key_index < head_dim; ++key_index) {
+                delta_proj_dot: for (key_index = 0; key_index < head_dim; ++key_index) {
                     projection += state_head[(size_t)key_index * value_dim + value_index] *
                                   (k_head[key_index] * k_inv);
                 }
                 head_buffer[value_index] = beta * (v_head[value_index] - projection);
             }
 
-            for (index = 0; index < head_dim; ++index) {
+            state_update_k: for (index = 0; index < head_dim; ++index) {
                 float normalized_k = k_head[index] * k_inv;
                 float *state_row = state_head + (size_t)index * value_dim;
-                for (value_index = 0; value_index < value_dim; ++value_index) {
+                state_update_v: for (value_index = 0; value_index < value_dim; ++value_index) {
                     state_row[value_index] += normalized_k * head_buffer[value_index];
                 }
             }
 
-            for (value_index = 0; value_index < value_dim; ++value_index) {
+            query_out: for (value_index = 0; value_index < value_dim; ++value_index) {
                 float sum = 0.0f;
                 uint32_t key_index;
-                for (key_index = 0; key_index < head_dim; ++key_index) {
+                query_out_dot: for (key_index = 0; key_index < head_dim; ++key_index) {
                     sum += state_head[(size_t)key_index * value_dim + value_index] *
                            (q_head[key_index] * q_inv * q_scale);
                 }
@@ -521,19 +521,19 @@ static void gdn_output_norm_and_gate(
     float eps
 ) {
     uint32_t token_index;
-    for (token_index = 0; token_index < num_tokens; ++token_index) {
+    onorm_token: for (token_index = 0; token_index < num_tokens; ++token_index) {
         uint32_t head_index;
-        for (head_index = 0; head_index < num_heads; ++head_index) {
+        onorm_head: for (head_index = 0; head_index < num_heads; ++head_index) {
             float *attn_head = attn + (size_t)token_index * num_heads * head_dim + (size_t)head_index * head_dim;
             const float *gate_head = gate + (size_t)token_index * num_heads * head_dim + (size_t)head_index * head_dim;
             double sum = 0.0;
             uint32_t index;
             float scale;
-            for (index = 0; index < head_dim; ++index) {
+            onorm_sq: for (index = 0; index < head_dim; ++index) {
                 sum += (double)attn_head[index] * (double)attn_head[index];
             }
             scale = 1.0f / sqrtf((float)(sum / head_dim) + eps);
-            for (index = 0; index < head_dim; ++index) {
+            onorm_gate: for (index = 0; index < head_dim; ++index) {
                 float normalized = attn_head[index] * scale * weight[index];
                 float gate_value = gate_head[index];
                 attn_head[index] = normalized * gate_value * gdn_sigmoid(gate_value);
@@ -544,7 +544,7 @@ static void gdn_output_norm_and_gate(
 
 static void gdn_swiglu_inplace(float *gate, const float *up, size_t count) {
     size_t index;
-    for (index = 0; index < count; ++index) {
+    swiglu_loop: for (index = 0; index < count; ++index) {
         gate[index] = gdn_silu(gate[index]) * up[index];
     }
 }
@@ -612,7 +612,7 @@ int gdn_forward(
     mlp_count = (size_t)num_tokens * intermediate;
 
     gdn_embed_tokens(x, embeddings, tokens, num_tokens, hidden, config->vocab_size);
-    for (layer_index = 0; layer_index < config->num_layers; ++layer_index) {
+    layer_loop: for (layer_index = 0; layer_index < config->num_layers; ++layer_index) {
         size_t layer_offset = gdn_layer_weight_offset(config, layer_index);
         const float *layer_attn_norm = weight_data + layer_offset;
         const float *layer_a_log;
@@ -702,7 +702,7 @@ int gdn_forward(
         );
         gdn_output_norm_and_gate(attn, gate, layer_o_norm, num_tokens, num_heads, head_dim, config->norm_eps);
         gdn_matmul(tmp_hidden, attn, layer_o_proj, num_tokens, hidden, hidden);
-        for (index = 0; index < hidden_count; ++index) {
+        attn_residual: for (index = 0; index < hidden_count; ++index) {
             x[index] += tmp_hidden[index];
         }
 
@@ -711,7 +711,7 @@ int gdn_forward(
         gdn_matmul(mlp_up, x_norm, layer_mlp_up_proj, num_tokens, hidden, intermediate);
         gdn_swiglu_inplace(mlp_gate, mlp_up, mlp_count);
         gdn_matmul(tmp_hidden, mlp_gate, layer_mlp_down_proj, num_tokens, intermediate, hidden);
-        for (index = 0; index < hidden_count; ++index) {
+        mlp_residual: for (index = 0; index < hidden_count; ++index) {
             x[index] += tmp_hidden[index];
         }
     }
