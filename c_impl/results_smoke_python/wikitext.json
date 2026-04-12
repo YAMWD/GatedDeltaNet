@@ -1,0 +1,16 @@
+{
+  "fixture": "c_impl/fixtures_smoke/wikitext.gdnreq",
+  "kind": 3,
+  "num_examples": 1,
+  "metrics": {
+    "word_perplexity": 15.813882396061597,
+    "byte_perplexity": 1.7031769249506252,
+    "bits_per_byte": 0.7682283090569002
+  },
+  "examples": [
+    {
+      "index": 0,
+      "logprob": -3017.65078830719
+    }
+  ]
+}
