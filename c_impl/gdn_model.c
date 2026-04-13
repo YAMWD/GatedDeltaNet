@@ -391,6 +391,13 @@ static void gdn_rmsnorm_rows(
     }
 }
 
+/* Tile sizes for tiled matmul — chosen to divide evenly into hidden=2048
+   and intermediate=5632 (=16*352).  out_dim=8 (a/b proj) is smaller than
+   TILE_C but handled by the boundary guard inside the inner loops. */
+#define MM_TILE_R 16   /* rows (num_tokens dimension) */
+#define MM_TILE_C 16   /* columns (out_dim dimension) */
+#define MM_TILE_K 16   /* reduction (in_dim dimension) */
+
 static void gdn_matmul(
     float *out,
     const float *in,
@@ -399,26 +406,118 @@ static void gdn_matmul(
     uint32_t in_dim,
     uint32_t out_dim
 ) {
-    uint32_t row;
-    
-    matmul_row: for (row = 0; row < num_rows; ++row) {
+    uint32_t tr, tc, tk;   /* tile indices */
+    uint32_t r, c, k;      /* intra-tile indices */
+    float local_in[MM_TILE_R][MM_TILE_K];
+    float local_wt[MM_TILE_K][MM_TILE_C];
+    float local_out[MM_TILE_R][MM_TILE_C];
+    #pragma HLS array_partition variable=local_in  dim=2 complete
+    #pragma HLS array_partition variable=local_wt  dim=1 complete
+    #pragma HLS array_partition variable=local_out dim=2 complete
+
+    /* Zero the output buffer — replacement for memset so HLS can estimate latency */
+    mm_zero_row: for (r = 0; r < num_rows; ++r) {
     #pragma HLS loop_tripcount min=1 max=2048  /* num_tokens: 1..max_seq_len */
-        const float *in_row = in + (size_t)row * in_dim;
-        float *out_row = out + (size_t)row * out_dim;
-        uint32_t out_index;
-        matmul_col: for (out_index = 0; out_index < out_dim; ++out_index) {
-        #pragma HLS loop_tripcount min=8 max=5632  /* out_dim: num_heads=8 (a/b proj) to intermediate=5632 (MLP) */
-            const float *weight_row = weights + (size_t)out_index * in_dim;
-            float sum = 0.0f;
-            uint32_t in_index;
-            matmul_dot: for (in_index = 0; in_index < in_dim; ++in_index) {
-            #pragma HLS loop_tripcount min=2048 max=5632  /* in_dim: hidden=2048 (most) to intermediate=5632 (MLP down) */
-            #pragma HLS pipeline II=1
-                sum += in_row[in_index] * weight_row[in_index];
-            }
-            out_row[out_index] = sum;
+        mm_zero_col: for (c = 0; c < out_dim; ++c) {
+    #pragma HLS loop_tripcount min=8 max=5632  /* out_dim: num_heads=8 to intermediate=5632 */
+    #pragma HLS pipeline II=1
+            out[(size_t)r * out_dim + c] = 0.0f;
         }
     }
+
+    /* Tiled matrix multiply: out[R][C] += in[R][K] * weights[C][K]^T
+       Weight layout is row-major with weights[out_index] being one row of
+       length in_dim, i.e. weights is (out_dim x in_dim). */
+    mm_tile_r: for (tr = 0; tr < num_rows; tr += MM_TILE_R) {
+    #pragma HLS loop_tripcount min=1 max=128  /* ceil(2048/16) */
+        mm_tile_k: for (tk = 0; tk < in_dim; tk += MM_TILE_K) {
+    #pragma HLS loop_tripcount min=128 max=352  /* ceil(2048/16) to ceil(5632/16) */
+
+            /* Load input tile: local_in[r][k] = in[tr+r][tk+k] */
+            mm_load_in_r: for (r = 0; r < MM_TILE_R; ++r) {
+            #pragma HLS loop_tripcount min=16 max=16
+                mm_load_in_k: for (k = 0; k < MM_TILE_K; ++k) {
+                #pragma HLS loop_tripcount min=16 max=16
+                #pragma HLS pipeline II=1
+                    uint32_t gr = tr + r;
+                    uint32_t gk = tk + k;
+                    local_in[r][k] = (gr < num_rows && gk < in_dim)
+                        ? in[(size_t)gr * in_dim + gk] : 0.0f;
+                }
+            }
+
+            mm_tile_c: for (tc = 0; tc < out_dim; tc += MM_TILE_C) {
+            #pragma HLS loop_tripcount min=1 max=352  /* ceil(8/16)=1 to ceil(5632/16)=352 */
+
+                /* Load weight tile: local_wt[k][c] = weights[tc+c][tk+k] */
+                mm_load_wt_c: for (c = 0; c < MM_TILE_C; ++c) {
+                #pragma HLS loop_tripcount min=16 max=16
+                    mm_load_wt_k: for (k = 0; k < MM_TILE_K; ++k) {
+                    #pragma HLS loop_tripcount min=16 max=16
+                    #pragma HLS pipeline II=1
+                        uint32_t gc = tc + c;
+                        uint32_t gk = tk + k;
+                        local_wt[k][c] = (gc < out_dim && gk < in_dim)
+                            ? weights[(size_t)gc * in_dim + gk] : 0.0f;
+                    }
+                }
+
+                /* Load partial sums (only on the first K-tile) */
+                if (tk == 0) {
+                    mm_load_out_r: for (r = 0; r < MM_TILE_R; ++r) {
+                    #pragma HLS loop_tripcount min=16 max=16
+                        mm_load_out_c: for (c = 0; c < MM_TILE_C; ++c) {
+                        #pragma HLS loop_tripcount min=16 max=16
+                        #pragma HLS pipeline II=1
+                            local_out[r][c] = 0.0f;
+                        }
+                    }
+                } else {
+                    mm_reload_out_r: for (r = 0; r < MM_TILE_R; ++r) {
+                    #pragma HLS loop_tripcount min=16 max=16
+                        mm_reload_out_c: for (c = 0; c < MM_TILE_C; ++c) {
+                        #pragma HLS loop_tripcount min=16 max=16
+                        #pragma HLS pipeline II=1
+                            uint32_t gr = tr + r;
+                            uint32_t gc = tc + c;
+                            local_out[r][c] = (gr < num_rows && gc < out_dim)
+                                ? out[(size_t)gr * out_dim + gc] : 0.0f;
+                        }
+                    }
+                }
+
+                /* Compute: local_out[r][c] += sum_k local_in[r][k] * local_wt[k][c] */
+                mm_comp_r: for (r = 0; r < MM_TILE_R; ++r) {
+                #pragma HLS loop_tripcount min=16 max=16
+                    mm_comp_k: for (k = 0; k < MM_TILE_K; ++k) {
+                    #pragma HLS loop_tripcount min=16 max=16
+                    #pragma HLS pipeline II=1
+                        float a_val = local_in[r][k];
+                        mm_comp_c: for (c = 0; c < MM_TILE_C; ++c) {
+                        #pragma HLS loop_tripcount min=16 max=16
+                        #pragma HLS unroll
+                            local_out[r][c] += a_val * local_wt[k][c];
+                        }
+                    }
+                }
+
+                /* Store output tile back to DRAM */
+                mm_store_r: for (r = 0; r < MM_TILE_R; ++r) {
+                #pragma HLS loop_tripcount min=16 max=16
+                    mm_store_c: for (c = 0; c < MM_TILE_C; ++c) {
+                    #pragma HLS loop_tripcount min=16 max=16
+                    #pragma HLS pipeline II=1
+                        uint32_t gr = tr + r;
+                        uint32_t gc = tc + c;
+                        if (gr < num_rows && gc < out_dim) {
+                            out[(size_t)gr * out_dim + gc] = local_out[r][c];
+                        }
+                    }
+                }
+
+            } /* mm_tile_c */
+        } /* mm_tile_k */
+    } /* mm_tile_r */
 }
 
 static void gdn_depthwise_conv_silu(
