@@ -99,4 +99,13 @@ int gdn_forward(
 int gdn_forward_host(const GDNModel *model, GDNRunState *state, const int32_t *tokens, uint32_t num_tokens);
 void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logits_out);
 
+int gdn_attn_forward_layer(
+    const GDNModel *model,
+    GDNRunState *state,
+    uint32_t layer_index,
+    const float *input,
+    float *output,
+    uint32_t num_tokens
+);
+
 #endif

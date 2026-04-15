@@ -905,3 +905,69 @@ void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logit
         logits_out[vocab_index] = sum;
     }
 }
+
+int gdn_attn_forward_layer(
+    const GDNModel *model,
+    GDNRunState *state,
+    uint32_t layer_index,
+    const float *input,
+    float *output,
+    uint32_t num_tokens
+) {
+    uint32_t hidden = model->config.hidden_size;
+    uint32_t num_heads = model->config.num_heads;
+    uint32_t head_dim = model->config.head_dim;
+    uint32_t conv_size = model->config.conv_size;
+    size_t hidden_count = (size_t)num_tokens * hidden;
+    const GDNLayerWeights *lw;
+    size_t index;
+
+    if (layer_index >= model->config.num_layers) {
+        gdn_print_error("layer index out of range");
+        return -1;
+    }
+    if (num_tokens == 0 || num_tokens > state->max_tokens) {
+        gdn_print_error("invalid token count for attn forward");
+        return -1;
+    }
+
+    lw = &model->layers[layer_index];
+
+    /* Projections: input -> q, k, v, a, b, gate */
+    gdn_matmul(state->q, input, lw->q_proj, num_tokens, hidden, hidden);
+    gdn_matmul(state->k, input, lw->k_proj, num_tokens, hidden, hidden);
+    gdn_matmul(state->v, input, lw->v_proj, num_tokens, hidden, hidden);
+    gdn_matmul(state->a, input, lw->a_proj, num_tokens, hidden, num_heads);
+    gdn_matmul(state->b, input, lw->b_proj, num_tokens, hidden, num_heads);
+    gdn_matmul(state->gate, input, lw->g_proj, num_tokens, hidden, hidden);
+
+    /* Depthwise conv1d + SiLU on q, k, v */
+    gdn_depthwise_conv_silu(state->tmp_hidden, state->q, lw->q_conv, num_tokens, hidden, conv_size);
+    for (index = 0; index < hidden_count; ++index) state->q[index] = state->tmp_hidden[index];
+
+    gdn_depthwise_conv_silu(state->tmp_hidden, state->k, lw->k_conv, num_tokens, hidden, conv_size);
+    for (index = 0; index < hidden_count; ++index) state->k[index] = state->tmp_hidden[index];
+
+    gdn_depthwise_conv_silu(state->tmp_hidden, state->v, lw->v_conv, num_tokens, hidden, conv_size);
+    for (index = 0; index < hidden_count; ++index) state->v[index] = state->tmp_hidden[index];
+
+    /* Recurrent attention */
+    gdn_recurrent_attention(
+        state->attn, state->recurrent_state, state->head_buffer,
+        state->q, state->k, state->v,
+        state->a, state->b,
+        lw->a_log, lw->dt_bias,
+        hidden, num_heads, head_dim, num_tokens
+    );
+
+    /* Output norm + gate */
+    gdn_output_norm_and_gate(
+        state->attn, state->gate, lw->o_norm,
+        num_tokens, num_heads, head_dim, model->config.norm_eps
+    );
+
+    /* Output projection -> output */
+    gdn_matmul(output, state->attn, lw->o_proj, num_tokens, hidden, hidden);
+
+    return 0;
+}
