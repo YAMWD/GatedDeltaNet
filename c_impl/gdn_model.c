@@ -906,6 +906,159 @@ void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logit
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * HLS-synthesizable single-layer GDN attention forward.
+ *
+ * Struct pointers are disaggregated into flat arrays so Vitis HLS can attach
+ * m_axi interfaces.  The host wrapper gdn_attn_forward_layer (below) packs
+ * the call for testbench use.
+ * ----------------------------------------------------------------------- */
+int gdn_attn_forward(
+    const GDNWeightHeader *config,
+    const float *weight_data,
+    uint32_t layer_index,
+    const float *input,
+    float *output,
+    float *q,
+    float *k,
+    float *v,
+    float *a,
+    float *b,
+    float *gate,
+    float *attn,
+    float *tmp_hidden,
+    float *recurrent_state,
+    float *head_buffer,
+    uint32_t num_tokens
+) {
+    /* m_axi depth sized for single-layer attention:
+       weight_data covers layer 0 attn weights (vocab*hidden + layer_attn_stride ≈ 87M).
+       Per-token buffers sized for max_seq_len*hidden = 2048*2048 = 4M. */
+    #pragma HLS interface m_axi port=config depth=1 offset=slave
+    #pragma HLS interface m_axi port=weight_data depth=87000000 offset=slave
+    #pragma HLS interface m_axi port=input depth=129024 offset=slave
+    #pragma HLS interface m_axi port=output depth=129024 offset=slave
+    #pragma HLS interface m_axi port=q depth=129024 offset=slave
+    #pragma HLS interface m_axi port=k depth=129024 offset=slave
+    #pragma HLS interface m_axi port=v depth=129024 offset=slave
+    #pragma HLS interface m_axi port=a depth=504 offset=slave
+    #pragma HLS interface m_axi port=b depth=504 offset=slave
+    #pragma HLS interface m_axi port=gate depth=129024 offset=slave
+    #pragma HLS interface m_axi port=attn depth=129024 offset=slave
+    #pragma HLS interface m_axi port=tmp_hidden depth=129024 offset=slave
+    #pragma HLS interface m_axi port=recurrent_state depth=524288 offset=slave
+    #pragma HLS interface m_axi port=head_buffer depth=256 offset=slave
+    #pragma HLS interface s_axilite port=layer_index
+    #pragma HLS interface s_axilite port=num_tokens
+    #pragma HLS interface s_axilite port=return
+
+    uint32_t hidden = config->hidden_size;
+    uint32_t num_heads = config->num_heads;
+    uint32_t head_dim = config->head_dim;
+    uint32_t conv_size = config->conv_size;
+    size_t hidden_count = (size_t)num_tokens * hidden;
+    size_t index;
+
+    /* Compute weight pointers for the requested layer */
+    size_t layer_offset = gdn_layer_weight_offset(config, layer_index);
+    const float *layer_a_log;
+    const float *layer_dt_bias;
+    const float *layer_q_proj;
+    const float *layer_k_proj;
+    const float *layer_v_proj;
+    const float *layer_a_proj;
+    const float *layer_b_proj;
+    const float *layer_q_conv;
+    const float *layer_k_conv;
+    const float *layer_v_conv;
+    const float *layer_g_proj;
+    const float *layer_o_norm;
+    const float *layer_o_proj;
+
+    if (layer_index >= config->num_layers) {
+        gdn_print_error("layer index out of range");
+        return -1;
+    }
+    if (num_tokens == 0 || num_tokens > config->max_seq_len) {
+        gdn_print_error("invalid token count for attn forward");
+        return -1;
+    }
+
+    layer_offset += hidden;
+    layer_a_log = weight_data + layer_offset;
+    layer_offset += num_heads;
+    layer_dt_bias = weight_data + layer_offset;
+    layer_offset += num_heads;
+    layer_q_proj = weight_data + layer_offset;
+    layer_offset += (size_t)hidden * hidden;
+    layer_k_proj = weight_data + layer_offset;
+    layer_offset += (size_t)hidden * hidden;
+    layer_v_proj = weight_data + layer_offset;
+    layer_offset += (size_t)hidden * hidden;
+    layer_a_proj = weight_data + layer_offset;
+    layer_offset += (size_t)num_heads * hidden;
+    layer_b_proj = weight_data + layer_offset;
+    layer_offset += (size_t)num_heads * hidden;
+    layer_q_conv = weight_data + layer_offset;
+    layer_offset += (size_t)hidden * conv_size;
+    layer_k_conv = weight_data + layer_offset;
+    layer_offset += (size_t)hidden * conv_size;
+    layer_v_conv = weight_data + layer_offset;
+    layer_offset += (size_t)hidden * conv_size;
+    layer_g_proj = weight_data + layer_offset;
+    layer_offset += (size_t)hidden * hidden;
+    layer_o_norm = weight_data + layer_offset;
+    layer_offset += head_dim;
+    layer_o_proj = weight_data + layer_offset;
+
+    /* Projections: input -> q, k, v, a, b, gate */
+    gdn_matmul(q, input, layer_q_proj, num_tokens, hidden, hidden);
+    gdn_matmul(k, input, layer_k_proj, num_tokens, hidden, hidden);
+    gdn_matmul(v, input, layer_v_proj, num_tokens, hidden, hidden);
+    gdn_matmul(a, input, layer_a_proj, num_tokens, hidden, num_heads);
+    gdn_matmul(b, input, layer_b_proj, num_tokens, hidden, num_heads);
+    gdn_matmul(gate, input, layer_g_proj, num_tokens, hidden, hidden);
+
+    /* Depthwise conv1d + SiLU on q, k, v */
+    gdn_depthwise_conv_silu(tmp_hidden, q, layer_q_conv, num_tokens, hidden, conv_size);
+    attn_conv_copy_q: for (index = 0; index < hidden_count; ++index) {
+    #pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
+        q[index] = tmp_hidden[index];
+    }
+
+    gdn_depthwise_conv_silu(tmp_hidden, k, layer_k_conv, num_tokens, hidden, conv_size);
+    attn_conv_copy_k: for (index = 0; index < hidden_count; ++index) {
+    #pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
+        k[index] = tmp_hidden[index];
+    }
+
+    gdn_depthwise_conv_silu(tmp_hidden, v, layer_v_conv, num_tokens, hidden, conv_size);
+    attn_conv_copy_v: for (index = 0; index < hidden_count; ++index) {
+    #pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
+        v[index] = tmp_hidden[index];
+    }
+
+    /* Recurrent attention */
+    gdn_recurrent_attention(
+        attn, recurrent_state, head_buffer,
+        q, k, v, a, b,
+        layer_a_log, layer_dt_bias,
+        hidden, num_heads, head_dim, num_tokens
+    );
+
+    /* Output norm + gate */
+    gdn_output_norm_and_gate(
+        attn, gate, layer_o_norm,
+        num_tokens, num_heads, head_dim, config->norm_eps
+    );
+
+    /* Output projection -> output */
+    gdn_matmul(output, attn, layer_o_proj, num_tokens, hidden, hidden);
+
+    return 0;
+}
+
+/* Host-side wrapper: packs GDNModel/GDNRunState into flat args for testbench */
 int gdn_attn_forward_layer(
     const GDNModel *model,
     GDNRunState *state,
@@ -914,60 +1067,22 @@ int gdn_attn_forward_layer(
     float *output,
     uint32_t num_tokens
 ) {
-    uint32_t hidden = model->config.hidden_size;
-    uint32_t num_heads = model->config.num_heads;
-    uint32_t head_dim = model->config.head_dim;
-    uint32_t conv_size = model->config.conv_size;
-    size_t hidden_count = (size_t)num_tokens * hidden;
-    const GDNLayerWeights *lw;
-    size_t index;
-
-    if (layer_index >= model->config.num_layers) {
-        gdn_print_error("layer index out of range");
-        return -1;
-    }
-    if (num_tokens == 0 || num_tokens > state->max_tokens) {
-        gdn_print_error("invalid token count for attn forward");
-        return -1;
-    }
-
-    lw = &model->layers[layer_index];
-
-    /* Projections: input -> q, k, v, a, b, gate */
-    gdn_matmul(state->q, input, lw->q_proj, num_tokens, hidden, hidden);
-    gdn_matmul(state->k, input, lw->k_proj, num_tokens, hidden, hidden);
-    gdn_matmul(state->v, input, lw->v_proj, num_tokens, hidden, hidden);
-    gdn_matmul(state->a, input, lw->a_proj, num_tokens, hidden, num_heads);
-    gdn_matmul(state->b, input, lw->b_proj, num_tokens, hidden, num_heads);
-    gdn_matmul(state->gate, input, lw->g_proj, num_tokens, hidden, hidden);
-
-    /* Depthwise conv1d + SiLU on q, k, v */
-    gdn_depthwise_conv_silu(state->tmp_hidden, state->q, lw->q_conv, num_tokens, hidden, conv_size);
-    for (index = 0; index < hidden_count; ++index) state->q[index] = state->tmp_hidden[index];
-
-    gdn_depthwise_conv_silu(state->tmp_hidden, state->k, lw->k_conv, num_tokens, hidden, conv_size);
-    for (index = 0; index < hidden_count; ++index) state->k[index] = state->tmp_hidden[index];
-
-    gdn_depthwise_conv_silu(state->tmp_hidden, state->v, lw->v_conv, num_tokens, hidden, conv_size);
-    for (index = 0; index < hidden_count; ++index) state->v[index] = state->tmp_hidden[index];
-
-    /* Recurrent attention */
-    gdn_recurrent_attention(
-        state->attn, state->recurrent_state, state->head_buffer,
-        state->q, state->k, state->v,
-        state->a, state->b,
-        lw->a_log, lw->dt_bias,
-        hidden, num_heads, head_dim, num_tokens
+    return gdn_attn_forward(
+        &model->config,
+        model->weight_data,
+        layer_index,
+        input,
+        output,
+        state->q,
+        state->k,
+        state->v,
+        state->a,
+        state->b,
+        state->gate,
+        state->attn,
+        state->tmp_hidden,
+        state->recurrent_state,
+        state->head_buffer,
+        num_tokens
     );
-
-    /* Output norm + gate */
-    gdn_output_norm_and_gate(
-        state->attn, state->gate, lw->o_norm,
-        num_tokens, num_heads, head_dim, model->config.norm_eps
-    );
-
-    /* Output projection -> output */
-    gdn_matmul(output, state->attn, lw->o_proj, num_tokens, hidden, hidden);
-
-    return 0;
 }
