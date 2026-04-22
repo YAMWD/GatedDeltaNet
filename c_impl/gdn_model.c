@@ -7,6 +7,12 @@
 
 #define GDN_WEIGHT_HEADER_BYTES 60
 
+/* Compile-time constants for GDN-1.3B (used by on-chip state and parallelism) */
+#define GDN_HEADS   8
+#define GDN_DK    256   /* head_dim = query/key dimension */
+#define GDN_DV    256   /* value_dim = hidden/num_heads   */
+#define GDN_PK     16   /* column parallelism factor      */
+
 static void gdn_print_error(const char *message) {
 #ifdef __SYNTHESIS__
     (void)message;
@@ -550,10 +556,26 @@ static void gdn_depthwise_conv_silu(
     }
 }
 
+/* -----------------------------------------------------------------------
+ * Optimized recurrent attention with:
+ *   1. Persistent on-chip state in BRAM (eliminates external memory traffic)
+ *   2. Fused two-pass pipeline (1 read + 1 read-modify-write vs 4 passes)
+ *   3. Column parallelism P_K=16 (16 MACs per cycle on state accesses)
+ *
+ * Algebraic fusion (Gupta et al.):
+ *   S_new = g*S_old + k_norm * Δv^T
+ *   o = (1/√d) * S_new^T * q_norm
+ *     = (1/√d) * (g * S_old^T * q_norm + (q_norm^T * k_norm) * Δv)
+ *     = q_scale * (g * ô + α * Δv)
+ * where ô_i = Σ_j S_old[j][i]*q_norm[j], α = q_norm^T * k_norm.
+ * This lets us compute retrieval (r) and partial output (ô) in a single
+ * read pass, then apply a scalar correction, reducing state passes from
+ * 4 to 2.
+ * ----------------------------------------------------------------------- */
 static void gdn_recurrent_attention(
     float *attn_out,
-    float *recurrent_state,
-    float *head_buffer,
+    float *recurrent_state,  /* unused: state is now on-chip BRAM */
+    float *head_buffer,      /* unused: local buffers used instead */
     const float *q,
     const float *k,
     const float *v,
@@ -566,78 +588,170 @@ static void gdn_recurrent_attention(
     uint32_t head_dim,
     uint32_t num_tokens
 ) {
-    uint32_t value_dim = hidden / num_heads;
-    float q_scale = 1.0f / sqrtf((float)head_dim);
-    size_t state_size = (size_t)num_heads * head_dim * value_dim;
+    /* On-chip persistent recurrent state: 8 heads × 256 × 256 FP32 = 2 MB */
+    static float state[GDN_HEADS][GDN_DK][GDN_DV];
+#pragma HLS bind_storage variable=state type=RAM_2P impl=BRAM
+#pragma HLS array_partition variable=state dim=3 cyclic factor=16
+
+    float q_scale = 1.0f / sqrtf((float)GDN_DK);
+    uint32_t h, j, i, p;
     uint32_t token_index;
 
-    {
-        size_t index;
-        state_clear: for (index = 0; index < state_size; ++index) {
-        #pragma HLS loop_tripcount min=524288 max=524288  /* num_heads*head_dim*value_dim = 8*256*256 */
-            recurrent_state[index] = 0.0f;
+    /* Clear on-chip state (parallelised by P_K) */
+    state_clr_h: for (h = 0; h < GDN_HEADS; ++h) {
+    #pragma HLS loop_tripcount min=8 max=8
+        state_clr_j: for (j = 0; j < GDN_DK; ++j) {
+        #pragma HLS loop_tripcount min=256 max=256
+            state_clr_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
+            #pragma HLS loop_tripcount min=16 max=16
+            #pragma HLS pipeline II=1
+                uint32_t pp;
+                for (pp = 0; pp < GDN_PK; ++pp) {
+                #pragma HLS unroll
+                    state[h][j][i + pp] = 0.0f;
+                }
+            }
         }
     }
 
     recur_token: for (token_index = 0; token_index < num_tokens; ++token_index) {
-    #pragma HLS loop_tripcount min=1 max=2048  /* num_tokens: 1..max_seq_len */
+    #pragma HLS loop_tripcount min=1 max=2048
         uint32_t head_index;
-        recur_head: for (head_index = 0; head_index < num_heads; ++head_index) {
-        #pragma HLS loop_tripcount min=8 max=8  /* num_heads=8 */
-            const float *q_head = q + (size_t)token_index * hidden + (size_t)head_index * head_dim;
-            const float *k_head = k + (size_t)token_index * hidden + (size_t)head_index * head_dim;
-            const float *v_head = v + (size_t)token_index * hidden + (size_t)head_index * value_dim;
-            float *state_head = recurrent_state + (size_t)head_index * head_dim * value_dim;
-            float *out_head = attn_out + (size_t)token_index * hidden + (size_t)head_index * value_dim;
-            float q_inv = gdn_l2_norm_inv(q_head, head_dim);
-            float k_inv = gdn_l2_norm_inv(k_head, head_dim);
-            float beta = gdn_sigmoid(b[(size_t)token_index * num_heads + head_index]);
-            float decay_input = a[(size_t)token_index * num_heads + head_index] + layer_dt_bias[head_index];
-            float decay_value = -expf(layer_a_log[head_index]) * gdn_softplus(decay_input);
-            float decay = expf(decay_value);
-            uint32_t index;
-            uint32_t value_index;
+        recur_head: for (head_index = 0; head_index < GDN_HEADS; ++head_index) {
+        #pragma HLS loop_tripcount min=8 max=8
 
-            state_decay: for (index = 0; index < head_dim * value_dim; ++index) {
-            #pragma HLS loop_tripcount min=65536 max=65536  /* head_dim*value_dim = 256*256 */
-                state_head[index] *= decay;
+            const float *q_head = q + (size_t)token_index * hidden
+                                    + (size_t)head_index * GDN_DK;
+            const float *k_head = k + (size_t)token_index * hidden
+                                    + (size_t)head_index * GDN_DK;
+            const float *v_head = v + (size_t)token_index * hidden
+                                    + (size_t)head_index * GDN_DV;
+            float *out_head = attn_out + (size_t)token_index * hidden
+                                       + (size_t)head_index * GDN_DV;
+
+            /* ---- Local per-token buffers ---- */
+            float q_loc[GDN_DK];
+            float k_loc[GDN_DK];
+            float v_loc[GDN_DV];
+            float r_buf[GDN_DV];   /* retrieval result           */
+            float o_buf[GDN_DV];   /* partial output              */
+            float dv[GDN_DV];      /* delta correction            */
+#pragma HLS array_partition variable=r_buf cyclic factor=16
+#pragma HLS array_partition variable=o_buf cyclic factor=16
+#pragma HLS array_partition variable=dv    cyclic factor=16
+#pragma HLS array_partition variable=v_loc cyclic factor=16
+
+            /* ---- Load q, k from DRAM and compute L2 norms ---- */
+            double q_sq = 0.0, k_sq = 0.0;
+            load_qk: for (j = 0; j < GDN_DK; ++j) {
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+                float qj = q_head[j];
+                float kj = k_head[j];
+                q_loc[j] = qj;
+                k_loc[j] = kj;
+                q_sq += (double)qj * (double)qj;
+                k_sq += (double)kj * (double)kj;
+            }
+            float q_inv = 1.0f / sqrtf((float)q_sq + 1e-6f);
+            float k_inv = 1.0f / sqrtf((float)k_sq + 1e-6f);
+
+            /* Normalise q and k in local buffers */
+            norm_qk: for (j = 0; j < GDN_DK; ++j) {
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+                q_loc[j] *= q_inv;
+                k_loc[j] *= k_inv;
             }
 
-            delta_proj: for (value_index = 0; value_index < value_dim; ++value_index) {
-            #pragma HLS loop_tripcount min=256 max=256  /* value_dim = hidden/num_heads = 2048/8 = 256 */
-                float projection = 0.0f;
-                uint32_t key_index;
-                delta_proj_dot: for (key_index = 0; key_index < head_dim; ++key_index) {
-                #pragma HLS loop_tripcount min=256 max=256  /* head_dim=256 */
-                    projection += state_head[(size_t)key_index * value_dim + value_index] *
-                                  (k_head[key_index] * k_inv);
+            /* Load v from DRAM */
+            load_v: for (i = 0; i < GDN_DV; ++i) {
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+                v_loc[i] = v_head[i];
+            }
+
+            /* Scalar gates */
+            float beta = gdn_sigmoid(
+                b[(size_t)token_index * num_heads + head_index]);
+            float decay_in = a[(size_t)token_index * num_heads + head_index]
+                           + layer_dt_bias[head_index];
+            float decay_val = -expf(layer_a_log[head_index])
+                            * gdn_softplus(decay_in);
+            float g = expf(decay_val);   /* decay factor */
+
+            /* ---- Phase 1: α = q_norm^T · k_norm (scalar) ---- */
+            float alpha = 0.0f;
+            dot_alpha: for (j = 0; j < GDN_DK; ++j) {
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+                alpha += q_loc[j] * k_loc[j];
+            }
+
+            /* ---- Phase 2: FUSED READ PASS ----
+             * For each column i, accumulate across rows j:
+             *   r_buf[i] = Σ_j S[j][i] * k_norm[j]   (retrieval)
+             *   o_buf[i] = Σ_j S[j][i] * q_norm[j]   (partial output)
+             * With P_K=16 column parallelism at II=1.
+             */
+            init_ro: for (i = 0; i < GDN_DV; ++i) {
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+            #pragma HLS unroll factor=16
+                r_buf[i] = 0.0f;
+                o_buf[i] = 0.0f;
+            }
+
+            fused_rd_j: for (j = 0; j < GDN_DK; ++j) {
+            #pragma HLS loop_tripcount min=256 max=256
+                float kj = k_loc[j];
+                float qj = q_loc[j];
+                fused_rd_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
+                #pragma HLS loop_tripcount min=16 max=16
+                #pragma HLS pipeline II=1
+                    uint32_t pp;
+                    for (pp = 0; pp < GDN_PK; ++pp) {
+                    #pragma HLS unroll
+                        float s = state[head_index][j][i + pp];
+                        r_buf[i + pp] += s * kj;
+                        o_buf[i + pp] += s * qj;
+                    }
                 }
-                head_buffer[value_index] = beta * (v_head[value_index] - projection);
             }
 
-            state_update_k: for (index = 0; index < head_dim; ++index) {
-            #pragma HLS loop_tripcount min=256 max=256  /* head_dim=256 */
-                float normalized_k = k_head[index] * k_inv;
-                float *state_row = state_head + (size_t)index * value_dim;
-                state_update_v: for (value_index = 0; value_index < value_dim; ++value_index) {
-                #pragma HLS loop_tripcount min=256 max=256  /* value_dim = hidden/num_heads = 256 */
-                    state_row[value_index] += normalized_k * head_buffer[value_index];
-                }
+            /* ---- Phase 3: Delta correction + output correction ----
+             * Δv[i] = β * (v[i] - r[i])
+             * o[i]  = q_scale * (g * ô[i] + α * Δv[i])
+             */
+            delta_out: for (i = 0; i < GDN_DV; ++i) {
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+            #pragma HLS unroll factor=16
+                float d = beta * (v_loc[i] - g * r_buf[i]);
+                dv[i] = d;
+                out_head[i] = q_scale * (g * o_buf[i] + alpha * d);
             }
 
-            query_out: for (value_index = 0; value_index < value_dim; ++value_index) {
-            #pragma HLS loop_tripcount min=256 max=256  /* value_dim = hidden/num_heads = 256 */
-                float sum = 0.0f;
-                uint32_t key_index;
-                query_out_dot: for (key_index = 0; key_index < head_dim; ++key_index) {
-                #pragma HLS loop_tripcount min=256 max=256  /* head_dim=256 */
-                    sum += state_head[(size_t)key_index * value_dim + value_index] *
-                           (q_head[key_index] * q_inv * q_scale);
+            /* ---- Phase 4: FUSED WRITE PASS (state update + decay) ----
+             * S[j][i] = g * S[j][i] + k_norm[j] * Δv[i]
+             */
+            fused_wr_j: for (j = 0; j < GDN_DK; ++j) {
+            #pragma HLS loop_tripcount min=256 max=256
+                float kj = k_loc[j];
+                fused_wr_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
+                #pragma HLS loop_tripcount min=16 max=16
+                #pragma HLS pipeline II=1
+                    uint32_t pp;
+                    for (pp = 0; pp < GDN_PK; ++pp) {
+                    #pragma HLS unroll
+                        state[head_index][j][i + pp] =
+                            g * state[head_index][j][i + pp]
+                            + kj * dv[i + pp];
+                    }
                 }
-                out_head[value_index] = sum;
             }
-        }
-    }
+        } /* recur_head */
+    } /* recur_token */
 }
 
 static void gdn_output_norm_and_gate(
