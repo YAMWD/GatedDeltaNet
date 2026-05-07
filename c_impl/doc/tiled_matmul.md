@@ -137,29 +137,30 @@ Each level is a balanced pair-add — 4 stages of fadd plus one fmul stage
 gives an iteration latency of 19 cycles, and HLS schedules a new iter every
 cycle (II=1).
 
-## Synthesis Results (single matmul call, VU11P @ 100 MHz)
+## Synthesis Results (single matmul call, U55C @ 100 MHz)
 
 | Iteration              | mm_comp inner II | per tile_c iter | per call (2048×2048) | Notes |
 |------------------------|-----------------:|----------------:|---------------------:|-------|
 | v0 (k pipelined, c unrolled, no flatten) | 2 | 624 cyc | 26.83 G | original |
 | v1 (8-lane partial accs)                 | 2 | 528 cyc | 24.34 G | auto-flattened, lane mux still serialised |
 | v3 (loop swap, c outer, no flatten)      | 2 | 1456 cyc | 38.88 G | regression: 16x pipeline-fill overhead + serial dot+= |
-| v4 (manual flatten + explicit tree + dep false) | **1** | **1271 cyc** | **20.18 G** | final |
+| v4 (manual flatten + explicit tree + dep false) | **1** | **1266 cyc** | **20.11 G** | final, U55C |
 
 For the seven matmul calls in `gdn_attn_forward`, total cost dropped from
 **~190 G** in v0 to **~141 G** in v7 (single-layer attention).
 
 ## Where the time still goes (v7)
 
-For each `mm_tile_c` iteration:
+For each `mm_tile_c` iteration on U55C (from the matmul_1 instance,
+`solution2/syn/report/csynth.rpt`):
 
 | Sub-phase           | Cycles | % |
 |---------------------|-------:|--:|
-| `mm_load_wt`        | 330    | 26 % |
-| `mm_load_out` / `mm_reload_out` | 258 / 330 | 23 % |
-| `mm_comp_rc`        | 275    | 22 % |
-| `mm_store`          | 328    | 26 % |
-| **total**           | **1271** | 100 % |
+| `mm_load_wt`        | 329    | 26 % |
+| `mm_load_out` / `mm_reload_out` | 258 / 329 | 23 % |
+| `mm_comp_rc`        | 274    | 22 % |
+| `mm_store`          | 327    | 26 % |
+| **total**           | **1266** | 100 % |
 
 Compute is only **22 %** of per-tile time. The remaining 78 % is **m_axi
 load/store overhead** of the 16×16 partial output tile reload and store-back
@@ -167,18 +168,18 @@ through DRAM between every adjacent `tk` step. This is the fundamental
 bottleneck and is the motivation for the dataflow / streaming-GEMM follow-up
 in [optimization_log.md §"Critical follow-ups"](optimization_log.md).
 
-## Resource Cost (single instance)
+## Resource Cost (per instance, U55C)
 
-| Resource | Value |
-|----------|------:|
-| DSP      | 98 (1 %) |
-| FF       | 21 k (~0 %) |
-| LUT      | 22 k (1 %) |
+| Resource | matmul_1 (mem_q out) | matmul_2 (gmem / mem_k out) |
+|----------|---------------------:|----------------------------:|
+| BRAM_18K | 0                    | 0                           |
+| DSP      | 92 (1 %)             | 98 (1 %)                    |
+| FF       | 19.4 k (~0 %)        | 20.6 k (~0 %)               |
+| LUT      | 18.4 k (1 %)         | 23.1 k (1 %)                |
 
-Note: when the `q` and `k` AXI ports are placed on separate bundles
-(`bundle=mem_q`, `bundle=mem_k` in v7), HLS instantiates two matmul
-instances (`gdn_matmul_1`, `gdn_matmul_2`) — one per AXI bundle — so the
-top-level resource summary shows roughly double these numbers for matmul.
+Note: with `q` and `k` on separate AXI bundles (`bundle=mem_q`,
+`bundle=mem_k`) HLS instantiates two matmul implementations (`gdn_matmul_1`
+and `gdn_matmul_2`). The top-level resource summary aggregates both.
 
 ## Why the v0 form was suboptimal
 

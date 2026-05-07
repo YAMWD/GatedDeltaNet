@@ -112,16 +112,18 @@ A naive `for j unroll: sum += arr[j]` does not help here — HLS unrolls but
 emits a 256-deep linear adder chain instead of a balanced tree. v5 made that
 mistake; v6 introduced the explicit tree helper.
 
-## Synthesis Results
+## Synthesis Results (U55C @ 100 MHz)
+
+From `solution2/syn/report/csynth.rpt` for the v7 design.
 
 Per (token, head) latency:
 
-| Phase           | v0 (orig) | v4 (lane partial) | v6/v7 (tree) |
-|-----------------|----------:|------------------:|-------------:|
-| onorm_sq        | 846       | 587 (II=2)        | **329** (II=1) |
-| onorm_load_g    | n/a       | 327 (II=1)        | 327 |
-| onorm_gate      | 40,962    | 344 (II=1)        | 344 |
-| **total / call**| 41,808    | 1,258             | **1,058** (incl. tree reduce ~58) |
+| Phase           | v0 (orig) | v4 (lane partial) | v7 (tree, U55C) |
+|-----------------|----------:|------------------:|----------------:|
+| onorm_sq        | 846       | 587 (II=2)        | **330** (II=1) |
+| onorm_load_g    | n/a       | 327 (II=1)        | 329 |
+| onorm_gate      | 40,962    | 344 (II=1)        | 342 |
+| **total / call**| 41,808    | 1,258             | **1,052** (incl. tree reduce) |
 
 For a full 2048-token sequence × 8 heads = 16,384 calls:
 
@@ -129,21 +131,24 @@ For a full 2048-token sequence × 8 heads = 16,384 calls:
 |------|---------------------------------------:|-------------:|
 | v0   | 685.6 M | 6.86 s |
 | v4   | 21.3 M  | 213 ms |
-| v7   | **17.3 M** | **173 ms** |
+| v7   | **17.24 M** | **172 ms** |
 
 That's **40× faster** than v0 and **19 % faster** than v4.
 
-## Resource Cost
+## Resource Cost (U55C)
 
 | Resource | Value |
 |----------|------:|
-| BRAM_18K | 24    |
-| DSP      | 13    |
-| FF       | 26 k  |
-| LUT      | 17 k  |
+| BRAM_18K | 0     |
+| DSP      | 13 (~0 %) |
+| FF       | 26.5 k (~0 %) |
+| LUT      | 17.6 k (1 %) |
 
-The DSP cost is small because the helper tree reduce reuses fadd cores across
-the four call sites (q_sq, k_sq, α, sum).
+No BRAM is needed: the per-(token, head) `attn_loc[256]` and `gate_loc[256]`
+buffers fit in registers because of the cyclic factor=8 partitioning, and the
+shared `weight_loc[256]` is similarly mapped. The DSP cost is small because
+the helper tree reduce reuses fadd cores across the four call sites
+(q_sq, k_sq, α, sum).
 
 ## Why the original was so slow
 

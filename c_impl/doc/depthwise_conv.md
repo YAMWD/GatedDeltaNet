@@ -146,39 +146,41 @@ The 4-tap MAC is a balanced expression `(a + b) + (c + d)` — HLS schedules
 this as two parallel adds followed by one final add (depth ≈ 2 fadd stages),
 not as a 4-deep serial accumulator chain.
 
-## Synthesis Results (single-layer, VU11P @ 100 MHz)
+## Synthesis Results (single-layer, U55C @ 100 MHz)
 
-Per-call latency:
+Per-call latency, from `solution2/syn/report/csynth.rpt`:
 
 | Pass | conv_row_conv_col | per-call total | per-call ns |
 |------|------------------:|---------------:|------------:|
 | v1 (original)  | 759 M (II=N/A, no pipeline) | 759.2 M | 7.59 s |
 | v2 (fused)     | 1.74 G (II=155)             | 1.74 G | 17.45 s |
-| v3+ (2-phase)  | 8.61–8.76 M (II=1 each)     | **8.76 M** | **87.6 ms** |
+| v3+ (2-phase)  | 8.74 M (conv_load II=1, conv_compute II=1) | **8.75 M** | **87.5 ms** |
 
 The 2-phase split is **86× faster** than v1 and **200× faster** than v2.
 
 Total per call:
-- weights pre-load: 8266 cyc (paid once)
+- weights pre-load: 8265 cyc (paid once)
 - window init: 8194 cyc (paid once)
-- main: `num_rows × (conv_load + conv_compute)` = 2048 × (2119 + 2147) ≈ 8.74 M
-- **total ≈ 8.76 M cycles ≈ 87.6 ms @ 100 MHz**
+- main: `num_rows × (conv_load + conv_compute)` = 2048 × (2051 + 2144) ≈ 8.59 M (matmul_1 instance) or 2048 × (2121 + 2144) ≈ 8.74 M (matmul_2 instance)
+- **total ≈ 8.75 M cycles ≈ 87.5 ms @ 100 MHz**
 
-For the three calls (Q, K, V) per attention layer, total conv cost is 26.3 M
+For the three calls (Q, K, V) per attention layer, total conv cost is ~26.2 M
 cycles — <0.02 % of `gdn_attn_forward`.
 
-## Resource Cost (single instance)
+## Resource Cost (per instance, U55C)
 
-| Resource | Value |
-|----------|------:|
-| BRAM_18K | 32    |
-| DSP      | 36    |
-| FF       | 6.5 k |
-| LUT      | 11.4 k |
+| Resource | conv_silu_1 (mem_q out) | conv_silu_2 (mem_k / gmem out) |
+|----------|------------------------:|--------------------------------:|
+| BRAM_18K | 32                      | 32                              |
+| DSP      | 36                      | 6                               |
+| FF       | 4.9 k                   | 4.1 k                           |
+| LUT      | 9.3 k                   | 9.4 k                           |
 
 Note: with the v7 `bundle=mem_q` / `bundle=mem_k` split on the top-level AXI,
-HLS instantiates the function twice (one per bundle), so resource is roughly
-doubled at the top-level resource summary.
+HLS instantiates two conv implementations (`gdn_depthwise_conv_silu_1` for
+the call producing `q`, `_2` for `k` / `v`). Their `conv_compute` schedules
+differ slightly (different tap-DSP packing), which is why the DSP counts
+diverge (36 vs 6).
 
 ## Why the original was so slow
 

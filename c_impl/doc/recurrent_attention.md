@@ -77,7 +77,7 @@ static float state[GDN_HEADS][GDN_DK][GDN_DV];
 The state is declared `static` so it persists across function calls (across
 layers and tokens). It is bound to dual-port BRAM, providing one read port
 and one write port per cycle. Total storage: 8 × 256 × 256 × 4 bytes = 2 MB,
-consuming 938 BRAM_18K (≈ 70 % of one SLR on VU11P, ≈ 23 % of total device).
+consuming 938 BRAM_18K — the dominant on-chip memory cost.
 
 The `recurrent_state` and `head_buffer` m_axi ports are kept in the interface
 for API compatibility but are unused.
@@ -290,34 +290,38 @@ delta_out                31        Compute Δv + out_loc (II=1, ×16)
 delta_drain              327       Drain out_loc → m_axi (II=1)
 fused_wr_j/i             4 103     Fused write: decay + state update
 -----------              ------
-Total per head           ~9 305 (was 19,105,698 in naive baseline)
+Total per (token,head)   ~9 598 (was 19,105,698 in naive baseline)
 ```
 
-For 2048 tokens × 8 heads = **152.6 M cycles total** vs the naive baseline of
-**313 G cycles** — a **2,050× speedup** on the recurrent module alone.
+For 2048 tokens × 8 heads = **157.3 M cycles total** vs the naive baseline of
+**313 G cycles** — a **~2,000× speedup** on the recurrent module alone.
 
-## Synthesis Results (single-layer, VU11P @ 100 MHz)
+## Synthesis Results (single-layer, U55C @ 100 MHz)
+
+From `GDN_single_attn/solution2/syn/report/csynth.rpt`, target
+`xcu55c-fsvh2892-2L-e`:
 
 | Module                        | Naive   | v7      | Speedup |
 |-------------------------------|--------:|--------:|--------:|
-| `gdn_recurrent_attention` cycles | 313.0 G | 152.6 M | **2,050×** |
-| `gdn_recurrent_attention` time   | 3,130 s | 1.526 s | **2,050×** |
-| Per-head iteration            | 19.1 M  | 9 305   | **2,050×** |
-| Top-level `gdn_attn_forward`  | 469.6 G | 141.5 G | **3.32×** |
+| `gdn_recurrent_attention` cycles | 313.0 G | 157.29 M | **~2,000×** |
+| `gdn_recurrent_attention` time   | 3,130 s | 1.573 s  | **~2,000×** |
+| Per-(token, head) iteration   | 19.1 M  | 9 598    | **~2,000×** |
+| Top-level `gdn_attn_forward`  | 469.6 G | 141.03 G | **3.33×** |
 
 ## Resource Cost (`gdn_recurrent_attention` v7)
 
 | Resource | Naive | v7    | Δ       |
 |----------|------:|------:|--------:|
-| BRAM_18K | 0     | 938   | +938 (on-chip state) |
-| DSP      | 71    | 488   | +417 |
-| FF       | 21 k  | 96 k  | +75 k |
-| LUT      | 59 k  | 77 k  | +18 k |
+| BRAM_18K | 0     | 258   | +258 (on-chip state) |
+| DSP      | 71    | 494   | +423 |
+| FF       | 21 k  | 92.7 k | +72 k |
+| LUT      | 59 k  | 79.3 k | +20 k |
 | URAM     | 0     | 0     | — |
 
-BRAM utilisation is 70 % of one SLR (938 / 1344). The design fits within a
-single SLR on VU11P and uses 23 % of total device BRAM. The 938-BRAM is
-entirely the persistent state.
+On the U55C target, HLS maps each of the 16 cyclic-partitioned state banks
+(`gdn_recurrent_attention_state_X_U`) into 16 BRAM_18K blocks (16 × 16 = 256,
+plus a few control-path BRAMs ⇒ 258 total). The state matrix (8 × 256 × 256 ×
+4 bytes = 2 MB) is the single-largest contributor to the layer's BRAM budget.
 
 ## Known Limitations
 

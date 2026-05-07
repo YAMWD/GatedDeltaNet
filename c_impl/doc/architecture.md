@@ -28,9 +28,8 @@ State matrix per layer: 8 heads x 256 x 256 FP32 = 2 MB.
 | `gdn_model.c`          | All synthesizable compute functions + HLS top functions (`gdn_forward`, `gdn_attn_forward`) |
 | `gdn_eval.c`           | Host testbench: loads `.gdnw` weights, reads `.gdnreq` fixtures, runs `gdn_forward`, writes JSON output |
 | `gdn_attn_test.c`      | Host testbench for single-layer attention: loads `.gdnw` + `.gdnblk`, runs `gdn_attn_forward`, checks parity |
-| `test.tcl`             | Vitis HLS TCL script for full-model (csim/csynth/cosim) |
-| `test_single_GDN_attn.tcl` | TCL script for single-layer attention (csim/csynth/cosim), targets Alveo U55C |
-| `test_opt_attn.tcl`    | TCL script for optimized single-layer attention (csim/csynth only), targets VU11P |
+| `test.tcl`             | Vitis HLS TCL script for full-model (csim/csynth/cosim), targets Alveo U55C |
+| `test_single_GDN_attn.tcl` | TCL script for single-layer attention (csim/csynth), targets Alveo U55C — **primary optimisation target** |
 | `test_parity.sh`       | Automated end-to-end parity test against Python golden results |
 | `Makefile`             | Native C build (GCC, no BLAS) |
 
@@ -219,14 +218,16 @@ violation that could not be resolved without this bundle split.
 - Parity target: < 1e-3 absolute tolerance vs Python golden reference.
 - Observed parity: ~1e-5 to 1e-6 max absolute difference.
 
-## 8. Target Devices
+## 8. Target Device
 
-| Device | FPGA | Use |
+The canonical target for both `gdn_forward` and `gdn_attn_forward` is the
+Xilinx Alveo U55C card:
+
+| Device | FPGA | TCL |
 |--------|------|-----|
-| `xcvu11p-flga2577-1-e` | Virtex UltraScale+ VU11P | Full model synthesis, optimised attention |
-| `xcu55c-fsvh2892-2L-e` | Alveo U55C | Single-layer attention (naive baseline) |
+| `xcu55c-fsvh2892-2L-e` | Virtex UltraScale+ VU13P (U55C card) | `test.tcl`, `test_single_GDN_attn.tcl` |
 
-Both targets use a 10 ns clock period (100 MHz).
+Clock period: 10 ns (100 MHz).
 
 ## 9. Optimisation History
 
@@ -236,11 +237,17 @@ single-layer attention (max-seq-length 2048):
 
 | Metric                         | Baseline (v0) | Final (v7) | Δ |
 |--------------------------------|---------------|-----------:|---|
-| Top-level latency              | 190.96 G cyc  | **141.47 G** | −26 % |
-| Outstanding II violations      | 7             | **0**      | −7 |
-| Timing slack @ 100 MHz target  | −0.46 ns      | −0.40 ns   | +0.06 ns |
-| BRAM_18K utilisation           | 23 %          | 25 %       |   |
-| DSP utilisation                | 3 %           | 11 %       |   |
+| Top-level latency              | 190.96 G cyc  | **141.03 G** | −26 % |
+| Outstanding II violations      | 7             | **0**        | −7 |
+| Timing slack @ 100 MHz target  | −0.46 ns      | **0.00 ns**  | +0.46 ns (closes timing) |
+| BRAM_18K                       | 938 (23 %)    | 322 (7 %)    | −616 |
+| DSP                            | 317 (3 %)     | 1042 (11 %)  | +725 |
+| LUT                            | 172 k (13 %)  | 237 k (18 %) | +65 k |
+| FF                             | 96 k (3 %)    | 210 k (8 %)  | +114 k |
+
+(Numbers from `GDN_single_attn/solution2/syn/report/csynth.rpt`, U55C target.
+The BRAM count drops on U55C because HLS maps the persistent state with a
+denser per-partition allocation than it did on the prior VU11P run.)
 
 All inner pipelines now run at II=1 except the single AXI-bound `mm_tile_*`
 load/store sub-loops (which are inherently serial on the AXI master). The

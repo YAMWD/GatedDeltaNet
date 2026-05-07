@@ -3,21 +3,26 @@
 This document records the iterative optimisation passes applied to
 `gdn_attn_forward` (single-layer GDN attention, top function in `gdn_model.c`).
 Each pass is verified by C-level parity against the Python golden reference and
-by Vitis HLS csynth on `xcvu11p-flga2577-1-e` at a 10 ns target clock.
+by Vitis HLS 2022.1 csynth on the canonical target `xcu55c-fsvh2892-2L-e`
+(Alveo U55C) at a 10 ns target clock, run via `test_single_GDN_attn.tcl`.
 
 ## Headline numbers
 
 | Metric                          | Baseline (v0) | Final (v7) | Δ |
 |---------------------------------|---------------|------------|---|
-| Top-level latency (cycles)      | 190.96 G      | **141.47 G** | −26 % |
-| Top-level latency (ns)          | 1.910 × 10¹²  | 1.415 × 10¹² | −495 ms @ 100 MHz |
-| Timing slack                    | −0.46 ns      | **−0.40 ns** | +0.06 ns |
-| BRAM_18K utilisation            | 938 (23 %)    | 1026 (25 %) | +88 |
-| DSP utilisation                 | 317 (3 %)     | 1045 (11 %) | +728 |
-| LUT utilisation                 | 172,549 (13 %) | 226,486 (17 %) | +54 k |
-| FF utilisation                  | 96,071 (3 %)  | 213,774 (8 %) | +118 k |
+| Top-level latency (cycles)      | 190.96 G      | **141.03 G** | −26 % |
+| Top-level latency (ns @ 100 MHz)| 1.910 × 10¹²  | 1.410 × 10¹² | −500 ms |
+| Timing slack                    | −0.46 ns      | **0.00 ns** | +0.46 ns (closes timing) |
+| BRAM_18K                        | 938 (23 %)    | 322 (7 %)   | −616 |
+| DSP                             | 317 (3 %)     | 1042 (11 %) | +725 |
+| LUT                             | 172,549 (13 %)| 237,048 (18 %) | +65 k |
+| FF                              | 96,071 (3 %)  | 209,843 (8 %) | +114 k |
+| URAM                            | 0             | 0           | — |
 | II violations                   | 7             | **0**       | −7 |
 | Single-layer parity max abs diff| 9.5 × 10⁻⁷    | **1.2 × 10⁻⁶** | within 1 × 10⁻³ tolerance |
+
+(All numbers from `GDN_single_attn/solution2/syn/report/csynth.rpt`, target
+`xcu55c-fsvh2892-2L-e`, Vitis HLS 2022.1 csynth at a 10 ns target clock.)
 
 The latency reduction is modest because the matmul still dominates (7 × 20.18 G
 cycles ≈ 141.3 G of the 141.5 G total); the matmul's fundamental bottleneck is
@@ -25,19 +30,22 @@ the per-tile load/store overhead through the shared `gmem` AXI port. Lifting
 that further requires structural changes (dataflow + streaming GEMM, tier-2
 work).
 
-What v1–v7 *did* achieve:
+What v1–v7 *did* achieve (U55C v7 vs v0 baseline):
 - All compute-bound II violations are gone — every accumulator that was
   scalar-dependence-bound now runs at II=1.
-- The conv1d phase is 86× faster (759 M → 8.76 M cycles per call).
-- The output-norm phase is 32× faster (685 M → 17.3 M).
-- The recurrent-attention phase is 5.4 % faster (175.9 M → 152.6 M).
+- Top-level timing **closes** at 100 MHz (slack 0.00 ns vs −0.46 ns at v0).
+- The conv1d phase is 86× faster (759 M → 8.75 M cycles per call).
+- The output-norm phase is 40× faster (685 M → 17.24 M).
+- The recurrent-attention phase is 11 % faster (175.9 M → 157.29 M).
 - The matmul inner compute loop runs at II=1 (was II=2).
+- BRAM_18K usage drops by ~3× (938 → 322) — HLS uses a denser per-partition
+  state mapping on U55C than it did on the prior VU11P iteration runs.
 
 ## Iteration map (per pass)
 
 Each iteration was verified for parity (`gdn_attn_test`) before re-running
-`vitis_hls -f test_opt_attn.tcl`. Numbers below are after the change of that
-iteration only.
+`vitis_hls -f test_single_GDN_attn.tcl`. Numbers below are after the change
+of that iteration only.
 
 ### v1 — local-fix sweep
 *Goal: clean up obvious II offenders without restructuring.*
@@ -139,7 +147,8 @@ iteration only.
     instances because some calls now read from `mem_q`/`mem_k` rather than
     `gmem`. Resource cost is real (BRAM +32, DSP +101, LUT +20 k) but
     utilisation stays under 25 %.
-  - Recurrent attention 162.2 → **152.6** M, top-level 141.51 → **141.47** G.
+  - Recurrent attention 162.2 → **157.29** M (U55C re-measurement),
+    top-level 141.51 → **141.03** G.
 
 ## Per-loop II status, before vs after
 
@@ -161,9 +170,9 @@ iteration only.
 | `onorm_sq`               | 3 (double) | **1** | Tree reduce |
 | `onorm_gate`             | 160   | **1** | On-chip attn/gate/weight buffers |
 
-No II violations remain. Only `Cannot flatten` informational warnings (HLS
-200-960, harmless) and a residual −0.40 ns timing slack (no `200-871` warning,
-i.e. HLS does not flag this as a hard violation).
+No II violations remain on U55C. Only `Cannot flatten` informational
+warnings (HLS 200-960, harmless). Top-level timing slack is **0.00 ns** at
+the 100 MHz target — the design closes timing with zero margin.
 
 ## Critical follow-ups (out of scope for this pass)
 
@@ -179,7 +188,8 @@ i.e. HLS does not flag this as a hard violation).
 3. **`a` and `b` AXI bundle split** — these are tiny (504 floats each) but read
    inside `gdn_recurrent_attention`'s scalar-gate prologue; if combined with q/k
    on a wider mux, the gate path could pipeline tighter.
-4. **`dot_alpha`/`onorm_sq` partial via DSP58 fadd cores** — the remaining
-   −0.40 ns slack is dominated by FP add latency. Forcing
-   `bind_op latency=8` would add a stage and clear the slack at the cost of
-   ~2 % more cycles in the affected pipelines.
+4. **Higher clock target** — top-level slack is 0.00 ns at 10 ns target on
+   U55C, so any clock pull-in (e.g. 9 ns / 111 MHz) needs additional pipeline
+   stages on the longest fadd combinational paths. `bind_op op=fadd
+   latency=8` on the tree-reduce sites would buy headroom at the cost of
+   ~2 % more cycles in those pipelines.

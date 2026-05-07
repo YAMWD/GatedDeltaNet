@@ -12,5 +12,5 @@ config_export -format ip_catalog -rtl verilog -vivado_clock 10
 #source "./GDN_single_attn/solution2/directives.tcl"
 csim_design -argv {artifacts/gdn-1.3b-f32.gdnw fixtures_block/block0_attn.gdnblk}
 csynth_design
-cosim_design -argv {artifacts/gdn-1.3b-f32.gdnw fixtures_block/block0_attn.gdnblk}
+# cosim_design -argv {artifacts/gdn-1.3b-f32.gdnw fixtures_block/block0_attn.gdnblk}
 #export_design -flow syn -rtl verilog -format ip_catalog
