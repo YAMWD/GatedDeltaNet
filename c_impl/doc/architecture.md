@@ -47,7 +47,7 @@ State matrix per layer: 8 heads x 256 x 256 FP32 = 2 MB.
 
 ### 3.1 `gdn_forward` (full model)
 
-**Location:** `gdn_model.c:800`
+**Location:** `gdn_model.c:998`
 
 Full 24-layer GatedDeltaNet forward pass. All arguments are flat pointers with
 `m_axi` interfaces. The function:
@@ -68,7 +68,7 @@ Full 24-layer GatedDeltaNet forward pass. All arguments are flat pointers with
 
 ### 3.2 `gdn_attn_forward` (single-layer attention)
 
-**Location:** `gdn_model.c:1030`
+**Location:** `gdn_model.c:1228`
 
 Single-layer attention forward for isolated synthesis/co-simulation. Uses the
 same internal functions as `gdn_forward` but only runs one layer. This is the
@@ -82,14 +82,14 @@ pointers in top-function arguments).
 
 ### 4.1 `gdn_embed_tokens`
 
-**Location:** `gdn_model.c:345`
+**Location:** `gdn_model.c:379`
 
 Copies embedding rows from the weight table into the hidden state buffer.
 Simple lookup, no compute.
 
 ### 4.2 `gdn_rmsnorm_rows`
 
-**Location:** `gdn_model.c:372`
+**Location:** `gdn_model.c:406`
 
 RMSNorm over each row (token) of the input. Uses `double` accumulation for
 numerical stability. Called before every projection block and at the final
@@ -97,40 +97,58 @@ output.
 
 ### 4.3 `gdn_matmul` (Tiled)
 
-**Location:** `gdn_model.c:407`
+**Location:** `gdn_model.c:441`
 
-General-purpose tiled matrix multiplication. See [tiled_matmul.md](tiled_matmul.md)
-for detailed documentation.
+General-purpose tiled matrix multiplication. Manual-flattened R×C compute
+with explicit balanced fadd tree gives II=1 in the inner pipeline. See
+[tiled_matmul.md](tiled_matmul.md).
 
 ### 4.4 `gdn_depthwise_conv_silu`
 
-**Location:** `gdn_model.c:529`
+**Location:** `gdn_model.c:603`
 
 Depthwise 1D convolution with SiLU activation. Kernel size is always 4
 (causal, looking back 3 positions). Applied independently to Q, K, V after
-their linear projections. Each channel is convolved independently (depthwise).
+their linear projections. Uses pre-buffered weights and a 4-row sliding window;
+two-phase per-row execution (load + shift, then compute + write) keeps both
+phases at II=1. See [depthwise_conv.md](depthwise_conv.md).
 
 ### 4.5 `gdn_recurrent_attention` (Optimised)
 
-**Location:** `gdn_model.c:559`
+**Location:** `gdn_model.c:695`
 
-Core gated delta rule recurrence. See [recurrent_attention.md](recurrent_attention.md)
-for detailed documentation.
+Core gated delta rule recurrence. Persistent BRAM state, fused two-pass
+read/write, P_K=16 column parallelism, on-chip out_loc + drain split for
+the AXI write phase, and tree-reduced L2 norm / α reductions. See
+[recurrent_attention.md](recurrent_attention.md).
 
 ### 4.6 `gdn_output_norm_and_gate`
 
-**Location:** `gdn_model.c:755`
+**Location:** `gdn_model.c:915`
 
 Per-head RMSNorm on attention output, followed by gated SiLU:
 ```
 out[i] = RMSNorm(attn[i]) * gate[i] * sigmoid(gate[i])
 ```
+Pre-loaded shared weight, on-chip per-(token, head) attn/gate buffers, and a
+tree-reduced sum-of-squares give II=1 across all sub-passes. See
+[output_norm.md](output_norm.md).
 
 ### 4.7 `gdn_swiglu_inplace`
 
-**Location:** `gdn_model.c:792`
+**Location:** `gdn_model.c:990`
 
 Element-wise SwiGLU activation for MLP: `gate[i] = SiLU(gate[i]) * up[i]`.
+
+### 4.8 `gdn_tree_reduce_256` (helper)
+
+**Location:** `gdn_model.c:341`
+
+Inline 8-level paired-sum FP32 fadd tree (256 → 128 → … → 1). Used by
+`gdn_recurrent_attention` (`q_sq`, `k_sq`, `α`) and `gdn_output_norm_and_gate`
+(`sum`) to reduce per-element scratch arrays. Replaces `for j unroll: sum +=
+arr[j]` patterns, which HLS emits as a 256-deep linear adder rather than a
+balanced tree.
 
 ## 5. Data Flow (Single Layer)
 
@@ -181,6 +199,19 @@ The `GDNWeightHeader` struct is read from DRAM via `m_axi` to extract config
 parameters at runtime (hidden size, num heads, etc.). Weight pointers for
 each layer are computed as offsets into the flat `weight_data` array.
 
+### AXI bundle topology (`gdn_attn_forward`, v7)
+
+| Bundle    | Ports                                                                 |
+|-----------|------------------------------------------------------------------------|
+| `gmem`    | config, weight_data, input, output, v, a, b, gate, attn, tmp_hidden, recurrent_state, head_buffer |
+| `mem_q`   | q                                                                      |
+| `mem_k`   | k                                                                      |
+
+Splitting `q` and `k` onto dedicated bundles lets `gdn_recurrent_attention`'s
+`load_qk` issue both reads in the same cycle (II=1). The AXI port-contention
+warning ("HLS 200-885: limited memory ports") was the only structural
+violation that could not be resolved without this bundle split.
+
 ## 7. Numerical Precision
 
 - All compute is FP32.
@@ -196,3 +227,23 @@ each layer are computed as offsets into the flat `weight_data` array.
 | `xcu55c-fsvh2892-2L-e` | Alveo U55C | Single-layer attention (naive baseline) |
 
 Both targets use a 10 ns clock period (100 MHz).
+
+## 9. Optimisation History
+
+The optimisation passes applied to `gdn_attn_forward` are documented in
+[optimization_log.md](optimization_log.md). The headline result for
+single-layer attention (max-seq-length 2048):
+
+| Metric                         | Baseline (v0) | Final (v7) | Δ |
+|--------------------------------|---------------|-----------:|---|
+| Top-level latency              | 190.96 G cyc  | **141.47 G** | −26 % |
+| Outstanding II violations      | 7             | **0**      | −7 |
+| Timing slack @ 100 MHz target  | −0.46 ns      | −0.40 ns   | +0.06 ns |
+| BRAM_18K utilisation           | 23 %          | 25 %       |   |
+| DSP utilisation                | 3 %           | 11 %       |   |
+
+All inner pipelines now run at II=1 except the single AXI-bound `mm_tile_*`
+load/store sub-loops (which are inherently serial on the AXI master). The
+matmul still dominates total latency (≈99 % of runtime); reducing it further
+requires structural changes — see the "Critical follow-ups" section in
+[optimization_log.md](optimization_log.md).
