@@ -1404,3 +1404,44 @@ int gdn_attn_forward_layer(
         num_tokens
     );
 }
+
+/* -----------------------------------------------------------------------
+ * gdn_matmul_top — HLS synthesis target for matmul-only optimisation.
+ *
+ * Exposes the internal `gdn_matmul` as a kernel-flow top function with
+ * separate AXI master bundles per pointer:
+ *   in       on m_axi_mem_in   (read)
+ *   weights  on m_axi_mem_wt   (read)
+ *   out      on m_axi_mem_out  (read+write — read happens on the partial
+ *                                 reload between adjacent tk steps)
+ *
+ * Splitting bundles lets a future streaming-GEMM refactor overlap input
+ * fetch, weight fetch, and result store without serialising on a single
+ * `gmem` port. Depths are sized for the largest GDN-1.3B matmul:
+ *   num_rows * in_dim  ≤ 2048 * 2048 = 4 194 304 floats
+ *   out_dim  * in_dim  ≤ 2048 * 2048 = 4 194 304 floats
+ * Smaller calls (e.g. the 2048×8 A/B projections) reuse the same kernel.
+ * ----------------------------------------------------------------------- */
+int gdn_matmul_top(
+    float *out,
+    const float *in,
+    const float *weights,
+    uint32_t num_rows,
+    uint32_t in_dim,
+    uint32_t out_dim
+) {
+    #pragma HLS interface m_axi port=in      depth=4194304 offset=slave bundle=mem_in
+    #pragma HLS interface m_axi port=weights depth=4194304 offset=slave bundle=mem_wt
+    #pragma HLS interface m_axi port=out     depth=4194304 offset=slave bundle=mem_out
+    #pragma HLS interface s_axilite port=num_rows
+    #pragma HLS interface s_axilite port=in_dim
+    #pragma HLS interface s_axilite port=out_dim
+    #pragma HLS interface s_axilite port=return
+
+    if (num_rows == 0 || in_dim == 0 || out_dim == 0) {
+        return -1;
+    }
+
+    gdn_matmul(out, in, weights, num_rows, in_dim, out_dim);
+    return 0;
+}
