@@ -7,6 +7,12 @@
 
 #define GDN_WEIGHT_HEADER_BYTES 60
 
+/* Compile-time constants for GDN-1.3B (used by on-chip state and parallelism) */
+#define GDN_HEADS   8
+#define GDN_DK    256   /* head_dim = query/key dimension */
+#define GDN_DV    256   /* value_dim = hidden/num_heads   */
+#define GDN_PK     16   /* column parallelism factor      */
+
 static void gdn_print_error(const char *message) {
 #ifdef __SYNTHESIS__
     (void)message;
@@ -326,6 +332,40 @@ static float gdn_softplus(float x) {
     return log1pf(expf(x));
 }
 
+/* 256-input fully unrolled balanced fadd tree (8 levels, depth log2(256)=8).
+ * HLS's auto-balance on `sum += arr[i]` produced a 256-deep serial chain
+ * instead of a tree, which makes the reduction the bottleneck of any II=1
+ * pipelined loop that feeds it. Calling this helper from the reduction site
+ * forces an explicit paired-sum tree shape. The function is `inline` so it
+ * lives in the caller's pipeline scope. */
+static float gdn_tree_reduce_256(const float arr[256]) {
+#pragma HLS inline
+    float l128[128];
+    float l64[64];
+    float l32[32];
+    float l16[16];
+    float l8[8];
+    float l4[4];
+    float l2[2];
+    #pragma HLS array_partition variable=l128 complete
+    #pragma HLS array_partition variable=l64  complete
+    #pragma HLS array_partition variable=l32  complete
+    #pragma HLS array_partition variable=l16  complete
+    #pragma HLS array_partition variable=l8   complete
+    #pragma HLS array_partition variable=l4   complete
+    #pragma HLS array_partition variable=l2   complete
+
+    uint32_t i;
+    L128: for (i = 0; i < 128; ++i) { _Pragma("HLS unroll") l128[i] = arr[2*i]   + arr[2*i+1];   }
+    L64:  for (i = 0; i < 64;  ++i) { _Pragma("HLS unroll") l64[i]  = l128[2*i]  + l128[2*i+1];  }
+    L32:  for (i = 0; i < 32;  ++i) { _Pragma("HLS unroll") l32[i]  = l64[2*i]   + l64[2*i+1];   }
+    L16:  for (i = 0; i < 16;  ++i) { _Pragma("HLS unroll") l16[i]  = l32[2*i]   + l32[2*i+1];   }
+    L8:   for (i = 0; i < 8;   ++i) { _Pragma("HLS unroll") l8[i]   = l16[2*i]   + l16[2*i+1];   }
+    L4:   for (i = 0; i < 4;   ++i) { _Pragma("HLS unroll") l4[i]   = l8[2*i]    + l8[2*i+1];    }
+    L2:   for (i = 0; i < 2;   ++i) { _Pragma("HLS unroll") l2[i]   = l4[2*i]    + l4[2*i+1];    }
+    return l2[0] + l2[1];
+}
+
 static float gdn_l2_norm_inv(const float *x, uint32_t length) {
     double sum = 0.0;
     uint32_t index;
@@ -486,19 +526,54 @@ static void gdn_matmul(
                     }
                 }
 
-                /* Compute: local_out[r][c] += sum_k local_in[r][k] * local_wt[k][c] */
-                mm_comp_r: for (r = 0; r < MM_TILE_R; ++r) {
-                #pragma HLS loop_tripcount min=16 max=16
+                /* Compute: local_out[r][c] += sum_k local_in[r][k] * local_wt[k][c]
+                 *
+                 * Manually flattened (R x C) loop: HLS won't auto-flatten the
+                 * mm_comp_r/mm_comp_c nest (the warning "outer loop is not a
+                 * perfect loop" appears because the surrounding tile loop has
+                 * statements before/after this pair). Manual flatten avoids
+                 * 16x pipeline-fill overhead (each fill costs ~30 cycles).
+                 *
+                 * Within the loop body:
+                 *   - mm_comp_k is fully unrolled into 16 parallel fmuls.
+                 *   - The 16 partial products are reduced through a balanced
+                 *     4-level fadd tree (paired sums), so the critical path is
+                 *     log2(16) fadd stages instead of a 16-deep serial chain
+                 *     (which is what HLS auto-generated from `dot += ...` and
+                 *     stretched the iteration latency to 55 cycles).
+                 *   - dependence false on local_out: the carried dep is
+                 *     genuinely false because each iteration touches a unique
+                 *     (r, c) pair, and dim 2 complete partition makes each c
+                 *     a distinct register bank.
+                 */
+                mm_comp_rc: for (uint32_t rc = 0; rc < MM_TILE_R * MM_TILE_C; ++rc) {
+                #pragma HLS loop_tripcount min=256 max=256
+                #pragma HLS pipeline II=1
+                #pragma HLS dependence variable=local_out type=inter direction=RAW false
+                    uint32_t r = rc / MM_TILE_C;
+                    uint32_t c = rc % MM_TILE_C;
+
+                    float p[MM_TILE_K];
                     mm_comp_k: for (k = 0; k < MM_TILE_K; ++k) {
                     #pragma HLS loop_tripcount min=16 max=16
-                    #pragma HLS pipeline II=1
-                        float a_val = local_in[r][k];
-                        mm_comp_c: for (c = 0; c < MM_TILE_C; ++c) {
-                        #pragma HLS loop_tripcount min=16 max=16
-                        #pragma HLS unroll
-                            local_out[r][c] += a_val * local_wt[k][c];
-                        }
+                    #pragma HLS unroll
+                        p[k] = local_in[r][k] * local_wt[k][c];
                     }
+
+                    /* Balanced 4-level adder tree: 16 -> 8 -> 4 -> 2 -> 1 */
+                    float s2_0 = p[0]  + p[1],  s2_1 = p[2]  + p[3];
+                    float s2_2 = p[4]  + p[5],  s2_3 = p[6]  + p[7];
+                    float s2_4 = p[8]  + p[9],  s2_5 = p[10] + p[11];
+                    float s2_6 = p[12] + p[13], s2_7 = p[14] + p[15];
+
+                    float s4_0 = s2_0 + s2_1, s4_1 = s2_2 + s2_3;
+                    float s4_2 = s2_4 + s2_5, s4_3 = s2_6 + s2_7;
+
+                    float s8_0 = s4_0 + s4_1, s8_1 = s4_2 + s4_3;
+
+                    float dot  = s8_0 + s8_1;
+
+                    local_out[r][c] += dot;
                 }
 
                 /* Store output tile back to DRAM */
@@ -520,6 +595,11 @@ static void gdn_matmul(
     } /* mm_tile_r */
 }
 
+/* Compile-time bounds for the conv buffers. The model always calls this with
+ * hidden=2048 and conv_size=4; smaller calls still fit. */
+#define GDN_CONV_COLS_MAX 2048
+#define GDN_CONV_K_MAX    4
+
 static void gdn_depthwise_conv_silu(
     float *out,
     const float *in,
@@ -528,32 +608,94 @@ static void gdn_depthwise_conv_silu(
     uint32_t num_cols,
     uint32_t kernel_size
 ) {
-    uint32_t row;
+    /* Buffered weights (per-channel, num_cols x kernel_size) and a 4-row
+     * sliding window over the input. Together these eliminate the AXI-port
+     * contention that prevented conv_col from pipelining when the kernel was
+     * unrolled with raw m_axi loads. */
+    float w_loc[GDN_CONV_COLS_MAX][GDN_CONV_K_MAX];
+    #pragma HLS array_partition variable=w_loc dim=2 complete
+
+    float in_window[GDN_CONV_K_MAX][GDN_CONV_COLS_MAX];
+    #pragma HLS array_partition variable=in_window dim=1 complete
+
+    uint32_t col, row, k;
+
+    /* Load all weights once: weights[col * kernel_size + k] for col=0..num_cols-1, k=0..kernel_size-1. */
+    conv_load_w_col: for (col = 0; col < num_cols; ++col) {
+    #pragma HLS loop_tripcount min=2048 max=2048
+        conv_load_w_k: for (k = 0; k < kernel_size; ++k) {
+        #pragma HLS loop_tripcount min=4 max=4
+        #pragma HLS pipeline II=1
+            w_loc[col][k] = weights[(size_t)col * kernel_size + k];
+        }
+    }
+
+    /* Zero the sliding window so the first (kernel_size-1) rows automatically
+     * skip out-of-bounds source rows (no conditional needed). */
+    conv_init_win_k: for (k = 0; k < kernel_size; ++k) {
+    #pragma HLS loop_tripcount min=4 max=4
+    #pragma HLS unroll
+        conv_init_win_col: for (col = 0; col < num_cols; ++col) {
+        #pragma HLS loop_tripcount min=2048 max=2048
+        #pragma HLS pipeline II=1
+            in_window[k][col] = 0.0f;
+        }
+    }
+
+    /* Streaming conv: per row, do two II=1 phases.
+     *   Phase A (load + shift): pull row r from m_axi and shift the window.
+     *                           Only the gmem READ channel is touched.
+     *   Phase B (compute + write): MAC against w_loc and emit to m_axi.
+     *                              Only the gmem WRITE channel is touched.
+     *
+     * Fusing into one phase forces HLS to schedule a gmem read and write in
+     * the same iteration, which it serialises through a single port even
+     * though the AR/AW channels are independent — costing II=155 in v2. */
     conv_row: for (row = 0; row < num_rows; ++row) {
-    #pragma HLS loop_tripcount min=1 max=2048  /* num_tokens: 1..max_seq_len */
-        uint32_t col;
-        conv_col: for (col = 0; col < num_cols; ++col) {
-        #pragma HLS loop_tripcount min=2048 max=2048  /* always called with hidden=2048 */
-            float sum = 0.0f;
-            uint32_t kernel_index;
-            int32_t start = (int32_t)row - (int32_t)kernel_size + 1;
-            conv_kern: for (kernel_index = 0; kernel_index < kernel_size; ++kernel_index) {
-            #pragma HLS loop_tripcount min=4 max=4  /* conv_size=4 for all layers */
-                int32_t source_row = start + (int32_t)kernel_index;
-                if (source_row >= 0) {
-                    sum += in[(size_t)source_row * num_cols + col] *
-                           weights[(size_t)col * kernel_size + kernel_index];
-                }
-            }
+    #pragma HLS loop_tripcount min=1 max=2048
+
+        conv_load: for (col = 0; col < num_cols; ++col) {
+        #pragma HLS loop_tripcount min=2048 max=2048
+        #pragma HLS pipeline II=1
+            in_window[0][col] = in_window[1][col];
+            in_window[1][col] = in_window[2][col];
+            in_window[2][col] = in_window[3][col];
+            in_window[3][col] = in[(size_t)row * num_cols + col];
+        }
+
+        conv_compute: for (col = 0; col < num_cols; ++col) {
+        #pragma HLS loop_tripcount min=2048 max=2048
+        #pragma HLS pipeline II=1
+            /* in_window[k] holds source row (row - kernel_size + 1 + k). */
+            float sum = in_window[0][col] * w_loc[col][0]
+                      + in_window[1][col] * w_loc[col][1]
+                      + in_window[2][col] * w_loc[col][2]
+                      + in_window[3][col] * w_loc[col][3];
             out[(size_t)row * num_cols + col] = gdn_silu(sum);
         }
     }
 }
 
+/* -----------------------------------------------------------------------
+ * Optimized recurrent attention with:
+ *   1. Persistent on-chip state in BRAM (eliminates external memory traffic)
+ *   2. Fused two-pass pipeline (1 read + 1 read-modify-write vs 4 passes)
+ *   3. Column parallelism P_K=16 (16 MACs per cycle on state accesses)
+ *
+ * Algebraic fusion (Gupta et al.):
+ *   S_new = g*S_old + k_norm * Δv^T
+ *   o = (1/√d) * S_new^T * q_norm
+ *     = (1/√d) * (g * S_old^T * q_norm + (q_norm^T * k_norm) * Δv)
+ *     = q_scale * (g * ô + α * Δv)
+ * where ô_i = Σ_j S_old[j][i]*q_norm[j], α = q_norm^T * k_norm.
+ * This lets us compute retrieval (r) and partial output (ô) in a single
+ * read pass, then apply a scalar correction, reducing state passes from
+ * 4 to 2.
+ * ----------------------------------------------------------------------- */
 static void gdn_recurrent_attention(
     float *attn_out,
-    float *recurrent_state,
-    float *head_buffer,
+    float *recurrent_state,  /* unused: state is now on-chip BRAM */
+    float *head_buffer,      /* unused: local buffers used instead */
     const float *q,
     const float *k,
     const float *v,
@@ -566,78 +708,208 @@ static void gdn_recurrent_attention(
     uint32_t head_dim,
     uint32_t num_tokens
 ) {
-    uint32_t value_dim = hidden / num_heads;
-    float q_scale = 1.0f / sqrtf((float)head_dim);
-    size_t state_size = (size_t)num_heads * head_dim * value_dim;
+    /* On-chip persistent recurrent state: 8 heads × 256 × 256 FP32 = 2 MB */
+    static float state[GDN_HEADS][GDN_DK][GDN_DV];
+#pragma HLS bind_storage variable=state type=RAM_2P impl=BRAM
+#pragma HLS array_partition variable=state dim=3 cyclic factor=16
+
+    float q_scale = 1.0f / sqrtf((float)GDN_DK);
+    uint32_t h, j, i, p;
     uint32_t token_index;
 
-    {
-        size_t index;
-        state_clear: for (index = 0; index < state_size; ++index) {
-        #pragma HLS loop_tripcount min=524288 max=524288  /* num_heads*head_dim*value_dim = 8*256*256 */
-            recurrent_state[index] = 0.0f;
+    /* Clear on-chip state (parallelised by P_K) */
+    state_clr_h: for (h = 0; h < GDN_HEADS; ++h) {
+    #pragma HLS loop_tripcount min=8 max=8
+        state_clr_j: for (j = 0; j < GDN_DK; ++j) {
+        #pragma HLS loop_tripcount min=256 max=256
+            state_clr_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
+            #pragma HLS loop_tripcount min=16 max=16
+            #pragma HLS pipeline II=1
+                uint32_t pp;
+                for (pp = 0; pp < GDN_PK; ++pp) {
+                #pragma HLS unroll
+                    state[h][j][i + pp] = 0.0f;
+                }
+            }
         }
     }
 
     recur_token: for (token_index = 0; token_index < num_tokens; ++token_index) {
-    #pragma HLS loop_tripcount min=1 max=2048  /* num_tokens: 1..max_seq_len */
+    #pragma HLS loop_tripcount min=1 max=2048
         uint32_t head_index;
-        recur_head: for (head_index = 0; head_index < num_heads; ++head_index) {
-        #pragma HLS loop_tripcount min=8 max=8  /* num_heads=8 */
-            const float *q_head = q + (size_t)token_index * hidden + (size_t)head_index * head_dim;
-            const float *k_head = k + (size_t)token_index * hidden + (size_t)head_index * head_dim;
-            const float *v_head = v + (size_t)token_index * hidden + (size_t)head_index * value_dim;
-            float *state_head = recurrent_state + (size_t)head_index * head_dim * value_dim;
-            float *out_head = attn_out + (size_t)token_index * hidden + (size_t)head_index * value_dim;
-            float q_inv = gdn_l2_norm_inv(q_head, head_dim);
-            float k_inv = gdn_l2_norm_inv(k_head, head_dim);
-            float beta = gdn_sigmoid(b[(size_t)token_index * num_heads + head_index]);
-            float decay_input = a[(size_t)token_index * num_heads + head_index] + layer_dt_bias[head_index];
-            float decay_value = -expf(layer_a_log[head_index]) * gdn_softplus(decay_input);
-            float decay = expf(decay_value);
-            uint32_t index;
-            uint32_t value_index;
+        recur_head: for (head_index = 0; head_index < GDN_HEADS; ++head_index) {
+        #pragma HLS loop_tripcount min=8 max=8
 
-            state_decay: for (index = 0; index < head_dim * value_dim; ++index) {
-            #pragma HLS loop_tripcount min=65536 max=65536  /* head_dim*value_dim = 256*256 */
-                state_head[index] *= decay;
+            const float *q_head = q + (size_t)token_index * hidden
+                                    + (size_t)head_index * GDN_DK;
+            const float *k_head = k + (size_t)token_index * hidden
+                                    + (size_t)head_index * GDN_DK;
+            const float *v_head = v + (size_t)token_index * hidden
+                                    + (size_t)head_index * GDN_DV;
+            float *out_head = attn_out + (size_t)token_index * hidden
+                                       + (size_t)head_index * GDN_DV;
+
+            /* ---- Local per-token buffers ---- */
+            float q_loc[GDN_DK];
+            float k_loc[GDN_DK];
+            float v_loc[GDN_DV];
+            float r_buf[GDN_DV];   /* retrieval result           */
+            float o_buf[GDN_DV];   /* partial output              */
+            float dv[GDN_DV];      /* delta correction            */
+#pragma HLS array_partition variable=r_buf cyclic factor=16
+#pragma HLS array_partition variable=o_buf cyclic factor=16
+#pragma HLS array_partition variable=dv    cyclic factor=16
+#pragma HLS array_partition variable=v_loc cyclic factor=16
+
+            /* ---- Load q, k from DRAM, square into per-element scratch ----
+             * Pipelined load loop has no carried dep (each iteration writes a
+             * different qsq[j]/ksq[j]). The L2 sums are produced by a fully-
+             * unrolled tree reduction in a separate phase. The earlier 8-lane
+             * partial accumulator was muxed by HLS into a single register and
+             * tracked as a carried dep, holding load_qk at II=2.
+             *
+             * load_qk itself is still bound by 2 m_axi reads per iter on the
+             * shared gmem port (HLS schedules them in 2 cycles), so II=2 is
+             * fundamental here without splitting q/k onto separate bundles.
+             */
+            float qsq_arr[GDN_DK], ksq_arr[GDN_DK];
+            #pragma HLS array_partition variable=qsq_arr complete
+            #pragma HLS array_partition variable=ksq_arr complete
+
+            load_qk: for (j = 0; j < GDN_DK; ++j) {
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+                float qj = q_head[j];
+                float kj = k_head[j];
+                q_loc[j] = qj;
+                k_loc[j] = kj;
+                qsq_arr[j] = qj * qj;
+                ksq_arr[j] = kj * kj;
             }
 
-            delta_proj: for (value_index = 0; value_index < value_dim; ++value_index) {
-            #pragma HLS loop_tripcount min=256 max=256  /* value_dim = hidden/num_heads = 2048/8 = 256 */
-                float projection = 0.0f;
-                uint32_t key_index;
-                delta_proj_dot: for (key_index = 0; key_index < head_dim; ++key_index) {
-                #pragma HLS loop_tripcount min=256 max=256  /* head_dim=256 */
-                    projection += state_head[(size_t)key_index * value_dim + value_index] *
-                                  (k_head[key_index] * k_inv);
+            float q_sq = gdn_tree_reduce_256(qsq_arr);
+            float k_sq = gdn_tree_reduce_256(ksq_arr);
+
+            float q_inv = 1.0f / sqrtf(q_sq + 1e-6f);
+            float k_inv = 1.0f / sqrtf(k_sq + 1e-6f);
+
+            /* Normalise q and k in local buffers */
+            norm_qk: for (j = 0; j < GDN_DK; ++j) {
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+                q_loc[j] *= q_inv;
+                k_loc[j] *= k_inv;
+            }
+
+            /* Load v from DRAM */
+            load_v: for (i = 0; i < GDN_DV; ++i) {
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+                v_loc[i] = v_head[i];
+            }
+
+            /* Scalar gates */
+            float beta = gdn_sigmoid(
+                b[(size_t)token_index * num_heads + head_index]);
+            float decay_in = a[(size_t)token_index * num_heads + head_index]
+                           + layer_dt_bias[head_index];
+            float decay_val = -expf(layer_a_log[head_index])
+                            * gdn_softplus(decay_in);
+            float g = expf(decay_val);   /* decay factor */
+
+            /* ---- Phase 1: α = q_norm^T · k_norm (scalar) ----
+             * Same store-products + tree-reduce pattern as load_qk above.
+             * No carried dep -> dot_alpha pipelines at II=1.
+             */
+            float alpha_prod[GDN_DK];
+            #pragma HLS array_partition variable=alpha_prod complete
+
+            dot_alpha: for (j = 0; j < GDN_DK; ++j) {
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+                alpha_prod[j] = q_loc[j] * k_loc[j];
+            }
+
+            float alpha = gdn_tree_reduce_256(alpha_prod);
+
+            /* ---- Phase 2: FUSED READ PASS ----
+             * For each column i, accumulate across rows j:
+             *   r_buf[i] = Σ_j S[j][i] * k_norm[j]   (retrieval)
+             *   o_buf[i] = Σ_j S[j][i] * q_norm[j]   (partial output)
+             * With P_K=16 column parallelism at II=1.
+             */
+            init_ro: for (i = 0; i < GDN_DV; ++i) {
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+            #pragma HLS unroll factor=16
+                r_buf[i] = 0.0f;
+                o_buf[i] = 0.0f;
+            }
+
+            fused_rd_j: for (j = 0; j < GDN_DK; ++j) {
+            #pragma HLS loop_tripcount min=256 max=256
+                float kj = k_loc[j];
+                float qj = q_loc[j];
+                fused_rd_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
+                #pragma HLS loop_tripcount min=16 max=16
+                #pragma HLS pipeline II=1
+                    uint32_t pp;
+                    for (pp = 0; pp < GDN_PK; ++pp) {
+                    #pragma HLS unroll
+                        float s = state[head_index][j][i + pp];
+                        r_buf[i + pp] += s * kj;
+                        o_buf[i + pp] += s * qj;
+                    }
                 }
-                head_buffer[value_index] = beta * (v_head[value_index] - projection);
             }
 
-            state_update_k: for (index = 0; index < head_dim; ++index) {
-            #pragma HLS loop_tripcount min=256 max=256  /* head_dim=256 */
-                float normalized_k = k_head[index] * k_inv;
-                float *state_row = state_head + (size_t)index * value_dim;
-                state_update_v: for (value_index = 0; value_index < value_dim; ++value_index) {
-                #pragma HLS loop_tripcount min=256 max=256  /* value_dim = hidden/num_heads = 256 */
-                    state_row[value_index] += normalized_k * head_buffer[value_index];
-                }
+            /* ---- Phase 3: Delta correction + output correction ----
+             * Δv[i] = β * (v[i] - r[i])
+             * o[i]  = q_scale * (g * ô[i] + α * Δv[i])
+             *
+             * Compute into on-chip out_loc with P_K=16 column parallelism, then
+             * drain to the AXI port in a separate II=1 loop. Without the split,
+             * delta_out's 16 simultaneous m_axi stores serialised onto a single
+             * gmem port and HLS reported II=16 ("limited memory ports").
+             */
+            float out_loc[GDN_DV];
+            #pragma HLS array_partition variable=out_loc cyclic factor=16
+
+            delta_out: for (i = 0; i < GDN_DV; ++i) {
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+            #pragma HLS unroll factor=16
+                float d = beta * (v_loc[i] - g * r_buf[i]);
+                dv[i] = d;
+                out_loc[i] = q_scale * (g * o_buf[i] + alpha * d);
             }
 
-            query_out: for (value_index = 0; value_index < value_dim; ++value_index) {
-            #pragma HLS loop_tripcount min=256 max=256  /* value_dim = hidden/num_heads = 256 */
-                float sum = 0.0f;
-                uint32_t key_index;
-                query_out_dot: for (key_index = 0; key_index < head_dim; ++key_index) {
-                #pragma HLS loop_tripcount min=256 max=256  /* head_dim=256 */
-                    sum += state_head[(size_t)key_index * value_dim + value_index] *
-                           (q_head[key_index] * q_inv * q_scale);
-                }
-                out_head[value_index] = sum;
+            delta_drain: for (i = 0; i < GDN_DV; ++i) {
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+                out_head[i] = out_loc[i];
             }
-        }
-    }
+
+            /* ---- Phase 4: FUSED WRITE PASS (state update + decay) ----
+             * S[j][i] = g * S[j][i] + k_norm[j] * Δv[i]
+             */
+            fused_wr_j: for (j = 0; j < GDN_DK; ++j) {
+            #pragma HLS loop_tripcount min=256 max=256
+                float kj = k_loc[j];
+                fused_wr_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
+                #pragma HLS loop_tripcount min=16 max=16
+                #pragma HLS pipeline II=1
+                    uint32_t pp;
+                    for (pp = 0; pp < GDN_PK; ++pp) {
+                    #pragma HLS unroll
+                        state[head_index][j][i + pp] =
+                            g * state[head_index][j][i + pp]
+                            + kj * dv[i + pp];
+                    }
+                }
+            }
+        } /* recur_head */
+    } /* recur_token */
 }
 
 static void gdn_output_norm_and_gate(
@@ -649,6 +921,17 @@ static void gdn_output_norm_and_gate(
     uint32_t head_dim,
     float eps
 ) {
+    /* Pre-load the per-head norm weight (head_dim=256 floats) once and reuse
+     * for every (token, head) pair — eliminates an AXI read per iteration. */
+    float weight_loc[GDN_DV];
+    #pragma HLS array_partition variable=weight_loc cyclic factor=8
+    uint32_t windex;
+    onorm_load_w: for (windex = 0; windex < head_dim; ++windex) {
+    #pragma HLS loop_tripcount min=256 max=256
+    #pragma HLS pipeline II=1
+        weight_loc[windex] = weight[windex];
+    }
+
     uint32_t token_index;
     onorm_token: for (token_index = 0; token_index < num_tokens; ++token_index) {
     #pragma HLS loop_tripcount min=1 max=2048  /* num_tokens: 1..max_seq_len */
@@ -657,18 +940,47 @@ static void gdn_output_norm_and_gate(
         #pragma HLS loop_tripcount min=8 max=8  /* num_heads=8 */
             float *attn_head = attn + (size_t)token_index * num_heads * head_dim + (size_t)head_index * head_dim;
             const float *gate_head = gate + (size_t)token_index * num_heads * head_dim + (size_t)head_index * head_dim;
-            double sum = 0.0;
+
+            /* On-chip buffers break the AXI read-after-write hazard on attn_head
+             * (was II=160) and avoid a second AXI read of gate_head per element. */
+            float attn_loc[GDN_DV];
+            float gate_loc[GDN_DV];
+            #pragma HLS array_partition variable=attn_loc cyclic factor=8
+            #pragma HLS array_partition variable=gate_loc cyclic factor=8
+
+            /* Per-element squares scratch -- store-products + tree-reduce
+             * pattern (same as load_qk / dot_alpha). The earlier 8-lane mux
+             * pattern stayed at II=2 because HLS muxed the partial array into
+             * a single register and tracked the carried dep on the mux. */
+            float sq_arr[GDN_DV];
+            #pragma HLS array_partition variable=sq_arr complete
+
+            /* Phase 1: load attn_head into local + record squared values */
             uint32_t index;
-            float scale;
             onorm_sq: for (index = 0; index < head_dim; ++index) {
-            #pragma HLS loop_tripcount min=256 max=256  /* head_dim=256 */
-                sum += (double)attn_head[index] * (double)attn_head[index];
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+                float v = attn_head[index];
+                attn_loc[index] = v;
+                sq_arr[index] = v * v;
             }
-            scale = 1.0f / sqrtf((float)(sum / head_dim) + eps);
+
+            /* Phase 2: load gate_head into local buffer */
+            onorm_load_g: for (index = 0; index < head_dim; ++index) {
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+                gate_loc[index] = gate_head[index];
+            }
+
+            float sum = gdn_tree_reduce_256(sq_arr);
+            float scale = 1.0f / sqrtf(sum / (float)head_dim + eps);
+
+            /* Phase 3: combine and write back (writes only on the AXI port) */
             onorm_gate: for (index = 0; index < head_dim; ++index) {
-            #pragma HLS loop_tripcount min=256 max=256  /* head_dim=256 */
-                float normalized = attn_head[index] * scale * weight[index];
-                float gate_value = gate_head[index];
+            #pragma HLS loop_tripcount min=256 max=256
+            #pragma HLS pipeline II=1
+                float normalized = attn_loc[index] * scale * weight_loc[index];
+                float gate_value = gate_loc[index];
                 attn_head[index] = normalized * gate_value * gdn_sigmoid(gate_value);
             }
         }
@@ -904,4 +1216,191 @@ void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logit
         }
         logits_out[vocab_index] = sum;
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * HLS-synthesizable single-layer GDN attention forward.
+ *
+ * Struct pointers are disaggregated into flat arrays so Vitis HLS can attach
+ * m_axi interfaces.  The host wrapper gdn_attn_forward_layer (below) packs
+ * the call for testbench use.
+ * ----------------------------------------------------------------------- */
+int gdn_attn_forward(
+    const GDNWeightHeader *config,
+    const float *weight_data,
+    uint32_t layer_index,
+    const float *input,
+    float *output,
+    float *q,
+    float *k,
+    float *v,
+    float *a,
+    float *b,
+    float *gate,
+    float *attn,
+    float *tmp_hidden,
+    float *recurrent_state,
+    float *head_buffer,
+    uint32_t num_tokens
+) {
+    /* m_axi depth sized for single-layer attention:
+       weight_data covers layer 0 attn weights (vocab*hidden + layer_attn_stride ≈ 87M).
+       Per-token buffers sized for max_seq_len*hidden = 2048*2048 = 4M. */
+    /* AXI bundles:
+     *   - q on bundle=mem_q and k on bundle=mem_k put the two parallel reads in
+     *     gdn_recurrent_attention.load_qk on separate AXI master ports, lifting
+     *     load_qk from II=2 (gmem port contention) to II=1.
+     *   - All other ports stay on the default `gmem` bundle.
+     */
+    #pragma HLS interface m_axi port=config depth=1 offset=slave
+    #pragma HLS interface m_axi port=weight_data depth=87000000 offset=slave
+    #pragma HLS interface m_axi port=input depth=129024 offset=slave
+    #pragma HLS interface m_axi port=output depth=129024 offset=slave
+    #pragma HLS interface m_axi port=q depth=129024 offset=slave bundle=mem_q
+    #pragma HLS interface m_axi port=k depth=129024 offset=slave bundle=mem_k
+    #pragma HLS interface m_axi port=v depth=129024 offset=slave
+    #pragma HLS interface m_axi port=a depth=504 offset=slave
+    #pragma HLS interface m_axi port=b depth=504 offset=slave
+    #pragma HLS interface m_axi port=gate depth=129024 offset=slave
+    #pragma HLS interface m_axi port=attn depth=129024 offset=slave
+    #pragma HLS interface m_axi port=tmp_hidden depth=129024 offset=slave
+    #pragma HLS interface m_axi port=recurrent_state depth=524288 offset=slave
+    #pragma HLS interface m_axi port=head_buffer depth=256 offset=slave
+    #pragma HLS interface s_axilite port=layer_index
+    #pragma HLS interface s_axilite port=num_tokens
+    #pragma HLS interface s_axilite port=return
+
+    uint32_t hidden = config->hidden_size;
+    uint32_t num_heads = config->num_heads;
+    uint32_t head_dim = config->head_dim;
+    uint32_t conv_size = config->conv_size;
+    size_t hidden_count = (size_t)num_tokens * hidden;
+    size_t index;
+
+    /* Compute weight pointers for the requested layer */
+    size_t layer_offset = gdn_layer_weight_offset(config, layer_index);
+    const float *layer_a_log;
+    const float *layer_dt_bias;
+    const float *layer_q_proj;
+    const float *layer_k_proj;
+    const float *layer_v_proj;
+    const float *layer_a_proj;
+    const float *layer_b_proj;
+    const float *layer_q_conv;
+    const float *layer_k_conv;
+    const float *layer_v_conv;
+    const float *layer_g_proj;
+    const float *layer_o_norm;
+    const float *layer_o_proj;
+
+    if (layer_index >= config->num_layers) {
+        gdn_print_error("layer index out of range");
+        return -1;
+    }
+    if (num_tokens == 0 || num_tokens > config->max_seq_len) {
+        gdn_print_error("invalid token count for attn forward");
+        return -1;
+    }
+
+    layer_offset += hidden;
+    layer_a_log = weight_data + layer_offset;
+    layer_offset += num_heads;
+    layer_dt_bias = weight_data + layer_offset;
+    layer_offset += num_heads;
+    layer_q_proj = weight_data + layer_offset;
+    layer_offset += (size_t)hidden * hidden;
+    layer_k_proj = weight_data + layer_offset;
+    layer_offset += (size_t)hidden * hidden;
+    layer_v_proj = weight_data + layer_offset;
+    layer_offset += (size_t)hidden * hidden;
+    layer_a_proj = weight_data + layer_offset;
+    layer_offset += (size_t)num_heads * hidden;
+    layer_b_proj = weight_data + layer_offset;
+    layer_offset += (size_t)num_heads * hidden;
+    layer_q_conv = weight_data + layer_offset;
+    layer_offset += (size_t)hidden * conv_size;
+    layer_k_conv = weight_data + layer_offset;
+    layer_offset += (size_t)hidden * conv_size;
+    layer_v_conv = weight_data + layer_offset;
+    layer_offset += (size_t)hidden * conv_size;
+    layer_g_proj = weight_data + layer_offset;
+    layer_offset += (size_t)hidden * hidden;
+    layer_o_norm = weight_data + layer_offset;
+    layer_offset += head_dim;
+    layer_o_proj = weight_data + layer_offset;
+
+    /* Projections: input -> q, k, v, a, b, gate */
+    gdn_matmul(q, input, layer_q_proj, num_tokens, hidden, hidden);
+    gdn_matmul(k, input, layer_k_proj, num_tokens, hidden, hidden);
+    gdn_matmul(v, input, layer_v_proj, num_tokens, hidden, hidden);
+    gdn_matmul(a, input, layer_a_proj, num_tokens, hidden, num_heads);
+    gdn_matmul(b, input, layer_b_proj, num_tokens, hidden, num_heads);
+    gdn_matmul(gate, input, layer_g_proj, num_tokens, hidden, hidden);
+
+    /* Depthwise conv1d + SiLU on q, k, v */
+    gdn_depthwise_conv_silu(tmp_hidden, q, layer_q_conv, num_tokens, hidden, conv_size);
+    attn_conv_copy_q: for (index = 0; index < hidden_count; ++index) {
+    #pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
+        q[index] = tmp_hidden[index];
+    }
+
+    gdn_depthwise_conv_silu(tmp_hidden, k, layer_k_conv, num_tokens, hidden, conv_size);
+    attn_conv_copy_k: for (index = 0; index < hidden_count; ++index) {
+    #pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
+        k[index] = tmp_hidden[index];
+    }
+
+    gdn_depthwise_conv_silu(tmp_hidden, v, layer_v_conv, num_tokens, hidden, conv_size);
+    attn_conv_copy_v: for (index = 0; index < hidden_count; ++index) {
+    #pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
+        v[index] = tmp_hidden[index];
+    }
+
+    /* Recurrent attention */
+    gdn_recurrent_attention(
+        attn, recurrent_state, head_buffer,
+        q, k, v, a, b,
+        layer_a_log, layer_dt_bias,
+        hidden, num_heads, head_dim, num_tokens
+    );
+
+    /* Output norm + gate */
+    gdn_output_norm_and_gate(
+        attn, gate, layer_o_norm,
+        num_tokens, num_heads, head_dim, config->norm_eps
+    );
+
+    /* Output projection -> output */
+    gdn_matmul(output, attn, layer_o_proj, num_tokens, hidden, hidden);
+
+    return 0;
+}
+
+/* Host-side wrapper: packs GDNModel/GDNRunState into flat args for testbench */
+int gdn_attn_forward_layer(
+    const GDNModel *model,
+    GDNRunState *state,
+    uint32_t layer_index,
+    const float *input,
+    float *output,
+    uint32_t num_tokens
+) {
+    return gdn_attn_forward(
+        &model->config,
+        model->weight_data,
+        layer_index,
+        input,
+        output,
+        state->q,
+        state->k,
+        state->v,
+        state->a,
+        state->b,
+        state->gate,
+        state->attn,
+        state->tmp_hidden,
+        state->recurrent_state,
+        state->head_buffer,
+        num_tokens
+    );
 }
