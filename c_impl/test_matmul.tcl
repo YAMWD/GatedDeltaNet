@@ -1,8 +1,8 @@
 open_project GDN_matmul
 set_top gdn_matmul_top
-add_files gdn_model.c
+add_files gdn_model.cpp
 add_files gdn_model.h
-add_files -tb gdn_matmul_test.c
+add_files -tb gdn_matmul_test.cpp
 open_solution -reset "solution1" -flow_target vitis
 set_part {xcu55c-fsvh2892-2L-e}
 create_clock -period 10 -name default

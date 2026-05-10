@@ -1,8 +1,8 @@
 open_project GDN_single_attn
 set_top gdn_attn_forward
-add_files gdn_model.c
+add_files gdn_model.cpp
 add_files gdn_model.h
-add_files -tb gdn_attn_test.c
+add_files -tb gdn_attn_test.cpp
 add_files -tb artifacts
 add_files -tb fixtures_block
 open_solution -reset "solution2" -flow_target vitis

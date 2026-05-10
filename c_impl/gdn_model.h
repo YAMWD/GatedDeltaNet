@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct {
     char magic[8];
     uint32_t version;
@@ -142,5 +146,9 @@ int gdn_matmul_top(
     uint32_t in_dim,
     uint32_t out_dim
 );
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
 
 #endif
