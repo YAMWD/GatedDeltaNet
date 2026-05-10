@@ -447,28 +447,33 @@ static void gdn_rmsnorm_rows(
  * transpose + broadcast to both chains; ReadB ping-pongs between two
  * tile-buffers so load(next) overlaps stream(cur) at II=1.
  *
- * Kernel constraints (run_systolic_kernel returns -k on violation):
- *   num_rows % N_PES (=16)              == 0
+ * Kernel constraints (gdn_matmul_systolic returns -k on violation):
  *   out_dim  % (NUM_CHAINS * M_PER_PE) (=32) == 0
  *   in_dim   % 16                       == 0
- *   in_dim   <= IN_DIM_MAX (=2048)
+ *   in_dim   <= IN_DIM_MAX (=5632)
+ *   num_rows is unconstrained — the kernel pads to the next multiple of
+ *   N_PES on-chip (zero-fills A reads beyond num_rows, skips DRAM writes
+ *   beyond num_rows; the c_streams are still drained to keep dataflow
+ *   FIFOs balanced).
  *
- * gdn_matmul_systolic() further wraps run_systolic_kernel with:
- *   - token padding: zero-pad rows up to the next multiple of N_PES
- *   - K-tiling: chunk in_dim into IN_DIM_MAX-wide stripes, accumulate
- *     partials on host
- * so any (out_dim%32==0, in_dim%16==0) shape can be served. The dispatch
- * gdn_matmul() below tries this first and falls back to gdn_matmul_tiled()
- * for shapes that don't fit (a/b_proj have out_dim=8). The standalone
- * matmul-only HLS top in gdn_matmul_systolic.cpp keeps an authoritative
- * copy of these helpers; this in-file version exists so gdn_model.cpp is
+ * IN_DIM_MAX is sized at 5632 so that mlp_down_proj (in_dim=5632) fits a
+ * single kernel invocation — no host-side K-tiling is needed. q/k/v/g/o
+ * (in_dim=2048) and mlp_gate/up (in_dim=2048) reuse the same kernel; only
+ * the K-loop runtime changes.
+ *
+ * The dispatch gdn_matmul() below tries gdn_matmul_systolic first and
+ * falls back to gdn_matmul_tiled() for shapes that don't fit (a/b_proj
+ * have out_dim=8). The standalone matmul-only HLS top in
+ * gdn_matmul_systolic.cpp keeps an authoritative copy of these helpers
+ * for test_matmul.tcl; this in-file version exists so gdn_model.cpp is
  * self-contained and gdn_eval/gdn_attn_test don't need to link the
- * standalone source file.
+ * standalone source file. No malloc/free anywhere — same code path runs
+ * under csim and csynth.
  * ======================================================================= */
 
 #define N_PES 16
 #define M_PER_PE 16
-#define IN_DIM_MAX 2048
+#define IN_DIM_MAX 5632
 #define NUM_CHAINS 2
 
 struct Pack16 {
@@ -505,7 +510,7 @@ static void ProcessingElement(
             }
 
             pe_k: for (uint32_t k = 0; k < in_dim; ++k) {
-            #pragma HLS loop_tripcount min=1 max=2048
+            #pragma HLS loop_tripcount min=1 max=5632
             #pragma HLS pipeline II=1
                 Pack16 a_pack = aIn.read();
                 float a_val = a_pack.data[location];
@@ -546,15 +551,22 @@ static void ProcessingElement(
     }
 }
 
+/* ReadA — loads outer-N stripes of A into BRAM and broadcasts column packs
+ * to both PE chains. Handles in-kernel token padding: when num_rows is not
+ * a multiple of N_PES, the last outer-N stripe contains some padding rows.
+ * For those, the m_axi address is clamped to row 0 (so DDR/HBM never sees
+ * an OOB address) and the loaded data is zeroed in `a_buf` — the PE chain
+ * then MACs against zero `a_val` for that row, which contributes nothing
+ * to the output. WriteC_chain skips the DRAM write for those rows. */
 static void ReadA(
     const Pack16 *a_wide,
     Stream16 &a_out_0,
     Stream16 &a_out_1,
     uint32_t num_rows,
+    uint32_t num_outer_n,
     uint32_t in_dim,
     uint32_t out_dim
 ) {
-    uint32_t num_outer_n = num_rows / N_PES;
     uint32_t num_outer_m = out_dim / M_PER_PE;
     uint32_t num_outer_m_per_chain = num_outer_m / NUM_CHAINS;
     uint32_t k_packs = in_dim / 16;
@@ -567,21 +579,27 @@ static void ReadA(
     #pragma HLS loop_tripcount min=1 max=128
 
         load_a_rkp: for (uint32_t rkp = 0; rkp < (uint32_t)N_PES * k_packs; ++rkp) {
-        #pragma HLS loop_tripcount min=2048 max=2048
+        #pragma HLS loop_tripcount min=2048 max=5632
         #pragma HLS pipeline II=1
             uint32_t r  = rkp / k_packs;
             uint32_t kp = rkp % k_packs;
-            Pack16 wide = a_wide[(size_t)(n0 * N_PES + r) * k_packs + kp];
+            uint32_t global_row = n0 * N_PES + r;
+            bool valid = (global_row < num_rows);
+            /* Address-clamp: when this row is padding, read row 0 instead so
+             * the m_axi master never sees an OOB address; we'll zero the
+             * loaded pack below before storing to a_buf. */
+            uint32_t safe_row = valid ? global_row : 0;
+            Pack16 wide = a_wide[(size_t)safe_row * k_packs + kp];
             load_a_unpack: for (int kk = 0; kk < 16; ++kk) {
             #pragma HLS unroll
-                a_buf[r][kp * 16 + kk] = wide.data[kk];
+                a_buf[r][kp * 16 + kk] = valid ? wide.data[kk] : 0.0f;
             }
         }
 
         stream_a_m0: for (uint32_t m0 = 0; m0 < num_outer_m_per_chain; ++m0) {
         #pragma HLS loop_tripcount min=1 max=64
             stream_a_k: for (uint32_t k = 0; k < in_dim; ++k) {
-            #pragma HLS loop_tripcount min=1 max=2048
+            #pragma HLS loop_tripcount min=1 max=5632
             #pragma HLS pipeline II=1
                 Pack16 col;
                 stream_a_pack: for (int r = 0; r < N_PES; ++r) {
@@ -598,12 +616,11 @@ static void ReadA(
 static void ReadB(
     const Pack16 *b_wide,
     Stream16 &b_out,
-    uint32_t num_rows,
+    uint32_t num_outer_n,
     uint32_t in_dim,
     uint32_t m0_offset,
     uint32_t num_outer_m_per_chain
 ) {
-    uint32_t num_outer_n = num_rows / N_PES;
     uint32_t k_packs = in_dim / 16;
     uint32_t total_tiles = num_outer_n * num_outer_m_per_chain;
 
@@ -619,7 +636,7 @@ static void ReadB(
     if (total_tiles == 0) return;
 
     preload_ckp: for (uint32_t ckp = 0; ckp < (uint32_t)M_PER_PE * k_packs; ++ckp) {
-    #pragma HLS loop_tripcount min=2048 max=2048
+    #pragma HLS loop_tripcount min=2048 max=5632
     #pragma HLS pipeline II=1
         uint32_t c  = ckp / k_packs;
         uint32_t kp = ckp % k_packs;
@@ -638,7 +655,7 @@ static void ReadB(
         uint32_t m0_global_next   = m0_local_next + m0_offset;
 
         fused_io: for (uint32_t i = 0; i < in_dim; ++i) {
-        #pragma HLS loop_tripcount min=1 max=2048
+        #pragma HLS loop_tripcount min=1 max=5632
         #pragma HLS pipeline II=1
             Pack16 col;
             fused_stream_pack: for (int c = 0; c < M_PER_PE; ++c) {
@@ -659,7 +676,7 @@ static void ReadB(
 
     uint32_t last_idx = (total_tiles - 1) & 1u;
     last_stream: for (uint32_t k = 0; k < in_dim; ++k) {
-    #pragma HLS loop_tripcount min=1 max=2048
+    #pragma HLS loop_tripcount min=1 max=5632
     #pragma HLS pipeline II=1
         Pack16 col;
         last_stream_pack: for (int c = 0; c < M_PER_PE; ++c) {
@@ -682,7 +699,7 @@ static void SinkAB(
         sink_m0: for (uint32_t m0 = 0; m0 < num_outer_m; ++m0) {
         #pragma HLS loop_tripcount min=1 max=64
             sink_k: for (uint32_t k = 0; k < in_dim; ++k) {
-            #pragma HLS loop_tripcount min=1 max=2048
+            #pragma HLS loop_tripcount min=1 max=5632
             #pragma HLS pipeline II=1
                 a_in.read();
                 b_in.read();
@@ -695,11 +712,11 @@ static void WriteC_chain(
     Stream16 c_streams[N_PES],
     Pack16 *c_wide,
     uint32_t num_rows,
+    uint32_t num_outer_n,
     uint32_t out_dim,
     uint32_t m0_offset,
     uint32_t num_outer_m_per_chain
 ) {
-    uint32_t num_outer_n = num_rows / N_PES;
     uint32_t m_packs = out_dim / 16;
 
     write_c_n0: for (uint32_t n0 = 0; n0 < num_outer_n; ++n0) {
@@ -709,7 +726,15 @@ static void WriteC_chain(
             size_t base = (size_t)(n0 * N_PES) * m_packs + m0 + m0_offset;
             write_c_r: for (int r = 0; r < N_PES; ++r) {
             #pragma HLS pipeline II=1
-                c_wide[base + (size_t)r * m_packs] = c_streams[r].read();
+                /* Always drain c_streams to keep dataflow FIFOs balanced —
+                 * the PE chain wrote one Pack16 per (n0, m0, r) regardless
+                 * of token padding. Skip the m_axi write for padded rows
+                 * (global_row >= num_rows). */
+                Pack16 row = c_streams[r].read();
+                uint32_t global_row = n0 * N_PES + (uint32_t)r;
+                if (global_row < num_rows) {
+                    c_wide[base + (size_t)r * m_packs] = row;
+                }
             }
         }
     }
@@ -747,11 +772,11 @@ static void run_dataflow(
     #pragma HLS stream variable=c_streams_1 depth=32
 
     ReadA(in, a_pipes_0[0], a_pipes_1[0],
-          num_rows, in_dim, out_dim);
+          num_rows, num_outer_n, in_dim, out_dim);
 
-    ReadB(weights_lo, b_pipes_0[0], num_rows, in_dim,
+    ReadB(weights_lo, b_pipes_0[0], num_outer_n, in_dim,
           0u, num_outer_m_per_chain);
-    ReadB(weights_hi, b_pipes_1[0], num_rows, in_dim,
+    ReadB(weights_hi, b_pipes_1[0], num_outer_n, in_dim,
           num_outer_m_per_chain, num_outer_m_per_chain);
 
     /* Chain 0: 16 PEs. */
@@ -827,26 +852,38 @@ static void run_dataflow(
     SinkAB(a_pipes_1[N_PES], b_pipes_1[N_PES],
            num_outer_n, num_outer_m_per_chain, in_dim);
 
-    WriteC_chain(c_streams_0, out_lo, num_rows, out_dim,
+    WriteC_chain(c_streams_0, out_lo, num_rows, num_outer_n, out_dim,
                  0u, num_outer_m_per_chain);
-    WriteC_chain(c_streams_1, out_hi, num_rows, out_dim,
+    WriteC_chain(c_streams_1, out_hi, num_rows, num_outer_n, out_dim,
                  num_outer_m_per_chain, num_outer_m_per_chain);
 }
 
-/* run_systolic_kernel — float-pointer entry, validates geometry, casts to
- * Pack16, hands to run_dataflow. Callers must already have padded rows
- * and chunked K to satisfy the geometry constraints. */
-static int run_systolic_kernel(
+/* gdn_matmul_systolic — float-pointer entry to the systolic kernel. No
+ * malloc, no #ifdef: the same code path runs under both csim and csynth.
+ *
+ * Geometry checks:
+ *   out_dim % (NUM_CHAINS * M_PER_PE) (=32) == 0  -- caller falls back to
+ *                                                   gdn_matmul_tiled if not
+ *   in_dim  % 16                       == 0      -- ditto
+ *   in_dim  <= IN_DIM_MAX (=5632)               -- ditto (mlp_down fits)
+ *
+ * num_rows is unconstrained: ReadA zero-fills the loaded data when
+ * global_row >= num_rows (with the m_axi address clamped to row 0 so
+ * DRAM never sees an OOB address), and WriteC_chain skips the m_axi
+ * write for global_row >= num_rows (it still drains c_streams to keep
+ * the dataflow FIFOs balanced). The PE chain naturally produces zero
+ * outputs for padded rows because every K-cycle MAC for those rows
+ * uses a_val=0. */
+static int gdn_matmul_systolic(
     float *out, const float *in, const float *weights,
     uint32_t num_rows, uint32_t in_dim, uint32_t out_dim
 ) {
-    if (num_rows == 0 || in_dim == 0 || out_dim == 0)        return -1;
-    if ((num_rows % N_PES) != 0)                             return -2;
-    if ((out_dim % (NUM_CHAINS * M_PER_PE)) != 0)            return -3;
-    if ((in_dim  % 16)       != 0)                           return -4;
-    if (in_dim > IN_DIM_MAX)                                 return -5;
+    if (num_rows == 0 || in_dim == 0 || out_dim == 0)            return -1;
+    if ((out_dim % (NUM_CHAINS * M_PER_PE)) != 0)                return -3;
+    if ((in_dim  % 16)       != 0)                               return -4;
+    if (in_dim > (uint32_t)IN_DIM_MAX)                           return -5;
 
-    uint32_t num_outer_n            = num_rows / N_PES;
+    uint32_t num_outer_n            = (num_rows + N_PES - 1) / N_PES;
     uint32_t num_outer_m            = out_dim / M_PER_PE;
     uint32_t num_outer_m_per_chain  = num_outer_m / NUM_CHAINS;
 
@@ -859,112 +896,6 @@ static int run_systolic_kernel(
                  num_outer_n, num_outer_m_per_chain);
 
     return 0;
-}
-
-/* gdn_matmul_systolic — host-side wrapper that absorbs token padding (zero
- * rows up to the next multiple of N_PES) and K-tiling (split in_dim into
- * IN_DIM_MAX-wide stripes, accumulate partials) so callers can issue any
- * shape that satisfies out_dim%32==0 and in_dim%16==0. Returns 0 on
- * success; -3 when out_dim is not a multiple of 32 (e.g. a/b_proj with
- * out_dim=8) so gdn_matmul() can fall back to gdn_matmul_tiled. */
-static int gdn_matmul_systolic(
-    float *out, const float *in, const float *weights,
-    uint32_t num_rows, uint32_t in_dim, uint32_t out_dim
-) {
-    if (num_rows == 0 || in_dim == 0 || out_dim == 0)            return -1;
-    if ((out_dim % (NUM_CHAINS * M_PER_PE)) != 0)                return -3;
-    if ((in_dim  % 16)       != 0)                               return -4;
-
-    /* Token padding: round num_rows up to the next multiple of N_PES.
-     * Real rows are copied; pad rows are zeroed. After the kernel runs,
-     * only the first num_rows rows of the padded output are written back
-     * to `out`. */
-    uint32_t padded_rows = (num_rows + N_PES - 1) / N_PES * N_PES;
-    bool needs_pad = (padded_rows != num_rows);
-
-    const float *eff_in;
-    float *eff_out;
-    float *pad_in_buf  = NULL;
-    float *pad_out_buf = NULL;
-
-    if (needs_pad) {
-        pad_in_buf  = (float *)gdn_malloc_bytes((size_t)padded_rows * in_dim  * sizeof(float));
-        pad_out_buf = (float *)gdn_malloc_bytes((size_t)padded_rows * out_dim * sizeof(float));
-        for (uint32_t r = 0; r < num_rows; ++r) {
-            for (uint32_t k = 0; k < in_dim; ++k) {
-                pad_in_buf[(size_t)r * in_dim + k] = in[(size_t)r * in_dim + k];
-            }
-        }
-        for (uint32_t r = num_rows; r < padded_rows; ++r) {
-            for (uint32_t k = 0; k < in_dim; ++k) {
-                pad_in_buf[(size_t)r * in_dim + k] = 0.0f;
-            }
-        }
-        eff_in  = pad_in_buf;
-        eff_out = pad_out_buf;
-    } else {
-        eff_in  = in;
-        eff_out = out;
-    }
-
-    int rc = 0;
-    if (in_dim <= (uint32_t)IN_DIM_MAX) {
-        rc = run_systolic_kernel(eff_out, eff_in, weights, padded_rows, in_dim, out_dim);
-    } else {
-        /* K-tile: chunk in_dim into IN_DIM_MAX-wide stripes. Repack input
-         * and weight columns into contiguous per-chunk buffers (the kernel
-         * expects each row contiguous with stride=current_in_dim), and
-         * accumulate partials on host. mlp_down_proj (in_dim=5632) splits
-         * into 2048+2048+1536 — all multiples of 16. */
-        size_t out_count = (size_t)padded_rows * out_dim;
-        float *in_chunk    = (float *)gdn_malloc_bytes((size_t)padded_rows * IN_DIM_MAX * sizeof(float));
-        float *wt_chunk    = (float *)gdn_malloc_bytes((size_t)out_dim     * IN_DIM_MAX * sizeof(float));
-        float *out_partial = (float *)gdn_malloc_bytes(out_count * sizeof(float));
-
-        uint32_t k_done = 0;
-        bool first = true;
-        while (k_done < in_dim) {
-            uint32_t chunk = (in_dim - k_done > (uint32_t)IN_DIM_MAX) ? (uint32_t)IN_DIM_MAX : (in_dim - k_done);
-
-            for (uint32_t r = 0; r < padded_rows; ++r) {
-                for (uint32_t kk = 0; kk < chunk; ++kk) {
-                    in_chunk[(size_t)r * chunk + kk] = eff_in[(size_t)r * in_dim + k_done + kk];
-                }
-            }
-            for (uint32_t c = 0; c < out_dim; ++c) {
-                for (uint32_t kk = 0; kk < chunk; ++kk) {
-                    wt_chunk[(size_t)c * chunk + kk] = weights[(size_t)c * in_dim + k_done + kk];
-                }
-            }
-
-            float *target = first ? eff_out : out_partial;
-            rc = run_systolic_kernel(target, in_chunk, wt_chunk, padded_rows, chunk, out_dim);
-            if (rc != 0) break;
-            if (!first) {
-                for (size_t i = 0; i < out_count; ++i) eff_out[i] += out_partial[i];
-            }
-            first = false;
-            k_done += chunk;
-        }
-
-        free(in_chunk);
-        free(wt_chunk);
-        free(out_partial);
-    }
-
-    if (needs_pad) {
-        if (rc == 0) {
-            for (uint32_t r = 0; r < num_rows; ++r) {
-                for (uint32_t c = 0; c < out_dim; ++c) {
-                    out[(size_t)r * out_dim + c] = pad_out_buf[(size_t)r * out_dim + c];
-                }
-            }
-        }
-        free(pad_in_buf);
-        free(pad_out_buf);
-    }
-
-    return rc;
 }
 
 /* Tile sizes for tiled matmul — chosen to divide evenly into hidden=2048
