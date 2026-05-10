@@ -1,5 +1,7 @@
 #include "gdn_model.h"
 
+#include "hls_stream.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -431,6 +433,540 @@ static void gdn_rmsnorm_rows(
     }
 }
 
+/* =========================================================================
+ * Systolic-array matmul (architecture from spcl/gemm_hls).
+ *
+ *   ReadA ──a_pipes[0]──→ PE[0] ──a_pipes[1]──→ PE[1] ──→ ... ──→ PE[15]
+ *   ReadB ──b_pipes[0]──→ PE[0] ──b_pipes[1]──→ PE[1] ──→ ... ──→ PE[15]
+ *                            │                  │                   │
+ *                                ────────  WriteC  ────────
+ *
+ * 2 chains × 16 PEs × 16 MAC = 512 MAC/cycle peak. Each PE owns one row of
+ * the current outer-N tile and accumulates 16 PARTIAL lanes to break the
+ * FP32 fadd recurrence at II=1 under a 4 ns clock. ReadA does an on-chip
+ * transpose + broadcast to both chains; ReadB ping-pongs between two
+ * tile-buffers so load(next) overlaps stream(cur) at II=1.
+ *
+ * Kernel constraints (run_systolic_kernel returns -k on violation):
+ *   num_rows % N_PES (=16)              == 0
+ *   out_dim  % (NUM_CHAINS * M_PER_PE) (=32) == 0
+ *   in_dim   % 16                       == 0
+ *   in_dim   <= IN_DIM_MAX (=2048)
+ *
+ * gdn_matmul_systolic() further wraps run_systolic_kernel with:
+ *   - token padding: zero-pad rows up to the next multiple of N_PES
+ *   - K-tiling: chunk in_dim into IN_DIM_MAX-wide stripes, accumulate
+ *     partials on host
+ * so any (out_dim%32==0, in_dim%16==0) shape can be served. The dispatch
+ * gdn_matmul() below tries this first and falls back to gdn_matmul_tiled()
+ * for shapes that don't fit (a/b_proj have out_dim=8). The standalone
+ * matmul-only HLS top in gdn_matmul_systolic.cpp keeps an authoritative
+ * copy of these helpers; this in-file version exists so gdn_model.cpp is
+ * self-contained and gdn_eval/gdn_attn_test don't need to link the
+ * standalone source file.
+ * ======================================================================= */
+
+#define N_PES 16
+#define M_PER_PE 16
+#define IN_DIM_MAX 2048
+#define NUM_CHAINS 2
+
+struct Pack16 {
+    float data[16];
+};
+
+typedef hls::stream<Pack16> Stream16;
+
+static void ProcessingElement(
+    Stream16 &aIn, Stream16 &aOut,
+    Stream16 &bIn, Stream16 &bOut,
+    Stream16 &cOut,
+    int location,
+    uint32_t num_outer_n,
+    uint32_t num_outer_m,
+    uint32_t in_dim
+) {
+    /* PARTIAL=16 lanes, recurrence-free at II=1 even at 320+ MHz Fmax. */
+    static const int PARTIAL = 16;
+    float c_buf[M_PER_PE][PARTIAL];
+    #pragma HLS array_partition variable=c_buf complete
+
+    pe_n0: for (uint32_t n0 = 0; n0 < num_outer_n; ++n0) {
+    #pragma HLS loop_tripcount min=1 max=128
+        pe_m0: for (uint32_t m0 = 0; m0 < num_outer_m; ++m0) {
+        #pragma HLS loop_tripcount min=1 max=64
+
+            pe_init_m: for (int m = 0; m < M_PER_PE; ++m) {
+            #pragma HLS unroll
+                pe_init_p: for (int p = 0; p < PARTIAL; ++p) {
+                #pragma HLS unroll
+                    c_buf[m][p] = 0.0f;
+                }
+            }
+
+            pe_k: for (uint32_t k = 0; k < in_dim; ++k) {
+            #pragma HLS loop_tripcount min=1 max=2048
+            #pragma HLS pipeline II=1
+                Pack16 a_pack = aIn.read();
+                float a_val = a_pack.data[location];
+                aOut.write(a_pack);
+
+                Pack16 b_pack = bIn.read();
+                bOut.write(b_pack);
+
+                uint32_t lane = k & (PARTIAL - 1);
+                pe_mac: for (int m = 0; m < M_PER_PE; ++m) {
+                #pragma HLS unroll
+                    c_buf[m][lane] += a_val * b_pack.data[m];
+                }
+            }
+
+            /* Tree-reduce 16 lanes per row, emit one row pack. */
+            Pack16 my_c;
+            pe_pack: for (int m = 0; m < M_PER_PE; ++m) {
+            #pragma HLS unroll
+                float l0 = c_buf[m][0]  + c_buf[m][1];
+                float l1 = c_buf[m][2]  + c_buf[m][3];
+                float l2 = c_buf[m][4]  + c_buf[m][5];
+                float l3 = c_buf[m][6]  + c_buf[m][7];
+                float l4 = c_buf[m][8]  + c_buf[m][9];
+                float l5 = c_buf[m][10] + c_buf[m][11];
+                float l6 = c_buf[m][12] + c_buf[m][13];
+                float l7 = c_buf[m][14] + c_buf[m][15];
+                float q0 = l0 + l1;
+                float q1 = l2 + l3;
+                float q2 = l4 + l5;
+                float q3 = l6 + l7;
+                float h0 = q0 + q1;
+                float h1 = q2 + q3;
+                my_c.data[m] = h0 + h1;
+            }
+            cOut.write(my_c);
+        }
+    }
+}
+
+static void ReadA(
+    const Pack16 *a_wide,
+    Stream16 &a_out_0,
+    Stream16 &a_out_1,
+    uint32_t num_rows,
+    uint32_t in_dim,
+    uint32_t out_dim
+) {
+    uint32_t num_outer_n = num_rows / N_PES;
+    uint32_t num_outer_m = out_dim / M_PER_PE;
+    uint32_t num_outer_m_per_chain = num_outer_m / NUM_CHAINS;
+    uint32_t k_packs = in_dim / 16;
+
+    static float a_buf[N_PES][IN_DIM_MAX];
+    #pragma HLS array_partition variable=a_buf dim=1 complete
+    #pragma HLS array_partition variable=a_buf dim=2 cyclic factor=16
+
+    read_a_n0: for (uint32_t n0 = 0; n0 < num_outer_n; ++n0) {
+    #pragma HLS loop_tripcount min=1 max=128
+
+        load_a_rkp: for (uint32_t rkp = 0; rkp < (uint32_t)N_PES * k_packs; ++rkp) {
+        #pragma HLS loop_tripcount min=2048 max=2048
+        #pragma HLS pipeline II=1
+            uint32_t r  = rkp / k_packs;
+            uint32_t kp = rkp % k_packs;
+            Pack16 wide = a_wide[(size_t)(n0 * N_PES + r) * k_packs + kp];
+            load_a_unpack: for (int kk = 0; kk < 16; ++kk) {
+            #pragma HLS unroll
+                a_buf[r][kp * 16 + kk] = wide.data[kk];
+            }
+        }
+
+        stream_a_m0: for (uint32_t m0 = 0; m0 < num_outer_m_per_chain; ++m0) {
+        #pragma HLS loop_tripcount min=1 max=64
+            stream_a_k: for (uint32_t k = 0; k < in_dim; ++k) {
+            #pragma HLS loop_tripcount min=1 max=2048
+            #pragma HLS pipeline II=1
+                Pack16 col;
+                stream_a_pack: for (int r = 0; r < N_PES; ++r) {
+                #pragma HLS unroll
+                    col.data[r] = a_buf[r][k];
+                }
+                a_out_0.write(col);
+                a_out_1.write(col);
+            }
+        }
+    }
+}
+
+static void ReadB(
+    const Pack16 *b_wide,
+    Stream16 &b_out,
+    uint32_t num_rows,
+    uint32_t in_dim,
+    uint32_t m0_offset,
+    uint32_t num_outer_m_per_chain
+) {
+    uint32_t num_outer_n = num_rows / N_PES;
+    uint32_t k_packs = in_dim / 16;
+    uint32_t total_tiles = num_outer_n * num_outer_m_per_chain;
+
+    /* Function-local (NOT static): NUM_CHAINS ReadB invocations in dataflow
+     * each need their own BRAM instance — a static array would be shared
+     * state and trip "HLS 200-979 internal global variable failed dataflow
+     * checking". */
+    float b_buf[2][M_PER_PE][IN_DIM_MAX];
+    #pragma HLS array_partition variable=b_buf dim=1 complete
+    #pragma HLS array_partition variable=b_buf dim=2 complete
+    #pragma HLS array_partition variable=b_buf dim=3 cyclic factor=16
+
+    if (total_tiles == 0) return;
+
+    preload_ckp: for (uint32_t ckp = 0; ckp < (uint32_t)M_PER_PE * k_packs; ++ckp) {
+    #pragma HLS loop_tripcount min=2048 max=2048
+    #pragma HLS pipeline II=1
+        uint32_t c  = ckp / k_packs;
+        uint32_t kp = ckp % k_packs;
+        Pack16 wide = b_wide[(size_t)(m0_offset * M_PER_PE + c) * k_packs + kp];
+        preload_unpack: for (int kk = 0; kk < 16; ++kk) {
+        #pragma HLS unroll
+            b_buf[0][c][kp * 16 + kk] = wide.data[kk];
+        }
+    }
+
+    fused_tile: for (uint32_t tile = 1; tile < total_tiles; ++tile) {
+    #pragma HLS loop_tripcount min=1 max=8192
+        uint32_t stream_idx       = (tile - 1) & 1u;
+        uint32_t load_idx         = tile & 1u;
+        uint32_t m0_local_next    = tile % num_outer_m_per_chain;
+        uint32_t m0_global_next   = m0_local_next + m0_offset;
+
+        fused_io: for (uint32_t i = 0; i < in_dim; ++i) {
+        #pragma HLS loop_tripcount min=1 max=2048
+        #pragma HLS pipeline II=1
+            Pack16 col;
+            fused_stream_pack: for (int c = 0; c < M_PER_PE; ++c) {
+            #pragma HLS unroll
+                col.data[c] = b_buf[stream_idx][c][i];
+            }
+            b_out.write(col);
+
+            uint32_t load_c  = i / k_packs;
+            uint32_t load_kp = i % k_packs;
+            Pack16 wide = b_wide[(size_t)(m0_global_next * M_PER_PE + load_c) * k_packs + load_kp];
+            fused_load_unpack: for (int kk = 0; kk < 16; ++kk) {
+            #pragma HLS unroll
+                b_buf[load_idx][load_c][load_kp * 16 + kk] = wide.data[kk];
+            }
+        }
+    }
+
+    uint32_t last_idx = (total_tiles - 1) & 1u;
+    last_stream: for (uint32_t k = 0; k < in_dim; ++k) {
+    #pragma HLS loop_tripcount min=1 max=2048
+    #pragma HLS pipeline II=1
+        Pack16 col;
+        last_stream_pack: for (int c = 0; c < M_PER_PE; ++c) {
+        #pragma HLS unroll
+            col.data[c] = b_buf[last_idx][c][k];
+        }
+        b_out.write(col);
+    }
+}
+
+static void SinkAB(
+    Stream16 &a_in,
+    Stream16 &b_in,
+    uint32_t num_outer_n,
+    uint32_t num_outer_m,
+    uint32_t in_dim
+) {
+    sink_n0: for (uint32_t n0 = 0; n0 < num_outer_n; ++n0) {
+    #pragma HLS loop_tripcount min=1 max=128
+        sink_m0: for (uint32_t m0 = 0; m0 < num_outer_m; ++m0) {
+        #pragma HLS loop_tripcount min=1 max=64
+            sink_k: for (uint32_t k = 0; k < in_dim; ++k) {
+            #pragma HLS loop_tripcount min=1 max=2048
+            #pragma HLS pipeline II=1
+                a_in.read();
+                b_in.read();
+            }
+        }
+    }
+}
+
+static void WriteC_chain(
+    Stream16 c_streams[N_PES],
+    Pack16 *c_wide,
+    uint32_t num_rows,
+    uint32_t out_dim,
+    uint32_t m0_offset,
+    uint32_t num_outer_m_per_chain
+) {
+    uint32_t num_outer_n = num_rows / N_PES;
+    uint32_t m_packs = out_dim / 16;
+
+    write_c_n0: for (uint32_t n0 = 0; n0 < num_outer_n; ++n0) {
+    #pragma HLS loop_tripcount min=1 max=128
+        write_c_m0: for (uint32_t m0 = 0; m0 < num_outer_m_per_chain; ++m0) {
+        #pragma HLS loop_tripcount min=1 max=64
+            size_t base = (size_t)(n0 * N_PES) * m_packs + m0 + m0_offset;
+            write_c_r: for (int r = 0; r < N_PES; ++r) {
+            #pragma HLS pipeline II=1
+                c_wide[base + (size_t)r * m_packs] = c_streams[r].read();
+            }
+        }
+    }
+}
+
+/* run_dataflow lives in its own function so #pragma HLS dataflow is at
+ * function scope (HLS 207-5556 forbids it inside `{ ... }`) and the body
+ * stays canonical (only stream decls and function calls). */
+static void run_dataflow(
+    Pack16 *out_lo,
+    Pack16 *out_hi,
+    const Pack16 *in,
+    const Pack16 *weights_lo,
+    const Pack16 *weights_hi,
+    uint32_t num_rows,
+    uint32_t in_dim,
+    uint32_t out_dim,
+    uint32_t num_outer_n,
+    uint32_t num_outer_m_per_chain
+) {
+    #pragma HLS dataflow
+
+    Stream16 a_pipes_0[N_PES + 1];
+    Stream16 b_pipes_0[N_PES + 1];
+    Stream16 c_streams_0[N_PES];
+    #pragma HLS stream variable=a_pipes_0   depth=4
+    #pragma HLS stream variable=b_pipes_0   depth=4
+    #pragma HLS stream variable=c_streams_0 depth=32
+
+    Stream16 a_pipes_1[N_PES + 1];
+    Stream16 b_pipes_1[N_PES + 1];
+    Stream16 c_streams_1[N_PES];
+    #pragma HLS stream variable=a_pipes_1   depth=4
+    #pragma HLS stream variable=b_pipes_1   depth=4
+    #pragma HLS stream variable=c_streams_1 depth=32
+
+    ReadA(in, a_pipes_0[0], a_pipes_1[0],
+          num_rows, in_dim, out_dim);
+
+    ReadB(weights_lo, b_pipes_0[0], num_rows, in_dim,
+          0u, num_outer_m_per_chain);
+    ReadB(weights_hi, b_pipes_1[0], num_rows, in_dim,
+          num_outer_m_per_chain, num_outer_m_per_chain);
+
+    /* Chain 0: 16 PEs. */
+    ProcessingElement(a_pipes_0[0],  a_pipes_0[1],  b_pipes_0[0],  b_pipes_0[1],
+                      c_streams_0[0],  0,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[1],  a_pipes_0[2],  b_pipes_0[1],  b_pipes_0[2],
+                      c_streams_0[1],  1,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[2],  a_pipes_0[3],  b_pipes_0[2],  b_pipes_0[3],
+                      c_streams_0[2],  2,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[3],  a_pipes_0[4],  b_pipes_0[3],  b_pipes_0[4],
+                      c_streams_0[3],  3,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[4],  a_pipes_0[5],  b_pipes_0[4],  b_pipes_0[5],
+                      c_streams_0[4],  4,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[5],  a_pipes_0[6],  b_pipes_0[5],  b_pipes_0[6],
+                      c_streams_0[5],  5,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[6],  a_pipes_0[7],  b_pipes_0[6],  b_pipes_0[7],
+                      c_streams_0[6],  6,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[7],  a_pipes_0[8],  b_pipes_0[7],  b_pipes_0[8],
+                      c_streams_0[7],  7,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[8],  a_pipes_0[9],  b_pipes_0[8],  b_pipes_0[9],
+                      c_streams_0[8],  8,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[9],  a_pipes_0[10], b_pipes_0[9],  b_pipes_0[10],
+                      c_streams_0[9],  9,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[10], a_pipes_0[11], b_pipes_0[10], b_pipes_0[11],
+                      c_streams_0[10], 10, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[11], a_pipes_0[12], b_pipes_0[11], b_pipes_0[12],
+                      c_streams_0[11], 11, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[12], a_pipes_0[13], b_pipes_0[12], b_pipes_0[13],
+                      c_streams_0[12], 12, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[13], a_pipes_0[14], b_pipes_0[13], b_pipes_0[14],
+                      c_streams_0[13], 13, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[14], a_pipes_0[15], b_pipes_0[14], b_pipes_0[15],
+                      c_streams_0[14], 14, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_0[15], a_pipes_0[16], b_pipes_0[15], b_pipes_0[16],
+                      c_streams_0[15], 15, num_outer_n, num_outer_m_per_chain, in_dim);
+
+    /* Chain 1: 16 PEs. */
+    ProcessingElement(a_pipes_1[0],  a_pipes_1[1],  b_pipes_1[0],  b_pipes_1[1],
+                      c_streams_1[0],  0,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[1],  a_pipes_1[2],  b_pipes_1[1],  b_pipes_1[2],
+                      c_streams_1[1],  1,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[2],  a_pipes_1[3],  b_pipes_1[2],  b_pipes_1[3],
+                      c_streams_1[2],  2,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[3],  a_pipes_1[4],  b_pipes_1[3],  b_pipes_1[4],
+                      c_streams_1[3],  3,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[4],  a_pipes_1[5],  b_pipes_1[4],  b_pipes_1[5],
+                      c_streams_1[4],  4,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[5],  a_pipes_1[6],  b_pipes_1[5],  b_pipes_1[6],
+                      c_streams_1[5],  5,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[6],  a_pipes_1[7],  b_pipes_1[6],  b_pipes_1[7],
+                      c_streams_1[6],  6,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[7],  a_pipes_1[8],  b_pipes_1[7],  b_pipes_1[8],
+                      c_streams_1[7],  7,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[8],  a_pipes_1[9],  b_pipes_1[8],  b_pipes_1[9],
+                      c_streams_1[8],  8,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[9],  a_pipes_1[10], b_pipes_1[9],  b_pipes_1[10],
+                      c_streams_1[9],  9,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[10], a_pipes_1[11], b_pipes_1[10], b_pipes_1[11],
+                      c_streams_1[10], 10, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[11], a_pipes_1[12], b_pipes_1[11], b_pipes_1[12],
+                      c_streams_1[11], 11, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[12], a_pipes_1[13], b_pipes_1[12], b_pipes_1[13],
+                      c_streams_1[12], 12, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[13], a_pipes_1[14], b_pipes_1[13], b_pipes_1[14],
+                      c_streams_1[13], 13, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[14], a_pipes_1[15], b_pipes_1[14], b_pipes_1[15],
+                      c_streams_1[14], 14, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes_1[15], a_pipes_1[16], b_pipes_1[15], b_pipes_1[16],
+                      c_streams_1[15], 15, num_outer_n, num_outer_m_per_chain, in_dim);
+
+    SinkAB(a_pipes_0[N_PES], b_pipes_0[N_PES],
+           num_outer_n, num_outer_m_per_chain, in_dim);
+    SinkAB(a_pipes_1[N_PES], b_pipes_1[N_PES],
+           num_outer_n, num_outer_m_per_chain, in_dim);
+
+    WriteC_chain(c_streams_0, out_lo, num_rows, out_dim,
+                 0u, num_outer_m_per_chain);
+    WriteC_chain(c_streams_1, out_hi, num_rows, out_dim,
+                 num_outer_m_per_chain, num_outer_m_per_chain);
+}
+
+/* run_systolic_kernel — float-pointer entry, validates geometry, casts to
+ * Pack16, hands to run_dataflow. Callers must already have padded rows
+ * and chunked K to satisfy the geometry constraints. */
+static int run_systolic_kernel(
+    float *out, const float *in, const float *weights,
+    uint32_t num_rows, uint32_t in_dim, uint32_t out_dim
+) {
+    if (num_rows == 0 || in_dim == 0 || out_dim == 0)        return -1;
+    if ((num_rows % N_PES) != 0)                             return -2;
+    if ((out_dim % (NUM_CHAINS * M_PER_PE)) != 0)            return -3;
+    if ((in_dim  % 16)       != 0)                           return -4;
+    if (in_dim > IN_DIM_MAX)                                 return -5;
+
+    uint32_t num_outer_n            = num_rows / N_PES;
+    uint32_t num_outer_m            = out_dim / M_PER_PE;
+    uint32_t num_outer_m_per_chain  = num_outer_m / NUM_CHAINS;
+
+    Pack16 *out_p           = reinterpret_cast<Pack16 *>(out);
+    const Pack16 *in_p      = reinterpret_cast<const Pack16 *>(in);
+    const Pack16 *weights_p = reinterpret_cast<const Pack16 *>(weights);
+
+    run_dataflow(out_p, out_p, in_p, weights_p, weights_p,
+                 num_rows, in_dim, out_dim,
+                 num_outer_n, num_outer_m_per_chain);
+
+    return 0;
+}
+
+/* gdn_matmul_systolic — host-side wrapper that absorbs token padding (zero
+ * rows up to the next multiple of N_PES) and K-tiling (split in_dim into
+ * IN_DIM_MAX-wide stripes, accumulate partials) so callers can issue any
+ * shape that satisfies out_dim%32==0 and in_dim%16==0. Returns 0 on
+ * success; -3 when out_dim is not a multiple of 32 (e.g. a/b_proj with
+ * out_dim=8) so gdn_matmul() can fall back to gdn_matmul_tiled. */
+static int gdn_matmul_systolic(
+    float *out, const float *in, const float *weights,
+    uint32_t num_rows, uint32_t in_dim, uint32_t out_dim
+) {
+    if (num_rows == 0 || in_dim == 0 || out_dim == 0)            return -1;
+    if ((out_dim % (NUM_CHAINS * M_PER_PE)) != 0)                return -3;
+    if ((in_dim  % 16)       != 0)                               return -4;
+
+    /* Token padding: round num_rows up to the next multiple of N_PES.
+     * Real rows are copied; pad rows are zeroed. After the kernel runs,
+     * only the first num_rows rows of the padded output are written back
+     * to `out`. */
+    uint32_t padded_rows = (num_rows + N_PES - 1) / N_PES * N_PES;
+    bool needs_pad = (padded_rows != num_rows);
+
+    const float *eff_in;
+    float *eff_out;
+    float *pad_in_buf  = NULL;
+    float *pad_out_buf = NULL;
+
+    if (needs_pad) {
+        pad_in_buf  = (float *)gdn_malloc_bytes((size_t)padded_rows * in_dim  * sizeof(float));
+        pad_out_buf = (float *)gdn_malloc_bytes((size_t)padded_rows * out_dim * sizeof(float));
+        for (uint32_t r = 0; r < num_rows; ++r) {
+            for (uint32_t k = 0; k < in_dim; ++k) {
+                pad_in_buf[(size_t)r * in_dim + k] = in[(size_t)r * in_dim + k];
+            }
+        }
+        for (uint32_t r = num_rows; r < padded_rows; ++r) {
+            for (uint32_t k = 0; k < in_dim; ++k) {
+                pad_in_buf[(size_t)r * in_dim + k] = 0.0f;
+            }
+        }
+        eff_in  = pad_in_buf;
+        eff_out = pad_out_buf;
+    } else {
+        eff_in  = in;
+        eff_out = out;
+    }
+
+    int rc = 0;
+    if (in_dim <= (uint32_t)IN_DIM_MAX) {
+        rc = run_systolic_kernel(eff_out, eff_in, weights, padded_rows, in_dim, out_dim);
+    } else {
+        /* K-tile: chunk in_dim into IN_DIM_MAX-wide stripes. Repack input
+         * and weight columns into contiguous per-chunk buffers (the kernel
+         * expects each row contiguous with stride=current_in_dim), and
+         * accumulate partials on host. mlp_down_proj (in_dim=5632) splits
+         * into 2048+2048+1536 — all multiples of 16. */
+        size_t out_count = (size_t)padded_rows * out_dim;
+        float *in_chunk    = (float *)gdn_malloc_bytes((size_t)padded_rows * IN_DIM_MAX * sizeof(float));
+        float *wt_chunk    = (float *)gdn_malloc_bytes((size_t)out_dim     * IN_DIM_MAX * sizeof(float));
+        float *out_partial = (float *)gdn_malloc_bytes(out_count * sizeof(float));
+
+        uint32_t k_done = 0;
+        bool first = true;
+        while (k_done < in_dim) {
+            uint32_t chunk = (in_dim - k_done > (uint32_t)IN_DIM_MAX) ? (uint32_t)IN_DIM_MAX : (in_dim - k_done);
+
+            for (uint32_t r = 0; r < padded_rows; ++r) {
+                for (uint32_t kk = 0; kk < chunk; ++kk) {
+                    in_chunk[(size_t)r * chunk + kk] = eff_in[(size_t)r * in_dim + k_done + kk];
+                }
+            }
+            for (uint32_t c = 0; c < out_dim; ++c) {
+                for (uint32_t kk = 0; kk < chunk; ++kk) {
+                    wt_chunk[(size_t)c * chunk + kk] = weights[(size_t)c * in_dim + k_done + kk];
+                }
+            }
+
+            float *target = first ? eff_out : out_partial;
+            rc = run_systolic_kernel(target, in_chunk, wt_chunk, padded_rows, chunk, out_dim);
+            if (rc != 0) break;
+            if (!first) {
+                for (size_t i = 0; i < out_count; ++i) eff_out[i] += out_partial[i];
+            }
+            first = false;
+            k_done += chunk;
+        }
+
+        free(in_chunk);
+        free(wt_chunk);
+        free(out_partial);
+    }
+
+    if (needs_pad) {
+        if (rc == 0) {
+            for (uint32_t r = 0; r < num_rows; ++r) {
+                for (uint32_t c = 0; c < out_dim; ++c) {
+                    out[(size_t)r * out_dim + c] = pad_out_buf[(size_t)r * out_dim + c];
+                }
+            }
+        }
+        free(pad_in_buf);
+        free(pad_out_buf);
+    }
+
+    return rc;
+}
+
 /* Tile sizes for tiled matmul — chosen to divide evenly into hidden=2048
    and intermediate=5632 (=16*352).  out_dim=8 (a/b proj) is smaller than
    TILE_C but handled by the boundary guard inside the inner loops. */
@@ -438,7 +974,7 @@ static void gdn_rmsnorm_rows(
 #define MM_TILE_C 16   /* columns (out_dim dimension) */
 #define MM_TILE_K 16   /* reduction (in_dim dimension) */
 
-static void gdn_matmul(
+static void gdn_matmul_tiled(
     float *out,
     const float *in,
     const float *weights,
@@ -593,6 +1129,25 @@ static void gdn_matmul(
             } /* mm_tile_c */
         } /* mm_tile_k */
     } /* mm_tile_r */
+}
+
+/* gdn_matmul — dispatch wrapper. Tries the systolic implementation first
+ * (with token padding + K-tiling baked in); on shape mismatch — out_dim
+ * not %32 (a/b_proj have out_dim=8) or in_dim not %16 — falls through to
+ * the tiled path. All call sites in gdn_forward / gdn_attn_forward keep
+ * calling gdn_matmul; the routing is handled here. */
+static void gdn_matmul(
+    float *out,
+    const float *in,
+    const float *weights,
+    uint32_t num_rows,
+    uint32_t in_dim,
+    uint32_t out_dim
+) {
+    if (gdn_matmul_systolic(out, in, weights, num_rows, in_dim, out_dim) == 0) {
+        return;
+    }
+    gdn_matmul_tiled(out, in, weights, num_rows, in_dim, out_dim);
 }
 
 /* Compile-time bounds for the conv buffers. The model always calls this with
@@ -1405,43 +1960,8 @@ int gdn_attn_forward_layer(
     );
 }
 
-/* -----------------------------------------------------------------------
- * gdn_matmul_top — HLS synthesis target for matmul-only optimisation.
- *
- * Exposes the internal `gdn_matmul` as a kernel-flow top function with
- * separate AXI master bundles per pointer:
- *   in       on m_axi_mem_in   (read)
- *   weights  on m_axi_mem_wt   (read)
- *   out      on m_axi_mem_out  (read+write — read happens on the partial
- *                                 reload between adjacent tk steps)
- *
- * Splitting bundles lets a future streaming-GEMM refactor overlap input
- * fetch, weight fetch, and result store without serialising on a single
- * `gmem` port. Depths are sized for the largest GDN-1.3B matmul:
- *   num_rows * in_dim  ≤ 2048 * 2048 = 4 194 304 floats
- *   out_dim  * in_dim  ≤ 2048 * 2048 = 4 194 304 floats
- * Smaller calls (e.g. the 2048×8 A/B projections) reuse the same kernel.
- * ----------------------------------------------------------------------- */
-int gdn_matmul_top(
-    float *out,
-    const float *in,
-    const float *weights,
-    uint32_t num_rows,
-    uint32_t in_dim,
-    uint32_t out_dim
-) {
-    #pragma HLS interface m_axi port=in      depth=4194304 offset=slave bundle=mem_in
-    #pragma HLS interface m_axi port=weights depth=4194304 offset=slave bundle=mem_wt
-    #pragma HLS interface m_axi port=out     depth=4194304 offset=slave bundle=mem_out
-    #pragma HLS interface s_axilite port=num_rows
-    #pragma HLS interface s_axilite port=in_dim
-    #pragma HLS interface s_axilite port=out_dim
-    #pragma HLS interface s_axilite port=return
-
-    if (num_rows == 0 || in_dim == 0 || out_dim == 0) {
-        return -1;
-    }
-
-    gdn_matmul(out, in, weights, num_rows, in_dim, out_dim);
-    return 0;
-}
+/* gdn_matmul_top — definition lives in gdn_matmul_systolic.cpp (the wide-AXI
+ * Pack16 systolic version, used as the standalone matmul-only HLS top by
+ * test_matmul.tcl and gdn_matmul_test.cpp). The header keeps the prototype
+ * for those callers; gdn_model.cpp uses the inlined systolic helpers above
+ * via gdn_matmul → gdn_matmul_systolic instead. */
