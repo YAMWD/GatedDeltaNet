@@ -508,7 +508,7 @@ static void ProcessingElement(
     pe_n0: for (uint32_t n0 = 0; n0 < num_outer_n; ++n0) {
     #pragma HLS loop_tripcount min=1 max=128
         pe_m0: for (uint32_t m0 = 0; m0 < num_outer_m; ++m0) {
-        #pragma HLS loop_tripcount min=1 max=64
+        #pragma HLS loop_tripcount min=1 max=352  /* max num_outer_m = 5632/16 = 352 for mlp_gate/up at out_dim=5632 */
 
             pe_init_m: for (int m = 0; m < M_PER_PE; ++m) {
             #pragma HLS unroll
@@ -605,7 +605,7 @@ static void ReadA(
         }
 
         stream_a_m0: for (uint32_t m0 = 0; m0 < num_outer_m_per_chain; ++m0) {
-        #pragma HLS loop_tripcount min=1 max=64
+        #pragma HLS loop_tripcount min=1 max=352  /* max num_outer_m = 5632/16 = 352 for mlp_gate/up at out_dim=5632 */
             stream_a_k: for (uint32_t k = 0; k < in_dim; ++k) {
             #pragma HLS loop_tripcount min=1 max=5632
             #pragma HLS pipeline II=1
@@ -655,7 +655,7 @@ static void ReadB(
     }
 
     fused_tile: for (uint32_t tile = 1; tile < total_tiles; ++tile) {
-    #pragma HLS loop_tripcount min=1 max=8192
+    #pragma HLS loop_tripcount min=1 max=45056  /* num_outer_n * num_outer_m_per_chain = 128*352 = 45056 worst case (mlp at out_dim=5632) */
         uint32_t stream_idx       = (tile - 1) & 1u;
         uint32_t load_idx         = tile & 1u;
         uint32_t m0_local_next    = tile % num_outer_m_per_chain;
@@ -704,7 +704,7 @@ static void SinkAB(
     sink_n0: for (uint32_t n0 = 0; n0 < num_outer_n; ++n0) {
     #pragma HLS loop_tripcount min=1 max=128
         sink_m0: for (uint32_t m0 = 0; m0 < num_outer_m; ++m0) {
-        #pragma HLS loop_tripcount min=1 max=64
+        #pragma HLS loop_tripcount min=1 max=352  /* max num_outer_m = 5632/16 = 352 for mlp_gate/up at out_dim=5632 */
             sink_k: for (uint32_t k = 0; k < in_dim; ++k) {
             #pragma HLS loop_tripcount min=1 max=5632
             #pragma HLS pipeline II=1
@@ -729,7 +729,7 @@ static void WriteC_chain(
     write_c_n0: for (uint32_t n0 = 0; n0 < num_outer_n; ++n0) {
     #pragma HLS loop_tripcount min=1 max=128
         write_c_m0: for (uint32_t m0 = 0; m0 < num_outer_m_per_chain; ++m0) {
-        #pragma HLS loop_tripcount min=1 max=64
+        #pragma HLS loop_tripcount min=1 max=352  /* max num_outer_m = 5632/16 = 352 for mlp_gate/up at out_dim=5632 */
             size_t base = (size_t)(n0 * N_PES) * m_packs + m0 + m0_offset;
             write_c_r: for (int r = 0; r < N_PES; ++r) {
             #pragma HLS pipeline II=1
@@ -1453,7 +1453,10 @@ int gdn_forward(
     /* Depths match gdn-1.3b-f32.gdnw: hidden=2048 heads=8 head_dim=256
     intermediate=5632 layers=24 conv=4 max_seq_len=2048 vocab=32000 */
     #pragma HLS interface m_axi port=config depth=1 offset=slave
-    #pragma HLS interface m_axi port=weight_data depth=1466343808 offset=slave
+    /* weight_data on its own bundle (same reason as in gdn_attn_forward) —
+     * systolic ReadB reads weights, ReadA reads x_norm/mlp_gate/attn;
+     * HLS dataflow requires distinct bundles per task. */
+    #pragma HLS interface m_axi port=weight_data depth=1466343808 offset=slave bundle=mem_weights
     #pragma HLS interface m_axi port=x depth=4194304 offset=slave
     #pragma HLS interface m_axi port=x_norm depth=4194304 offset=slave
     #pragma HLS interface m_axi port=q depth=4194304 offset=slave
