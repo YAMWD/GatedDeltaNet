@@ -474,7 +474,16 @@ static void gdn_rmsnorm_rows(
 #define N_PES 16
 #define M_PER_PE 16
 #define IN_DIM_MAX 5632
-#define NUM_CHAINS 2
+/* NUM_CHAINS=1 inside the integrated gdn_forward / gdn_attn_forward path
+ * so the dataflow region has exactly one reader on the input bundle, one
+ * reader on the weights bundle, and one writer on the output bundle —
+ * required by HLS dataflow's single-reader/single-writer rule when the
+ * call sites in gdn_attn_forward bind in/weights/out to single physical
+ * AXI masters. The standalone matmul-only HLS top in
+ * gdn_matmul_systolic.cpp keeps NUM_CHAINS=2 because it has 5 separate
+ * m_axi ports (mem_in / mem_wt_lo / mem_wt_hi / mem_out_lo / mem_out_hi)
+ * and can run two chains in parallel. */
+#define NUM_CHAINS 1
 
 struct Pack16 {
     float data[16];
@@ -551,8 +560,8 @@ static void ProcessingElement(
     }
 }
 
-/* ReadA — loads outer-N stripes of A into BRAM and broadcasts column packs
- * to both PE chains. Handles in-kernel token padding: when num_rows is not
+/* ReadA — loads outer-N stripes of A into BRAM and streams column packs
+ * to the PE chain. Handles in-kernel token padding: when num_rows is not
  * a multiple of N_PES, the last outer-N stripe contains some padding rows.
  * For those, the m_axi address is clamped to row 0 (so DDR/HBM never sees
  * an OOB address) and the loaded data is zeroed in `a_buf` — the PE chain
@@ -560,8 +569,7 @@ static void ProcessingElement(
  * to the output. WriteC_chain skips the DRAM write for those rows. */
 static void ReadA(
     const Pack16 *a_wide,
-    Stream16 &a_out_0,
-    Stream16 &a_out_1,
+    Stream16 &a_out,
     uint32_t num_rows,
     uint32_t num_outer_n,
     uint32_t in_dim,
@@ -606,8 +614,7 @@ static void ReadA(
                 #pragma HLS unroll
                     col.data[r] = a_buf[r][k];
                 }
-                a_out_0.write(col);
-                a_out_1.write(col);
+                a_out.write(col);
             }
         }
     }
@@ -744,11 +751,9 @@ static void WriteC_chain(
  * function scope (HLS 207-5556 forbids it inside `{ ... }`) and the body
  * stays canonical (only stream decls and function calls). */
 static void run_dataflow(
-    Pack16 *out_lo,
-    Pack16 *out_hi,
+    Pack16 *out,
     const Pack16 *in,
-    const Pack16 *weights_lo,
-    const Pack16 *weights_hi,
+    const Pack16 *weights,
     uint32_t num_rows,
     uint32_t in_dim,
     uint32_t out_dim,
@@ -757,105 +762,58 @@ static void run_dataflow(
 ) {
     #pragma HLS dataflow
 
-    Stream16 a_pipes_0[N_PES + 1];
-    Stream16 b_pipes_0[N_PES + 1];
-    Stream16 c_streams_0[N_PES];
-    #pragma HLS stream variable=a_pipes_0   depth=4
-    #pragma HLS stream variable=b_pipes_0   depth=4
-    #pragma HLS stream variable=c_streams_0 depth=32
+    Stream16 a_pipes[N_PES + 1];
+    Stream16 b_pipes[N_PES + 1];
+    Stream16 c_streams[N_PES];
+    #pragma HLS stream variable=a_pipes   depth=4
+    #pragma HLS stream variable=b_pipes   depth=4
+    #pragma HLS stream variable=c_streams depth=32
 
-    Stream16 a_pipes_1[N_PES + 1];
-    Stream16 b_pipes_1[N_PES + 1];
-    Stream16 c_streams_1[N_PES];
-    #pragma HLS stream variable=a_pipes_1   depth=4
-    #pragma HLS stream variable=b_pipes_1   depth=4
-    #pragma HLS stream variable=c_streams_1 depth=32
-
-    ReadA(in, a_pipes_0[0], a_pipes_1[0],
+    ReadA(in, a_pipes[0],
           num_rows, num_outer_n, in_dim, out_dim);
 
-    ReadB(weights_lo, b_pipes_0[0], num_outer_n, in_dim,
+    ReadB(weights, b_pipes[0], num_outer_n, in_dim,
           0u, num_outer_m_per_chain);
-    ReadB(weights_hi, b_pipes_1[0], num_outer_n, in_dim,
-          num_outer_m_per_chain, num_outer_m_per_chain);
 
-    /* Chain 0: 16 PEs. */
-    ProcessingElement(a_pipes_0[0],  a_pipes_0[1],  b_pipes_0[0],  b_pipes_0[1],
-                      c_streams_0[0],  0,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[1],  a_pipes_0[2],  b_pipes_0[1],  b_pipes_0[2],
-                      c_streams_0[1],  1,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[2],  a_pipes_0[3],  b_pipes_0[2],  b_pipes_0[3],
-                      c_streams_0[2],  2,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[3],  a_pipes_0[4],  b_pipes_0[3],  b_pipes_0[4],
-                      c_streams_0[3],  3,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[4],  a_pipes_0[5],  b_pipes_0[4],  b_pipes_0[5],
-                      c_streams_0[4],  4,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[5],  a_pipes_0[6],  b_pipes_0[5],  b_pipes_0[6],
-                      c_streams_0[5],  5,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[6],  a_pipes_0[7],  b_pipes_0[6],  b_pipes_0[7],
-                      c_streams_0[6],  6,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[7],  a_pipes_0[8],  b_pipes_0[7],  b_pipes_0[8],
-                      c_streams_0[7],  7,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[8],  a_pipes_0[9],  b_pipes_0[8],  b_pipes_0[9],
-                      c_streams_0[8],  8,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[9],  a_pipes_0[10], b_pipes_0[9],  b_pipes_0[10],
-                      c_streams_0[9],  9,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[10], a_pipes_0[11], b_pipes_0[10], b_pipes_0[11],
-                      c_streams_0[10], 10, num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[11], a_pipes_0[12], b_pipes_0[11], b_pipes_0[12],
-                      c_streams_0[11], 11, num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[12], a_pipes_0[13], b_pipes_0[12], b_pipes_0[13],
-                      c_streams_0[12], 12, num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[13], a_pipes_0[14], b_pipes_0[13], b_pipes_0[14],
-                      c_streams_0[13], 13, num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[14], a_pipes_0[15], b_pipes_0[14], b_pipes_0[15],
-                      c_streams_0[14], 14, num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_0[15], a_pipes_0[16], b_pipes_0[15], b_pipes_0[16],
-                      c_streams_0[15], 15, num_outer_n, num_outer_m_per_chain, in_dim);
+    /* 16-PE chain. */
+    ProcessingElement(a_pipes[0],  a_pipes[1],  b_pipes[0],  b_pipes[1],
+                      c_streams[0],  0,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[1],  a_pipes[2],  b_pipes[1],  b_pipes[2],
+                      c_streams[1],  1,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[2],  a_pipes[3],  b_pipes[2],  b_pipes[3],
+                      c_streams[2],  2,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[3],  a_pipes[4],  b_pipes[3],  b_pipes[4],
+                      c_streams[3],  3,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[4],  a_pipes[5],  b_pipes[4],  b_pipes[5],
+                      c_streams[4],  4,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[5],  a_pipes[6],  b_pipes[5],  b_pipes[6],
+                      c_streams[5],  5,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[6],  a_pipes[7],  b_pipes[6],  b_pipes[7],
+                      c_streams[6],  6,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[7],  a_pipes[8],  b_pipes[7],  b_pipes[8],
+                      c_streams[7],  7,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[8],  a_pipes[9],  b_pipes[8],  b_pipes[9],
+                      c_streams[8],  8,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[9],  a_pipes[10], b_pipes[9],  b_pipes[10],
+                      c_streams[9],  9,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[10], a_pipes[11], b_pipes[10], b_pipes[11],
+                      c_streams[10], 10, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[11], a_pipes[12], b_pipes[11], b_pipes[12],
+                      c_streams[11], 11, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[12], a_pipes[13], b_pipes[12], b_pipes[13],
+                      c_streams[12], 12, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[13], a_pipes[14], b_pipes[13], b_pipes[14],
+                      c_streams[13], 13, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[14], a_pipes[15], b_pipes[14], b_pipes[15],
+                      c_streams[14], 14, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[15], a_pipes[16], b_pipes[15], b_pipes[16],
+                      c_streams[15], 15, num_outer_n, num_outer_m_per_chain, in_dim);
 
-    /* Chain 1: 16 PEs. */
-    ProcessingElement(a_pipes_1[0],  a_pipes_1[1],  b_pipes_1[0],  b_pipes_1[1],
-                      c_streams_1[0],  0,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[1],  a_pipes_1[2],  b_pipes_1[1],  b_pipes_1[2],
-                      c_streams_1[1],  1,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[2],  a_pipes_1[3],  b_pipes_1[2],  b_pipes_1[3],
-                      c_streams_1[2],  2,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[3],  a_pipes_1[4],  b_pipes_1[3],  b_pipes_1[4],
-                      c_streams_1[3],  3,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[4],  a_pipes_1[5],  b_pipes_1[4],  b_pipes_1[5],
-                      c_streams_1[4],  4,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[5],  a_pipes_1[6],  b_pipes_1[5],  b_pipes_1[6],
-                      c_streams_1[5],  5,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[6],  a_pipes_1[7],  b_pipes_1[6],  b_pipes_1[7],
-                      c_streams_1[6],  6,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[7],  a_pipes_1[8],  b_pipes_1[7],  b_pipes_1[8],
-                      c_streams_1[7],  7,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[8],  a_pipes_1[9],  b_pipes_1[8],  b_pipes_1[9],
-                      c_streams_1[8],  8,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[9],  a_pipes_1[10], b_pipes_1[9],  b_pipes_1[10],
-                      c_streams_1[9],  9,  num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[10], a_pipes_1[11], b_pipes_1[10], b_pipes_1[11],
-                      c_streams_1[10], 10, num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[11], a_pipes_1[12], b_pipes_1[11], b_pipes_1[12],
-                      c_streams_1[11], 11, num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[12], a_pipes_1[13], b_pipes_1[12], b_pipes_1[13],
-                      c_streams_1[12], 12, num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[13], a_pipes_1[14], b_pipes_1[13], b_pipes_1[14],
-                      c_streams_1[13], 13, num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[14], a_pipes_1[15], b_pipes_1[14], b_pipes_1[15],
-                      c_streams_1[14], 14, num_outer_n, num_outer_m_per_chain, in_dim);
-    ProcessingElement(a_pipes_1[15], a_pipes_1[16], b_pipes_1[15], b_pipes_1[16],
-                      c_streams_1[15], 15, num_outer_n, num_outer_m_per_chain, in_dim);
-
-    SinkAB(a_pipes_0[N_PES], b_pipes_0[N_PES],
-           num_outer_n, num_outer_m_per_chain, in_dim);
-    SinkAB(a_pipes_1[N_PES], b_pipes_1[N_PES],
+    SinkAB(a_pipes[N_PES], b_pipes[N_PES],
            num_outer_n, num_outer_m_per_chain, in_dim);
 
-    WriteC_chain(c_streams_0, out_lo, num_rows, num_outer_n, out_dim,
+    WriteC_chain(c_streams, out, num_rows, num_outer_n, out_dim,
                  0u, num_outer_m_per_chain);
-    WriteC_chain(c_streams_1, out_hi, num_rows, num_outer_n, out_dim,
-                 num_outer_m_per_chain, num_outer_m_per_chain);
 }
 
 /* gdn_matmul_systolic — float-pointer entry to the systolic kernel. No
@@ -891,7 +849,7 @@ static int gdn_matmul_systolic(
     const Pack16 *in_p      = reinterpret_cast<const Pack16 *>(in);
     const Pack16 *weights_p = reinterpret_cast<const Pack16 *>(weights);
 
-    run_dataflow(out_p, out_p, in_p, weights_p, weights_p,
+    run_dataflow(out_p, in_p, weights_p,
                  num_rows, in_dim, out_dim,
                  num_outer_n, num_outer_m_per_chain);
 
@@ -938,7 +896,7 @@ static void gdn_matmul_tiled(
     mm_tile_r: for (tr = 0; tr < num_rows; tr += MM_TILE_R) {
     #pragma HLS loop_tripcount min=1 max=128  /* ceil(2048/16) */
         mm_tile_k: for (tk = 0; tk < in_dim; tk += MM_TILE_K) {
-    #pragma HLS loop_tripcount min=128 max=352  /* ceil(2048/16) to ceil(5632/16) */
+    #pragma HLS loop_tripcount min=128 max=128  /* a/b_proj only: in_dim=2048, ceil(2048/16)=128 */
 
             /* Load input tile: local_in[r][k] = in[tr+r][tk+k] */
             mm_load_in_r: for (r = 0; r < MM_TILE_R; ++r) {
@@ -954,7 +912,7 @@ static void gdn_matmul_tiled(
             }
 
             mm_tile_c: for (tc = 0; tc < out_dim; tc += MM_TILE_C) {
-            #pragma HLS loop_tripcount min=1 max=352  /* ceil(8/16)=1 to ceil(5632/16)=352 */
+            #pragma HLS loop_tripcount min=1 max=1  /* a/b_proj only: out_dim=8 < MM_TILE_C=16, single iter */
 
                 /* Load weight tile: local_wt[k][c] = weights[tc+c][tk+k] */
                 mm_load_wt_c: for (c = 0; c < MM_TILE_C; ++c) {
@@ -1062,24 +1020,14 @@ static void gdn_matmul_tiled(
     } /* mm_tile_r */
 }
 
-/* gdn_matmul — dispatch wrapper. Tries the systolic implementation first
- * (with token padding + K-tiling baked in); on shape mismatch — out_dim
- * not %32 (a/b_proj have out_dim=8) or in_dim not %16 — falls through to
- * the tiled path. All call sites in gdn_forward / gdn_attn_forward keep
- * calling gdn_matmul; the routing is handled here. */
-static void gdn_matmul(
-    float *out,
-    const float *in,
-    const float *weights,
-    uint32_t num_rows,
-    uint32_t in_dim,
-    uint32_t out_dim
-) {
-    if (gdn_matmul_systolic(out, in, weights, num_rows, in_dim, out_dim) == 0) {
-        return;
-    }
-    gdn_matmul_tiled(out, in, weights, num_rows, in_dim, out_dim);
-}
+/* No dispatch wrapper here — call sites in gdn_forward / gdn_attn_forward
+ * call gdn_matmul_systolic directly for systolic-eligible shapes
+ * (out_dim %32==0 && in_dim %16==0 && in_dim<=5632) and gdn_matmul_tiled
+ * directly for the small a/b_proj shapes (out_dim=8). A runtime dispatch
+ * wrapper would force HLS to allocate hardware for both paths at every
+ * call site and report sum(systolic + tiled) per call, which inflates
+ * the latency estimate by ~30× for the systolic-eligible calls. Direct
+ * calls let HLS report just the path actually used. */
 
 /* Compile-time bounds for the conv buffers. The model always calls this with
  * hidden=2048 and conv_size=4; smaller calls still fit. */
@@ -1603,12 +1551,12 @@ int gdn_forward(
         layer_mlp_down_proj = weight_data + layer_offset;
 
         gdn_rmsnorm_rows(x_norm, x, layer_attn_norm, num_tokens, hidden, config->norm_eps);
-        gdn_matmul(q, x_norm, layer_q_proj, num_tokens, hidden, hidden);
-        gdn_matmul(k, x_norm, layer_k_proj, num_tokens, hidden, hidden);
-        gdn_matmul(v, x_norm, layer_v_proj, num_tokens, hidden, hidden);
-        gdn_matmul(a, x_norm, layer_a_proj, num_tokens, hidden, num_heads);
-        gdn_matmul(b, x_norm, layer_b_proj, num_tokens, hidden, num_heads);
-        gdn_matmul(gate, x_norm, layer_g_proj, num_tokens, hidden, hidden);
+        gdn_matmul_systolic(q, x_norm, layer_q_proj, num_tokens, hidden, hidden);
+        gdn_matmul_systolic(k, x_norm, layer_k_proj, num_tokens, hidden, hidden);
+        gdn_matmul_systolic(v, x_norm, layer_v_proj, num_tokens, hidden, hidden);
+        gdn_matmul_tiled(a, x_norm, layer_a_proj, num_tokens, hidden, num_heads);
+        gdn_matmul_tiled(b, x_norm, layer_b_proj, num_tokens, hidden, num_heads);
+        gdn_matmul_systolic(gate, x_norm, layer_g_proj, num_tokens, hidden, hidden);
 
         gdn_depthwise_conv_silu(tmp_hidden, q, layer_q_conv, num_tokens, hidden, config->conv_size);
         conv_copy_q: for (index = 0; index < hidden_count; ++index) {
@@ -1643,17 +1591,17 @@ int gdn_forward(
             num_tokens
         );
         gdn_output_norm_and_gate(attn, gate, layer_o_norm, num_tokens, num_heads, head_dim, config->norm_eps);
-        gdn_matmul(tmp_hidden, attn, layer_o_proj, num_tokens, hidden, hidden);
+        gdn_matmul_systolic(tmp_hidden, attn, layer_o_proj, num_tokens, hidden, hidden);
         attn_residual: for (index = 0; index < hidden_count; ++index) {
         #pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
             x[index] += tmp_hidden[index];
         }
 
         gdn_rmsnorm_rows(x_norm, x, layer_mlp_norm, num_tokens, hidden, config->norm_eps);
-        gdn_matmul(mlp_gate, x_norm, layer_mlp_gate_proj, num_tokens, hidden, intermediate);
-        gdn_matmul(mlp_up, x_norm, layer_mlp_up_proj, num_tokens, hidden, intermediate);
+        gdn_matmul_systolic(mlp_gate, x_norm, layer_mlp_gate_proj, num_tokens, hidden, intermediate);
+        gdn_matmul_systolic(mlp_up, x_norm, layer_mlp_up_proj, num_tokens, hidden, intermediate);
         gdn_swiglu_inplace(mlp_gate, mlp_up, mlp_count);
-        gdn_matmul(tmp_hidden, mlp_gate, layer_mlp_down_proj, num_tokens, intermediate, hidden);
+        gdn_matmul_systolic(tmp_hidden, mlp_gate, layer_mlp_down_proj, num_tokens, intermediate, hidden);
         mlp_residual: for (index = 0; index < hidden_count; ++index) {
         #pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
             x[index] += tmp_hidden[index];
@@ -1739,7 +1687,10 @@ int gdn_attn_forward(
      *   - All other ports stay on the default `gmem` bundle.
      */
     #pragma HLS interface m_axi port=config depth=1 offset=slave
-    #pragma HLS interface m_axi port=weight_data depth=87000000 offset=slave
+    /* weight_data on its own bundle so the systolic ReadB task doesn't
+     * collide with ReadA (which reads `input` or `attn`) on the default
+     * gmem bundle — HLS dataflow requires distinct bundles per task. */
+    #pragma HLS interface m_axi port=weight_data depth=87000000 offset=slave bundle=mem_weights
     #pragma HLS interface m_axi port=input depth=129024 offset=slave
     #pragma HLS interface m_axi port=output depth=129024 offset=slave
     #pragma HLS interface m_axi port=q depth=129024 offset=slave bundle=mem_q
@@ -1816,12 +1767,12 @@ int gdn_attn_forward(
     layer_o_proj = weight_data + layer_offset;
 
     /* Projections: input -> q, k, v, a, b, gate */
-    gdn_matmul(q, input, layer_q_proj, num_tokens, hidden, hidden);
-    gdn_matmul(k, input, layer_k_proj, num_tokens, hidden, hidden);
-    gdn_matmul(v, input, layer_v_proj, num_tokens, hidden, hidden);
-    gdn_matmul(a, input, layer_a_proj, num_tokens, hidden, num_heads);
-    gdn_matmul(b, input, layer_b_proj, num_tokens, hidden, num_heads);
-    gdn_matmul(gate, input, layer_g_proj, num_tokens, hidden, hidden);
+    gdn_matmul_systolic(q, input, layer_q_proj, num_tokens, hidden, hidden);
+    gdn_matmul_systolic(k, input, layer_k_proj, num_tokens, hidden, hidden);
+    gdn_matmul_systolic(v, input, layer_v_proj, num_tokens, hidden, hidden);
+    gdn_matmul_tiled(a, input, layer_a_proj, num_tokens, hidden, num_heads);
+    gdn_matmul_tiled(b, input, layer_b_proj, num_tokens, hidden, num_heads);
+    gdn_matmul_systolic(gate, input, layer_g_proj, num_tokens, hidden, hidden);
 
     /* Depthwise conv1d + SiLU on q, k, v */
     gdn_depthwise_conv_silu(tmp_hidden, q, layer_q_conv, num_tokens, hidden, conv_size);
@@ -1857,7 +1808,7 @@ int gdn_attn_forward(
     );
 
     /* Output projection -> output */
-    gdn_matmul(output, attn, layer_o_proj, num_tokens, hidden, hidden);
+    gdn_matmul_systolic(output, attn, layer_o_proj, num_tokens, hidden, hidden);
 
     return 0;
 }
