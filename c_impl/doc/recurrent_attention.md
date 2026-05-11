@@ -1,6 +1,6 @@
 # Optimised Recurrent Attention (`gdn_recurrent_attention`)
 
-**Location:** `gdn_model.c:695`
+**Location:** `gdn_model.cpp:1129`
 
 ## Overview
 
@@ -74,10 +74,13 @@ static float state[GDN_HEADS][GDN_DK][GDN_DV];
 #pragma HLS array_partition variable=state dim=3 cyclic factor=16
 ```
 
-The state is declared `static` so it persists across function calls (across
-layers and tokens). It is bound to dual-port BRAM, providing one read port
-and one write port per cycle. Total storage: 8 × 256 × 256 × 4 bytes = 2 MB,
-consuming 938 BRAM_18K — the dominant on-chip memory cost.
+The state is declared `static` and bound to dual-port BRAM. It is cleared at
+the start of each recurrent-attention invocation, then remains on chip for the
+entire token sequence. The external `recurrent_state` pointer is kept only for
+API compatibility and is not used for state traffic. Total storage is
+8 × 256 × 256 × 4 bytes = 2 MB. In the current U55C reports this maps to
+258 BRAM_18K blocks, which is the dominant on-chip memory cost of the
+recurrent module.
 
 The `recurrent_state` and `head_buffer` m_axi ports are kept in the interface
 for API compatibility but are unused.

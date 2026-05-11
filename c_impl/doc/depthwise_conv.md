@@ -1,6 +1,6 @@
 # Depthwise 1D Convolution + SiLU (`gdn_depthwise_conv_silu`)
 
-**Location:** `gdn_model.c:603`
+**Location:** `gdn_model.cpp:1037`
 
 ## Overview
 

@@ -25,11 +25,15 @@ State matrix per layer: 8 heads x 256 x 256 FP32 = 2 MB.
 | File                    | Role |
 |-------------------------|------|
 | `gdn_model.h`          | Public API: structs (`GDNWeightHeader`, `GDNLayerWeights`, `GDNModel`, `GDNRunState`), function prototypes for full-model and single-layer forward |
-| `gdn_model.c`          | All synthesizable compute functions + HLS top functions (`gdn_forward`, `gdn_attn_forward`) |
-| `gdn_eval.c`           | Host testbench: loads `.gdnw` weights, reads `.gdnreq` fixtures, runs `gdn_forward`, writes JSON output |
-| `gdn_attn_test.c`      | Host testbench for single-layer attention: loads `.gdnw` + `.gdnblk`, runs `gdn_attn_forward`, checks parity |
+| `gdn_model.cpp`        | Main synthesizable implementation + HLS top functions (`gdn_forward`, `gdn_attn_forward`) |
+| `gdn_matmul_systolic.cpp` | Standalone two-chain systolic matmul top for matmul-only synthesis and parity testing |
+| `gdn_eval.cpp`        | Host testbench: loads `.gdnw` weights, reads `.gdnreq` fixtures, runs `gdn_forward`, writes JSON output |
+| `gdn_attn_test.cpp`   | Host testbench for single-layer attention: loads `.gdnw` + `.gdnblk`, runs `gdn_attn_forward`, checks parity |
+| `gdn_matmul_test.cpp` | Host testbench for standalone systolic matmul against a native-C golden matmul |
 | `test.tcl`             | Vitis HLS TCL script for full-model (csim/csynth/cosim), targets Alveo U55C |
-| `test_single_GDN_attn.tcl` | TCL script for single-layer attention (csim/csynth), targets Alveo U55C — **primary optimisation target** |
+| `test_single_GDN_attn_synth.tcl` | Current TCL script for single-layer attention systolic synthesis, targets Alveo U55C |
+| `test_single_GDN_attn.tcl` | Older v7 single-layer attention script, retained for the pre-systolic tiled-matmul baseline |
+| `test_matmul.tcl`      | Standalone systolic matmul script; default test is 2048 x 2048 x 2048 |
 | `test_parity.sh`       | Automated end-to-end parity test against Python golden results |
 | `Makefile`             | Native C build (GCC, no BLAS) |
 
@@ -46,7 +50,7 @@ State matrix per layer: 8 heads x 256 x 256 FP32 = 2 MB.
 
 ### 3.1 `gdn_forward` (full model)
 
-**Location:** `gdn_model.c:998`
+**Location:** `gdn_model.cpp:1432`
 
 Full 24-layer GatedDeltaNet forward pass. All arguments are flat pointers with
 `m_axi` interfaces. The function:
@@ -67,7 +71,7 @@ Full 24-layer GatedDeltaNet forward pass. All arguments are flat pointers with
 
 ### 3.2 `gdn_attn_forward` (single-layer attention)
 
-**Location:** `gdn_model.c:1228`
+**Location:** `gdn_model.cpp:1665`
 
 Single-layer attention forward for isolated synthesis/co-simulation. Uses the
 same internal functions as `gdn_forward` but only runs one layer. This is the
@@ -81,30 +85,49 @@ pointers in top-function arguments).
 
 ### 4.1 `gdn_embed_tokens`
 
-**Location:** `gdn_model.c:379`
+**Location:** `gdn_model.cpp:381`
 
 Copies embedding rows from the weight table into the hidden state buffer.
 Simple lookup, no compute.
 
 ### 4.2 `gdn_rmsnorm_rows`
 
-**Location:** `gdn_model.c:406`
+**Location:** `gdn_model.cpp:408`
 
 RMSNorm over each row (token) of the input. Uses `double` accumulation for
 numerical stability. Called before every projection block and at the final
 output.
 
-### 4.3 `gdn_matmul` (Tiled)
+### 4.3 `gdn_matmul_systolic` (Current Large-GEMM Engine)
 
-**Location:** `gdn_model.c:441`
+**Location:** `gdn_model.cpp:835`
 
-General-purpose tiled matrix multiplication. Manual-flattened R×C compute
-with explicit balanced fadd tree gives II=1 in the inner pipeline. See
+Current GEMM engine for large projections. It is a one-chain 1-D systolic
+array in the integrated model:
+
+```
+16 PEs x 16 output columns/PE = 256 FP32 MAC/cycle peak
+```
+
+The kernel uses `hls::stream` and a `#pragma HLS dataflow` region around
+`ReadA`, `ReadB`, a 16-PE chain, `SinkAB`, and `WriteC_chain`. It supports
+runtime `num_rows`, pads rows on chip to a multiple of 16, and supports
+`in_dim <= 5632` so the MLP down projection fits without host-side K tiling.
+See [systolic_matmul.md](systolic_matmul.md).
+
+### 4.4 `gdn_matmul_tiled` (Fallback)
+
+**Location:** `gdn_model.cpp:866`
+
+Legacy 16 x 16 x 16 tiled matrix multiplication. It remains in the current
+design as the fallback for A/B projections where `out_dim=8`, which is too
+small for the 16-column systolic output tile. Manual-flattened R x C compute
+with an explicit balanced fadd tree gives II=1 in the inner pipeline. See
 [tiled_matmul.md](tiled_matmul.md).
 
-### 4.4 `gdn_depthwise_conv_silu`
+### 4.5 `gdn_depthwise_conv_silu`
 
-**Location:** `gdn_model.c:603`
+**Location:** `gdn_model.cpp:1037`
 
 Depthwise 1D convolution with SiLU activation. Kernel size is always 4
 (causal, looking back 3 positions). Applied independently to Q, K, V after
@@ -112,18 +135,18 @@ their linear projections. Uses pre-buffered weights and a 4-row sliding window;
 two-phase per-row execution (load + shift, then compute + write) keeps both
 phases at II=1. See [depthwise_conv.md](depthwise_conv.md).
 
-### 4.5 `gdn_recurrent_attention` (Optimised)
+### 4.6 `gdn_recurrent_attention` (Optimised)
 
-**Location:** `gdn_model.c:695`
+**Location:** `gdn_model.cpp:1129`
 
 Core gated delta rule recurrence. Persistent BRAM state, fused two-pass
 read/write, P_K=16 column parallelism, on-chip out_loc + drain split for
 the AXI write phase, and tree-reduced L2 norm / α reductions. See
 [recurrent_attention.md](recurrent_attention.md).
 
-### 4.6 `gdn_output_norm_and_gate`
+### 4.7 `gdn_output_norm_and_gate`
 
-**Location:** `gdn_model.c:915`
+**Location:** `gdn_model.cpp:1349`
 
 Per-head RMSNorm on attention output, followed by gated SiLU:
 ```
@@ -133,15 +156,15 @@ Pre-loaded shared weight, on-chip per-(token, head) attn/gate buffers, and a
 tree-reduced sum-of-squares give II=1 across all sub-passes. See
 [output_norm.md](output_norm.md).
 
-### 4.7 `gdn_swiglu_inplace`
+### 4.8 `gdn_swiglu_inplace`
 
-**Location:** `gdn_model.c:990`
+**Location:** `gdn_model.cpp:1424`
 
 Element-wise SwiGLU activation for MLP: `gate[i] = SiLU(gate[i]) * up[i]`.
 
-### 4.8 `gdn_tree_reduce_256` (helper)
+### 4.9 `gdn_tree_reduce_256` (helper)
 
-**Location:** `gdn_model.c:341`
+**Location:** `gdn_model.cpp:343`
 
 Inline 8-level paired-sum FP32 fadd tree (256 → 128 → … → 1). Used by
 `gdn_recurrent_attention` (`q_sq`, `k_sq`, `α`) and `gdn_output_norm_and_gate`
@@ -156,7 +179,8 @@ input (num_tokens x 2048)
   |
   +-- RMSNorm --> x_norm
   |
-  +-- MatMul x6 --> Q, K, V, A, B, Gate     (projections)
+  +-- Systolic MatMul x4 --> Q, K, V, Gate
+  +-- Tiled MatMul x2 ----> A, B             (small out_dim=8 fallback)
   |
   +-- DepthwiseConv1D+SiLU --> Q', K', V'   (causal conv, kernel=4)
   |
@@ -174,13 +198,14 @@ input (num_tokens x 2048)
   |
   +-- OutputNormGate(attn, Gate)
   |
-  +-- MatMul(o_proj) --> tmp_hidden
+  +-- Systolic MatMul(o_proj) --> tmp_hidden
   |
   +-- Residual: x += tmp_hidden
   |
   +-- RMSNorm --> x_norm
   |
-  +-- MLP: MatMul(gate_proj), MatMul(up_proj), SwiGLU, MatMul(down_proj)
+  +-- MLP: Systolic MatMul(gate_proj), Systolic MatMul(up_proj),
+  |        SwiGLU, Systolic MatMul(down_proj)
   |
   +-- Residual: x += tmp_hidden
   |
@@ -198,11 +223,12 @@ The `GDNWeightHeader` struct is read from DRAM via `m_axi` to extract config
 parameters at runtime (hidden size, num heads, etc.). Weight pointers for
 each layer are computed as offsets into the flat `weight_data` array.
 
-### AXI bundle topology (`gdn_attn_forward`, v7)
+### AXI bundle topology (`gdn_attn_forward`, current systolic path)
 
 | Bundle    | Ports                                                                 |
 |-----------|------------------------------------------------------------------------|
-| `gmem`    | config, weight_data, input, output, v, a, b, gate, attn, tmp_hidden, recurrent_state, head_buffer |
+| `gmem`    | config, input, output, v, a, b, gate, attn, tmp_hidden, recurrent_state, head_buffer |
+| `mem_weights` | weight_data |
 | `mem_q`   | q                                                                      |
 | `mem_k`   | k                                                                      |
 
@@ -210,6 +236,12 @@ Splitting `q` and `k` onto dedicated bundles lets `gdn_recurrent_attention`'s
 `load_qk` issue both reads in the same cycle (II=1). The AXI port-contention
 warning ("HLS 200-885: limited memory ports") was the only structural
 violation that could not be resolved without this bundle split.
+
+`weight_data` is also placed on `mem_weights` so the systolic `ReadB` task
+does not contend with `ReadA`, which reads activations from the default bundle.
+The full-model `gdn_forward` top uses `mem_weights` for weights and the default
+bundle for all activation/state buffers; only `gdn_attn_forward` splits q/k
+because those are explicit top-level buffers in the single-layer top.
 
 ## 7. Numerical Precision
 
@@ -229,11 +261,45 @@ Xilinx Alveo U55C card:
 
 Clock period: 10 ns (100 MHz).
 
-## 9. Optimisation History
+## 9. Current Synthesis Snapshot
 
-The optimisation passes applied to `gdn_attn_forward` are documented in
-[optimization_log.md](optimization_log.md). The headline result for
-single-layer attention (max-seq-length 2048):
+### Single-layer attention
+
+| Metric | v7 tiled matmul | Current systolic matmul |
+|--------|----------------:|------------------------:|
+| Top-level latency | 141.03 G cycles | 3.976 G cycles |
+| Timing slack @ 100 MHz target | 0.00 ns | -0.04 ns |
+| BRAM_18K | 322 (7 %) | 1602 (39 %) |
+| DSP | 1042 (11 %) | 4690 (51 %) |
+| FF | 209.8 k (8 %) | 848.9 k (32 %) |
+| LUT | 237.0 k (18 %) | 932.0 k (71 %) |
+
+The latency reduction comes from replacing the dominant large projection
+matmuls with the systolic dataflow kernel. The resource increase is expected:
+the current single-attention top contains multiple systolic dataflow instances
+plus the persistent recurrent state. The report has a small timing miss
+(-0.04 ns).
+
+### Full model
+
+| Metric | Current `gdn_forward` |
+|--------|----------------------:|
+| Top-level latency | 129.686 G cycles |
+| Timing slack @ 100 MHz target | -0.04 ns |
+| BRAM_18K | 1058 (26 %) |
+| DSP | 2847 (31 %) |
+| FF | 508.4 k (19 %) |
+| LUT | 580.3 k (44 %) |
+
+The full model does not instantiate 24 physical layers. The layer loop is a
+time loop, so resources are for one reused datapath and the 24 layers increase
+latency rather than multiplying resource use.
+
+## 10. Optimisation History
+
+The v1-v7 optimisation passes applied to `gdn_attn_forward` before the
+systolic matmul rewrite are documented in [optimization_log.md](optimization_log.md).
+The v7 tiled-matmul baseline for single-layer attention was:
 
 | Metric                         | Baseline (v0) | Final (v7) | Δ |
 |--------------------------------|---------------|-----------:|---|
@@ -249,8 +315,7 @@ single-layer attention (max-seq-length 2048):
 The BRAM count drops on U55C because HLS maps the persistent state with a
 denser per-partition allocation than it did on the prior VU11P run.)
 
-All inner pipelines now run at II=1 except the single AXI-bound `mm_tile_*`
-load/store sub-loops (which are inherently serial on the AXI master). The
-matmul still dominates total latency (≈99 % of runtime); reducing it further
-requires structural changes — see the "Critical follow-ups" section in
-[optimization_log.md](optimization_log.md).
+The current architecture implements that structural follow-up through the
+systolic matmul described in [systolic_matmul.md](systolic_matmul.md). The
+older tiled matmul documentation remains relevant for the A/B projection
+fallback path and for explaining the pre-systolic baseline.

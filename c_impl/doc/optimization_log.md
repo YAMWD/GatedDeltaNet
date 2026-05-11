@@ -1,10 +1,52 @@
 # GDN HLS Optimisation Log (single-layer attention)
 
 This document records the iterative optimisation passes applied to
-`gdn_attn_forward` (single-layer GDN attention, top function in `gdn_model.c`).
+`gdn_attn_forward` (single-layer GDN attention, top function in `gdn_model.cpp`).
 Each pass is verified by C-level parity against the Python golden reference and
 by Vitis HLS 2022.1 csynth on the canonical target `xcu55c-fsvh2892-2L-e`
 (Alveo U55C) at a 10 ns target clock, run via `test_single_GDN_attn.tcl`.
+
+## Current post-v7 architecture update
+
+The v1-v7 log below describes the pre-systolic design, whose final state used
+the optimized tiled GEMM. The current architecture has since replaced the large
+projection tiled GEMMs with a systolic/dataflow matmul kernel. The tiled kernel
+remains as a fallback for A/B projections (`out_dim=8`).
+
+Current docs:
+
+- [architecture.md](architecture.md) -- current top-level architecture and
+  synthesis snapshot.
+- [systolic_matmul.md](systolic_matmul.md) -- current systolic-array matmul
+  design, integrated vs standalone differences, and resource interpretation.
+- [tiled_matmul.md](tiled_matmul.md) -- legacy/fallback tiled GEMM and the
+  pre-systolic baseline.
+
+Current single-attention synthesis snapshot:
+
+| Metric | v7 tiled matmul | Current systolic matmul |
+|--------|----------------:|------------------------:|
+| Top-level latency | 141.03 G cycles | 3.976 G cycles |
+| Speedup | 1.0x | 35.5x vs v7 |
+| Timing slack | 0.00 ns | -0.04 ns |
+| BRAM_18K | 322 (7 %) | 1602 (39 %) |
+| DSP | 1042 (11 %) | 4690 (51 %) |
+| FF | 209.8 k (8 %) | 848.9 k (32 %) |
+| LUT | 237.0 k (18 %) | 932.0 k (71 %) |
+
+Current full-model synthesis snapshot:
+
+| Metric | Current `gdn_forward` |
+|--------|----------------------:|
+| Top-level latency | 129.686 G cycles |
+| Timing slack | -0.04 ns |
+| BRAM_18K | 1058 (26 %) |
+| DSP | 2847 (31 %) |
+| FF | 508.4 k (19 %) |
+| LUT | 580.3 k (44 %) |
+
+The full-model report is a reused hardware datapath over a 24-iteration layer
+loop. It does not instantiate 24 physical copies of the layer.
 
 ## Headline numbers
 
@@ -174,13 +216,12 @@ No II violations remain on U55C. Only `Cannot flatten` informational
 warnings (HLS 200-960, harmless). Top-level timing slack is **0.00 ns** at
 the 100 MHz target — the design closes timing with zero margin.
 
-## Critical follow-ups (out of scope for this pass)
+## Critical follow-ups after v7
 
-1. **Streaming/dataflow GEMM** — the current matmul spends ~76 % of its time on
-   tile load/store (per tile_c iter: 916 cyc memory vs 275 cyc compute). A
-   weight-stationary or output-stationary streaming engine would eliminate the
-   per-k-tile DRAM partial-sum reload/store and overlap with compute via
-   `#pragma HLS dataflow`. Estimated 2–3× further reduction on matmul.
+1. **Streaming/dataflow GEMM** — completed for large projections by the current
+   systolic matmul design. See [systolic_matmul.md](systolic_matmul.md). The
+   remaining matmul follow-up is improving the integrated `ReadB` schedule,
+   which currently reports II=16 in the single-attention systolic report.
 2. **`gdn_attn_forward` macro-stage dataflow** — wrap the body
    (matmul → conv → recurrent → onorm → matmul) in a `dataflow` region with
    `hls::stream` between stages. Eliminates the three `attn_conv_copy_*` AXI

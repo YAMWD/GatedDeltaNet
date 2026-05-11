@@ -1,17 +1,25 @@
-# Tiled Matrix Multiplication (`gdn_matmul`)
+# Tiled Matrix Multiplication (`gdn_matmul_tiled`)
 
-**Location:** `gdn_model.c:441`
+**Location:** `gdn_model.cpp:866`
+
+> Current status: this is no longer the main large-projection GEMM engine.
+> The current design uses the systolic dataflow kernel for Q/K/V/Gate/O and
+> MLP projections. This tiled kernel remains as the fallback for small
+> projections, especially A/B where `out_dim=8`. See
+> [systolic_matmul.md](systolic_matmul.md) for the current large-GEMM path.
 
 ## Overview
 
-`gdn_matmul` implements a tiled GEMM for all linear projections in
-GatedDeltaNet. It computes `out = in * weights^T` where `in` is
-`(num_rows × in_dim)` and `weights` is `(out_dim × in_dim)` stored row-major.
+`gdn_matmul_tiled` implements the legacy/fallback tiled GEMM. It computes
+`out = in * weights^T` where `in` is `(num_rows × in_dim)` and `weights` is
+`(out_dim × in_dim)` stored row-major.
 
-This is the single most latency-dominant submodule. In the v7 implementation
-of `gdn_attn_forward`, the seven matmul calls (Q, K, V, A, B, gate, output
-projection) consume **141.3 G of the 141.5 G total cycles** — ≈ 99.9 % of the
-attention layer's runtime.
+This was the single most latency-dominant submodule in the v7 implementation.
+There, the seven matmul calls (Q, K, V, A, B, gate, output projection)
+consume **141.3 G of the 141.5 G total cycles** -- about 99.9 % of the
+attention layer's runtime. The current systolic design removes this bottleneck
+for the large projections but keeps this tiled path for shapes that do not fit
+the systolic geometry.
 
 ## Tile Strategy
 
@@ -21,7 +29,7 @@ attention layer's runtime.
 #define MM_TILE_K 16   /* reduction (in_dim dimension) */
 ```
 
-These divide evenly into hidden=2048 and intermediate=5632 (= 16 × 352).
+These divide evenly into hidden=2048 and intermediate=5632 (= 16 x 352).
 Smaller output dimensions (e.g. `num_heads = 8` for A/B projections) are
 handled by boundary guards in the load/store loops.
 
@@ -137,7 +145,7 @@ Each level is a balanced pair-add — 4 stages of fadd plus one fmul stage
 gives an iteration latency of 19 cycles, and HLS schedules a new iter every
 cycle (II=1).
 
-## Synthesis Results (single matmul call, U55C @ 100 MHz)
+## Synthesis Results (legacy single matmul call, U55C @ 100 MHz)
 
 | Iteration              | mm_comp inner II | per tile_c iter | per call (2048×2048) | Notes |
 |------------------------|-----------------:|----------------:|---------------------:|-------|
@@ -146,8 +154,10 @@ cycle (II=1).
 | v3 (loop swap, c outer, no flatten)      | 2 | 1456 cyc | 38.88 G | regression: 16x pipeline-fill overhead + serial dot+= |
 | v4 (manual flatten + explicit tree + dep false) | **1** | **1266 cyc** | **20.11 G** | final, U55C |
 
-For the seven matmul calls in `gdn_attn_forward`, total cost dropped from
-**~190 G** in v0 to **~141 G** in v7 (single-layer attention).
+For the seven matmul calls in the v7 `gdn_attn_forward`, total cost dropped
+from **~190 G** in v0 to **~141 G** in v7 (single-layer attention). The
+current systolic single-attention top is **3.976 G cycles**, so the v7 result
+should now be read as the pre-systolic baseline.
 
 ## Where the time still goes (v7)
 
@@ -192,14 +202,21 @@ removed), giving inconsistent and brittle results. The v4 manual flatten plus
 explicit tree gives the same II=1 deterministically, with depth that is
 log₂(16) fadd levels (≈ 19 cycles) instead of a 16-deep linear chain.
 
-## Potential Future Optimisations
+## Why This Kernel Still Exists
 
-- **Larger tiles** — a 32×32×16 or 16×16×32 tile would increase compute
+- A/B projections have `out_dim=8`, below the 16-column systolic tile width.
+- The tiled kernel has simple boundary guards and handles small output
+  dimensions naturally.
+- It provides a compact baseline for testing HLS scheduling changes without
+  the larger dataflow systolic kernel.
+
+## Historical Future Optimisations
+
+- **Larger tiles** -- a 32 x 32 x 16 or 16 x 16 x 32 tile would increase compute
   density but require more BRAM and partition bandwidth.
-- **Output-stationary streaming GEMM** — keep the output tile in BRAM across
+- **Output-stationary streaming GEMM** -- keep the output tile in BRAM across
   the entire `tk` traversal of one `(tr, tc)` and never reload from DRAM.
-  This eliminates ~46 % of per-tile time. Requires `#pragma HLS dataflow` and
-  `hls::stream` channels for input/weight feeds.
-- **Weight-stationary** — for batch-1 inference, stream activations through a
+  This was implemented for large projections as the current systolic matmul.
+- **Weight-stationary** -- for batch-1 inference, stream activations through a
   pre-loaded weight grid. Best when activations are small relative to weights;
   may not fit the GDN-1.3B layer dims (hidden=2048).
