@@ -1,5 +1,7 @@
 #include "gdn_model.h"
 
+#include "hls_stream.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -431,6 +433,429 @@ static void gdn_rmsnorm_rows(
     }
 }
 
+/* =========================================================================
+ * Systolic-array matmul (architecture from spcl/gemm_hls).
+ *
+ *   ReadA ──a_pipes[0]──→ PE[0] ──a_pipes[1]──→ PE[1] ──→ ... ──→ PE[15]
+ *   ReadB ──b_pipes[0]──→ PE[0] ──b_pipes[1]──→ PE[1] ──→ ... ──→ PE[15]
+ *                            │                  │                   │
+ *                                ────────  WriteC  ────────
+ *
+ * 2 chains × 16 PEs × 16 MAC = 512 MAC/cycle peak. Each PE owns one row of
+ * the current outer-N tile and accumulates 16 PARTIAL lanes to break the
+ * FP32 fadd recurrence at II=1 under a 4 ns clock. ReadA does an on-chip
+ * transpose + broadcast to both chains; ReadB ping-pongs between two
+ * tile-buffers so load(next) overlaps stream(cur) at II=1.
+ *
+ * Kernel constraints (gdn_matmul_systolic returns -k on violation):
+ *   out_dim  % (NUM_CHAINS * M_PER_PE) (=32) == 0
+ *   in_dim   % 16                       == 0
+ *   in_dim   <= IN_DIM_MAX (=5632)
+ *   num_rows is unconstrained — the kernel pads to the next multiple of
+ *   N_PES on-chip (zero-fills A reads beyond num_rows, skips DRAM writes
+ *   beyond num_rows; the c_streams are still drained to keep dataflow
+ *   FIFOs balanced).
+ *
+ * IN_DIM_MAX is sized at 5632 so that mlp_down_proj (in_dim=5632) fits a
+ * single kernel invocation — no host-side K-tiling is needed. q/k/v/g/o
+ * (in_dim=2048) and mlp_gate/up (in_dim=2048) reuse the same kernel; only
+ * the K-loop runtime changes.
+ *
+ * The dispatch gdn_matmul() below tries gdn_matmul_systolic first and
+ * falls back to gdn_matmul_tiled() for shapes that don't fit (a/b_proj
+ * have out_dim=8). The standalone matmul-only HLS top in
+ * gdn_matmul_systolic.cpp keeps an authoritative copy of these helpers
+ * for test_matmul.tcl; this in-file version exists so gdn_model.cpp is
+ * self-contained and gdn_eval/gdn_attn_test don't need to link the
+ * standalone source file. No malloc/free anywhere — same code path runs
+ * under csim and csynth.
+ * ======================================================================= */
+
+#define N_PES 16
+#define M_PER_PE 16
+#define IN_DIM_MAX 5632
+/* NUM_CHAINS=1 inside the integrated gdn_forward / gdn_attn_forward path
+ * so the dataflow region has exactly one reader on the input bundle, one
+ * reader on the weights bundle, and one writer on the output bundle —
+ * required by HLS dataflow's single-reader/single-writer rule when the
+ * call sites in gdn_attn_forward bind in/weights/out to single physical
+ * AXI masters. The standalone matmul-only HLS top in
+ * gdn_matmul_systolic.cpp keeps NUM_CHAINS=2 because it has 5 separate
+ * m_axi ports (mem_in / mem_wt_lo / mem_wt_hi / mem_out_lo / mem_out_hi)
+ * and can run two chains in parallel. */
+#define NUM_CHAINS 1
+
+struct Pack16 {
+    float data[16];
+};
+
+typedef hls::stream<Pack16> Stream16;
+
+static void ProcessingElement(
+    Stream16 &aIn, Stream16 &aOut,
+    Stream16 &bIn, Stream16 &bOut,
+    Stream16 &cOut,
+    int location,
+    uint32_t num_outer_n,
+    uint32_t num_outer_m,
+    uint32_t in_dim
+) {
+    /* PARTIAL=16 lanes, recurrence-free at II=1 even at 320+ MHz Fmax. */
+    static const int PARTIAL = 16;
+    float c_buf[M_PER_PE][PARTIAL];
+    #pragma HLS array_partition variable=c_buf complete
+
+    pe_n0: for (uint32_t n0 = 0; n0 < num_outer_n; ++n0) {
+    #pragma HLS loop_tripcount min=1 max=128
+        pe_m0: for (uint32_t m0 = 0; m0 < num_outer_m; ++m0) {
+        #pragma HLS loop_tripcount min=1 max=352  /* max num_outer_m = 5632/16 = 352 for mlp_gate/up at out_dim=5632 */
+
+            pe_init_m: for (int m = 0; m < M_PER_PE; ++m) {
+            #pragma HLS unroll
+                pe_init_p: for (int p = 0; p < PARTIAL; ++p) {
+                #pragma HLS unroll
+                    c_buf[m][p] = 0.0f;
+                }
+            }
+
+            pe_k: for (uint32_t k = 0; k < in_dim; ++k) {
+            #pragma HLS loop_tripcount min=1 max=5632
+            #pragma HLS pipeline II=1
+                Pack16 a_pack = aIn.read();
+                float a_val = a_pack.data[location];
+                aOut.write(a_pack);
+
+                Pack16 b_pack = bIn.read();
+                bOut.write(b_pack);
+
+                uint32_t lane = k & (PARTIAL - 1);
+                pe_mac: for (int m = 0; m < M_PER_PE; ++m) {
+                #pragma HLS unroll
+                    c_buf[m][lane] += a_val * b_pack.data[m];
+                }
+            }
+
+            /* Tree-reduce 16 lanes per row, emit one row pack. */
+            Pack16 my_c;
+            pe_pack: for (int m = 0; m < M_PER_PE; ++m) {
+            #pragma HLS unroll
+                float l0 = c_buf[m][0]  + c_buf[m][1];
+                float l1 = c_buf[m][2]  + c_buf[m][3];
+                float l2 = c_buf[m][4]  + c_buf[m][5];
+                float l3 = c_buf[m][6]  + c_buf[m][7];
+                float l4 = c_buf[m][8]  + c_buf[m][9];
+                float l5 = c_buf[m][10] + c_buf[m][11];
+                float l6 = c_buf[m][12] + c_buf[m][13];
+                float l7 = c_buf[m][14] + c_buf[m][15];
+                float q0 = l0 + l1;
+                float q1 = l2 + l3;
+                float q2 = l4 + l5;
+                float q3 = l6 + l7;
+                float h0 = q0 + q1;
+                float h1 = q2 + q3;
+                my_c.data[m] = h0 + h1;
+            }
+            cOut.write(my_c);
+        }
+    }
+}
+
+/* ReadA — loads outer-N stripes of A into BRAM and streams column packs
+ * to the PE chain. Handles in-kernel token padding: when num_rows is not
+ * a multiple of N_PES, the last outer-N stripe contains some padding rows.
+ * For those, the m_axi address is clamped to row 0 (so DDR/HBM never sees
+ * an OOB address) and the loaded data is zeroed in `a_buf` — the PE chain
+ * then MACs against zero `a_val` for that row, which contributes nothing
+ * to the output. WriteC_chain skips the DRAM write for those rows. */
+static void ReadA(
+    const Pack16 *a_wide,
+    Stream16 &a_out,
+    uint32_t num_rows,
+    uint32_t num_outer_n,
+    uint32_t in_dim,
+    uint32_t out_dim
+) {
+    uint32_t num_outer_m = out_dim / M_PER_PE;
+    uint32_t num_outer_m_per_chain = num_outer_m / NUM_CHAINS;
+    uint32_t k_packs = in_dim / 16;
+
+    static float a_buf[N_PES][IN_DIM_MAX];
+    #pragma HLS array_partition variable=a_buf dim=1 complete
+    #pragma HLS array_partition variable=a_buf dim=2 cyclic factor=16
+
+    read_a_n0: for (uint32_t n0 = 0; n0 < num_outer_n; ++n0) {
+    #pragma HLS loop_tripcount min=1 max=128
+
+        load_a_rkp: for (uint32_t rkp = 0; rkp < (uint32_t)N_PES * k_packs; ++rkp) {
+        #pragma HLS loop_tripcount min=2048 max=5632
+        #pragma HLS pipeline II=1
+            uint32_t r  = rkp / k_packs;
+            uint32_t kp = rkp % k_packs;
+            uint32_t global_row = n0 * N_PES + r;
+            bool valid = (global_row < num_rows);
+            /* Address-clamp: when this row is padding, read row 0 instead so
+             * the m_axi master never sees an OOB address; we'll zero the
+             * loaded pack below before storing to a_buf. */
+            uint32_t safe_row = valid ? global_row : 0;
+            Pack16 wide = a_wide[(size_t)safe_row * k_packs + kp];
+            load_a_unpack: for (int kk = 0; kk < 16; ++kk) {
+            #pragma HLS unroll
+                a_buf[r][kp * 16 + kk] = valid ? wide.data[kk] : 0.0f;
+            }
+        }
+
+        stream_a_m0: for (uint32_t m0 = 0; m0 < num_outer_m_per_chain; ++m0) {
+        #pragma HLS loop_tripcount min=1 max=352  /* max num_outer_m = 5632/16 = 352 for mlp_gate/up at out_dim=5632 */
+            stream_a_k: for (uint32_t k = 0; k < in_dim; ++k) {
+            #pragma HLS loop_tripcount min=1 max=5632
+            #pragma HLS pipeline II=1
+                Pack16 col;
+                stream_a_pack: for (int r = 0; r < N_PES; ++r) {
+                #pragma HLS unroll
+                    col.data[r] = a_buf[r][k];
+                }
+                a_out.write(col);
+            }
+        }
+    }
+}
+
+static void ReadB(
+    const Pack16 *b_wide,
+    Stream16 &b_out,
+    uint32_t num_outer_n,
+    uint32_t in_dim,
+    uint32_t m0_offset,
+    uint32_t num_outer_m_per_chain
+) {
+    uint32_t k_packs = in_dim / 16;
+    uint32_t total_tiles = num_outer_n * num_outer_m_per_chain;
+
+    /* Function-local (NOT static): NUM_CHAINS ReadB invocations in dataflow
+     * each need their own BRAM instance — a static array would be shared
+     * state and trip "HLS 200-979 internal global variable failed dataflow
+     * checking". */
+    float b_buf[2][M_PER_PE][IN_DIM_MAX];
+    #pragma HLS array_partition variable=b_buf dim=1 complete
+    #pragma HLS array_partition variable=b_buf dim=2 complete
+    #pragma HLS array_partition variable=b_buf dim=3 cyclic factor=16
+
+    if (total_tiles == 0) return;
+
+    preload_ckp: for (uint32_t ckp = 0; ckp < (uint32_t)M_PER_PE * k_packs; ++ckp) {
+    #pragma HLS loop_tripcount min=2048 max=5632
+    #pragma HLS pipeline II=1
+        uint32_t c  = ckp / k_packs;
+        uint32_t kp = ckp % k_packs;
+        Pack16 wide = b_wide[(size_t)(m0_offset * M_PER_PE + c) * k_packs + kp];
+        preload_unpack: for (int kk = 0; kk < 16; ++kk) {
+        #pragma HLS unroll
+            b_buf[0][c][kp * 16 + kk] = wide.data[kk];
+        }
+    }
+
+    fused_tile: for (uint32_t tile = 1; tile < total_tiles; ++tile) {
+    #pragma HLS loop_tripcount min=1 max=45056  /* num_outer_n * num_outer_m_per_chain = 128*352 = 45056 worst case (mlp at out_dim=5632) */
+        uint32_t stream_idx       = (tile - 1) & 1u;
+        uint32_t load_idx         = tile & 1u;
+        uint32_t m0_local_next    = tile % num_outer_m_per_chain;
+        uint32_t m0_global_next   = m0_local_next + m0_offset;
+
+        fused_io: for (uint32_t i = 0; i < in_dim; ++i) {
+        #pragma HLS loop_tripcount min=1 max=5632
+        #pragma HLS pipeline II=1
+            Pack16 col;
+            fused_stream_pack: for (int c = 0; c < M_PER_PE; ++c) {
+            #pragma HLS unroll
+                col.data[c] = b_buf[stream_idx][c][i];
+            }
+            b_out.write(col);
+
+            uint32_t load_c  = i / k_packs;
+            uint32_t load_kp = i % k_packs;
+            Pack16 wide = b_wide[(size_t)(m0_global_next * M_PER_PE + load_c) * k_packs + load_kp];
+            fused_load_unpack: for (int kk = 0; kk < 16; ++kk) {
+            #pragma HLS unroll
+                b_buf[load_idx][load_c][load_kp * 16 + kk] = wide.data[kk];
+            }
+        }
+    }
+
+    uint32_t last_idx = (total_tiles - 1) & 1u;
+    last_stream: for (uint32_t k = 0; k < in_dim; ++k) {
+    #pragma HLS loop_tripcount min=1 max=5632
+    #pragma HLS pipeline II=1
+        Pack16 col;
+        last_stream_pack: for (int c = 0; c < M_PER_PE; ++c) {
+        #pragma HLS unroll
+            col.data[c] = b_buf[last_idx][c][k];
+        }
+        b_out.write(col);
+    }
+}
+
+static void SinkAB(
+    Stream16 &a_in,
+    Stream16 &b_in,
+    uint32_t num_outer_n,
+    uint32_t num_outer_m,
+    uint32_t in_dim
+) {
+    sink_n0: for (uint32_t n0 = 0; n0 < num_outer_n; ++n0) {
+    #pragma HLS loop_tripcount min=1 max=128
+        sink_m0: for (uint32_t m0 = 0; m0 < num_outer_m; ++m0) {
+        #pragma HLS loop_tripcount min=1 max=352  /* max num_outer_m = 5632/16 = 352 for mlp_gate/up at out_dim=5632 */
+            sink_k: for (uint32_t k = 0; k < in_dim; ++k) {
+            #pragma HLS loop_tripcount min=1 max=5632
+            #pragma HLS pipeline II=1
+                a_in.read();
+                b_in.read();
+            }
+        }
+    }
+}
+
+static void WriteC_chain(
+    Stream16 c_streams[N_PES],
+    Pack16 *c_wide,
+    uint32_t num_rows,
+    uint32_t num_outer_n,
+    uint32_t out_dim,
+    uint32_t m0_offset,
+    uint32_t num_outer_m_per_chain
+) {
+    uint32_t m_packs = out_dim / 16;
+
+    write_c_n0: for (uint32_t n0 = 0; n0 < num_outer_n; ++n0) {
+    #pragma HLS loop_tripcount min=1 max=128
+        write_c_m0: for (uint32_t m0 = 0; m0 < num_outer_m_per_chain; ++m0) {
+        #pragma HLS loop_tripcount min=1 max=352  /* max num_outer_m = 5632/16 = 352 for mlp_gate/up at out_dim=5632 */
+            size_t base = (size_t)(n0 * N_PES) * m_packs + m0 + m0_offset;
+            write_c_r: for (int r = 0; r < N_PES; ++r) {
+            #pragma HLS pipeline II=1
+                /* Always drain c_streams to keep dataflow FIFOs balanced —
+                 * the PE chain wrote one Pack16 per (n0, m0, r) regardless
+                 * of token padding. Skip the m_axi write for padded rows
+                 * (global_row >= num_rows). */
+                Pack16 row = c_streams[r].read();
+                uint32_t global_row = n0 * N_PES + (uint32_t)r;
+                if (global_row < num_rows) {
+                    c_wide[base + (size_t)r * m_packs] = row;
+                }
+            }
+        }
+    }
+}
+
+/* run_dataflow lives in its own function so #pragma HLS dataflow is at
+ * function scope (HLS 207-5556 forbids it inside `{ ... }`) and the body
+ * stays canonical (only stream decls and function calls). */
+static void run_dataflow(
+    Pack16 *out,
+    const Pack16 *in,
+    const Pack16 *weights,
+    uint32_t num_rows,
+    uint32_t in_dim,
+    uint32_t out_dim,
+    uint32_t num_outer_n,
+    uint32_t num_outer_m_per_chain
+) {
+    #pragma HLS dataflow
+
+    Stream16 a_pipes[N_PES + 1];
+    Stream16 b_pipes[N_PES + 1];
+    Stream16 c_streams[N_PES];
+    #pragma HLS stream variable=a_pipes   depth=4
+    #pragma HLS stream variable=b_pipes   depth=4
+    #pragma HLS stream variable=c_streams depth=32
+
+    ReadA(in, a_pipes[0],
+          num_rows, num_outer_n, in_dim, out_dim);
+
+    ReadB(weights, b_pipes[0], num_outer_n, in_dim,
+          0u, num_outer_m_per_chain);
+
+    /* 16-PE chain. */
+    ProcessingElement(a_pipes[0],  a_pipes[1],  b_pipes[0],  b_pipes[1],
+                      c_streams[0],  0,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[1],  a_pipes[2],  b_pipes[1],  b_pipes[2],
+                      c_streams[1],  1,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[2],  a_pipes[3],  b_pipes[2],  b_pipes[3],
+                      c_streams[2],  2,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[3],  a_pipes[4],  b_pipes[3],  b_pipes[4],
+                      c_streams[3],  3,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[4],  a_pipes[5],  b_pipes[4],  b_pipes[5],
+                      c_streams[4],  4,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[5],  a_pipes[6],  b_pipes[5],  b_pipes[6],
+                      c_streams[5],  5,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[6],  a_pipes[7],  b_pipes[6],  b_pipes[7],
+                      c_streams[6],  6,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[7],  a_pipes[8],  b_pipes[7],  b_pipes[8],
+                      c_streams[7],  7,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[8],  a_pipes[9],  b_pipes[8],  b_pipes[9],
+                      c_streams[8],  8,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[9],  a_pipes[10], b_pipes[9],  b_pipes[10],
+                      c_streams[9],  9,  num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[10], a_pipes[11], b_pipes[10], b_pipes[11],
+                      c_streams[10], 10, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[11], a_pipes[12], b_pipes[11], b_pipes[12],
+                      c_streams[11], 11, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[12], a_pipes[13], b_pipes[12], b_pipes[13],
+                      c_streams[12], 12, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[13], a_pipes[14], b_pipes[13], b_pipes[14],
+                      c_streams[13], 13, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[14], a_pipes[15], b_pipes[14], b_pipes[15],
+                      c_streams[14], 14, num_outer_n, num_outer_m_per_chain, in_dim);
+    ProcessingElement(a_pipes[15], a_pipes[16], b_pipes[15], b_pipes[16],
+                      c_streams[15], 15, num_outer_n, num_outer_m_per_chain, in_dim);
+
+    SinkAB(a_pipes[N_PES], b_pipes[N_PES],
+           num_outer_n, num_outer_m_per_chain, in_dim);
+
+    WriteC_chain(c_streams, out, num_rows, num_outer_n, out_dim,
+                 0u, num_outer_m_per_chain);
+}
+
+/* gdn_matmul_systolic — float-pointer entry to the systolic kernel. No
+ * malloc, no #ifdef: the same code path runs under both csim and csynth.
+ *
+ * Geometry checks:
+ *   out_dim % (NUM_CHAINS * M_PER_PE) (=32) == 0  -- caller falls back to
+ *                                                   gdn_matmul_tiled if not
+ *   in_dim  % 16                       == 0      -- ditto
+ *   in_dim  <= IN_DIM_MAX (=5632)               -- ditto (mlp_down fits)
+ *
+ * num_rows is unconstrained: ReadA zero-fills the loaded data when
+ * global_row >= num_rows (with the m_axi address clamped to row 0 so
+ * DRAM never sees an OOB address), and WriteC_chain skips the m_axi
+ * write for global_row >= num_rows (it still drains c_streams to keep
+ * the dataflow FIFOs balanced). The PE chain naturally produces zero
+ * outputs for padded rows because every K-cycle MAC for those rows
+ * uses a_val=0. */
+static int gdn_matmul_systolic(
+    float *out, const float *in, const float *weights,
+    uint32_t num_rows, uint32_t in_dim, uint32_t out_dim
+) {
+    if (num_rows == 0 || in_dim == 0 || out_dim == 0)            return -1;
+    if ((out_dim % (NUM_CHAINS * M_PER_PE)) != 0)                return -3;
+    if ((in_dim  % 16)       != 0)                               return -4;
+    if (in_dim > (uint32_t)IN_DIM_MAX)                           return -5;
+
+    uint32_t num_outer_n            = (num_rows + N_PES - 1) / N_PES;
+    uint32_t num_outer_m            = out_dim / M_PER_PE;
+    uint32_t num_outer_m_per_chain  = num_outer_m / NUM_CHAINS;
+
+    Pack16 *out_p           = reinterpret_cast<Pack16 *>(out);
+    const Pack16 *in_p      = reinterpret_cast<const Pack16 *>(in);
+    const Pack16 *weights_p = reinterpret_cast<const Pack16 *>(weights);
+
+    run_dataflow(out_p, in_p, weights_p,
+                 num_rows, in_dim, out_dim,
+                 num_outer_n, num_outer_m_per_chain);
+
+    return 0;
+}
+
 /* Tile sizes for tiled matmul — chosen to divide evenly into hidden=2048
    and intermediate=5632 (=16*352).  out_dim=8 (a/b proj) is smaller than
    TILE_C but handled by the boundary guard inside the inner loops. */
@@ -438,7 +863,7 @@ static void gdn_rmsnorm_rows(
 #define MM_TILE_C 16   /* columns (out_dim dimension) */
 #define MM_TILE_K 16   /* reduction (in_dim dimension) */
 
-static void gdn_matmul(
+static void gdn_matmul_tiled(
     float *out,
     const float *in,
     const float *weights,
@@ -471,7 +896,7 @@ static void gdn_matmul(
     mm_tile_r: for (tr = 0; tr < num_rows; tr += MM_TILE_R) {
     #pragma HLS loop_tripcount min=1 max=128  /* ceil(2048/16) */
         mm_tile_k: for (tk = 0; tk < in_dim; tk += MM_TILE_K) {
-    #pragma HLS loop_tripcount min=128 max=352  /* ceil(2048/16) to ceil(5632/16) */
+    #pragma HLS loop_tripcount min=128 max=128  /* a/b_proj only: in_dim=2048, ceil(2048/16)=128 */
 
             /* Load input tile: local_in[r][k] = in[tr+r][tk+k] */
             mm_load_in_r: for (r = 0; r < MM_TILE_R; ++r) {
@@ -487,7 +912,7 @@ static void gdn_matmul(
             }
 
             mm_tile_c: for (tc = 0; tc < out_dim; tc += MM_TILE_C) {
-            #pragma HLS loop_tripcount min=1 max=352  /* ceil(8/16)=1 to ceil(5632/16)=352 */
+            #pragma HLS loop_tripcount min=1 max=1  /* a/b_proj only: out_dim=8 < MM_TILE_C=16, single iter */
 
                 /* Load weight tile: local_wt[k][c] = weights[tc+c][tk+k] */
                 mm_load_wt_c: for (c = 0; c < MM_TILE_C; ++c) {
@@ -594,6 +1019,15 @@ static void gdn_matmul(
         } /* mm_tile_k */
     } /* mm_tile_r */
 }
+
+/* No dispatch wrapper here — call sites in gdn_forward / gdn_attn_forward
+ * call gdn_matmul_systolic directly for systolic-eligible shapes
+ * (out_dim %32==0 && in_dim %16==0 && in_dim<=5632) and gdn_matmul_tiled
+ * directly for the small a/b_proj shapes (out_dim=8). A runtime dispatch
+ * wrapper would force HLS to allocate hardware for both paths at every
+ * call site and report sum(systolic + tiled) per call, which inflates
+ * the latency estimate by ~30× for the systolic-eligible calls. Direct
+ * calls let HLS report just the path actually used. */
 
 /* Compile-time bounds for the conv buffers. The model always calls this with
  * hidden=2048 and conv_size=4; smaller calls still fit. */
@@ -1019,7 +1453,10 @@ int gdn_forward(
     /* Depths match gdn-1.3b-f32.gdnw: hidden=2048 heads=8 head_dim=256
     intermediate=5632 layers=24 conv=4 max_seq_len=2048 vocab=32000 */
     #pragma HLS interface m_axi port=config depth=1 offset=slave
-    #pragma HLS interface m_axi port=weight_data depth=1466343808 offset=slave
+    /* weight_data on its own bundle (same reason as in gdn_attn_forward) —
+     * systolic ReadB reads weights, ReadA reads x_norm/mlp_gate/attn;
+     * HLS dataflow requires distinct bundles per task. */
+    #pragma HLS interface m_axi port=weight_data depth=1466343808 offset=slave bundle=mem_weights
     #pragma HLS interface m_axi port=x depth=4194304 offset=slave
     #pragma HLS interface m_axi port=x_norm depth=4194304 offset=slave
     #pragma HLS interface m_axi port=q depth=4194304 offset=slave
@@ -1117,12 +1554,12 @@ int gdn_forward(
         layer_mlp_down_proj = weight_data + layer_offset;
 
         gdn_rmsnorm_rows(x_norm, x, layer_attn_norm, num_tokens, hidden, config->norm_eps);
-        gdn_matmul(q, x_norm, layer_q_proj, num_tokens, hidden, hidden);
-        gdn_matmul(k, x_norm, layer_k_proj, num_tokens, hidden, hidden);
-        gdn_matmul(v, x_norm, layer_v_proj, num_tokens, hidden, hidden);
-        gdn_matmul(a, x_norm, layer_a_proj, num_tokens, hidden, num_heads);
-        gdn_matmul(b, x_norm, layer_b_proj, num_tokens, hidden, num_heads);
-        gdn_matmul(gate, x_norm, layer_g_proj, num_tokens, hidden, hidden);
+        gdn_matmul_systolic(q, x_norm, layer_q_proj, num_tokens, hidden, hidden);
+        gdn_matmul_systolic(k, x_norm, layer_k_proj, num_tokens, hidden, hidden);
+        gdn_matmul_systolic(v, x_norm, layer_v_proj, num_tokens, hidden, hidden);
+        gdn_matmul_tiled(a, x_norm, layer_a_proj, num_tokens, hidden, num_heads);
+        gdn_matmul_tiled(b, x_norm, layer_b_proj, num_tokens, hidden, num_heads);
+        gdn_matmul_systolic(gate, x_norm, layer_g_proj, num_tokens, hidden, hidden);
 
         gdn_depthwise_conv_silu(tmp_hidden, q, layer_q_conv, num_tokens, hidden, config->conv_size);
         conv_copy_q: for (index = 0; index < hidden_count; ++index) {
@@ -1157,17 +1594,17 @@ int gdn_forward(
             num_tokens
         );
         gdn_output_norm_and_gate(attn, gate, layer_o_norm, num_tokens, num_heads, head_dim, config->norm_eps);
-        gdn_matmul(tmp_hidden, attn, layer_o_proj, num_tokens, hidden, hidden);
+        gdn_matmul_systolic(tmp_hidden, attn, layer_o_proj, num_tokens, hidden, hidden);
         attn_residual: for (index = 0; index < hidden_count; ++index) {
         #pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
             x[index] += tmp_hidden[index];
         }
 
         gdn_rmsnorm_rows(x_norm, x, layer_mlp_norm, num_tokens, hidden, config->norm_eps);
-        gdn_matmul(mlp_gate, x_norm, layer_mlp_gate_proj, num_tokens, hidden, intermediate);
-        gdn_matmul(mlp_up, x_norm, layer_mlp_up_proj, num_tokens, hidden, intermediate);
+        gdn_matmul_systolic(mlp_gate, x_norm, layer_mlp_gate_proj, num_tokens, hidden, intermediate);
+        gdn_matmul_systolic(mlp_up, x_norm, layer_mlp_up_proj, num_tokens, hidden, intermediate);
         gdn_swiglu_inplace(mlp_gate, mlp_up, mlp_count);
-        gdn_matmul(tmp_hidden, mlp_gate, layer_mlp_down_proj, num_tokens, intermediate, hidden);
+        gdn_matmul_systolic(tmp_hidden, mlp_gate, layer_mlp_down_proj, num_tokens, intermediate, hidden);
         mlp_residual: for (index = 0; index < hidden_count; ++index) {
         #pragma HLS loop_tripcount min=2048 max=4194304  /* hidden_count = num_tokens*hidden: 1*2048 to 2048*2048 */
             x[index] += tmp_hidden[index];
@@ -1253,7 +1690,10 @@ int gdn_attn_forward(
      *   - All other ports stay on the default `gmem` bundle.
      */
     #pragma HLS interface m_axi port=config depth=1 offset=slave
-    #pragma HLS interface m_axi port=weight_data depth=87000000 offset=slave
+    /* weight_data on its own bundle so the systolic ReadB task doesn't
+     * collide with ReadA (which reads `input` or `attn`) on the default
+     * gmem bundle — HLS dataflow requires distinct bundles per task. */
+    #pragma HLS interface m_axi port=weight_data depth=87000000 offset=slave bundle=mem_weights
     #pragma HLS interface m_axi port=input depth=129024 offset=slave
     #pragma HLS interface m_axi port=output depth=129024 offset=slave
     #pragma HLS interface m_axi port=q depth=129024 offset=slave bundle=mem_q
@@ -1330,12 +1770,12 @@ int gdn_attn_forward(
     layer_o_proj = weight_data + layer_offset;
 
     /* Projections: input -> q, k, v, a, b, gate */
-    gdn_matmul(q, input, layer_q_proj, num_tokens, hidden, hidden);
-    gdn_matmul(k, input, layer_k_proj, num_tokens, hidden, hidden);
-    gdn_matmul(v, input, layer_v_proj, num_tokens, hidden, hidden);
-    gdn_matmul(a, input, layer_a_proj, num_tokens, hidden, num_heads);
-    gdn_matmul(b, input, layer_b_proj, num_tokens, hidden, num_heads);
-    gdn_matmul(gate, input, layer_g_proj, num_tokens, hidden, hidden);
+    gdn_matmul_systolic(q, input, layer_q_proj, num_tokens, hidden, hidden);
+    gdn_matmul_systolic(k, input, layer_k_proj, num_tokens, hidden, hidden);
+    gdn_matmul_systolic(v, input, layer_v_proj, num_tokens, hidden, hidden);
+    gdn_matmul_tiled(a, input, layer_a_proj, num_tokens, hidden, num_heads);
+    gdn_matmul_tiled(b, input, layer_b_proj, num_tokens, hidden, num_heads);
+    gdn_matmul_systolic(gate, input, layer_g_proj, num_tokens, hidden, hidden);
 
     /* Depthwise conv1d + SiLU on q, k, v */
     gdn_depthwise_conv_silu(tmp_hidden, q, layer_q_conv, num_tokens, hidden, conv_size);
@@ -1371,7 +1811,7 @@ int gdn_attn_forward(
     );
 
     /* Output projection -> output */
-    gdn_matmul(output, attn, layer_o_proj, num_tokens, hidden, hidden);
+    gdn_matmul_systolic(output, attn, layer_o_proj, num_tokens, hidden, hidden);
 
     return 0;
 }
@@ -1404,3 +1844,9 @@ int gdn_attn_forward_layer(
         num_tokens
     );
 }
+
+/* gdn_matmul_top — definition lives in gdn_matmul_systolic.cpp (the wide-AXI
+ * Pack16 systolic version, used as the standalone matmul-only HLS top by
+ * test_matmul.tcl and gdn_matmul_test.cpp). The header keeps the prototype
+ * for those callers; gdn_model.cpp uses the inlined systolic helpers above
+ * via gdn_matmul → gdn_matmul_systolic instead. */

@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct {
     char magic[8];
     uint32_t version;
@@ -126,5 +130,25 @@ int gdn_attn_forward_layer(
     float *output,
     uint32_t num_tokens
 );
+
+/* HLS top wrapper for the tiled matmul: out = in * weights^T.
+ *   in       is num_rows x in_dim   (row-major)
+ *   weights  is out_dim x in_dim    (row-major)
+ *   out      is num_rows x out_dim  (row-major)
+ * Each pointer is mapped to its own AXI master bundle so load_in / load_wt /
+ * store_out can be parallelised in any future dataflow refactor.
+ * Returns 0 on success. */
+int gdn_matmul_top(
+    float *out,
+    const float *in,
+    const float *weights,
+    uint32_t num_rows,
+    uint32_t in_dim,
+    uint32_t out_dim
+);
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
 
 #endif
