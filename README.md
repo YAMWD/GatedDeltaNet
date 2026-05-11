@@ -1,7 +1,7 @@
 # GatedDeltaNet HLS Accelerator
 
 A Vitis HLS hardware accelerator for **GatedDeltaNet-1.3B** inference on
-the Xilinx **Alveo U55C** (`xcu55c-fsvh2892-2L-e`). The C source under
+the Xilinx **Alveo U55C** (`xcu55c-fsvh2892-2L-e`). The CPP source under
 [`c_impl/`](c_impl/) is the primary development target; the surrounding
 PyTorch / Triton implementation is the **golden reference** used to verify
 correctness.
@@ -14,7 +14,7 @@ The model is from
 
 | Path | Role |
 |------|------|
-| `c_impl/` | **HLS synthesis target.** Forward-only C implementation of GDN-1.3B inference, plus host testbenches and Vitis HLS scripts. See [`c_impl/README.md`](c_impl/README.md). |
+| `c_impl/` | **HLS synthesis target.** Forward-only CPP implementation of GDN-1.3B inference, plus host testbenches and Vitis HLS scripts. See [`c_impl/README.md`](c_impl/README.md). |
 | `c_impl/doc/` | Submodule docs: architecture, tiled matmul, depthwise conv, recurrent attention, output-norm, and a chronological optimisation log (v0 → v7). |
 | `lit_gpt/` | Python golden reference: `model.py`, `gated_delta_net.py`, FLA / Triton kernels under `gated_delta_rule_ops/`. |
 | `pretrain.py`, `packed_dataset.py` | Pretraining harness (Lightning Fabric + FSDP, BF16). Used to produce the weight checkpoint that drives the HLS testbenches; not exercised by the synthesis flow. |
@@ -26,11 +26,11 @@ The model is from
 The PyTorch / Triton implementation in [`lit_gpt/`](lit_gpt/) (and the FLA
 kernels under [`lit_gpt/gated_delta_rule_ops/fla_version/`](lit_gpt/gated_delta_rule_ops/fla_version/))
 is the **golden reference** for the HLS work. Every intermediate tensor that
-the C testbenches compare against is produced by running the Python model.
-The C implementation in [`c_impl/gdn_model.c`](c_impl/gdn_model.c) mirrors
+the CPP testbenches compare against is produced by running the Python model.
+The CPP implementation in [`c_impl/gdn_model.cpp`](c_impl/gdn_model.cpp) mirrors
 the corresponding Python code path, function for function:
 
-| Python (`lit_gpt/`) | C / HLS (`c_impl/gdn_model.c`) |
+| Python (`lit_gpt/`) | C / HLS (`c_impl/gdn_model.cpp`) |
 |---------------------|--------------------------------|
 | `model.py` — `GPT`, `Block`, `MBlock` | `gdn_forward` (full 24-layer top function) |
 | `gated_delta_net.py` — `GatedDeltaNet` block | `gdn_attn_forward` (single-layer top function) |
@@ -63,13 +63,13 @@ to produce the flat `.gdnw` weight blob in `c_impl/artifacts/`.
    `scripts/export_block_fixture.py → c_impl/fixtures_block/*.gdnblk`).
 3. **Run the Python reference** on the same fixtures
    (`scripts/compare_gdn_c.py`) to capture the per-task golden JSON.
-4. **Run the C/HLS implementation** on those fixtures (`gdn_eval`,
+4. **Run the CPP/HLS implementation** on those fixtures (`gdn_eval`,
    `gdn_attn_test`, or Vitis HLS csim/cosim).
 5. **Diff** with `scripts/check_gdn_c_parity.py` (1 × 10⁻³ absolute
    tolerance; observed diffs are ~1 × 10⁻⁵). `c_impl/test_parity.sh`
    automates steps 4–5 for the smoke fixture set.
 
-Any change to the C source — and especially anything that perturbs the FP
+Any change to the CPP source — and especially anything that perturbs the FP
 order of operations (e.g. tree-reduce reordering, tile-shape changes) — is
 gated through this loop before being merged.
 
@@ -123,14 +123,14 @@ GDN-1.3B is the only configuration the HLS path is wired for:
 
 ## Quick start
 
-### Build the C testbenches and run parity
+### Build the CPP testbenches and run parity
 ```bash
 make -C c_impl
 cd c_impl && bash test_parity.sh
 ```
 
 `test_parity.sh` rebuilds `gdn_eval`, runs every `fixtures_smoke/*.gdnreq`
-through the C implementation, and diffs the JSON outputs against
+through the CPP implementation, and diffs the JSON outputs against
 `results_smoke_python/` via `scripts/check_gdn_c_parity.py`.
 
 ### Vitis HLS synthesis
