@@ -82,20 +82,26 @@ within tolerance.
 
 ### Hardware build (v++ → `.xclbin`) and on-card test
 
-The Makefile also drives the full Vitis hardware flow on Alveo U55C:
+The Makefile drives the full Vitis hardware flow on Alveo U55C. The
+one-shot path is:
 
 ```bash
 cd c_impl
-
-# 1) Compile the kernel: gdn_model.cpp → build.hw/gdn_forward.xo (~30–60 min)
-make xo TARGET=hw
-
-# 2) Link + place + route → build.hw/gdn_forward.xclbin (~4–6 hr)
-make xclbin TARGET=hw
-
-# 3) Build the XRT host program
-make host
+make run_hw                       # xo → xclbin → host → ./host.exe on the U55C
 ```
+
+`run_hw` is dependency-driven, so it only redoes the phases whose inputs
+have changed. The expected wall-times for a cold build are:
+
+| Phase | Output | Time | Triggered by |
+|-------|--------|------|--------------|
+| `make xo` | `build.hw/gdn_forward.xo` | ~30–60 min | edits to `gdn_model.cpp` / `gdn_model.h` |
+| `make xclbin` | `build.hw/gdn_forward.xclbin` | ~4–6 hr | edits to the `.xo`, `hw.cfg`, or `pblock_pe_split.tcl` |
+| `make host` | `host.exe` | seconds | edits to `host.cpp` or `gdn_model.h` |
+| `make run_hw` | on-card execution + `$(HW_OUT)` JSON | minutes | run-time only |
+
+You can also invoke the individual phases (e.g. just `make xclbin
+TARGET=hw_emu` for hardware emulation).
 
 Build knobs (override on the command line):
 
@@ -107,6 +113,22 @@ Build knobs (override on the command line):
 | `JOBS` | `8` | Parallel jobs for HLS / synth / impl |
 | `XILINX_XRT` | `/opt/xilinx/xrt` | XRT install root for the host build |
 | `XILINX_VITIS` | `/tools/Xilinx/Vitis/2022.1` | Vitis install root |
+
+`run_hw` knobs:
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `WEIGHTS` | `artifacts/gdn-1.3b-f32.gdnw` | Flat `.gdnw` weight blob |
+| `FIXTURE` | `fixtures_smoke/wikitext.gdnreq` | Pretokenised input fixture |
+| `HW_OUT` | `hw_$(basename FIXTURE).json` | JSON output (auto-derived from `FIXTURE`) |
+| `HW_DEVICE` | `0` | XRT device index (multi-card hosts) |
+| `HW_MAX_EX` | *(empty = all)* | Cap on number of examples |
+
+```bash
+make run_hw FIXTURE=fixtures_smoke/piqa.gdnreq        # → hw_piqa.json
+make run_hw HW_MAX_EX=4                                # quick smoke
+make run_hw HW_DEVICE=2                                # pick a specific card
+```
 
 The link step is driven by two files in this directory:
 
@@ -124,8 +146,9 @@ The link step is driven by two files in this directory:
   to SLR2 and `gdn_output_norm_and_gate` to SLR1. With this split the
   fully-routed design closes timing at 100 MHz with **WNS = +0.003 ns**.
 
-Once `build.hw/gdn_forward.xclbin` and `./host.exe` are present, run the
-end-to-end hardware parity test against a smoke fixture:
+Once the bitstream and host program are present, the canonical on-card
+invocation is `make run_hw` (defaults to the wikitext smoke fixture). The
+underlying command is:
 
 ```bash
 ./host.exe build.hw/gdn_forward.xclbin \
@@ -133,6 +156,9 @@ end-to-end hardware parity test against a smoke fixture:
            fixtures_smoke/wikitext.gdnreq \
            hw_wikitext.json
 ```
+
+so you can also invoke `host.exe` directly if you need flags outside what
+the Make wrapper exposes (the binary's `--help` lists everything).
 
 The host program:
 1. Allocates one `xrt::bo` per kernel argument (weights, activations,

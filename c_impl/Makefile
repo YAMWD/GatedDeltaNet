@@ -88,9 +88,24 @@ HOST_LIB       := -L$(XILINX_XRT)/lib -Wl,-rpath,$(XILINX_XRT)/lib \
 
 
 # ----------------------------------------------------------------------------
+# On-card run knobs (consumed by the `run_hw` target)
+# ----------------------------------------------------------------------------
+#   WEIGHTS   flat .gdnw weight blob (~5.6 GB for GDN-1.3B)
+#   FIXTURE   pretokenised .gdnreq fixture to score
+#   HW_OUT    JSON result file (defaults to hw_<fixture-stem>.json)
+#   HW_DEVICE XRT device index (0 if multiple U55Cs are on the host)
+#   HW_MAX_EX optional cap on examples processed; leave empty for "all"
+WEIGHTS        ?= artifacts/gdn-1.3b-f32.gdnw
+FIXTURE        ?= fixtures_smoke/wikitext.gdnreq
+HW_OUT         ?= hw_$(basename $(notdir $(FIXTURE))).json
+HW_DEVICE      ?= 0
+HW_MAX_EX      ?=
+
+
+# ----------------------------------------------------------------------------
 # Default target
 # ----------------------------------------------------------------------------
-.PHONY: all host_tb xo xclbin host clean clean_hw distclean help
+.PHONY: all host_tb xo xclbin host run_hw clean clean_hw distclean help
 
 all: host_tb
 
@@ -100,6 +115,7 @@ help:
 	@echo "  xo          v++ compile  → $(XO)"
 	@echo "  xclbin      v++ link     → $(XCLBIN)"
 	@echo "  host        XRT host    → $(HOST_BIN)"
+	@echo "  run_hw      xo + xclbin + host + ./host.exe ... (full hardware run)"
 	@echo "  clean       remove host-tb binaries"
 	@echo "  clean_hw    remove build.\$$(TARGET), _x/, v++ logs"
 	@echo "  distclean   clean + clean_hw + remove host.exe"
@@ -109,6 +125,13 @@ help:
 	@echo "  TARGET=$(TARGET)        (sw_emu | hw_emu | hw)"
 	@echo "  FREQ=$(FREQ) MHz"
 	@echo "  JOBS=$(JOBS)"
+	@echo ""
+	@echo "run_hw knobs (override on cmdline, e.g. make run_hw FIXTURE=fixtures_smoke/piqa.gdnreq):"
+	@echo "  WEIGHTS=$(WEIGHTS)"
+	@echo "  FIXTURE=$(FIXTURE)"
+	@echo "  HW_OUT=$(HW_OUT)"
+	@echo "  HW_DEVICE=$(HW_DEVICE)"
+	@echo "  HW_MAX_EX=$(if $(HW_MAX_EX),$(HW_MAX_EX),(all))"
 
 
 # ----------------------------------------------------------------------------
@@ -164,6 +187,25 @@ host: $(HOST_BIN)
 $(HOST_BIN): $(HOST_SRC) gdn_model.h
 	$(CXX) -O2 -std=c++17 -Wall -Wno-unknown-pragmas \
 	    $(HOST_INC) -o $@ $(HOST_SRC) $(HOST_LIB)
+
+
+# ----------------------------------------------------------------------------
+# End-to-end hardware run
+# ----------------------------------------------------------------------------
+# Builds the .xo (if missing), links the .xclbin (if missing), builds the
+# host program (if missing), then invokes host.exe to score $(FIXTURE) on the
+# Alveo card. Reuses cached build artefacts when the prerequisite files have
+# not changed, so a re-run after only editing $(FIXTURE) skips straight to
+# the on-card invocation.
+run_hw: $(XCLBIN) $(HOST_BIN)
+	@echo "=== Running on hardware ==="
+	@echo "  xclbin : $(XCLBIN)"
+	@echo "  weights: $(WEIGHTS)"
+	@echo "  fixture: $(FIXTURE)"
+	@echo "  output : $(HW_OUT)"
+	@echo "  device : $(HW_DEVICE)"
+	@echo "  max_ex : $(if $(HW_MAX_EX),$(HW_MAX_EX),(all))"
+	./$(HOST_BIN) $(XCLBIN) $(WEIGHTS) $(FIXTURE) $(HW_OUT) $(HW_DEVICE) $(HW_MAX_EX)
 
 
 # ----------------------------------------------------------------------------
