@@ -144,6 +144,24 @@ The single-layer csynth report is written to
 `c_impl/GDN_single_attn/solution2/syn/report/csynth.rpt`. Both TCL scripts
 target `xcu55c-fsvh2892-2L-e` at 10 ns clock period.
 
+### Hardware build & on-card test (Vitis v++)
+```bash
+cd c_impl
+make xo TARGET=hw                       # gdn_model.cpp → build.hw/gdn_forward.xo
+make xclbin TARGET=hw                   # link + place + route → build.hw/gdn_forward.xclbin
+make host                               # XRT host program
+./host.exe build.hw/gdn_forward.xclbin \
+           artifacts/gdn-1.3b-f32.gdnw \
+           fixtures_smoke/wikitext.gdnreq hw_wikitext.json
+```
+
+The link wires in `c_impl/pblock_pe_split.tcl` as a pre-place script so the
+matmul `ProcessingElement` chain is split across SLR0/SLR1 and the recurrent
+attention / output norm modules land in SLR2/SLR1 respectively — this is what
+gets the design through route_design at 100 MHz on U55C. See
+[`c_impl/README.md`](c_impl/README.md) for the full hardware build flow,
+knobs, and the latest on-card parity numbers.
+
 ### Generate weights and fixtures
 ```bash
 # Flat float32 weight blob (~5.6 GB)
