@@ -1,6 +1,6 @@
 # Output Norm + Gate (`gdn_output_norm_and_gate`)
 
-**Location:** `gdn_model.c:915`
+**Location:** `gdn_model.cpp:1349`
 
 ## Overview
 

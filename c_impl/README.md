@@ -80,6 +80,125 @@ This rebuilds `gdn_eval`, runs every `fixtures_smoke/*.gdnreq` through it, and
 diffs against `results_smoke_python/`. Exit code 0 means all task scores agree
 within tolerance.
 
+### Hardware build (v++ → `.xclbin`) and on-card test
+
+The Makefile drives the full Vitis hardware flow on Alveo U55C. The
+one-shot path is:
+
+```bash
+cd c_impl
+make run_hw                       # xo → xclbin → host → ./host.exe on the U55C
+```
+
+`run_hw` is dependency-driven, so it only redoes the phases whose inputs
+have changed. The expected wall-times for a cold build are:
+
+| Phase | Output | Time | Triggered by |
+|-------|--------|------|--------------|
+| `make xo` | `build.hw/gdn_forward.xo` | ~30–60 min | edits to `gdn_model.cpp` / `gdn_model.h` |
+| `make xclbin` | `build.hw/gdn_forward.xclbin` | ~4–6 hr | edits to the `.xo`, `hw.cfg`, or `pblock_pe_split.tcl` |
+| `make host` | `host.exe` | seconds | edits to `host.cpp` or `gdn_model.h` |
+| `make run_hw` | on-card execution + `$(HW_OUT)` JSON | minutes | run-time only |
+
+You can also invoke the individual phases (e.g. just `make xclbin
+TARGET=hw_emu` for hardware emulation).
+
+Build knobs (override on the command line):
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `PLATFORM` | `xilinx_u55c_gen3x16_xdma_3_202210_1` | Vitis platform identifier |
+| `TARGET` | `hw` | `sw_emu` \| `hw_emu` \| `hw` |
+| `FREQ` | `100` | Kernel clock in MHz. **Must match the HLS source's 10 ns target — overrides the platform default of 300 MHz, otherwise route fails with WNS ≈ −8.7 ns.** |
+| `JOBS` | `8` | Parallel jobs for HLS / synth / impl |
+| `XILINX_XRT` | `/opt/xilinx/xrt` | XRT install root for the host build |
+| `XILINX_VITIS` | `/tools/Xilinx/Vitis/2022.1` | Vitis install root |
+
+`run_hw` knobs:
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `WEIGHTS` | `artifacts/gdn-1.3b-f32.gdnw` | Flat `.gdnw` weight blob |
+| `FIXTURE` | `fixtures_smoke/wikitext.gdnreq` | Pretokenised input fixture |
+| `HW_OUT` | `hw_$(basename FIXTURE).json` | JSON output (auto-derived from `FIXTURE`) |
+| `HW_DEVICE` | `0` | XRT device index (multi-card hosts) |
+| `HW_MAX_EX` | *(empty = all)* | Cap on number of examples |
+
+```bash
+make run_hw FIXTURE=fixtures_smoke/piqa.gdnreq        # → hw_piqa.json
+make run_hw HW_MAX_EX=4                                # quick smoke
+make run_hw HW_DEVICE=2                                # pick a specific card
+```
+
+The link step is driven by two files in this directory:
+
+- **`hw.cfg`** — v++ link configuration. Defines the kernel instance
+  (`nk=gdn_forward:1:gdn_forward_1`), maps the 5.6 GB `weight_data` port to
+  HBM channels 1–31 (the activation / state buffers stay on HBM[0]), wires a
+  pre-place TCL into `opt_design`, and sets congestion-oriented Vivado
+  strategies (`SSI_SpreadLogic_high` placer, `AlternateCLBRouting` router,
+  `AggressiveExplore` phys_opt).
+- **`pblock_pe_split.tcl`** — pre-place floorplan. The default placement
+  collapsed the matmul into one SLR and the router quit at congestion level 7
+  (see [`congestion_reports/`](.) for the first build's failure analysis).
+  This TCL pblocks the 16 systolic `ProcessingElement` cells across SLR0
+  (PEs 0–7) and SLR1 (PEs 8–15), and additionally pins `gdn_recurrent_attention`
+  to SLR2 and `gdn_output_norm_and_gate` to SLR1. With this split the
+  fully-routed design closes timing at 100 MHz with **WNS = +0.003 ns**.
+
+Once the bitstream and host program are present, the canonical on-card
+invocation is `make run_hw` (defaults to the wikitext smoke fixture). The
+underlying command is:
+
+```bash
+./host.exe build.hw/gdn_forward.xclbin \
+           artifacts/gdn-1.3b-f32.gdnw \
+           fixtures_smoke/wikitext.gdnreq \
+           hw_wikitext.json
+```
+
+so you can also invoke `host.exe` directly if you need flags outside what
+the Make wrapper exposes (the binary's `--help` lists everything).
+
+The host program:
+1. Allocates one `xrt::bo` per kernel argument (weights, activations,
+   intermediate state).
+2. **Uploads the 5.6 GB weight blob** to HBM in 16 MiB chunks. The xocl
+   xdma driver in XRT 2022.1 caps any single `sync()` transfer at ~16 MiB —
+   larger calls fail with `EINVAL`/`EIO`. A `sync_bo_chunked()` helper in
+   `host.cpp` wraps every potentially-large sync.
+3. Streams pretokenised contexts through `gdn_forward` window-by-window,
+   collecting log-probabilities. The output JSON has the same schema as
+   `gdn_eval`'s, so [`scripts/check_gdn_c_parity.py`](../scripts/check_gdn_c_parity.py)
+   diffs it against the Python golden directly.
+
+The host links against XRT with `-Wl,-rpath,$(XILINX_XRT)/lib` baked in,
+so it runs without sourcing `setup.sh`. (You still need `source
+/opt/xilinx/xrt/setup.sh` to use `xbutil`, `xclbinutil`, etc.)
+
+**Latest hardware result** (Wikitext smoke, 2048-token rolling window):
+
+| | Hardware | Python golden | Δ |
+|---|---:|---:|---:|
+| `word_perplexity` | 15.813882207 | 15.813882396 | 1.9 × 10⁻⁷ |
+| `byte_perplexity` | 1.703176921 | 1.703176925 | 4 × 10⁻⁹ |
+| `bits_per_byte` | 0.768228306 | 0.768228309 | 3 × 10⁻⁹ |
+| `logprob` (example 0) | −3017.650775 | −3017.650788 | 1.3 × 10⁻⁵ |
+
+Bit-equivalent to the Python golden modulo FP32 noise. The first
+multi-minute hardware kernel run was ~33.7 min wall, ≈ 1.56× the
+129.7 G-cycle synth estimate at 100 MHz — consistent with the known
+`ReadB` II = 16 in the synthesis report (see
+[`doc/systolic_matmul.md`](doc/systolic_matmul.md), known limitations).
+
+### Cleaning hardware build artefacts
+
+```bash
+make clean       # removes the C++ testbench binaries
+make clean_hw    # removes build.$(TARGET)/, _x/, v++ logs
+make distclean   # clean + clean_hw + host.exe
+```
+
 ## Generating fixtures and weights
 
 Run from the repo root with the project's Python environment.

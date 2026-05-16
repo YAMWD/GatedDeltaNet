@@ -1,1 +1,46 @@
 c_impl/artifacts/*.gdnw
+
+# Vitis HLS / v++ work directories and reports
+c_impl/_x/
+c_impl/_x.failed.*/
+c_impl/_x.routed_error.*/
+c_impl/build.host/
+c_impl/build.hw/
+c_impl/build.hw.failed.*/
+c_impl/GDN/
+c_impl/GDN_matmul/
+c_impl/GDN_matmul.broken.*/
+c_impl/GDN_single_attn/
+c_impl/GDN_single_attn_synth/
+c_impl/GDN_single_attn_synth.broken.*/
+c_impl/GDN_synth/
+c_impl/.ipcache/
+c_impl/.Xil/
+c_impl/.run/
+
+# v++/Vivado/HLS logs and metadata
+c_impl/v++_*.log
+c_impl/v++_*.jou
+c_impl/vivado*.log
+c_impl/vivado*.jou
+c_impl/run_hw.log
+c_impl/hls_qor.tcl
+c_impl/congestion_diag.tcl
+c_impl/congestion_reports/
+
+# Host testbench / hardware binaries and intermediates
+c_impl/gdn_eval
+c_impl/gdn_eval.o
+c_impl/gdn_attn_test
+c_impl/gdn_attn_test.o
+c_impl/gdn_matmul_test
+c_impl/gdn_matmul_test.o
+c_impl/gdn_model.o
+c_impl/gdn_model_main.o
+c_impl/gdn_matmul_systolic.o
+c_impl/host.exe
+
+# Hardware run outputs and parity artefacts produced by gdn_eval / host.exe
+c_impl/hw_*.json
+c_impl/results_smoke_c/
+c_impl/results_smoke_parity.json

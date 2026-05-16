@@ -144,6 +144,31 @@ The single-layer csynth report is written to
 `c_impl/GDN_single_attn/solution2/syn/report/csynth.rpt`. Both TCL scripts
 target `xcu55c-fsvh2892-2L-e` at 10 ns clock period.
 
+### Hardware build & on-card test (Vitis v++)
+```bash
+cd c_impl
+make run_hw                             # xo → xclbin → host → ./host.exe on the U55C
+```
+
+`make run_hw` is dependency-driven: it builds the kernel (`gdn_forward.xo`),
+links the bitstream (`gdn_forward.xclbin`), and the XRT host (`host.exe`)
+only if they are missing or stale, then invokes the on-card test. Override
+the fixture or output via Make variables:
+
+```bash
+make run_hw FIXTURE=fixtures_smoke/piqa.gdnreq          # HW_OUT auto-derives to hw_piqa.json
+make run_hw HW_MAX_EX=4                                  # cap example count
+make run_hw HW_DEVICE=2                                  # XRT device index
+```
+
+The link wires in `c_impl/pblock_pe_split.tcl` as a pre-place script so the
+matmul `ProcessingElement` chain is split across SLR0/SLR1 and the recurrent
+attention / output norm modules land in SLR2/SLR1 respectively — this is what
+gets the design through route_design at 100 MHz on U55C. The individual
+targets (`make xo`, `make xclbin`, `make host`) are still available if you
+want to stop at any phase. See [`c_impl/README.md`](c_impl/README.md) for the
+full hardware build flow, knobs, and the latest on-card parity numbers.
+
 ### Generate weights and fixtures
 ```bash
 # Flat float32 weight blob (~5.6 GB)
