@@ -461,28 +461,26 @@ static void gdn_rmsnorm_rows(
  * (in_dim=2048) and mlp_gate/up (in_dim=2048) reuse the same kernel; only
  * the K-loop runtime changes.
  *
- * The dispatch gdn_matmul() below tries gdn_matmul_systolic first and
- * falls back to gdn_matmul_tiled() for shapes that don't fit (a/b_proj
- * have out_dim=8). The standalone matmul-only HLS top in
- * gdn_matmul_systolic.cpp keeps an authoritative copy of these helpers
- * for test_matmul.tcl; this in-file version exists so gdn_model.cpp is
- * self-contained and gdn_eval/gdn_attn_test don't need to link the
- * standalone source file. No malloc/free anywhere — same code path runs
- * under csim and csynth.
+ * Call sites in `gdn_forward` / `gdn_attn_forward` use `gdn_matmul_systolic`
+ * directly for systolic-eligible shapes (`out_dim % M_PER_PE == 0 && in_dim
+ * % 16 == 0 && in_dim <= IN_DIM_MAX`) and fall back to `gdn_matmul_tiled`
+ * for shapes that don't fit (a/b_proj at `out_dim=8`). The matmul-only HLS
+ * top `gdn_matmul_top` further down in this file wraps the same systolic
+ * kernel with its own AXI bundle layout so `test_matmul.tcl` and
+ * `gdn_matmul_test.cpp` can exercise it in isolation. No malloc/free
+ * anywhere — same code path runs under csim and csynth.
  * ======================================================================= */
 
 #define N_PES 16
 #define M_PER_PE 16
 #define IN_DIM_MAX 5632
-/* NUM_CHAINS=1 inside the integrated gdn_forward / gdn_attn_forward path
- * so the dataflow region has exactly one reader on the input bundle, one
- * reader on the weights bundle, and one writer on the output bundle —
- * required by HLS dataflow's single-reader/single-writer rule when the
- * call sites in gdn_attn_forward bind in/weights/out to single physical
- * AXI masters. The standalone matmul-only HLS top in
- * gdn_matmul_systolic.cpp keeps NUM_CHAINS=2 because it has 5 separate
- * m_axi ports (mem_in / mem_wt_lo / mem_wt_hi / mem_out_lo / mem_out_hi)
- * and can run two chains in parallel. */
+/* NUM_CHAINS=1 because the dataflow region must have exactly one reader on
+ * the input bundle, one reader on the weights bundle, and one writer on the
+ * output bundle — HLS dataflow's single-reader/single-writer rule when each
+ * argument binds to a single physical AXI master. Adding a second chain
+ * would require either splitting the m_axi bundles per chain (more top-level
+ * AXI ports, more SLLs to bridge the chains' I/O) or a fork task that fans
+ * out the weight stream — both items remain on the optimisation backlog. */
 #define NUM_CHAINS 1
 
 struct Pack16 {
@@ -1845,8 +1843,34 @@ int gdn_attn_forward_layer(
     );
 }
 
-/* gdn_matmul_top — definition lives in gdn_matmul_systolic.cpp (the wide-AXI
- * Pack16 systolic version, used as the standalone matmul-only HLS top by
- * test_matmul.tcl and gdn_matmul_test.cpp). The header keeps the prototype
- * for those callers; gdn_model.cpp uses the inlined systolic helpers above
- * via gdn_matmul → gdn_matmul_systolic instead. */
+/* gdn_matmul_top — synthesisable HLS top exposing the systolic matmul as a
+ * standalone kernel. Used by `test_matmul.tcl` for matmul-only csim/csynth
+ * and by `gdn_matmul_test.cpp` for native-C parity against the
+ * `naive_matmul` reference. It is a thin wrapper around the in-file
+ * `gdn_matmul_systolic()` so the matmul kernel has exactly one definition
+ * across the integrated `gdn_forward` path and the standalone test path.
+ *
+ * Each pointer gets its own AXI master bundle (`mem_in`, `mem_weights`,
+ * `mem_out`) so ReadA/ReadB/WriteC_chain inside the dataflow region each
+ * have a dedicated AXI port and don't serialise through a shared adapter.
+ * Depths are sized for the default 2048 x 2048 x 2048 csim shape with
+ * comfortable headroom for larger experiments (8 M FP32 elements ≈ 32 MB
+ * per port). */
+int gdn_matmul_top(
+    float *out,
+    const float *in,
+    const float *weights,
+    uint32_t num_rows,
+    uint32_t in_dim,
+    uint32_t out_dim
+) {
+    #pragma HLS interface m_axi port=out      depth=8388608 offset=slave bundle=mem_out
+    #pragma HLS interface m_axi port=in       depth=8388608 offset=slave bundle=mem_in
+    #pragma HLS interface m_axi port=weights  depth=8388608 offset=slave bundle=mem_weights
+    #pragma HLS interface s_axilite port=num_rows
+    #pragma HLS interface s_axilite port=in_dim
+    #pragma HLS interface s_axilite port=out_dim
+    #pragma HLS interface s_axilite port=return
+
+    return gdn_matmul_systolic(out, in, weights, num_rows, in_dim, out_dim);
+}

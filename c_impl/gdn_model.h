@@ -131,13 +131,16 @@ int gdn_attn_forward_layer(
     uint32_t num_tokens
 );
 
-/* HLS top wrapper for the tiled matmul: out = in * weights^T.
+/* HLS top for the systolic matmul: out = in * weights^T.
  *   in       is num_rows x in_dim   (row-major)
  *   weights  is out_dim x in_dim    (row-major)
  *   out      is num_rows x out_dim  (row-major)
- * Each pointer is mapped to its own AXI master bundle so load_in / load_wt /
- * store_out can be parallelised in any future dataflow refactor.
- * Returns 0 on success. */
+ * Each pointer maps to its own AXI master bundle (mem_in, mem_weights,
+ * mem_out) so ReadA / ReadB / WriteC_chain in the dataflow region each
+ * have a dedicated AXI port. Used by test_matmul.tcl (csim + csynth) and
+ * gdn_matmul_test.cpp (host parity); wraps the same in-file
+ * gdn_matmul_systolic kernel that gdn_forward and gdn_attn_forward call
+ * directly. Returns 0 on success. */
 int gdn_matmul_top(
     float *out,
     const float *in,

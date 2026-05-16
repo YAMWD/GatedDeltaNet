@@ -24,18 +24,19 @@ State matrix per layer: 8 heads x 256 x 256 FP32 = 2 MB.
 
 | File                    | Role |
 |-------------------------|------|
-| `gdn_model.h`          | Public API: structs (`GDNWeightHeader`, `GDNLayerWeights`, `GDNModel`, `GDNRunState`), function prototypes for full-model and single-layer forward |
-| `gdn_model.cpp`        | Main synthesizable implementation + HLS top functions (`gdn_forward`, `gdn_attn_forward`) |
-| `gdn_matmul_systolic.cpp` | Standalone two-chain systolic matmul top for matmul-only synthesis and parity testing |
+| `gdn_model.h`          | Public API: structs (`GDNWeightHeader`, `GDNLayerWeights`, `GDNModel`, `GDNRunState`), function prototypes for full-model, single-layer, and matmul-only tops |
+| `gdn_model.cpp`        | Main synthesizable implementation + HLS top functions (`gdn_forward`, `gdn_attn_forward`, `gdn_matmul_top`). Contains the systolic matmul kernel as in-file static helpers reused by all three tops. |
 | `gdn_eval.cpp`        | Host testbench: loads `.gdnw` weights, reads `.gdnreq` fixtures, runs `gdn_forward`, writes JSON output |
 | `gdn_attn_test.cpp`   | Host testbench for single-layer attention: loads `.gdnw` + `.gdnblk`, runs `gdn_attn_forward`, checks parity |
-| `gdn_matmul_test.cpp` | Host testbench for standalone systolic matmul against a native-C golden matmul |
+| `gdn_matmul_test.cpp` | Host testbench for the systolic matmul (`gdn_matmul_top`) against a native-C golden matmul |
+| `host.cpp`            | XRT host program for on-card execution against `gdn_forward.xclbin` |
 | `test.tcl`             | Vitis HLS TCL script for full-model (csim/csynth/cosim), targets Alveo U55C |
 | `test_single_GDN_attn_synth.tcl` | Current TCL script for single-layer attention systolic synthesis, targets Alveo U55C |
 | `test_single_GDN_attn.tcl` | Older v7 single-layer attention script, retained for the pre-systolic tiled-matmul baseline |
-| `test_matmul.tcl`      | Standalone systolic matmul script; default test is 2048 x 2048 x 2048 |
+| `test_matmul.tcl`      | Matmul-only csim/csynth script (top = `gdn_matmul_top`); default test is 2048 x 2048 x 2048 |
 | `test_parity.sh`       | Automated end-to-end parity test against Python golden results |
-| `Makefile`             | Native C build (GCC, no BLAS) |
+| `hw.cfg`, `pblock_pe_split.tcl` | v++ link configuration and pre-place floorplan TCL (SLR split for the U55C bitstream) |
+| `Makefile`             | Builds host testbenches, v++ kernel (`xo`/`xclbin`), and the XRT host; `make run_hw` is the end-to-end on-card path |
 
 ### Weight and Fixture Formats
 
@@ -100,10 +101,9 @@ output.
 
 ### 4.3 `gdn_matmul_systolic` (Current Large-GEMM Engine)
 
-**Location:** `gdn_model.cpp:835`
+**Location:** `gdn_model.cpp` (in-file static helper)
 
-Current GEMM engine for large projections. It is a one-chain 1-D systolic
-array in the integrated model:
+Current GEMM engine for large projections. One-chain 1-D systolic array:
 
 ```
 16 PEs x 16 output columns/PE = 256 FP32 MAC/cycle peak
@@ -113,7 +113,9 @@ The kernel uses `hls::stream` and a `#pragma HLS dataflow` region around
 `ReadA`, `ReadB`, a 16-PE chain, `SinkAB`, and `WriteC_chain`. It supports
 runtime `num_rows`, pads rows on chip to a multiple of 16, and supports
 `in_dim <= 5632` so the MLP down projection fits without host-side K tiling.
-See [systolic_matmul.md](systolic_matmul.md).
+Called directly from `gdn_forward` / `gdn_attn_forward` and also exposed as
+the standalone HLS top `gdn_matmul_top` (for `test_matmul.tcl` and
+`gdn_matmul_test`). See [systolic_matmul.md](systolic_matmul.md).
 
 ### 4.4 `gdn_matmul_tiled` (Fallback)
 

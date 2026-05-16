@@ -23,6 +23,9 @@ c_impl/v++_*.log
 c_impl/v++_*.jou
 c_impl/vivado*.log
 c_impl/vivado*.jou
+c_impl/vitis_hls.log
+c_impl/xcd.log
+c_impl/xrc.log
 c_impl/run_hw.log
 c_impl/hls_qor.tcl
 c_impl/congestion_diag.tcl

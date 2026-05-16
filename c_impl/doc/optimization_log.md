@@ -18,7 +18,7 @@ Current docs:
 - [architecture.md](architecture.md) -- current top-level architecture and
   synthesis snapshot.
 - [systolic_matmul.md](systolic_matmul.md) -- current systolic-array matmul
-  design, integrated vs standalone differences, and resource interpretation.
+  design and resource breakdown.
 - [tiled_matmul.md](tiled_matmul.md) -- legacy/fallback tiled GEMM and the
   pre-systolic baseline.
 

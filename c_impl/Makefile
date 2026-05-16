@@ -24,8 +24,8 @@ CXX            ?= c++
 # host gcc does not understand.
 CXXFLAGS       ?= -O3 -std=c++14 -Wall -Wextra -pedantic -Wno-unknown-pragmas
 
-# Vitis HLS install location — provides hls_stream.h used by gdn_model.cpp
-# (inlined systolic kernel) and the standalone gdn_matmul_systolic.cpp.
+# Vitis HLS install location — provides hls_stream.h used by the systolic
+# matmul kernel in gdn_model.cpp.
 XILINX_HLS_INC ?= /tools/Xilinx/Vitis_HLS/2022.1/include
 
 
@@ -145,12 +145,13 @@ gdn_eval: gdn_eval.cpp gdn_model.cpp gdn_model.h
 gdn_attn_test: gdn_attn_test.cpp gdn_model.cpp gdn_model.h
 	$(CXX) $(CXXFLAGS) -I$(XILINX_HLS_INC) -o $@ gdn_attn_test.cpp gdn_model.cpp -lm
 
-# gdn_matmul_test exercises the standalone wide-AXI systolic top
-# (gdn_matmul_top in gdn_matmul_systolic.cpp) — linked as a separate TU.
-# Static helpers in gdn_model.cpp don't collide because they're file-local.
-gdn_matmul_test: gdn_matmul_test.cpp gdn_matmul_systolic.cpp gdn_model.cpp gdn_model.h
+# gdn_matmul_test exercises the systolic matmul through the gdn_matmul_top
+# HLS entry in gdn_model.cpp, comparing against the native-C naive_matmul
+# reference in gdn_matmul_test.cpp. Same translation unit as the rest of
+# the model — no separate matmul source file.
+gdn_matmul_test: gdn_matmul_test.cpp gdn_model.cpp gdn_model.h
 	$(CXX) $(CXXFLAGS) -I$(XILINX_HLS_INC) -o $@ \
-	    gdn_matmul_test.cpp gdn_matmul_systolic.cpp gdn_model.cpp -lm
+	    gdn_matmul_test.cpp gdn_model.cpp -lm
 
 
 # ----------------------------------------------------------------------------

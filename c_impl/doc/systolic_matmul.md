@@ -9,12 +9,12 @@ small output dimensions.
 
 | File | Role |
 |------|------|
-| `gdn_model.cpp:439` | Integrated copy used by `gdn_forward` and `gdn_attn_forward` |
-| `gdn_matmul_systolic.cpp:1` | Standalone matmul-only HLS top and test target |
-| `gdn_matmul_test.cpp` | Native C parity testbench for the standalone top |
-| `test_matmul.tcl` | HLS script for the standalone matmul test |
+| `gdn_model.cpp` (in-file static helpers) | Synthesisable kernel: `ProcessingElement`, `ReadA`, `ReadB`, `SinkAB`, `WriteC_chain`, `run_dataflow`, `gdn_matmul_systolic` |
+| `gdn_model.cpp` (`gdn_matmul_top`) | Synthesisable HLS top that wraps `gdn_matmul_systolic` with its own `m_axi` bundle layout (`mem_in`, `mem_weights`, `mem_out`) for the matmul-only test path |
+| `gdn_matmul_test.cpp` | Native-C parity testbench: random inputs through `naive_matmul` (golden) vs `gdn_matmul_top` (kernel) |
+| `test_matmul.tcl` | Vitis HLS script: csim + csynth with `set_top gdn_matmul_top` and `add_files gdn_model.cpp` |
 
-Both implementations compute:
+The kernel computes:
 
 ```text
 out[num_rows x out_dim] = in[num_rows x in_dim] * weights[out_dim x in_dim]^T
@@ -39,103 +39,65 @@ The systolic design changes the data movement model:
 - Use packed 16-float words (`Pack16`) to align the datapath with wide AXI
   memory beats where HLS can legally widen the top-level port.
 
-## Current Dispatch Policy
+## Dispatch Policy
 
-The integrated model has two matmul paths:
+`gdn_forward` and `gdn_attn_forward` have two matmul paths:
 
 | Shape | Current path | Reason |
 |-------|--------------|--------|
 | Q/K/V/Gate/O projection, `out_dim=2048` | `gdn_matmul_systolic` | Large output dimension, divisible by 16 |
 | MLP gate/up, `out_dim=5632` | `gdn_matmul_systolic` | Large output dimension, divisible by 16 |
-| MLP down, `in_dim=5632`, `out_dim=2048` | `gdn_matmul_systolic` | `IN_DIM_MAX=5632` in integrated kernel |
+| MLP down, `in_dim=5632`, `out_dim=2048` | `gdn_matmul_systolic` | `IN_DIM_MAX=5632` covers MLP down |
 | A/B projections, `out_dim=8` | `gdn_matmul_tiled` | Too small for the 16-column systolic tile |
 
 The fallback is intentional. The A/B projection output dimension is only the
 number of heads, so forcing it through a 16-column systolic tile would waste
 most of the PE array and complicate boundary handling.
 
-## Integrated vs Standalone Kernels
-
-There are two related but not identical systolic kernels.
-
-### Integrated kernel (`gdn_model.cpp`)
+## Configuration
 
 ```c
-#define N_PES       16
-#define M_PER_PE   16
-#define IN_DIM_MAX 5632
-#define NUM_CHAINS 1
+#define N_PES       16     // PE chain length (rows per outer-N stripe)
+#define M_PER_PE    16     // output columns produced by each PE
+#define IN_DIM_MAX  5632   // largest `in_dim` the kernel handles in one call
+#define NUM_CHAINS  1      // single PE chain
 ```
 
-The integrated kernel uses one PE chain. This keeps the HLS dataflow region
-compatible with the single-reader/single-writer rule on each physical AXI
-bundle in the full model and single-attention top. `weight_data` is placed on
-`bundle=mem_weights`, while activations and outputs remain on the default
-`gmem` bundle, except `q` and `k` in `gdn_attn_forward`, which use `mem_q` and
-`mem_k` for recurrent-attention load bandwidth.
-
-### Standalone matmul kernel (`gdn_matmul_systolic.cpp`)
-
-```c
-#define N_PES       16
-#define M_PER_PE   16
-#define IN_DIM_MAX 2048
-#define NUM_CHAINS 2
-```
-
-The standalone top uses two PE chains and five explicit AXI bundles:
-
-```text
-mem_in, mem_wt_lo, mem_wt_hi, mem_out_lo, mem_out_hi
-```
-
-This is a peak-throughput experiment for the dominant 2048 x 2048 x 2048
-projection shape. It is not resource-comparable to the integrated model,
-because it deliberately instantiates more parallel hardware and exposes a
-different top-level memory interface.
+`NUM_CHAINS=1` keeps the dataflow region compatible with the
+single-reader/single-writer rule on each physical AXI bundle in the
+integrated tops (`gdn_forward`, `gdn_attn_forward`). Adding a second chain
+would require either splitting the m_axi bundles per chain or introducing a
+fork task that fans out the weight stream — see the optimisation backlog.
 
 ## Geometry
 
-### Integrated kernel
-
 | Constraint | Value |
 |------------|-------|
-| `out_dim % (NUM_CHAINS * M_PER_PE)` | must be 0, so multiple of 16 |
+| `out_dim % M_PER_PE` | must be 0 (multiple of 16) |
 | `in_dim % 16` | must be 0 |
-| `in_dim` | must be <= 5632 |
-| `num_rows` | any positive value; padded on chip to a multiple of 16 |
+| `in_dim` | must be <= `IN_DIM_MAX` (5632) |
+| `num_rows` | any positive value; padded on chip to a multiple of `N_PES` |
 
 When `num_rows` is not a multiple of 16, `ReadA` zero-fills padded rows and
 `WriteC_chain` drains but skips out-of-range writes. This keeps stream counts
 balanced without issuing out-of-bounds DRAM accesses.
 
-### Standalone kernel
+### Matmul-only test shape
 
-| Constraint | Value |
-|------------|-------|
-| `num_rows % 16` | must be 0 |
-| `out_dim % 32` | must be 0, because `NUM_CHAINS=2` |
-| `in_dim % 16` | must be 0 |
-| `in_dim` | must be <= 2048 |
-
-The default standalone test is:
-
-```text
-num_rows = 2048
-in_dim   = 2048
-out_dim  = 2048
-seed     = 42
-```
-
-This is set in `test_matmul.tcl` with:
+`test_matmul.tcl` exercises the kernel through `gdn_matmul_top` with the
+dominant projection shape:
 
 ```tcl
 csim_design -argv {2048 2048 2048 42}
 ```
 
+i.e. `num_rows = in_dim = out_dim = 2048`, RNG seed 42. The shape matches
+the Q/K/V/Gate/O projections in GDN-1.3B. Drop to `{64 64 64 42}` for fast
+iteration during bring-up.
+
 ## Dataflow Architecture
 
-The integrated one-chain dataflow region is:
+The one-chain dataflow region is:
 
 ```text
 ReadA -> a_pipes[0] -> PE0 -> PE1 -> ... -> PE15 -> SinkAB
@@ -148,9 +110,6 @@ ReadB -> b_pipes[0] -> PE0 -> PE1 -> ... -> PE15 -> SinkAB
                                   WriteC_chain
 ```
 
-The standalone two-chain version duplicates the PE chain and ReadB/WriteC
-paths. `ReadA` broadcasts the same activation column pack to both chains.
-
 ## `Pack16`
 
 ```c
@@ -160,10 +119,10 @@ struct Pack16 {
 ```
 
 `Pack16` is the internal stream word: 16 FP32 values, or 64 bytes. The
-standalone HLS top exposes `Pack16 *` ports directly, which forces 512-bit AXI
-data width. The integrated top has float-pointer public ports and casts inside
-the helper; Vitis may widen some accesses, but the top-level bundle behavior is
-controlled by the surrounding `gdn_forward` / `gdn_attn_forward` interfaces.
+public HLS top functions expose float-pointer ports and cast to `Pack16 *`
+inside the kernel; Vitis may widen some accesses through the m_axi adapter,
+but the top-level bundle layout is controlled by the surrounding
+`gdn_forward` / `gdn_attn_forward` / `gdn_matmul_top` interfaces.
 
 ## `ReadA`
 
@@ -182,8 +141,7 @@ Important pragmas:
 
 The load phase reads contiguous row-major activation packs from DRAM. The
 stream phase emits one column pack per K index, so each PE receives the value
-for its row at the same K step. In the integrated kernel, padded rows are
-filled with zero.
+for its row at the same K step. Padded rows are filled with zero.
 
 ## `ReadB`
 
@@ -208,10 +166,12 @@ The intended schedule is:
 3. Load the next tile into the other ping-pong half during the same loop.
 4. Repeat until the final tile, then drain it.
 
-In the current integrated single-attention synthesis report, `ReadB` is the
-dominant bottleneck and HLS schedules the `fused_tile_fused_io` loop at II=16.
-The standalone top is more aggressive because it has explicit `Pack16 *` ports
-and separate weight bundles for the two chains.
+In the current single-attention synthesis report, `ReadB` is the dominant
+bottleneck: HLS schedules the `fused_tile_fused_io` loop at II=16 because
+the m_axi adapter on `weight_data` defaults to 32-bit data width and reading
+one `Pack16` (16 floats) costs 16 narrow beats. Adding
+`max_widen_bitwidth=512` to the `weight_data` m_axi pragma is the canonical
+fix and remains the top item on the optimisation backlog.
 
 ## Processing Element
 
@@ -238,8 +198,8 @@ output column and emits one `Pack16` row on its `c_stream`.
 ## `WriteC_chain`
 
 `WriteC_chain` drains the per-PE output streams in row order and stores the
-16-column output packs. In the integrated kernel it also skips writes for
-padded rows while still draining all stream entries.
+16-column output packs. It skips writes for padded rows while still draining
+all stream entries to keep the dataflow FIFOs balanced.
 
 ## Synthesis Results
 
@@ -260,8 +220,7 @@ Top-level speedup:
 141.027e9 / 3.9759e9 = 35.5x
 ```
 
-Within the current single-attention report, each integrated `run_dataflow`
-instance is reported as:
+Within the same report, each `run_dataflow` instance is:
 
 | Module | Latency | BRAM_18K | DSP | FF | LUT |
 |--------|--------:|---------:|----:|---:|----:|
@@ -275,44 +234,24 @@ time loop, so resources are for one reused datapath.
 | Module | Latency | BRAM_18K | DSP | FF | LUT | Slack |
 |--------|--------:|---------:|----:|---:|----:|------:|
 | `gdn_forward` | 129.686 G cycles | 1058 (26%) | 2847 (31%) | 508.4 K (19%) | 580.3 K (44%) | -0.04 ns |
-| integrated `gdn_matmul_systolic` | 255.42 M cycles | 768 (19%) | 1862 (20%) | 316.3 K (12%) | 334.7 K (25%) | 0.00 ns |
+| `gdn_matmul_systolic` instance | 255.42 M cycles | 768 (19%) | 1862 (20%) | 316.3 K (12%) | 334.7 K (25%) | 0.00 ns |
 
-### Standalone matmul-only top
-
-The standalone test uses `2048 x 2048 x 2048`.
-
-| Module | Latency | BRAM_18K | DSP | FF | LUT | Notes |
-|--------|--------:|---------:|----:|---:|----:|-------|
-| `gdn_matmul_kernel` | 17.285 M cycles | 0 | 2659 (29%) | 976.3 K (37%) | 656.8 K (50%) | Two chains, five AXI bundles |
-
-The standalone top can use more FF/LUT/DSP than the full-model integrated
-matmul because it is a different kernel: two PE chains, `IN_DIM_MAX=2048`,
-explicit packed AXI ports, and no need to share the top-level interface with
-the rest of GatedDeltaNet.
-
-## Interpreting the Numbers
-
-Do not compare standalone and integrated resource rows as if they were the
-same hardware. Use:
-
-- Standalone matmul report for a peak-throughput `2048^3` GEMM experiment.
-- Single-attention report for the current attention block resource/latency
-  impact.
-- Full-model report for the reused 24-layer accelerator datapath.
-
-Also note that Vitis HLS latency estimates for the integrated design use
-`loop_tripcount` bounds on runtime dimensions. A module row may therefore
-reflect the maximum supported bound, not only the exact `2048 x 2048 x 2048`
-projection shape.
+Vitis HLS latency estimates use `loop_tripcount` bounds on runtime
+dimensions, so a module row may reflect the maximum supported bound rather
+than only the exact `2048 x 2048 x 2048` projection shape.
 
 ## Current Limitations
 
-- Integrated `ReadB` is still the bottleneck in the current report; HLS shows
-  II=16 for the fused stream/load loop.
-- The current systolic single-attention and full-model reports have a small
-  timing miss of -0.04 ns at a 10 ns target.
-- The integrated kernel uses one PE chain because adding a second chain would
-  require additional independent top-level AXI bundles or a more invasive
-  memory-interface redesign.
+- `ReadB` is the dominant bottleneck: HLS shows II=16 on the
+  `fused_tile_fused_io` loop because the `weight_data` m_axi adapter
+  defaults to 32-bit data width. Setting `max_widen_bitwidth=512` on that
+  port should drop it toward II=1 and unlock the next ~10x of matmul
+  throughput.
+- The single-attention and full-model reports have a small timing miss of
+  -0.04 ns at the 10 ns HLS target (the actual hardware build closes
+  cleanly at +0.003 ns once placement/route gets the SLR split right).
+- The kernel uses one PE chain because adding a second chain would require
+  additional independent top-level AXI bundles or a fork task that fans
+  out the weight stream.
 - A/B projections still use the tiled fallback because `out_dim=8`.
 
