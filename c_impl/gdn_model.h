@@ -98,7 +98,8 @@ int gdn_forward(
     float *recurrent_state,
     float *head_buffer,
     const int32_t *tokens,
-    uint32_t num_tokens
+    uint32_t num_tokens,
+    const float *weight_data_mm   /* alias of weight_data on a dedicated 512-bit AXI bundle */
 );
 int gdn_forward_host(const GDNModel *model, GDNRunState *state, const int32_t *tokens, uint32_t num_tokens);
 void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logits_out);

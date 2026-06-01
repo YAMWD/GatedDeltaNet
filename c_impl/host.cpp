@@ -334,6 +334,11 @@ public:
           recurrent_state_bo_(device, recurrent_state_bytes(model), kernel_.group_id(15)),
           head_buffer_bo_(device, head_buffer_bytes(model), kernel_.group_id(16)),
           tokens_bo_(device, static_cast<size_t>(max_tokens_) * sizeof(int32_t), kernel_.group_id(17)),
+          // weight_data_mm is the last kernel arg (index 19): the matmul's
+          // dedicated 512-bit weight bundle. Separate bo holding the same
+          // weights, so it binds correctly regardless of which HBM bank v++
+          // assigns the bundle to.
+          weight_bo_mm_(device, model.weight_data.size() * sizeof(float), kernel_.group_id(19)),
           x_norm_host_(static_cast<size_t>(max_tokens_) * hidden_, 0.0f) {
         std::cerr << "[progress] upload config and weights to device\n";
         config_bo_.write(&model.config, sizeof(GDNWeightHeader), 0);
@@ -341,6 +346,9 @@ public:
         const size_t weight_bytes = model.weight_data.size() * sizeof(float);
         weight_bo_.write(model.weight_data.data(), weight_bytes, 0);
         sync_bo_chunked(weight_bo_, XCL_BO_SYNC_BO_TO_DEVICE, weight_bytes, 0);
+        // Same weights into the matmul's dedicated bundle.
+        weight_bo_mm_.write(model.weight_data.data(), weight_bytes, 0);
+        sync_bo_chunked(weight_bo_mm_, XCL_BO_SYNC_BO_TO_DEVICE, weight_bytes, 0);
     }
 
     // On this xocl/xdma driver (XRT 2022.1, U55C) the per-call sync transfer
@@ -389,7 +397,8 @@ public:
             recurrent_state_bo_,
             head_buffer_bo_,
             tokens_bo_,
-            static_cast<uint32_t>(tokens.size())
+            static_cast<uint32_t>(tokens.size()),
+            weight_bo_mm_
         );
         auto start = std::chrono::high_resolution_clock::now();
         run.wait();
@@ -469,6 +478,7 @@ private:
     xrt::bo recurrent_state_bo_;
     xrt::bo head_buffer_bo_;
     xrt::bo tokens_bo_;
+    xrt::bo weight_bo_mm_;
     std::vector<float> x_norm_host_;
     double total_kernel_seconds_ = 0.0;
     uint64_t kernel_runs_ = 0;

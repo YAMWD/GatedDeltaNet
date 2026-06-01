@@ -1507,7 +1507,7 @@ static void gdn_swiglu_inplace(float *gate, const float *up, size_t count) {
 /* Forward decl: gdn_forward calls the weight-traffic-optimized matmul, which
  * is defined further below (it needs the MM2D_* / IN_DIM_MAX constants). */
 static void gdn_matmul_2d(
-    float *out, const float *in, const float *weights,
+    float *out, const float *in, const float *weights, uint32_t w_pack_off,
     uint32_t num_rows, uint32_t in_dim, uint32_t out_dim);
 
 int gdn_forward(
@@ -1529,7 +1529,8 @@ int gdn_forward(
     float *recurrent_state,
     float *head_buffer,
     const int32_t *tokens,
-    uint32_t num_tokens
+    uint32_t num_tokens,
+    const float *weight_data_mm
 ) {
     /* Depths match gdn-1.3b-f32.gdnw: hidden=2048 heads=8 head_dim=256
     intermediate=5632 layers=24 conv=4 max_seq_len=2048 vocab=32000 */
@@ -1544,6 +1545,14 @@ int gdn_forward(
      * weight side and similarly drops the per-element II of swiglu / the
      * residual adds / matmul output stores from ~150 to ~10. */
     #pragma HLS interface m_axi port=weight_data depth=1466343808 offset=slave bundle=mem_weights max_widen_bitwidth=512 max_read_burst_length=64
+    /* weight_data_mm aliases the same HBM weight blob but on a DEDICATED bundle
+     * read only by the matmul (gdn_matmul_2d, all Pack16). Splitting it off the
+     * scalar weight readers (rmsnorm/conv/onorm/embed, which share mem_weights)
+     * lets HLS widen the matmul weight reads to 512-bit instead of 32-bit — the
+     * scalar co-readers were demoting the shared bundle, capping the weight
+     * port at ~388 MB/s (32-bit) on hardware. The host binds the same weight
+     * buffer to both ports (read-only alias); hw.cfg maps both to HBM[1:31]. */
+    #pragma HLS interface m_axi port=weight_data_mm depth=1466343808 offset=slave bundle=mem_weights_mm max_widen_bitwidth=512 max_read_burst_length=64
     #pragma HLS interface m_axi port=x depth=4194304 offset=slave max_widen_bitwidth=512
     #pragma HLS interface m_axi port=x_norm depth=4194304 offset=slave max_widen_bitwidth=512
     #pragma HLS interface m_axi port=q depth=4194304 offset=slave max_widen_bitwidth=512
@@ -1609,11 +1618,11 @@ int gdn_forward(
         layer_offset += num_heads;
         layer_dt_bias = weight_data + layer_offset;
         layer_offset += num_heads;
-        layer_q_proj = weight_data + layer_offset;
+        layer_q_proj = weight_data_mm + layer_offset;
         layer_offset += (size_t)hidden * hidden;
-        layer_k_proj = weight_data + layer_offset;
+        layer_k_proj = weight_data_mm + layer_offset;
         layer_offset += (size_t)hidden * hidden;
-        layer_v_proj = weight_data + layer_offset;
+        layer_v_proj = weight_data_mm + layer_offset;
         layer_offset += (size_t)hidden * hidden;
         layer_a_proj = weight_data + layer_offset;
         layer_offset += (size_t)num_heads * hidden;
@@ -1625,27 +1634,27 @@ int gdn_forward(
         layer_offset += (size_t)hidden * config->conv_size;
         layer_v_conv = weight_data + layer_offset;
         layer_offset += (size_t)hidden * config->conv_size;
-        layer_g_proj = weight_data + layer_offset;
+        layer_g_proj = weight_data_mm + layer_offset;
         layer_offset += (size_t)hidden * hidden;
         layer_o_norm = weight_data + layer_offset;
         layer_offset += head_dim;
-        layer_o_proj = weight_data + layer_offset;
+        layer_o_proj = weight_data_mm + layer_offset;
         layer_offset += (size_t)hidden * hidden;
         layer_mlp_norm = weight_data + layer_offset;
         layer_offset += hidden;
-        layer_mlp_gate_proj = weight_data + layer_offset;
+        layer_mlp_gate_proj = weight_data_mm + layer_offset;
         layer_offset += (size_t)intermediate * hidden;
-        layer_mlp_up_proj = weight_data + layer_offset;
+        layer_mlp_up_proj = weight_data_mm + layer_offset;
         layer_offset += (size_t)intermediate * hidden;
-        layer_mlp_down_proj = weight_data + layer_offset;
+        layer_mlp_down_proj = weight_data_mm + layer_offset;
 
         gdn_rmsnorm_rows(x_norm, x, layer_attn_norm, num_tokens, hidden, config->norm_eps);
-        gdn_matmul_2d(q, x_norm, layer_q_proj, num_tokens, hidden, hidden);
-        gdn_matmul_2d(k, x_norm, layer_k_proj, num_tokens, hidden, hidden);
-        gdn_matmul_2d(v, x_norm, layer_v_proj, num_tokens, hidden, hidden);
+        gdn_matmul_2d(q, x_norm, weight_data_mm, (uint32_t)((layer_q_proj - weight_data_mm) / 16), num_tokens, hidden, hidden);
+        gdn_matmul_2d(k, x_norm, weight_data_mm, (uint32_t)((layer_k_proj - weight_data_mm) / 16), num_tokens, hidden, hidden);
+        gdn_matmul_2d(v, x_norm, weight_data_mm, (uint32_t)((layer_v_proj - weight_data_mm) / 16), num_tokens, hidden, hidden);
         gdn_matmul_tiled(a, x_norm, layer_a_proj, num_tokens, hidden, num_heads);
         gdn_matmul_tiled(b, x_norm, layer_b_proj, num_tokens, hidden, num_heads);
-        gdn_matmul_2d(gate, x_norm, layer_g_proj, num_tokens, hidden, hidden);
+        gdn_matmul_2d(gate, x_norm, weight_data_mm, (uint32_t)((layer_g_proj - weight_data_mm) / 16), num_tokens, hidden, hidden);
 
         gdn_depthwise_conv_silu(tmp_hidden, q, layer_q_conv, num_tokens, hidden, config->conv_size);
         gdn_pack16_copy(q, tmp_hidden, hidden_count);
@@ -1671,14 +1680,14 @@ int gdn_forward(
             num_tokens
         );
         gdn_output_norm_and_gate(attn, gate, layer_o_norm, num_tokens, num_heads, head_dim, config->norm_eps);
-        gdn_matmul_2d(tmp_hidden, attn, layer_o_proj, num_tokens, hidden, hidden);
+        gdn_matmul_2d(tmp_hidden, attn, weight_data_mm, (uint32_t)((layer_o_proj - weight_data_mm) / 16), num_tokens, hidden, hidden);
         gdn_pack16_add_inplace(x, tmp_hidden, hidden_count);
 
         gdn_rmsnorm_rows(x_norm, x, layer_mlp_norm, num_tokens, hidden, config->norm_eps);
-        gdn_matmul_2d(mlp_gate, x_norm, layer_mlp_gate_proj, num_tokens, hidden, intermediate);
-        gdn_matmul_2d(mlp_up, x_norm, layer_mlp_up_proj, num_tokens, hidden, intermediate);
+        gdn_matmul_2d(mlp_gate, x_norm, weight_data_mm, (uint32_t)((layer_mlp_gate_proj - weight_data_mm) / 16), num_tokens, hidden, intermediate);
+        gdn_matmul_2d(mlp_up, x_norm, weight_data_mm, (uint32_t)((layer_mlp_up_proj - weight_data_mm) / 16), num_tokens, hidden, intermediate);
         gdn_swiglu_inplace(mlp_gate, mlp_up, mlp_count);
-        gdn_matmul_2d(tmp_hidden, mlp_gate, layer_mlp_down_proj, num_tokens, intermediate, hidden);
+        gdn_matmul_2d(tmp_hidden, mlp_gate, weight_data_mm, (uint32_t)((layer_mlp_down_proj - weight_data_mm) / 16), num_tokens, intermediate, hidden);
         gdn_pack16_add_inplace(x, tmp_hidden, hidden_count);
     }
 
@@ -1706,7 +1715,8 @@ int gdn_forward_host(const GDNModel *model, GDNRunState *state, const int32_t *t
         state->recurrent_state,
         state->head_buffer,
         tokens,
-        num_tokens
+        num_tokens,
+        model->weight_data   /* weight_data_mm: same blob, dedicated 512-bit AXI bundle on HW */
     );
 }
 
@@ -1975,11 +1985,17 @@ int gdn_matmul_top(
                               * ceil(num_rows/256) instead of num_rows/16   */
 
 static void gdn_matmul_2d(
-    float *out, const float *in, const float *weights,
+    float *out, const float *in, const float *weights, uint32_t w_pack_off,
     uint32_t num_rows, uint32_t in_dim, uint32_t out_dim
 ) {
     /* One shared instance across all gdn_forward call sites (not inlined 8x). */
     #pragma HLS inline off
+    /* `weights` is the *base* of the weight m_axi port (provably 64-byte
+     * aligned); `w_pack_off` is this projection's offset in Pack16 (512-bit)
+     * units. Indexing the Pack16 base by an integer keeps every access 64-byte
+     * aligned, so HLS widens the weight reads to 512-bit + burst. Passing a
+     * pre-offset float pointer (weights + layer_offset) instead leaves the
+     * alignment unprovable and HLS demotes the reads to 32-bit (II=16). */
     /* localA: a resident A_BLOCK_ROWS-row block of activations (read once per
      * block, reused across every weight column). dim1 cyclic/16 puts the 16
      * rows of a sub-tile in distinct banks (parallel compute reads); dim2
@@ -2037,7 +2053,7 @@ static void gdn_matmul_2d(
              * n_subtiles row sub-tiles below. Each of the 16 cols is k_packs
              * contiguous Pack16 -> burst length k_packs. ---- */
             loadB_c: for (uint32_t c = 0; c < (uint32_t)MM2D_TILE; ++c) {
-                size_t b_base = (size_t)(ct + c) * k_packs;
+                size_t b_base = (size_t)w_pack_off + (size_t)(ct + c) * k_packs;
                 loadB_kp: for (uint32_t kp = 0; kp < k_packs; ++kp) {
                 #pragma HLS loop_tripcount min=128 max=352
                 #pragma HLS pipeline II=1
@@ -2131,6 +2147,6 @@ int gdn_matmul2d_top(
     if ((in_dim  % 16) != 0)                          return -4;
     if (in_dim > (uint32_t)IN_DIM_MAX)                return -5;
 
-    gdn_matmul_2d(out, in, weights, num_rows, in_dim, out_dim);
+    gdn_matmul_2d(out, in, weights, 0u, num_rows, in_dim, out_dim);
     return 0;
 }
