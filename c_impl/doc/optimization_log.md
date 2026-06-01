@@ -34,15 +34,25 @@ non-bursted transfers (1.55 % efficient), moving **507 GB at 387 MB/s ~= 22 of
 the 26 minutes**. `gdn_matmul_2d` (activation-stationary 256-row block +
 bursting) cut weight re-reads 16x. Measured on hardware, same wikitext run:
 
-| Metric | Systolic chain | `gdn_matmul_2d` | Change |
-|--------|---------------:|----------------:|-------:|
-| Weight data read | 507.8 GB | 32.9 GB | 15.4x less |
-| Application runtime | 25.9 min | **6.5 min** | **4.0x** |
-| Wikitext perplexity | 15.81 | 15.81 | match |
+| Metric | Systolic chain | Stage 1 | Stage 2 |
+|--------|---------------:|--------:|--------:|
+| Application runtime | 25.9 min | 6.5 min | **5.2 min** |
+| Kernel time | — | 4.7 min | **3.45 min** |
+| Matmul weight bandwidth | 387 MB/s | 388 MB/s | **5,405 MB/s** |
+| Weight data read | 507.8 GB | 32.9 GB | 32.8 GB |
+| Wikitext perplexity | 15.81 | 15.81 | **15.81** |
 
-Next bottleneck (confirmed): the weight port is now 32-bit-width-limited at
-388 MB/s because `loadB` shares the `mem_weights` bundle with the scalar weight
-readers. Stage 2 = dedicated 512-bit weight bundle. See
+Stage 1 = activation-stationary blocking + bursting (16x fewer weight
+re-reads). Stage 2 = 512-bit weight reads (aligned base + integer Pack16
+offset) on a dedicated `mem_weights_mm` bundle — lifted the weight port from
+388 MB/s to 5.4 GB/s (14x), so the 32.8 GB of weights now read in ~6 s (was
+~82 s). Weight traffic is no longer the bottleneck.
+
+Next bottleneck (Stage 3, confirmed on-card): the 207 s kernel now splits
+between matmul compute (~107 s, 256 MAC/cycle FP32 @ 100 MHz) and the gmem
+activation port (HBM[0] single channel: 78 GB reads + 7.5 GB of 11-byte
+writes). Levers: BF16 + grid widening + clock for compute; multi-channel HBM +
+Pack16 output writes for activations; parallelize recurrent attention. See
 [weight_stationary_matmul.md](weight_stationary_matmul.md).
 
 Current single-attention synthesis snapshot:

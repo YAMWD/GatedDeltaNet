@@ -89,21 +89,54 @@ Full-model parity also PASSED on all 10 smoke fixtures natively (max abs diff
 Integrated `gdn_forward` resources dropped (the chain freed BRAM/DSP):
 BRAM 13 %, DSP 26 %, URAM 53 % (vs the chain's BRAM 38 %, DSP 31 %, URAM 0).
 
-## Confirmed next bottleneck → Stage 2
+## Stage 1 → Stage 2: the 512-bit weight read
 
-The 15x weight-data reduction came entirely from killing the re-reads. **Weight
-bandwidth did not improve (387 → 388 MB/s)** because the weight read
-(`loadB`) was **width-demoted to 32-bit**: the matmul shares the `mem_weights`
-AXI bundle with the scalar weight readers (rmsnorm / conv / embed / onorm),
-which prevents 512-bit widening (confirmed in csynth, II=16, "bit width 32",
-and on-card: 388 MB/s ≈ a 32-bit path saturated at 100 MHz). Bursting raised
-bytes/transfer but cannot raise bandwidth when each beat is 4 bytes.
+After Stage 1, the matmul weight **bandwidth had not improved (387 → 388
+MB/s)** even though the data volume fell 15x. csynth showed the weight read
+(`loadB`) was stuck at **32-bit, II=16**. The cause was NOT the shared bundle
+(a dedicated bundle still came out 32-bit) — it was **pointer alignment**: the
+kernel received `weight_data + layer_offset`, a runtime float offset HLS cannot
+prove is 16-aligned, so it refused to widen the Pack16 reads. The activation
+read (`loadA`, a base pointer at offset 0) was already 512-bit.
 
-**Stage 2:** give the matmul weights a dedicated 512-bit AXI bundle, separate
-from the scalar weight readers. Projected: `32.9 GB / 6.4 GB/s ≈ 5 s` weight
-time (vs 85 s now) → application runtime ~1.5–2 min, at which point compute
-(256 MAC/cycle, FP32, 100 MHz) becomes the limit. Subsequent stages:
-precision (BF16) + grid widening + higher clock toward seconds.
+**Stage 2 fix (two parts):**
+
+1. **Aligned base + integer offset.** `gdn_matmul_2d` now takes the weight
+   *base* pointer plus a Pack16-unit offset `w_pack_off`, and indexes
+   `weights_p[w_pack_off + ...]`. Indexing a `Pack16*` base by an integer is
+   provably 64-byte aligned, so HLS widens `loadB` to **512-bit + burst, II=1**.
+2. **Dedicated bundle.** `weight_data_mm` is a separate AXI bundle
+   (`mem_weights_mm`) for the matmul weights, aliased to the same HBM blob (the
+   host uploads to both buffers; `hw.cfg` maps both to HBM[1:31]). Isolates the
+   matmul weight traffic from the scalar readers.
+
+### On-card results (three-point progression, same wikitext run)
+
+| Metric | Baseline | Stage 1 | Stage 2 |
+|---|---:|---:|---:|
+| Application runtime | 25.9 min | 6.5 min | **5.2 min** |
+| Kernel time | — | 4.7 min | **3.45 min** |
+| Matmul weight bandwidth | 387 MB/s | 388 MB/s | **5,405 MB/s** (14x) |
+| Matmul weight bytes/transfer | 63 B | 160 B | **2,869 B** |
+| Matmul weight efficiency | 1.55 % | 2.0 % | **28.1 %** |
+| Perplexity | 15.81 | 15.81 | **15.81** |
+
+The 32.8 GB of matmul weight reads now take ~6 s (was ~82 s). Parity preserved.
+
+## Confirmed next bottleneck → Stage 3 (compute + activation memory)
+
+With weights no longer the wall, the kernel's 207 s splits roughly between:
+
+- **Matmul compute** ~107 s — 256 MAC/cycle, FP32, 100 MHz. Now exposed.
+- **gmem activation port (HBM[0], single channel)** — 78 GB reads @ 1.48 GB/s
+  (~53 s) **plus 7.5 GB of 11-byte writes @ 183 MB/s (~41 s)**; those tiny
+  scattered writes are now the worst-efficiency traffic in the design.
+
+**Stage 3 levers:** (a) compute — BF16 + widen the PE grid past 16x16 + raise
+the clock (each ~2–5x on the 107 s); (b) activation memory — spread gmem across
+multiple HBM channels (it is pinned to HBM[0] today) and Pack16 the output/
+residual writes (kill the 11-byte transfers); (c) parallelize the recurrent
+attention. These target the path from ~3.5 min toward seconds.
 
 ## Build note
 
