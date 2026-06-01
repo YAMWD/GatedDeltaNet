@@ -469,22 +469,52 @@ static void gdn_rmsnorm_rows(
     uint32_t num_cols,
     float eps
 ) {
-    uint32_t row;
-    rmsnorm_row: for (row = 0; row < num_rows; ++row) {
+    /* Pack16-widened activation I/O: read/write 16 cols (512-bit) per beat by
+     * indexing the Pack16 *base* by an integer (row*col_packs + cp) — a
+     * pre-offset float pointer (in + row*num_cols) would leave alignment
+     * unprovable and HLS would demote the access to 32-bit. num_cols is always
+     * hidden=2048 (16 | num_cols). */
+    const Pack16 *in_p  = reinterpret_cast<const Pack16 *>(in);
+    Pack16       *out_p = reinterpret_cast<Pack16 *>(out);
+    uint32_t col_packs = num_cols / 16;
+
+    /* Buffer the per-channel norm weight once (it is otherwise re-read every
+     * row); cyclic/16 so the scale pass reads 16 lanes in parallel. */
+    float w_loc[2048];
+    #pragma HLS array_partition variable=w_loc cyclic factor=16
+    rms_load_w: for (uint32_t c = 0; c < num_cols; ++c) {
+    #pragma HLS loop_tripcount min=2048 max=2048
+    #pragma HLS pipeline II=1
+        w_loc[c] = weight[c];
+    }
+
+    rmsnorm_row: for (uint32_t row = 0; row < num_rows; ++row) {
     #pragma HLS loop_tripcount min=1 max=2048  /* num_tokens: 1..max_seq_len */
-        const float *in_row = in + (size_t)row * num_cols;
-        float *out_row = out + (size_t)row * num_cols;
+        /* sum of squares — 16 squares/beat reduced into a double accumulator
+         * (double preserves the precision of the original serial reduction). */
         double sum = 0.0;
-        uint32_t col;
-        float scale;
-        rmsnorm_sq: for (col = 0; col < num_cols; ++col) {
-        #pragma HLS loop_tripcount min=2048 max=2048  /* always called with hidden=2048 */
-            sum += (double)in_row[col] * (double)in_row[col];
+        rmsnorm_sq: for (uint32_t cp = 0; cp < col_packs; ++cp) {
+        #pragma HLS loop_tripcount min=128 max=128
+        #pragma HLS pipeline II=1
+            Pack16 v = in_p[(size_t)row * col_packs + cp];
+            float s = 0.0f;
+            sq_lane: for (int kk = 0; kk < 16; ++kk) {
+            #pragma HLS unroll
+                s += v.data[kk] * v.data[kk];
+            }
+            sum += (double)s;
         }
-        scale = 1.0f / sqrtf((float)(sum / num_cols) + eps);
-        rmsnorm_scale: for (col = 0; col < num_cols; ++col) {
-        #pragma HLS loop_tripcount min=2048 max=2048  /* always called with hidden=2048 */
-            out_row[col] = in_row[col] * scale * weight[col];
+        float scale = 1.0f / sqrtf((float)(sum / num_cols) + eps);
+        rmsnorm_scale: for (uint32_t cp = 0; cp < col_packs; ++cp) {
+        #pragma HLS loop_tripcount min=128 max=128
+        #pragma HLS pipeline II=1
+            Pack16 v = in_p[(size_t)row * col_packs + cp];
+            Pack16 o;
+            scl_lane: for (int kk = 0; kk < 16; ++kk) {
+            #pragma HLS unroll
+                o.data[kk] = v.data[kk] * scale * w_loc[cp * 16 + kk];
+            }
+            out_p[(size_t)row * col_packs + cp] = o;
         }
     }
 }
@@ -1109,10 +1139,18 @@ static void gdn_depthwise_conv_silu(
      * unrolled with raw m_axi loads. */
     float w_loc[GDN_CONV_COLS_MAX][GDN_CONV_K_MAX];
     #pragma HLS array_partition variable=w_loc dim=2 complete
+    #pragma HLS array_partition variable=w_loc dim=1 cyclic factor=16  /* 16 channels/beat */
 
     float in_window[GDN_CONV_K_MAX][GDN_CONV_COLS_MAX];
     #pragma HLS array_partition variable=in_window dim=1 complete
+    #pragma HLS array_partition variable=in_window dim=2 cyclic factor=16
 
+    /* Pack16-widened activation I/O: 16 channels (512-bit) per beat. conv is
+     * depthwise, so channels are independent and contiguous — index the Pack16
+     * base by an integer (row*col_packs + cp). num_cols=hidden=2048 (16|cols). */
+    const Pack16 *in_p  = reinterpret_cast<const Pack16 *>(in);
+    Pack16       *out_p = reinterpret_cast<Pack16 *>(out);
+    uint32_t col_packs = num_cols / 16;
     uint32_t col, row, k;
 
     /* Load all weights once: weights[col * kernel_size + k] for col=0..num_cols-1, k=0..kernel_size-1. */
@@ -1149,24 +1187,35 @@ static void gdn_depthwise_conv_silu(
     conv_row: for (row = 0; row < num_rows; ++row) {
     #pragma HLS loop_tripcount min=1 max=2048
 
-        conv_load: for (col = 0; col < num_cols; ++col) {
-        #pragma HLS loop_tripcount min=2048 max=2048
+        conv_load: for (uint32_t cp = 0; cp < col_packs; ++cp) {
+        #pragma HLS loop_tripcount min=128 max=128
         #pragma HLS pipeline II=1
-            in_window[0][col] = in_window[1][col];
-            in_window[1][col] = in_window[2][col];
-            in_window[2][col] = in_window[3][col];
-            in_window[3][col] = in[(size_t)row * num_cols + col];
+            Pack16 v = in_p[(size_t)row * col_packs + cp];
+            conv_load_lane: for (int kk = 0; kk < 16; ++kk) {
+            #pragma HLS unroll
+                uint32_t c = cp * 16 + kk;
+                in_window[0][c] = in_window[1][c];
+                in_window[1][c] = in_window[2][c];
+                in_window[2][c] = in_window[3][c];
+                in_window[3][c] = v.data[kk];
+            }
         }
 
-        conv_compute: for (col = 0; col < num_cols; ++col) {
-        #pragma HLS loop_tripcount min=2048 max=2048
+        conv_compute: for (uint32_t cp = 0; cp < col_packs; ++cp) {
+        #pragma HLS loop_tripcount min=128 max=128
         #pragma HLS pipeline II=1
-            /* in_window[k] holds source row (row - kernel_size + 1 + k). */
-            float sum = in_window[0][col] * w_loc[col][0]
-                      + in_window[1][col] * w_loc[col][1]
-                      + in_window[2][col] * w_loc[col][2]
-                      + in_window[3][col] * w_loc[col][3];
-            out[(size_t)row * num_cols + col] = gdn_silu(sum);
+            Pack16 o;
+            conv_comp_lane: for (int kk = 0; kk < 16; ++kk) {
+            #pragma HLS unroll
+                uint32_t c = cp * 16 + kk;
+                /* in_window[k] holds source row (row - kernel_size + 1 + k). */
+                float sum = in_window[0][c] * w_loc[c][0]
+                          + in_window[1][c] * w_loc[c][1]
+                          + in_window[2][c] * w_loc[c][2]
+                          + in_window[3][c] * w_loc[c][3];
+                o.data[kk] = gdn_silu(sum);
+            }
+            out_p[(size_t)row * col_packs + cp] = o;
         }
     }
 }
@@ -1416,10 +1465,18 @@ static void gdn_output_norm_and_gate(
     uint32_t head_dim,
     float eps
 ) {
-    /* Pre-load the per-head norm weight (head_dim=256 floats) once and reuse
-     * for every (token, head) pair — eliminates an AXI read per iteration. */
+    /* Pack16-widened: attn/gate are read/written 16 lanes (512-bit) per beat by
+     * indexing the Pack16 *base* with an integer pack offset. head_dim=256 is a
+     * multiple of 16, and (token*num_heads + head)*head_dim is too, so a whole
+     * head spans hd_packs=16 aligned Pack16 words. */
+    const Pack16 *attn_in  = reinterpret_cast<const Pack16 *>(attn);
+    Pack16       *attn_out = reinterpret_cast<Pack16 *>(attn);
+    const Pack16 *gate_p   = reinterpret_cast<const Pack16 *>(gate);
+    uint32_t hd_packs = head_dim / 16;
+
+    /* Pre-load the per-head norm weight once and reuse for every (token, head). */
     float weight_loc[GDN_DV];
-    #pragma HLS array_partition variable=weight_loc cyclic factor=8
+    #pragma HLS array_partition variable=weight_loc cyclic factor=16
     uint32_t windex;
     onorm_load_w: for (windex = 0; windex < head_dim; ++windex) {
     #pragma HLS loop_tripcount min=256 max=256
@@ -1433,50 +1490,57 @@ static void gdn_output_norm_and_gate(
         uint32_t head_index;
         onorm_head: for (head_index = 0; head_index < num_heads; ++head_index) {
         #pragma HLS loop_tripcount min=8 max=8  /* num_heads=8 */
-            float *attn_head = attn + (size_t)token_index * num_heads * head_dim + (size_t)head_index * head_dim;
-            const float *gate_head = gate + (size_t)token_index * num_heads * head_dim + (size_t)head_index * head_dim;
+            size_t base = (size_t)(token_index * num_heads + head_index) * hd_packs;
 
-            /* On-chip buffers break the AXI read-after-write hazard on attn_head
-             * (was II=160) and avoid a second AXI read of gate_head per element. */
+            /* On-chip buffers break the AXI read-after-write hazard on attn and
+             * avoid a second AXI read of gate per element. */
             float attn_loc[GDN_DV];
             float gate_loc[GDN_DV];
-            #pragma HLS array_partition variable=attn_loc cyclic factor=8
-            #pragma HLS array_partition variable=gate_loc cyclic factor=8
+            #pragma HLS array_partition variable=attn_loc cyclic factor=16
+            #pragma HLS array_partition variable=gate_loc cyclic factor=16
 
-            /* Per-element squares scratch -- store-products + tree-reduce
-             * pattern (same as load_qk / dot_alpha). The earlier 8-lane mux
-             * pattern stayed at II=2 because HLS muxed the partial array into
-             * a single register and tracked the carried dep on the mux. */
-            float sq_arr[GDN_DV];
-            #pragma HLS array_partition variable=sq_arr complete
-
-            /* Phase 1: load attn_head into local + record squared values */
-            uint32_t index;
-            onorm_sq: for (index = 0; index < head_dim; ++index) {
-            #pragma HLS loop_tripcount min=256 max=256
+            /* Phase 1: load attn (Pack16) into local + accumulate sum of squares */
+            double sum = 0.0;
+            onorm_sq: for (uint32_t ip = 0; ip < hd_packs; ++ip) {
+            #pragma HLS loop_tripcount min=16 max=16
             #pragma HLS pipeline II=1
-                float v = attn_head[index];
-                attn_loc[index] = v;
-                sq_arr[index] = v * v;
+                Pack16 v = attn_in[base + ip];
+                float s = 0.0f;
+                onorm_sq_lane: for (int kk = 0; kk < 16; ++kk) {
+                #pragma HLS unroll
+                    float a = v.data[kk];
+                    attn_loc[ip * 16 + kk] = a;
+                    s += a * a;
+                }
+                sum += (double)s;
             }
 
-            /* Phase 2: load gate_head into local buffer */
-            onorm_load_g: for (index = 0; index < head_dim; ++index) {
-            #pragma HLS loop_tripcount min=256 max=256
+            /* Phase 2: load gate (Pack16) into local buffer */
+            onorm_load_g: for (uint32_t ip = 0; ip < hd_packs; ++ip) {
+            #pragma HLS loop_tripcount min=16 max=16
             #pragma HLS pipeline II=1
-                gate_loc[index] = gate_head[index];
+                Pack16 g = gate_p[base + ip];
+                onorm_g_lane: for (int kk = 0; kk < 16; ++kk) {
+                #pragma HLS unroll
+                    gate_loc[ip * 16 + kk] = g.data[kk];
+                }
             }
 
-            float sum = gdn_tree_reduce_256(sq_arr);
-            float scale = 1.0f / sqrtf(sum / (float)head_dim + eps);
+            float scale = 1.0f / sqrtf((float)(sum / (double)head_dim) + eps);
 
-            /* Phase 3: combine and write back (writes only on the AXI port) */
-            onorm_gate: for (index = 0; index < head_dim; ++index) {
-            #pragma HLS loop_tripcount min=256 max=256
+            /* Phase 3: combine and write back (Pack16) */
+            onorm_gate: for (uint32_t ip = 0; ip < hd_packs; ++ip) {
+            #pragma HLS loop_tripcount min=16 max=16
             #pragma HLS pipeline II=1
-                float normalized = attn_loc[index] * scale * weight_loc[index];
-                float gate_value = gate_loc[index];
-                attn_head[index] = normalized * gate_value * gdn_sigmoid(gate_value);
+                Pack16 o;
+                onorm_gate_lane: for (int kk = 0; kk < 16; ++kk) {
+                #pragma HLS unroll
+                    uint32_t index = ip * 16 + kk;
+                    float normalized = attn_loc[index] * scale * weight_loc[index];
+                    float gate_value = gate_loc[index];
+                    o.data[kk] = normalized * gate_value * gdn_sigmoid(gate_value);
+                }
+                attn_out[base + ip] = o;
             }
         }
     }
