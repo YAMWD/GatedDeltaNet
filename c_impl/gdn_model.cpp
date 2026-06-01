@@ -1617,18 +1617,26 @@ int gdn_forward(
      * port at ~388 MB/s (32-bit) on hardware. The host binds the same weight
      * buffer to both ports (read-only alias); hw.cfg maps both to HBM[1:31]. */
     #pragma HLS interface m_axi port=weight_data_mm depth=1466343808 offset=slave bundle=mem_weights_mm max_widen_bitwidth=512 max_read_burst_length=64
-    #pragma HLS interface m_axi port=x depth=4194304 offset=slave max_widen_bitwidth=512
-    #pragma HLS interface m_axi port=x_norm depth=4194304 offset=slave max_widen_bitwidth=512
-    #pragma HLS interface m_axi port=q depth=4194304 offset=slave max_widen_bitwidth=512
-    #pragma HLS interface m_axi port=k depth=4194304 offset=slave max_widen_bitwidth=512
-    #pragma HLS interface m_axi port=v depth=4194304 offset=slave max_widen_bitwidth=512
+    /* Phase B: activations split across distinct AXI bundles -> distinct HBM
+     * channels (hw.cfg), so each stage's input-read master and output-write
+     * master run concurrently instead of contending on one gmem port (HBM[0]).
+     *   gmem_x   = residual stream + norm out + matmul-output staging
+     *   gmem_qkv = attention activations (matmul outputs / conv I/O)
+     *   gmem_mlp = MLP intermediates
+     * Matmul in/out pairs land on different bundles (x_norm->q, attn->tmp_hidden,
+     * x_norm->mlp_*, mlp_gate->tmp_hidden), enabling concurrent load/store. */
+    #pragma HLS interface m_axi port=x depth=4194304 offset=slave max_widen_bitwidth=512 bundle=gmem_x
+    #pragma HLS interface m_axi port=x_norm depth=4194304 offset=slave max_widen_bitwidth=512 bundle=gmem_x
+    #pragma HLS interface m_axi port=q depth=4194304 offset=slave max_widen_bitwidth=512 bundle=gmem_qkv
+    #pragma HLS interface m_axi port=k depth=4194304 offset=slave max_widen_bitwidth=512 bundle=gmem_qkv
+    #pragma HLS interface m_axi port=v depth=4194304 offset=slave max_widen_bitwidth=512 bundle=gmem_qkv
     #pragma HLS interface m_axi port=a depth=16384 offset=slave
     #pragma HLS interface m_axi port=b depth=16384 offset=slave
-    #pragma HLS interface m_axi port=gate depth=4194304 offset=slave max_widen_bitwidth=512
-    #pragma HLS interface m_axi port=attn depth=4194304 offset=slave max_widen_bitwidth=512
-    #pragma HLS interface m_axi port=tmp_hidden depth=4194304 offset=slave max_widen_bitwidth=512
-    #pragma HLS interface m_axi port=mlp_gate depth=11534336 offset=slave max_widen_bitwidth=512
-    #pragma HLS interface m_axi port=mlp_up depth=11534336 offset=slave max_widen_bitwidth=512
+    #pragma HLS interface m_axi port=gate depth=4194304 offset=slave max_widen_bitwidth=512 bundle=gmem_qkv
+    #pragma HLS interface m_axi port=attn depth=4194304 offset=slave max_widen_bitwidth=512 bundle=gmem_qkv
+    #pragma HLS interface m_axi port=tmp_hidden depth=4194304 offset=slave max_widen_bitwidth=512 bundle=gmem_x
+    #pragma HLS interface m_axi port=mlp_gate depth=11534336 offset=slave max_widen_bitwidth=512 bundle=gmem_mlp
+    #pragma HLS interface m_axi port=mlp_up depth=11534336 offset=slave max_widen_bitwidth=512 bundle=gmem_mlp
     #pragma HLS interface m_axi port=recurrent_state depth=524288 offset=slave
     #pragma HLS interface m_axi port=head_buffer depth=256 offset=slave
     #pragma HLS interface m_axi port=tokens depth=2048 offset=slave
