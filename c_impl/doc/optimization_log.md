@@ -17,10 +17,33 @@ Current docs:
 
 - [architecture.md](architecture.md) -- current top-level architecture and
   synthesis snapshot.
-- [systolic_matmul.md](systolic_matmul.md) -- current systolic-array matmul
-  design and resource breakdown.
+- [systolic_matmul.md](systolic_matmul.md) -- systolic-array matmul (1-D PE
+  chain); still used by `gdn_attn_forward` / `gdn_matmul_top`.
+- [weight_stationary_matmul.md](weight_stationary_matmul.md) -- **current**
+  matmul in `gdn_forward`: activation-stationary blocking + bursting, designed
+  from on-card profiling. **25.9 min -> 6.5 min on hardware (4.0x).**
 - [tiled_matmul.md](tiled_matmul.md) -- legacy/fallback tiled GEMM and the
   pre-systolic baseline.
+
+## Weight-traffic optimization (on-card, hardware-measured)
+
+The csynth latency above is a fixed-latency estimate that hides HBM bandwidth
+stalls. The real U55C run was **memory bound on weight traffic**: the systolic
+chain re-read the weights ~128x (once per 16-row token stripe) in 64-byte
+non-bursted transfers (1.55 % efficient), moving **507 GB at 387 MB/s ~= 22 of
+the 26 minutes**. `gdn_matmul_2d` (activation-stationary 256-row block +
+bursting) cut weight re-reads 16x. Measured on hardware, same wikitext run:
+
+| Metric | Systolic chain | `gdn_matmul_2d` | Change |
+|--------|---------------:|----------------:|-------:|
+| Weight data read | 507.8 GB | 32.9 GB | 15.4x less |
+| Application runtime | 25.9 min | **6.5 min** | **4.0x** |
+| Wikitext perplexity | 15.81 | 15.81 | match |
+
+Next bottleneck (confirmed): the weight port is now 32-bit-width-limited at
+388 MB/s because `loadB` shares the `mem_weights` bundle with the scalar weight
+readers. Stage 2 = dedicated 512-bit weight bundle. See
+[weight_stationary_matmul.md](weight_stationary_matmul.md).
 
 Current single-attention synthesis snapshot:
 

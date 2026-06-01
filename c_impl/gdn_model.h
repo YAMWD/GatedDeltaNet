@@ -150,6 +150,21 @@ int gdn_matmul_top(
     uint32_t out_dim
 );
 
+/* HLS top for the *standard* tiled output-stationary systolic matmul
+ * (gdn_matmul_2d) — the canonical Vitis "mmult" triple-loop form, adapted
+ * to FP32 + tiling. Same interface and AXI bundle layout as gdn_matmul_top
+ * so test_matmul2d.tcl / gdn_matmul2d_test.cpp can synthesize and parity-
+ * check it head-to-head against the gdn_matmul_systolic chain. Returns 0 on
+ * success, negative on an unsupported shape. */
+int gdn_matmul2d_top(
+    float *out,
+    const float *in,
+    const float *weights,
+    uint32_t num_rows,
+    uint32_t in_dim,
+    uint32_t out_dim
+);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

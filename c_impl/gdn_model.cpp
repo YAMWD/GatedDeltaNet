@@ -686,8 +686,17 @@ static void ReadB(
     /* Function-local (NOT static): NUM_CHAINS ReadB invocations in dataflow
      * each need their own BRAM instance — a static array would be shared
      * state and trip "HLS 200-979 internal global variable failed dataflow
-     * checking". */
-    float b_buf[2][M_PER_PE][IN_DIM_MAX];
+     * checking".
+     *
+     * b_buf is a BBUF_TILES-deep ring buffer of M_PER_PE × IN_DIM_MAX tiles
+     * (was 2-deep ping-pong). The deeper ring gives the load and stream
+     * tasks more elasticity so a future burst-friendly load (Phase 1b step
+     * "b") can fetch several tiles ahead of the streamer; on its own it
+     * does not change behaviour, just BRAM footprint
+     * (BBUF_TILES × M_PER_PE × IN_DIM_MAX × 4 B ≈ 1.4 MB at BBUF_TILES=4). */
+    #define BBUF_TILES 4
+    #define BBUF_MASK  (BBUF_TILES - 1)  /* requires BBUF_TILES to be a power of two */
+    float b_buf[BBUF_TILES][M_PER_PE][IN_DIM_MAX];
     #pragma HLS array_partition variable=b_buf dim=1 complete
     #pragma HLS array_partition variable=b_buf dim=2 complete
     #pragma HLS array_partition variable=b_buf dim=3 cyclic factor=16
@@ -708,8 +717,8 @@ static void ReadB(
 
     fused_tile: for (uint32_t tile = 1; tile < total_tiles; ++tile) {
     #pragma HLS loop_tripcount min=1 max=45056  /* num_outer_n * num_outer_m_per_chain = 128*352 = 45056 worst case (mlp at out_dim=5632) */
-        uint32_t stream_idx       = (tile - 1) & 1u;
-        uint32_t load_idx         = tile & 1u;
+        uint32_t stream_idx       = (tile - 1) & BBUF_MASK;
+        uint32_t load_idx         = tile & BBUF_MASK;
         uint32_t m0_local_next    = tile % num_outer_m_per_chain;
         uint32_t m0_global_next   = m0_local_next + m0_offset;
 
@@ -733,7 +742,7 @@ static void ReadB(
         }
     }
 
-    uint32_t last_idx = (total_tiles - 1) & 1u;
+    uint32_t last_idx = (total_tiles - 1) & BBUF_MASK;
     last_stream: for (uint32_t k = 0; k < in_dim; ++k) {
     #pragma HLS loop_tripcount min=1 max=5632
     #pragma HLS pipeline II=1
@@ -1495,6 +1504,12 @@ static void gdn_swiglu_inplace(float *gate, const float *up, size_t count) {
     }
 }
 
+/* Forward decl: gdn_forward calls the weight-traffic-optimized matmul, which
+ * is defined further below (it needs the MM2D_* / IN_DIM_MAX constants). */
+static void gdn_matmul_2d(
+    float *out, const float *in, const float *weights,
+    uint32_t num_rows, uint32_t in_dim, uint32_t out_dim);
+
 int gdn_forward(
     const GDNWeightHeader *config,
     const float *weight_data,
@@ -1528,7 +1543,7 @@ int gdn_forward(
      * instead of 16 narrow ones. Lifts ReadB from II=16 → II=1 on the
      * weight side and similarly drops the per-element II of swiglu / the
      * residual adds / matmul output stores from ~150 to ~10. */
-    #pragma HLS interface m_axi port=weight_data depth=1466343808 offset=slave bundle=mem_weights max_widen_bitwidth=512
+    #pragma HLS interface m_axi port=weight_data depth=1466343808 offset=slave bundle=mem_weights max_widen_bitwidth=512 max_read_burst_length=64
     #pragma HLS interface m_axi port=x depth=4194304 offset=slave max_widen_bitwidth=512
     #pragma HLS interface m_axi port=x_norm depth=4194304 offset=slave max_widen_bitwidth=512
     #pragma HLS interface m_axi port=q depth=4194304 offset=slave max_widen_bitwidth=512
@@ -1625,12 +1640,12 @@ int gdn_forward(
         layer_mlp_down_proj = weight_data + layer_offset;
 
         gdn_rmsnorm_rows(x_norm, x, layer_attn_norm, num_tokens, hidden, config->norm_eps);
-        gdn_matmul_systolic(q, x_norm, layer_q_proj, num_tokens, hidden, hidden);
-        gdn_matmul_systolic(k, x_norm, layer_k_proj, num_tokens, hidden, hidden);
-        gdn_matmul_systolic(v, x_norm, layer_v_proj, num_tokens, hidden, hidden);
+        gdn_matmul_2d(q, x_norm, layer_q_proj, num_tokens, hidden, hidden);
+        gdn_matmul_2d(k, x_norm, layer_k_proj, num_tokens, hidden, hidden);
+        gdn_matmul_2d(v, x_norm, layer_v_proj, num_tokens, hidden, hidden);
         gdn_matmul_tiled(a, x_norm, layer_a_proj, num_tokens, hidden, num_heads);
         gdn_matmul_tiled(b, x_norm, layer_b_proj, num_tokens, hidden, num_heads);
-        gdn_matmul_systolic(gate, x_norm, layer_g_proj, num_tokens, hidden, hidden);
+        gdn_matmul_2d(gate, x_norm, layer_g_proj, num_tokens, hidden, hidden);
 
         gdn_depthwise_conv_silu(tmp_hidden, q, layer_q_conv, num_tokens, hidden, config->conv_size);
         gdn_pack16_copy(q, tmp_hidden, hidden_count);
@@ -1656,14 +1671,14 @@ int gdn_forward(
             num_tokens
         );
         gdn_output_norm_and_gate(attn, gate, layer_o_norm, num_tokens, num_heads, head_dim, config->norm_eps);
-        gdn_matmul_systolic(tmp_hidden, attn, layer_o_proj, num_tokens, hidden, hidden);
+        gdn_matmul_2d(tmp_hidden, attn, layer_o_proj, num_tokens, hidden, hidden);
         gdn_pack16_add_inplace(x, tmp_hidden, hidden_count);
 
         gdn_rmsnorm_rows(x_norm, x, layer_mlp_norm, num_tokens, hidden, config->norm_eps);
-        gdn_matmul_systolic(mlp_gate, x_norm, layer_mlp_gate_proj, num_tokens, hidden, intermediate);
-        gdn_matmul_systolic(mlp_up, x_norm, layer_mlp_up_proj, num_tokens, hidden, intermediate);
+        gdn_matmul_2d(mlp_gate, x_norm, layer_mlp_gate_proj, num_tokens, hidden, intermediate);
+        gdn_matmul_2d(mlp_up, x_norm, layer_mlp_up_proj, num_tokens, hidden, intermediate);
         gdn_swiglu_inplace(mlp_gate, mlp_up, mlp_count);
-        gdn_matmul_systolic(tmp_hidden, mlp_gate, layer_mlp_down_proj, num_tokens, intermediate, hidden);
+        gdn_matmul_2d(tmp_hidden, mlp_gate, layer_mlp_down_proj, num_tokens, intermediate, hidden);
         gdn_pack16_add_inplace(x, tmp_hidden, hidden_count);
     }
 
@@ -1923,4 +1938,199 @@ int gdn_matmul_top(
     #pragma HLS interface s_axilite port=return
 
     return gdn_matmul_systolic(out, in, weights, num_rows, in_dim, out_dim);
+}
+
+/* =======================================================================
+ * gdn_matmul_2d — weight-traffic-optimized 2-D systolic matmul.
+ *
+ * Designed from the on-card profile (summary.csv), which showed the live
+ * kernel was MEMORY bound, not compute bound: 507 GB of weight reads in
+ * 8.0 B transfers of ~63 bytes each (1.55% efficiency, 386 MB/s). Two
+ * compounding causes, both fixed here:
+ *
+ *   (1) ~95x REDUNDANT weight re-reads. The chain kernel reloads the whole
+ *       weight tile from HBM for every 16-row token stripe (num_rows/16
+ *       times). Fix: ACTIVATION-STATIONARY blocking — hold an A_BLOCK_ROWS
+ *       block of activations resident on chip and stream each weight column
+ *       past *all* of them, so a weight is fetched once per row-block
+ *       (num_rows/A_BLOCK_ROWS times) instead of once per 16 rows. That is a
+ *       (A_BLOCK_ROWS/16)x = 16x cut in weight traffic at A_BLOCK_ROWS=256.
+ *
+ *   (2) 64-byte NON-BURSTED transfers (HLS "could not analyze pattern"). Fix:
+ *       every DRAM read is a clean contiguous inner loop with a monotonic
+ *       index and the boundary test hoisted out, so HLS infers a burst of
+ *       length k_packs (= in_dim/16, i.e. 128..352 beats) — transfer size
+ *       64 B -> 8..22 KB, efficiency ~1.5% -> ~100%.
+ *
+ * The weight tile is loaded once per (row-block, col-tile) and reused across
+ * all A_BLOCK_ROWS/16 row sub-tiles, so its load (k_packs cycles) is
+ * amortised over 16x more compute and needs no double-buffer.
+ *
+ * Compute core unchanged: a 16x16 PE grid, 256 MAC/cycle, FP32 recurrence
+ * broken with MM2D_PARTIAL accumulator banks (II=1).
+ * ======================================================================= */
+#define MM2D_TILE      16
+#define MM2D_PARTIAL   8     /* power of two; >= FP32 fadd latency in cycles */
+#define MM2D_ABLK_ROWS 256   /* resident activation rows; weight re-reads =
+                              * ceil(num_rows/256) instead of num_rows/16   */
+
+static void gdn_matmul_2d(
+    float *out, const float *in, const float *weights,
+    uint32_t num_rows, uint32_t in_dim, uint32_t out_dim
+) {
+    /* One shared instance across all gdn_forward call sites (not inlined 8x). */
+    #pragma HLS inline off
+    /* localA: a resident A_BLOCK_ROWS-row block of activations (read once per
+     * block, reused across every weight column). dim1 cyclic/16 puts the 16
+     * rows of a sub-tile in distinct banks (parallel compute reads); dim2
+     * cyclic/16 lets the 16-wide Pack16 load hit distinct banks (II=1 load).
+     * localB: one resident weight column-tile (16 cols), reused across all
+     * row sub-tiles in the block. */
+    static float localA[MM2D_ABLK_ROWS][IN_DIM_MAX];
+    static float localB[MM2D_TILE][IN_DIM_MAX];
+    #pragma HLS array_partition variable=localA dim=1 cyclic factor=16
+    #pragma HLS array_partition variable=localA dim=2 cyclic factor=16
+    #pragma HLS array_partition variable=localB dim=1 complete
+    #pragma HLS array_partition variable=localB dim=2 cyclic factor=16
+    /* The 5.76 MB activation block must live in URAM — left as BRAM it
+     * overflows the device (~107% BRAM). URAM is large (~34 MB) and lightly
+     * used elsewhere. */
+    #pragma HLS bind_storage variable=localA type=ram_t2p impl=uram
+
+    const Pack16 *in_p      = reinterpret_cast<const Pack16 *>(in);
+    const Pack16 *weights_p = reinterpret_cast<const Pack16 *>(weights);
+    Pack16       *out_p     = reinterpret_cast<Pack16 *>(out);
+
+    uint32_t k_packs = in_dim / 16;
+    uint32_t m_packs = out_dim / 16;
+
+    rb_loop: for (uint32_t rb = 0; rb < num_rows; rb += MM2D_ABLK_ROWS) {
+    #pragma HLS loop_tripcount min=1 max=8   /* ceil(2048/256) */
+        /* rows actually present in this block, rounded up to a sub-tile */
+        uint32_t rows_here    = num_rows - rb;
+        if (rows_here > (uint32_t)MM2D_ABLK_ROWS) rows_here = MM2D_ABLK_ROWS;
+        uint32_t n_subtiles   = (rows_here + MM2D_TILE - 1) / MM2D_TILE;
+
+        /* ---- BURST-load the A block: each row is k_packs contiguous Pack16
+         * (the `valid`/base test is hoisted out of the inner kp loop so the
+         * inner read is a clean monotonic burst). ---- */
+        loadA_r: for (uint32_t r = 0; r < (uint32_t)MM2D_ABLK_ROWS; ++r) {
+        #pragma HLS loop_tripcount min=1 max=256
+            uint32_t gr     = rb + r;
+            bool     valid  = (gr < num_rows);
+            size_t   a_base = (size_t)(valid ? gr : 0) * k_packs;
+            loadA_kp: for (uint32_t kp = 0; kp < k_packs; ++kp) {
+            #pragma HLS loop_tripcount min=128 max=352
+            #pragma HLS pipeline II=1
+                Pack16 w = in_p[a_base + kp];
+                loadA_un: for (int kk = 0; kk < 16; ++kk) {
+                #pragma HLS unroll
+                    localA[r][kp * 16 + kk] = valid ? w.data[kk] : 0.0f;
+                }
+            }
+        }
+
+        ct_loop: for (uint32_t ct = 0; ct < out_dim; ct += MM2D_TILE) {
+        #pragma HLS loop_tripcount min=1 max=352   /* ceil(5632/16) */
+
+            /* ---- BURST-load this weight column-tile once; reused across all
+             * n_subtiles row sub-tiles below. Each of the 16 cols is k_packs
+             * contiguous Pack16 -> burst length k_packs. ---- */
+            loadB_c: for (uint32_t c = 0; c < (uint32_t)MM2D_TILE; ++c) {
+                size_t b_base = (size_t)(ct + c) * k_packs;
+                loadB_kp: for (uint32_t kp = 0; kp < k_packs; ++kp) {
+                #pragma HLS loop_tripcount min=128 max=352
+                #pragma HLS pipeline II=1
+                    Pack16 w = weights_p[b_base + kp];
+                    loadB_un: for (int kk = 0; kk < 16; ++kk) {
+                    #pragma HLS unroll
+                        localB[c][kp * 16 + kk] = w.data[kk];
+                    }
+                }
+            }
+
+            sub_loop: for (uint32_t rs = 0; rs < n_subtiles * MM2D_TILE; rs += MM2D_TILE) {
+            #pragma HLS loop_tripcount min=1 max=16   /* MM2D_ABLK_ROWS/16 */
+
+                /* ---- 16x16 PE grid, PARTIAL banks ---- */
+                float acc[MM2D_TILE][MM2D_TILE][MM2D_PARTIAL];
+                #pragma HLS array_partition variable=acc complete
+                init_i: for (int i = 0; i < MM2D_TILE; ++i) {
+                #pragma HLS unroll
+                    init_j: for (int j = 0; j < MM2D_TILE; ++j) {
+                    #pragma HLS unroll
+                        init_p: for (int p = 0; p < MM2D_PARTIAL; ++p) {
+                        #pragma HLS unroll
+                            acc[i][j][p] = 0.0f;
+                        }
+                    }
+                }
+
+                sys_k: for (uint32_t k = 0; k < in_dim; ++k) {
+                #pragma HLS loop_tripcount min=2048 max=5632
+                #pragma HLS pipeline II=1
+                    uint32_t lane = k & (MM2D_PARTIAL - 1);
+                    pe_i: for (int i = 0; i < MM2D_TILE; ++i) {
+                    #pragma HLS unroll
+                        float a = localA[rs + i][k];
+                        pe_j: for (int j = 0; j < MM2D_TILE; ++j) {
+                        #pragma HLS unroll
+                            acc[i][j][lane] += a * localB[j][k];
+                        }
+                    }
+                }
+
+                /* ---- reduce PARTIAL banks (tree) + write 16x16 tile ---- */
+                write_i: for (int i = 0; i < MM2D_TILE; ++i) {
+                #pragma HLS pipeline II=1
+                    uint32_t gr = rb + rs + (uint32_t)i;
+                    Pack16 row;
+                    red_j: for (int j = 0; j < MM2D_TILE; ++j) {
+                    #pragma HLS unroll
+                        /* MM2D_PARTIAL=8 -> 8:4:2:1 balanced adder tree */
+                        float s0 = acc[i][j][0] + acc[i][j][1];
+                        float s1 = acc[i][j][2] + acc[i][j][3];
+                        float s2 = acc[i][j][4] + acc[i][j][5];
+                        float s3 = acc[i][j][6] + acc[i][j][7];
+                        float t0 = s0 + s1;
+                        float t1 = s2 + s3;
+                        row.data[j] = t0 + t1;
+                    }
+                    if (gr < num_rows) {
+                        out_p[(size_t)gr * m_packs + (ct / 16)] = row;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* gdn_matmul2d_top — standalone HLS top for the standard 2-D systolic
+ * matmul. Mirrors gdn_matmul_top's AXI bundle layout for a fair compare.
+ * Geometry: out_dim%16==0, in_dim%16==0, in_dim<=IN_DIM_MAX (same families
+ * gdn_matmul_systolic accepts, except the %32 -> %16 relaxation since the
+ * 2-D grid has no NUM_CHAINS split). */
+int gdn_matmul2d_top(
+    float *out,
+    const float *in,
+    const float *weights,
+    uint32_t num_rows,
+    uint32_t in_dim,
+    uint32_t out_dim
+) {
+    #pragma HLS interface m_axi port=out      depth=8388608 offset=slave bundle=mem_out     max_widen_bitwidth=512
+    #pragma HLS interface m_axi port=in       depth=8388608 offset=slave bundle=mem_in      max_widen_bitwidth=512 max_read_burst_length=64
+    #pragma HLS interface m_axi port=weights  depth=8388608 offset=slave bundle=mem_weights max_widen_bitwidth=512 max_read_burst_length=64
+    #pragma HLS interface s_axilite port=num_rows
+    #pragma HLS interface s_axilite port=in_dim
+    #pragma HLS interface s_axilite port=out_dim
+    #pragma HLS interface s_axilite port=return
+
+    if (num_rows == 0 || in_dim == 0 || out_dim == 0) return -1;
+    if ((out_dim % 16) != 0)                          return -3;
+    if ((in_dim  % 16) != 0)                          return -4;
+    if (in_dim > (uint32_t)IN_DIM_MAX)                return -5;
+
+    gdn_matmul_2d(out, in, weights, num_rows, in_dim, out_dim);
+    return 0;
 }
