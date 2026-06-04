@@ -1615,7 +1615,7 @@ int gdn_forward(
      * lets HLS widen the matmul weight reads to 512-bit instead of 32-bit — the
      * scalar co-readers were demoting the shared bundle, capping the weight
      * port at ~388 MB/s (32-bit) on hardware. The host binds the same weight
-     * buffer to both ports (read-only alias); hw.cfg maps both to HBM[1:31]. */
+     * buffer to both ports (read-only alias); hw.cfg maps both to HBM[10:31]. */
     #pragma HLS interface m_axi port=weight_data_mm depth=1466343808 offset=slave bundle=mem_weights_mm max_widen_bitwidth=512 max_read_burst_length=64
     /* Phase B: activations split across distinct AXI bundles -> distinct HBM
      * channels (hw.cfg), so each stage's input-read master and output-write
