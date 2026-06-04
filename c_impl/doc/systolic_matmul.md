@@ -167,11 +167,10 @@ The intended schedule is:
 4. Repeat until the final tile, then drain it.
 
 In the current single-attention synthesis report, `ReadB` is the dominant
-bottleneck: HLS schedules the `fused_tile_fused_io` loop at II=16 because
-the m_axi adapter on `weight_data` defaults to 32-bit data width and reading
-one `Pack16` (16 floats) costs 16 narrow beats. Adding
-`max_widen_bitwidth=512` to the `weight_data` m_axi pragma is the canonical
-fix and remains the top item on the optimisation backlog.
+bottleneck when the `weight_data` m_axi adapter is left at its default 32-bit
+width and reading one `Pack16` (16 floats) costs 16 narrow beats. Setting
+`max_widen_bitwidth=512` on the `weight_data` m_axi pragma is the canonical fix
+and is applied in this codebase (see the `gdn_forward` / `gdn_attn_forward` HLS interface pragmas).
 
 ## Processing Element
 
