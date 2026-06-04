@@ -17,10 +17,78 @@ Current docs:
 
 - [architecture.md](architecture.md) -- current top-level architecture and
   synthesis snapshot.
-- [systolic_matmul.md](systolic_matmul.md) -- current systolic-array matmul
-  design, integrated vs standalone differences, and resource interpretation.
+- [systolic_matmul.md](systolic_matmul.md) -- systolic-array matmul (1-D PE
+  chain); still used by `gdn_attn_forward` / `gdn_matmul_top`.
+- [weight_stationary_matmul.md](weight_stationary_matmul.md) -- **current**
+  matmul in `gdn_forward`: activation-stationary blocking + bursting, designed
+  from on-card profiling. **25.9 min -> 6.5 min on hardware (4.0x).**
 - [tiled_matmul.md](tiled_matmul.md) -- legacy/fallback tiled GEMM and the
   pre-systolic baseline.
+
+## Weight-traffic optimization (on-card, hardware-measured)
+
+The csynth latency above is a fixed-latency estimate that hides HBM bandwidth
+stalls. The real U55C run was **memory bound on weight traffic**: the systolic
+chain re-read the weights ~128x (once per 16-row token stripe) in 64-byte
+non-bursted transfers (1.55 % efficient), moving **507 GB at 387 MB/s ~= 22 of
+the 26 minutes**. `gdn_matmul_2d` (activation-stationary 256-row block +
+bursting) cut weight re-reads 16x. Measured on hardware, same wikitext run:
+
+| Metric | Systolic chain | Stage 1 | Stage 2 |
+|--------|---------------:|--------:|--------:|
+| Application runtime | 25.9 min | 6.5 min | **5.2 min** |
+| Kernel time | — | 4.7 min | **3.45 min** |
+| Matmul weight bandwidth | 387 MB/s | 388 MB/s | **5,405 MB/s** |
+| Weight data read | 507.8 GB | 32.9 GB | 32.8 GB |
+| Wikitext perplexity | 15.81 | 15.81 | **15.81** |
+
+Stage 1 = activation-stationary blocking + bursting (16x fewer weight
+re-reads). Stage 2 = 512-bit weight reads (aligned base + integer Pack16
+offset) on a dedicated `mem_weights_mm` bundle — lifted the weight port from
+388 MB/s to 5.4 GB/s (14x), so the 32.8 GB of weights now read in ~6 s (was
+~82 s). Weight traffic is no longer the bottleneck.
+
+Next bottleneck after Stage 2 (confirmed on-card): the 207 s kernel splits
+between matmul compute (~107 s, 256 MAC/cycle FP32 @ 100 MHz) and the gmem
+activation port (HBM[0] single channel: 78 GB reads + 7.5 GB of 11-byte
+writes).
+
+## Activation-memory phases A & B (on-card, hardware-measured)
+
+| Metric | Stage 2 | Phase A | Phase B |
+|--------|--------:|--------:|--------:|
+| Application runtime | 5.2 min | 4.4 min | **4.2 min** |
+| Kernel time | 207 s | 153 s | **141 s** |
+| Δ kernel vs prev | — | 1.35x | 1.09x |
+| Wikitext perplexity | 15.81 | 15.81 | **15.81** |
+
+- **Phase A** (`00e3264`): Pack16-widen the three scalar activation stages —
+  `rmsnorm`, depthwise `conv`, `output_norm` read/wrote 1 float/cycle (the
+  11-byte gmem writes). Rewrote to index the Pack16 base by integer offset and
+  process 16 lanes/beat. gmem writes 11 B → 35 B/transfer, 183 → 642 MB/s.
+- **Phase B** (`fda62c7`): split activations off the single gmem/HBM[0] master
+  into 3 AXI masters (`gmem_x`, `gmem_qkv`, `gmem_mlp`) on distinct HBM channels;
+  weights compressed to HBM[10:31]. The modest 1.09x and the 8–16% port
+  utilization confirmed the stages are sequential/latency-bound, not
+  bandwidth-bound — i.e. **the memory wall is solved; compute is the floor.**
+
+Net A+B: kernel 207 → 141 s; end-to-end (with Stages 1/2) 25.9 min → 4.2 min
+(~6.2x). HEAD is Phase B (`fda62c7`).
+
+## Phase C (PE-grid widening) — attempted, reverted
+
+Phase C widened the 16×16 grid (256 MAC/cycle) to cut the prefill compute floor.
+Both configs built were design-valid (csynth II=1, parity PASS) but failed on
+infrastructure: **32×32** → BRAM 4054 > 4032 RAMB18; **32×16** → `route_design`
+SLR1–2 SLL congestion at 102%. It was **reverted** (`git reset` to Phase B,
+grid kept at 16×16) because the target shifted to **decode**, where grid width
+is the wrong lever (decode is weight-bandwidth-bound, and the 16×16 grid is
+already ~19x over-provisioned for the available weight bandwidth).
+
+See **[decode_roadmap.md](decode_roadmap.md)** for the decode analysis, why the
+grid stays 16×16, and the decode plan (GEMV datapath + multi-channel weight
+readers + INT8). Of all the above, only Stage 2's 512-bit weight read transfers
+to decode; the rest is prefill-specific.
 
 Current single-attention synthesis snapshot:
 
