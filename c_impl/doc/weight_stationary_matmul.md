@@ -107,7 +107,7 @@ read (`loadA`, a base pointer at offset 0) was already 512-bit.
    provably 64-byte aligned, so HLS widens `loadB` to **512-bit + burst, II=1**.
 2. **Dedicated bundle.** `weight_data_mm` is a separate AXI bundle
    (`mem_weights_mm`) for the matmul weights, aliased to the same HBM blob (the
-   host uploads to both buffers; `hw.cfg` maps both to HBM[1:31]). Isolates the
+   host uploads to both buffers; `hw.cfg` maps both to HBM[10:31]). Isolates the
    matmul weight traffic from the scalar readers.
 
 ### On-card results (three-point progression, same wikitext run)
