@@ -6,6 +6,13 @@ for decode latency. It follows the activation-memory work in
 [optimization_log.md](optimization_log.md) and the matmul in
 [weight_stationary_matmul.md](weight_stationary_matmul.md).
 
+**Phase 0 (done):** the premise below is GPU-validated in
+[decode_premise.md](decode_premise.md) (GDN TPOT flat ~35 ms/token vs a
+transformer's O(n)), and on-card decode is **bit-exact to the GPU golden over
+64 tokens** with a re-prefill TPOT baseline in
+[decode_correctness.md](decode_correctness.md) — every step of this roadmap is
+gated by that correctness check.
+
 ## Where we landed (prefill benchmark, on U55C, wikitext 2048 tokens)
 
 | Stage | App runtime | Kernel | Lever |
