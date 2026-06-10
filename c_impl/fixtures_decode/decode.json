@@ -1,0 +1,9 @@
+{
+  "task": "decode",
+  "kind": 2,
+  "num_examples": 12,
+  "decode_len": 64,
+  "limit": null,
+  "path": "c_impl/fixtures_decode/decode.gdnreq",
+  "note": "cont[] is a placeholder; run compare_gdn_c.py --decode-golden to fill the golden trajectory"
+}

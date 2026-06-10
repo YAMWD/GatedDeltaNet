@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *c_impl/gdn_model.cpp|*c_impl/gdn_model.h|*c_impl/host.cpp|*c_impl/gdn_eval.cpp|*lit_gpt/gated_delta_net.py) echo '[hook] inference code changed -> decode_correctness_check.sh --fast' >&2; bash /home/yaoz0b/GatedDeltaNet/scripts/decode_correctness_check.sh --fast >&2 || exit 2;; esac"
+          }
+        ]
+      }
+    ]
+  }
+}

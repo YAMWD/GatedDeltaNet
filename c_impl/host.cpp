@@ -24,7 +24,9 @@ namespace {
 constexpr const char *kDefaultWeights = "artifacts/gdn-1.3b-f32.gdnw";
 constexpr const char *kDefaultFixture = "fixtures_full/wikitext.gdnreq";
 constexpr const char *kDefaultOutput = "hw_wikitext_results.json";
+constexpr const char *kDefaultDecodeOutput = "results_decode_hw/decode.hw.json";
 constexpr const char *kDefaultXrt = "/opt/xilinx/xrt";
+constexpr uint32_t kReqKindLL = 2;
 constexpr uint32_t kReqKindRolling = 3;
 constexpr size_t kWeightHeaderBytes = 60;
 
@@ -45,6 +47,7 @@ struct Fixture {
     uint32_t kind = 0;
     uint32_t num_examples = 0;
     std::vector<RollingReq> rolling_examples;
+    std::vector<PairReq> ll_examples;
 };
 
 struct ModelData {
@@ -60,19 +63,33 @@ struct Options {
     std::string output = kDefaultOutput;
     unsigned int device_index = 0;
     uint32_t max_examples = 0;
+    // --decode mode: mirror the native gdn_eval decode benchmark on-card.
+    bool decode = false;
+    uint32_t decode_len = 0;    // 0 => use each example's cont_len
+    uint32_t decode_limit = 0;  // 0 => all examples
+    bool output_set = false;    // whether an explicit positional output was given
 };
 
 static void usage(const char *argv0) {
     std::cerr
         << "usage: " << argv0
-        << " <gdn_forward.xclbin> [weights.gdnw] [wikitext.gdnreq]"
-        << " [output.json|-] [device_index] [max_examples]\n\n"
+        << " <gdn_forward.xclbin> [weights.gdnw] [fixture.gdnreq]"
+        << " [output.json|-] [device_index] [max_examples]\n"
+        << "       " << argv0
+        << " <gdn_forward.xclbin> [weights.gdnw] [decode.gdnreq]"
+        << " [output.json|-] [device_index] [max_examples]"
+        << " --decode [--decode-len N] [--limit E]\n\n"
         << "defaults:\n"
         << "  weights      " << kDefaultWeights << "\n"
         << "  fixture      " << kDefaultFixture << "\n"
-        << "  output       " << kDefaultOutput << "\n"
+        << "  output       " << kDefaultOutput
+        << " (rolling) | " << kDefaultDecodeOutput << " (--decode)\n"
         << "  device_index 0\n"
-        << "  max_examples 0 (all examples)\n";
+        << "  max_examples 0 (all examples)\n\n"
+        << "--decode flags:\n"
+        << "  --decode         run the LL-kind (kind=2) decode benchmark\n"
+        << "  --decode-len N   cap decode length per example (0 => use cont_len)\n"
+        << "  --limit E        cap number of examples (0 => all)\n";
 }
 
 static uint32_t parse_u32(const char *text, const char *name) {
@@ -86,16 +103,47 @@ static uint32_t parse_u32(const char *text, const char *name) {
 
 static Options parse_options(int argc, char **argv) {
     Options opts;
-    if (argc < 2 || argc > 7 || std::strcmp(argv[1], "--help") == 0) {
+    if (argc < 2 || std::strcmp(argv[1], "--help") == 0) {
         usage(argv[0]);
         std::exit(argc < 2 ? 1 : 0);
     }
-    opts.xclbin = argv[1];
-    if (argc > 2) opts.weights = argv[2];
-    if (argc > 3) opts.fixture = argv[3];
-    if (argc > 4) opts.output = argv[4];
-    if (argc > 5) opts.device_index = parse_u32(argv[5], "device_index");
-    if (argc > 6) opts.max_examples = parse_u32(argv[6], "max_examples");
+
+    // Separate optional --decode flags from the positional arguments. Without
+    // any --decode flag the positional contract is unchanged:
+    //   <xclbin> [weights] [fixture] [output] [device_index] [max_examples]
+    std::vector<std::string> positional;
+    for (int arg_index = 1; arg_index < argc; ++arg_index) {
+        std::string arg = argv[arg_index];
+        if (arg == "--decode") {
+            opts.decode = true;
+        } else if (arg == "--decode-len") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error("--decode-len requires a value");
+            }
+            opts.decode_len = parse_u32(argv[++arg_index], "decode-len");
+        } else if (arg == "--limit") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error("--limit requires a value");
+            }
+            opts.decode_limit = parse_u32(argv[++arg_index], "limit");
+        } else {
+            positional.push_back(arg);
+        }
+    }
+
+    if (positional.empty() || positional.size() > 6) {
+        usage(argv[0]);
+        std::exit(1);
+    }
+    opts.xclbin = positional[0];
+    if (positional.size() > 1) opts.weights = positional[1];
+    if (positional.size() > 2) opts.fixture = positional[2];
+    if (positional.size() > 3) {
+        opts.output = positional[3];
+        opts.output_set = true;
+    }
+    if (positional.size() > 4) opts.device_index = parse_u32(positional[4].c_str(), "device_index");
+    if (positional.size() > 5) opts.max_examples = parse_u32(positional[5].c_str(), "max_examples");
     return opts;
 }
 
@@ -181,6 +229,39 @@ static Fixture load_rolling_fixture(const std::string &path) {
             pair.ctx = read_i32_array(blob, offset, pair.ctx_len);
             pair.cont = read_i32_array(blob, offset, pair.cont_len);
         }
+    }
+
+    return fixture;
+}
+
+// Loader for the LL-kind (REQ_KIND_LL = 2) decode fixture. Mirrors the native
+// gdn_eval LL branch: each example is a (ctx, cont) pair where ctx is the
+// prompt token ids and cont is the golden greedy trajectory.
+static Fixture load_ll_fixture(const std::string &path) {
+    std::vector<uint8_t> blob = read_binary_file(path);
+    if (blob.size() < 20 || std::memcmp(blob.data(), "GDNREQ1", 7) != 0) {
+        throw std::runtime_error("unsupported fixture file: " + path);
+    }
+
+    size_t offset = 8;
+    uint32_t version = read_u32(blob, offset);
+    Fixture fixture;
+    fixture.kind = read_u32(blob, offset);
+    fixture.num_examples = read_u32(blob, offset);
+    if (version != 1) {
+        throw std::runtime_error("unsupported fixture version");
+    }
+    if (fixture.kind != kReqKindLL) {
+        throw std::runtime_error("--decode requires an LL-kind (.gdnreq kind=2) fixture");
+    }
+
+    fixture.ll_examples.resize(fixture.num_examples);
+    for (uint32_t example_index = 0; example_index < fixture.num_examples; ++example_index) {
+        PairReq &pair = fixture.ll_examples[example_index];
+        pair.ctx_len = read_u32(blob, offset);
+        pair.cont_len = read_u32(blob, offset);
+        pair.ctx = read_i32_array(blob, offset, pair.ctx_len);
+        pair.cont = read_i32_array(blob, offset, pair.cont_len);
     }
 
     return fixture;
@@ -276,6 +357,24 @@ static void compute_logits(const ModelData &model, const float *hidden, std::vec
         }
         logits[vocab_index] = sum;
     }
+}
+
+// Argmax of the logits for a hidden row. Reuses compute_logits (the same
+// vocab loop the scoring path uses) and breaks ties toward the first (lowest)
+// index via strict '>', matching the native gdn_eval argmax_logits exactly.
+static int argmax_logits(const ModelData &model, const float *hidden, std::vector<float> &logits) {
+    uint32_t vocab = model.config.vocab_size;
+    compute_logits(model, hidden, logits);
+
+    float max_logit = logits[0];
+    int max_index = 0;
+    for (uint32_t vocab_index = 1; vocab_index < vocab; ++vocab_index) {
+        if (logits[vocab_index] > max_logit) {
+            max_logit = logits[vocab_index];
+            max_index = static_cast<int>(vocab_index);
+        }
+    }
+    return max_index;
 }
 
 static double score_hidden_step(
@@ -484,6 +583,156 @@ private:
     uint64_t kernel_runs_ = 0;
 };
 
+// Per-example results of the on-card decode benchmark. Mirrors the native
+// gdn_eval schema plus an on-card kernel_ms series.
+struct DecodeExample {
+    uint32_t n = 0;                          // decode length used for this example
+    std::vector<int32_t> gen_traj;           // free-running greedy trajectory (N)
+    std::vector<int32_t> tf_argmax;          // teacher-forced per-position argmax (N)
+    std::vector<double> per_step_tpot_ms;    // wall ms per greedy step (N)
+    std::vector<double> kernel_ms;           // on-card kernel ms per greedy step (N)
+};
+
+// --decode driver, on-card analogue of gdn_eval's run_decode_mode.
+//
+// For each LL example (ctx = prompt, cont = golden greedy trajectory):
+//   - tf_argmax: ONE forward over prompt + golden[:-1]; argmax of hidden row
+//     (prompt_len + i - 1) for each i in 0..N-1.
+//   - gen_traj / per_step_tpot_ms / kernel_ms: free-running greedy. The forward
+//     clears recurrent state every call, so each step re-prefills the whole
+//     growing prefix (O(n^2) — the honest current-kernel baseline). per-step
+//     wall time is chrono around the run_forward + argmax; kernel_ms is the
+//     on-card kernel time run_forward returns (seconds * 1000).
+//
+// N = min(cont_len, decode_len) (decode_len == 0 means use cont_len);
+// E = min(num_examples, limit) (limit == 0 means all).
+static std::vector<DecodeExample> run_decode_hw(
+    const ModelData &model,
+    HwRunner &runner,
+    std::vector<float> &logits,
+    const Fixture &fixture,
+    uint32_t decode_len,
+    uint32_t limit
+) {
+    uint32_t example_count = fixture.num_examples;
+    if (limit != 0 && limit < example_count) {
+        example_count = limit;
+    }
+
+    std::vector<DecodeExample> results(example_count);
+
+    for (uint32_t example_index = 0; example_index < example_count; ++example_index) {
+        const PairReq &req = fixture.ll_examples[example_index];
+        uint32_t prompt_len = req.ctx_len;
+        if (prompt_len == 0) {
+            throw std::runtime_error("--decode: empty prompt (ctx_len == 0)");
+        }
+
+        uint32_t n = req.cont_len;
+        if (decode_len != 0 && decode_len < n) {
+            n = decode_len;
+        }
+        if (n == 0) {
+            throw std::runtime_error("--decode: zero decode length");
+        }
+        if (prompt_len + n - 1 > model.config.max_seq_len) {
+            throw std::runtime_error("--decode: prompt + decode_len exceeds max_seq_len");
+        }
+
+        DecodeExample &result = results[example_index];
+        result.n = n;
+        result.gen_traj.resize(n);
+        result.tf_argmax.resize(n);
+        result.per_step_tpot_ms.resize(n);
+        result.kernel_ms.resize(n);
+
+        std::cerr << "[progress] decode example " << (example_index + 1)
+                  << "/" << example_count
+                  << " prompt_len=" << prompt_len << " N=" << n << "\n";
+
+        // ---- Teacher-forced per-position argmax ----
+        // Tokens = prompt + golden[:-1]; length prompt_len + (n - 1). Position i
+        // predicts golden[i] from hidden row (prompt_len + i - 1).
+        {
+            uint32_t tf_total = prompt_len + n - 1;
+            std::vector<int32_t> tf_tokens(tf_total);
+            std::copy(req.ctx.begin(), req.ctx.begin() + prompt_len, tf_tokens.begin());
+            if (n > 1) {
+                std::copy(req.cont.begin(), req.cont.begin() + (n - 1),
+                          tf_tokens.begin() + prompt_len);
+            }
+            runner.run_forward(tf_tokens);
+            for (uint32_t i = 0; i < n; ++i) {
+                const float *hidden = runner.hidden_row(prompt_len + i - 1);
+                result.tf_argmax[i] = argmax_logits(model, hidden, logits);
+            }
+        }
+
+        // ---- Free-running greedy + per-step latency ----
+        std::vector<int32_t> prefix(req.ctx.begin(), req.ctx.begin() + prompt_len);
+        for (uint32_t step = 0; step < n; ++step) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            double ksec = runner.run_forward(prefix);
+            int next = argmax_logits(
+                model, runner.hidden_row(static_cast<uint32_t>(prefix.size() - 1)), logits);
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            result.per_step_tpot_ms[step] =
+                std::chrono::duration<double, std::milli>(t1 - t0).count();
+            result.kernel_ms[step] = ksec * 1000.0;
+            result.gen_traj[step] = next;
+            prefix.push_back(next);
+        }
+
+        std::cerr << "[progress] decode example " << (example_index + 1)
+                  << "/" << example_count << " complete\n";
+    }
+
+    return results;
+}
+
+// Writes the on-card decode JSON. Schema is the native gdn_eval decode schema
+// plus a per-step kernel_ms series.
+static void write_decode_json(
+    const std::string &output_path,
+    uint32_t decode_len,
+    const std::vector<DecodeExample> &results
+) {
+    std::ofstream file(output_path);
+    if (!file) {
+        throw std::runtime_error("failed to open output: " + output_path);
+    }
+
+    file << std::fixed << std::setprecision(6);
+    file << "{\"kind\": " << kReqKindLL
+         << ", \"decode_len\": " << decode_len
+         << ", \"num_examples\": " << results.size() << ",\n";
+    file << " \"examples\": [";
+    for (size_t example_index = 0; example_index < results.size(); ++example_index) {
+        const DecodeExample &result = results[example_index];
+        uint32_t n = result.n;
+        file << (example_index ? "," : "") << "\n  {\"index\": " << example_index << ",\n";
+        file << "   \"gen_traj\": [";
+        for (uint32_t j = 0; j < n; ++j) {
+            file << (j ? ", " : "") << result.gen_traj[j];
+        }
+        file << "],\n   \"tf_argmax\": [";
+        for (uint32_t j = 0; j < n; ++j) {
+            file << (j ? ", " : "") << result.tf_argmax[j];
+        }
+        file << "],\n   \"per_step_tpot_ms\": [";
+        for (uint32_t j = 0; j < n; ++j) {
+            file << (j ? ", " : "") << result.per_step_tpot_ms[j];
+        }
+        file << "],\n   \"kernel_ms\": [";
+        for (uint32_t j = 0; j < n; ++j) {
+            file << (j ? ", " : "") << result.kernel_ms[j];
+        }
+        file << "]}";
+    }
+    file << "\n ]}\n";
+}
+
 static double score_pair_hw(
     const ModelData &model,
     HwRunner &runner,
@@ -586,6 +835,30 @@ int main(int argc, char **argv) {
                   << " layers=" << model.config.num_layers
                   << " max_seq_len=" << model.config.max_seq_len
                   << " vocab=" << model.config.vocab_size << "\n";
+
+        if (opts.decode) {
+            // On-card decode benchmark over an LL-kind (kind=2) fixture.
+            // Default output is results_decode_hw/decode.hw.json unless an
+            // explicit positional output was supplied.
+            std::string decode_out = opts.output_set ? opts.output : kDefaultDecodeOutput;
+            std::cerr << "[progress] loading LL decode fixture from " << opts.fixture << "\n";
+            Fixture fixture = load_ll_fixture(opts.fixture);
+            std::cerr << "[progress] fixture examples=" << fixture.num_examples << "\n";
+
+            std::cerr << "[progress] allocate XRT buffers\n";
+            HwRunner runner(device, uuid, model);
+
+            std::vector<float> logits(model.config.vocab_size, 0.0f);
+            std::vector<DecodeExample> results =
+                run_decode_hw(model, runner, logits, fixture, opts.decode_len, opts.decode_limit);
+
+            write_decode_json(decode_out, opts.decode_len, results);
+            std::cerr << "[progress] decode finished examples=" << results.size()
+                      << " avg_kernel_ms=" << std::fixed << std::setprecision(3)
+                      << (runner.average_kernel_seconds() * 1000.0)
+                      << " output=" << decode_out << "\n";
+            return EXIT_SUCCESS;
+        }
 
         std::cerr << "[progress] loading rolling Wikitext fixture from " << opts.fixture << "\n";
         Fixture fixture = load_rolling_fixture(opts.fixture);

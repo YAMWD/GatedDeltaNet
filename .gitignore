@@ -47,3 +47,5 @@ c_impl/host.exe
 c_impl/hw_*.json
 c_impl/results_smoke_c/
 c_impl/results_smoke_parity.json
+c_impl/results_decode_c/
+c_impl/results_decode_hw/

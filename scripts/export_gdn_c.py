@@ -271,6 +271,51 @@ def build_ll_records(tokenizer, prefix_token_id: int, limit: int | None):
     return records
 
 
+# Curated natural-English prompts for the decode benchmark. Kept short so the
+# tokenized prompt lands in the 16-48 token range expected by the C testbench.
+DECODE_PROMPTS = [
+    "The history of the Roman Empire is a story of ambition, conquest, and "
+    "the slow transformation of a small city into a vast",
+    "In the early morning the fishermen pushed their boats out onto the calm "
+    "water, hoping that the day would bring a good",
+    "Scientists have long wondered how migrating birds manage to find their "
+    "way across thousands of miles of open ocean without",
+    "She opened the old wooden chest in the attic and found a bundle of "
+    "letters tied with a faded ribbon, each one written",
+    "The recipe calls for fresh tomatoes, a handful of basil, two cloves of "
+    "garlic, and a generous drizzle of olive",
+    "When the spacecraft finally entered orbit around the distant planet, the "
+    "engineers in the control room held their breath and",
+    "Learning to play the piano takes patience and daily practice, but the "
+    "reward of playing a beautiful piece of music is",
+    "The detective studied the room carefully, noting the overturned chair, "
+    "the broken glass, and the single muddy footprint near the",
+    "Across the rolling hills the farmers worked from dawn until dusk, "
+    "gathering the golden wheat before the autumn rains could",
+    "A good teacher does more than share facts; she inspires curiosity, "
+    "encourages questions, and helps each student discover the joy of",
+    "The river wound slowly through the green valley, past sleepy villages "
+    "and ancient stone bridges that had stood for many",
+    "After years of careful research the team finally announced that they had "
+    "discovered a new species of butterfly living deep within the",
+]
+
+
+def build_decode_records(tokenizer, prefix_token_id: int, decode_len: int, limit: int | None):
+    prompts = DECODE_PROMPTS if limit is None else DECODE_PROMPTS[:limit]
+    records = []
+    for text in prompts:
+        # tok_encode_default mirrors the parity tooling: the tokenizer prepends
+        # its own BOS, so the prompt is the exact prefill the FPGA reproduces.
+        prompt_ids = tok_encode_default(tokenizer, text)
+        if not prompt_ids or prompt_ids[0] != prefix_token_id:
+            prompt_ids = [prefix_token_id] + prompt_ids
+        # Placeholder continuation; the golden greedy trajectory is filled in by
+        # compare_gdn_c.py and written back into the .gdnreq when regenerated.
+        records.append({"prompt_ids": prompt_ids, "decode_len": decode_len})
+    return records
+
+
 def build_wikitext_records(tokenizer, prefix_token_id: int, max_seq_len: int, limit: int | None):
     dataset = load_dataset("EleutherAI/wikitext_document_level", "wikitext-2-raw-v1", split="test")
     iterator = dataset.select(range(limit)) if limit is not None else dataset
@@ -295,6 +340,38 @@ def build_wikitext_records(tokenizer, prefix_token_id: int, max_seq_len: int, li
             }
         )
     return records
+
+
+def export_decode_fixture(tokenizer, prefix_token_id: int, decode_len: int, output_dir: Path, limit: int | None) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / "decode.gdnreq"
+    manifest_path = output_dir / "decode.json"
+    records = build_decode_records(tokenizer, prefix_token_id, decode_len, limit)
+
+    # Decode fixtures reuse the LL kind: ctx[] = prompt ids, cont[] = greedy
+    # trajectory of length decode_len. The trajectory is a placeholder here and
+    # is rewritten in place by compare_gdn_c.py once the GPU golden is computed.
+    placeholder = [prefix_token_id] * decode_len
+    with out_path.open("wb") as handle:
+        handle.write(REQ_HEADER.pack(REQ_MAGIC, 1, REQ_KIND_LL, len(records)))
+        for rec in records:
+            prompt_ids = rec["prompt_ids"]
+            write_u32(handle, len(prompt_ids))
+            write_u32(handle, decode_len)
+            write_i32_array(handle, prompt_ids)
+            write_i32_array(handle, placeholder)
+
+    manifest = {
+        "task": "decode",
+        "kind": REQ_KIND_LL,
+        "num_examples": len(records),
+        "decode_len": decode_len,
+        "limit": limit,
+        "path": str(out_path),
+        "note": "cont[] is a placeholder; run compare_gdn_c.py --decode-golden to fill the golden trajectory",
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    print(f"wrote {out_path}")
 
 
 def export_task_fixture(task: str, tokenizer, prefix_token_id: int, max_seq_len: int, output_dir: Path, limit: int | None) -> None:
@@ -465,6 +542,16 @@ def main() -> None:
         default=Path("c_impl/fixtures"),
     )
 
+    decode_parser = subparsers.add_parser("decode")
+    decode_parser.add_argument("--model-name", default=DEFAULT_MODEL)
+    decode_parser.add_argument("--decode-len", type=int, default=64)
+    decode_parser.add_argument("--limit", type=int, default=None)
+    decode_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("c_impl/fixtures_decode"),
+    )
+
     args = parser.parse_args()
     if args.cmd == "weights":
         export_weights(args.model_name, args.output)
@@ -474,6 +561,10 @@ def main() -> None:
     prefix_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
     if prefix_token_id is None:
         raise ValueError("Tokenizer must define BOS or EOS token for prefix_token_id.")
+    if args.cmd == "decode":
+        export_decode_fixture(tokenizer, prefix_token_id, args.decode_len, args.output_dir, args.limit)
+        return
+
     max_seq_len = 2048
     for task in args.tasks:
         export_task_fixture(task, tokenizer, prefix_token_id, max_seq_len, args.output_dir, args.limit)
