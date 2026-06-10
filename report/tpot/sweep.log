@@ -1,0 +1,50 @@
+device: NVIDIA A100 80GB PCIe  |  dtype: bf16  |  contexts: [128, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]  |  decode_steps: 64
+
+[load] gdn-pure  (m-a-p/1.3B-100B-GatedDeltaNet-pure, dtype=bf16)
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:00<00:00,  4.40it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  7.70it/s]
+Some weights of the model checkpoint at m-a-p/1.3B-100B-GatedDeltaNet-pure were not used when initializing GatedDeltaNetForCausalLM: ['model.layers.0.attn.D', 'model.layers.1.attn.D', 'model.layers.10.attn.D', 'model.layers.11.attn.D', 'model.layers.12.attn.D', 'model.layers.13.attn.D', 'model.layers.14.attn.D', 'model.layers.15.attn.D', 'model.layers.16.attn.D', 'model.layers.17.attn.D', 'model.layers.18.attn.D', 'model.layers.19.attn.D', 'model.layers.2.attn.D', 'model.layers.20.attn.D', 'model.layers.21.attn.D', 'model.layers.22.attn.D', 'model.layers.23.attn.D', 'model.layers.3.attn.D', 'model.layers.4.attn.D', 'model.layers.5.attn.D', 'model.layers.6.attn.D', 'model.layers.7.attn.D', 'model.layers.8.attn.D', 'model.layers.9.attn.D']
+- This IS expected if you are initializing GatedDeltaNetForCausalLM from the checkpoint of a model trained on another task or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).
+- This IS NOT expected if you are initializing GatedDeltaNetForCausalLM from the checkpoint of a model that you expect to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model).
+[load] gdn-pure: 1.466B params in 2.3s
+[bench] gdn-pure     ctx=   128  TTFT=   56.36ms  TPOT= 34.511ms (   29.0 tok/s)  peak=  3221.9MB
+[bench] gdn-pure     ctx=   512  TTFT=   56.69ms  TPOT= 34.356ms (   29.1 tok/s)  peak=  3029.7MB
+[bench] gdn-pure     ctx=  1024  TTFT=   58.08ms  TPOT= 35.488ms (   28.2 tok/s)  peak=  3064.6MB
+[bench] gdn-pure     ctx=  2048  TTFT=   61.74ms  TPOT= 37.692ms (   26.5 tok/s)  peak=  3245.3MB
+[bench] gdn-pure     ctx=  4096  TTFT=   74.37ms  TPOT= 34.293ms (   29.2 tok/s)  peak=  3278.9MB
+[bench] gdn-pure     ctx=  8192  TTFT=  139.93ms  TPOT= 35.064ms (   28.5 tok/s)  peak=  3552.7MB
+[bench] gdn-pure     ctx= 16384  TTFT=  279.65ms  TPOT= 34.578ms (   28.9 tok/s)  peak=  4110.7MB
+[bench] gdn-pure     ctx= 32768  TTFT=  548.97ms  TPOT= 35.635ms (   28.1 tok/s)  peak=  5226.5MB
+[bench] gdn-pure     ctx= 65536  TTFT= 1097.88ms  TPOT= 34.899ms (   28.6 tok/s)  peak=  7458.1MB
+
+[load] pythia-1.4b  (EleutherAI/pythia-1.4b, dtype=bf16)
+[load] pythia-1.4b: attn_implementation=sdpa
+[load] pythia-1.4b: 1.415B params in 1.7s
+[bench] pythia-1.4b  ctx=   128  TTFT=   11.59ms  TPOT= 11.580ms (   86.4 tok/s)  peak=  2912.4MB
+[bench] pythia-1.4b  ctx=   512  TTFT=   12.72ms  TPOT= 11.569ms (   86.4 tok/s)  peak=  3093.7MB
+[bench] pythia-1.4b  ctx=  1024  TTFT=   19.48ms  TPOT= 11.489ms (   87.0 tok/s)  peak=  3347.7MB
+[bench] pythia-1.4b  ctx=  2048  TTFT=   36.70ms  TPOT= 11.375ms (   87.9 tok/s)  peak=  3857.6MB
+[bench] pythia-1.4b  ctx=  4096  TTFT=   74.33ms  TPOT= 11.710ms (   85.4 tok/s)  peak=  4878.4MB
+[bench] pythia-1.4b  ctx=  8192  TTFT=  159.59ms  TPOT= 12.158ms (   82.2 tok/s)  peak=  6916.8MB
+[bench] pythia-1.4b  ctx= 16384  TTFT=  388.10ms  TPOT= 18.604ms (   53.8 tok/s)  peak= 10995.9MB
+[bench] pythia-1.4b  ctx= 32768  TTFT= 1044.71ms  TPOT= 32.028ms (   31.2 tok/s)  peak= 19153.9MB
+[bench] pythia-1.4b  ctx= 65536  TTFT= 3263.71ms  TPOT= 59.412ms (   16.8 tok/s)  peak= 35470.0MB
+
+[load] opt-1.3b  (facebook/opt-1.3b, dtype=bf16)
+[load] opt-1.3b: attn_implementation=sdpa
+[load] opt-1.3b: 1.316B params in 2.2s
+[bench] opt-1.3b     ctx=   128  TTFT=    8.49ms  TPOT=  8.875ms (  112.7 tok/s)  peak=  2716.4MB
+[bench] opt-1.3b     ctx=   512  TTFT=   10.55ms  TPOT=  9.407ms (  106.3 tok/s)  peak=  2867.4MB
+[bench] opt-1.3b     ctx=  1024  TTFT=   17.28ms  TPOT=  9.047ms (  110.5 tok/s)  peak=  3068.8MB
+[skip] opt-1.3b @ ctx=2048 (> max_ctx 1024)
+[skip] opt-1.3b @ ctx=4096 (> max_ctx 1024)
+[skip] opt-1.3b @ ctx=8192 (> max_ctx 1024)
+[skip] opt-1.3b @ ctx=16384 (> max_ctx 1024)
+[skip] opt-1.3b @ ctx=32768 (> max_ctx 1024)
+[skip] opt-1.3b @ ctx=65536 (> max_ctx 1024)
+
+[out] wrote report/tpot/tpot_results.json
+[out] wrote report/tpot/tpot_results.csv
+[plot] wrote report/tpot/tpot_vs_context.png
+[plot] wrote report/tpot/mem_vs_context.png
+
+[done]
