@@ -153,30 +153,48 @@ the decode-only path and stays green.
 Removing the GEMM (16×16 grid + 5.76 MB URAM) let the kernel close timing with
 margin and **no `hbm_aclk` marginality** (Step-1 had −50 ps/21 paths).
 
-**Why 1.95 s and not the ~1.0 s single-port floor.** `gdn_gemv` reads weights
-and MACs in the *same* loop nest, one output row at a time. Each output restarts
-the `gemv_k` pipeline (Depth=54) and — the dominant cost — **breaks the AXI
-burst**: the contiguous 5.6 GB weight stream is chopped into `out_dim` separate
-HBM reads, each paying read latency, so the port sustains ~2.87 GB/s instead of
-6.4. The fix is the FlightLLM/Serpens streaming structure (§8 [1],[4]): a
-**dedicated weight-reader dataflow process** that issues one long contiguous
-burst per projection and feeds the MAC through an `hls::stream` FIFO, decoupling
-read from compute so the burst never breaks. That recovers toward ~1.0 s, and it
-is the same reader structure Step 2 replicates across HBM channels.
+In the coupled version, `gdn_gemv` read weights and MAC'd in the *same* loop
+nest, one output row at a time — each output restarted the `gemv_k` pipeline
+(Depth=54) and **broke the AXI burst**, chopping the 5.6 GB stream into `out_dim`
+latency-bound reads (2.87 GB/s = 45% of one port).
+
+## 6b. Stage 1 — decoupled reader → MAC (on-card, bit-exact)
+
+`gdn_gemv` is now an HLS **dataflow** of two processes: `gemv_read` issues one
+monotonic sweep over the whole projection's weights (a single long 512-bit
+burst) into an `hls::stream`; `gemv_compute` drains the FIFO and MACs against the
+resident activation. The burst no longer breaks between output rows.
+
+| metric | coupled | **decoupled** |
+|---|---:|---:|
+| kernel TPOT (flat) | 1949 ms | **1543 ms** (1.26×) |
+| weight-port rate (XRT) | 2.87 GB/s (45%) | **5.30 GB/s (83% of one 512-bit port)** |
+| avg read burst | — | **4.1 KB (full 64-beat)**, 97 ns latency |
+| vs Step-1 (2.56 s) | 1.31× | **1.66×** |
+| build / timing | — | 3 h 41 m; +3.77 ns, `hbm_aclk` 0 failing |
+
+**1.54 s is the single-port floor**, and the decouple reached it. XRT shows the
+port reads 5.6 GB/token at 5.30 GB/s ⇒ **~1.06 s of weight streaming**; the
+kernel is 1.54 s ⇒ **~0.48 s is non-gemv serial work** (recurrent-attention state
+R/W, the a/b `gdn_matmul_tiled`, conv) during which the weight port idles. So
+`1.06 (gemv @ 83% of one port) + 0.48 (non-gemv) = 1.54 s`. The ~1.0 s target had
+assumed a full 6.4 GB/s port *and* zero non-gemv — neither reachable on one
+master. The decouple's *purpose* (burst efficiency) was met and exceeded:
+**port 2.87 → 5.30 GB/s, 45% → 83%.** Further single-port tuning
+(`num_read_outstanding`) has <0.1 s of headroom (latency already hidden under
+4 KB bursts) — the lever that breaks the floor is multi-port.
 
 ## 7. Next
 
-On-card decode-only is **bit-exact and flat at 1.95 s/token** (1.31× over Step 1),
-sustaining 45% of the single weight port. The two remaining levers:
+Decode-only is bit-exact and flat at **1.54 s/token** (1.66× over Step 1), with
+the single weight port at 83% of peak. The remaining lever:
 
-1. **Decouple read from MAC (single port → ~1.0 s).** Split `gdn_gemv` into a
-   weight-reader dataflow process that bursts each projection's weights
-   contiguously into an `hls::stream`, and a MAC process that consumes it — so
-   the 5.6 GB stream is one long burst, not `out_dim` latency-bound reads. Closes
-   the 2.87 → 6.4 GB/s gap.
-2. **Step 2 — N parallel HBM weight readers (~55 ms).** Replicate that reader
-   across HBM pseudo-channels with on-chip partial accumulation (Serpens [4]
-   pattern); the 16-lane MAC widens to keep pace.
+- **Step 2 — N parallel HBM weight readers (~55 ms).** Replicate `gemv_read`
+  across HBM pseudo-channels (weights already span HBM[10:31]) with on-chip
+  partial accumulation (Serpens [4] pattern); the MAC lanes widen to keep pace.
+  This multiplies the 5.30 GB/s by the channel count, collapsing the 1.06 s gemv
+  portion well below the 0.48 s non-gemv floor (which then becomes the next
+  target — recurrent-attention state I/O and the a/b projection).
 
 ## 8. References
 

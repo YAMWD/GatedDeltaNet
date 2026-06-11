@@ -94,8 +94,9 @@ is the lever, not MAC/cycle** — which is exactly why the grid stays 16×16.
 |------|----------:|--------------------:|-----------|
 | Baseline (re-prefill, O(n)) | — | 6.95 s median (4.2→9.7 s, grows) | re-forwards whole prefix |
 | Step 1 — single-token, state persistence (GEMM at 1 row) | ~2.2 GB/s eff. | 2.56 s, flat (on-card, bit-exact) | GEMM-shaped at num_rows=1 |
-| **Disaggregated decode-only GEMV — ON-CARD, bit-exact** | 2.87 GB/s eff. | **1.95 s, FLAT (1.31× over Step 1)** | weight burst broken per-output (read+MAC coupled) |
-| + decouple reader→MAC (one contiguous burst) | ~5.4 GB/s | ~1.0 s | memory (1 weight master) |
+| Disaggregated decode-only GEMV (coupled read+MAC) | 2.87 GB/s | 1.95 s, flat | weight burst broken per-output |
+| **Stage 1 DONE — decoupled reader→MAC (dataflow), ON-CARD** | **5.30 GB/s (83% of 1 port)** | **1.54 s, FLAT (1.66× over Step 1)** | single-port floor: 1.06 s gemv + 0.48 s non-gemv |
+| Stage 2 — N parallel HBM weight readers | ~100 GB/s | ~55 ms | memory (multi-master) |
 | Multi-channel parallel weight readers (~8 masters) | ~100 GB/s | ~55 ms | memory (16×16 grid keeps pace) |
 | + INT8 weights (5.6 → 1.4 GB) | ~100 GB/s | ~14 ms | memory |
 | Toward HBM aggregate (~460 GB/s) | ~400 GB/s | ~3–10 ms | compute (only here widen) |

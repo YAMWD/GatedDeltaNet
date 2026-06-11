@@ -1471,10 +1471,12 @@ void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logit
  *      22 KB) is loaded once into on-chip `a_loc` and reused for every output;
  *      weights are STREAMED from HBM once and never cached. (The opposite of the
  *      prefill weight-stationary GEMM, which reused each weight across 256 rows.)
- *   2. CONTIGUOUS WEIGHT STREAM: weights are row-major [out_dim][in_dim], so one
- *      output's row W[o][:] is contiguous. Scanning ONE output at a time keeps
- *      the 512-bit weight port reading one Pack16 (16 fp32) beat/cycle at II=1 —
- *      a clean burst. (Interleaving 16 rows would scatter the port to II=16.)
+ *   2. DECOUPLED READER -> MAC (HLS dataflow): a dedicated gemv_read process
+ *      bursts the whole projection's weights (out_dim*k_packs beats, row-major
+ *      back-to-back) into a FIFO; gemv_compute drains it and MACs in parallel.
+ *      One contiguous 512-bit burst, never broken between output rows — the fix
+ *      for the read+MAC-coupled version that sustained only 45% of the port.
+ *      (This is FlightLLM's "streaming" weight transfer.)
  *   3. ADDER-TREE + PARTIAL BANKS: each beat does 16 multiplies reduced by a
  *      combinational tree; the running sum rotates across GEMV_PARTIAL banks to
  *      hide FP32 fadd latency so the k-loop holds II=1.
@@ -1489,24 +1491,29 @@ void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logit
 #define GEMV_PARTIAL 8       /* power of two; >= FP32 fadd latency in cycles */
 #define IN_DIM_MAX   5632    /* max in_dim (intermediate=5632) — sizes a_loc */
 
-static void gdn_gemv(
-    float *out, const float *in, const float *weights, uint32_t w_pack_off,
-    uint32_t num_rows, uint32_t in_dim, uint32_t out_dim
-) {
-    #pragma HLS inline off
-    (void)num_rows;  /* decode GEMV: always the single token (row 0) */
+/* Producer: stream a projection's weights as ONE contiguous burst. The address
+ * is a single monotonic sweep (w_pack_off .. +total_packs), so HLS issues one
+ * long 512-bit burst that never breaks between output rows — the fix for the
+ * read+MAC-coupled version that chopped the stream into out_dim latency-bound
+ * reads (45% of port BW). */
+static void gemv_read(const Pack16 *w_p, uint32_t w_pack_off,
+                      uint32_t total_packs, hls::stream<Pack16> &wf) {
+    gemv_rd: for (uint32_t i = 0; i < total_packs; ++i) {
+    #pragma HLS loop_tripcount min=262144 max=720896
+    #pragma HLS pipeline II=1
+        wf.write(w_p[(size_t)w_pack_off + i]);
+    }
+}
 
-    /* Resident activation vector; cyclic/16 so the Pack16 load and the 16-lane
-     * MAC both hit distinct banks (II=1). */
-    static float a_loc[IN_DIM_MAX];
+/* Consumer: load the resident activation vector (cyclic/16 for 16 parallel
+ * lanes), then MAC each output row against it from the weight FIFO; adder tree
+ * + GEMV_PARTIAL banks hold II=1; emit one Pack16 per 16 outputs. Runs in
+ * parallel with gemv_read under #pragma HLS dataflow. */
+static void gemv_compute(const Pack16 *in_p, hls::stream<Pack16> &wf,
+                         Pack16 *out_p, uint32_t out_dim, uint32_t k_packs) {
+    float a_loc[IN_DIM_MAX];
     #pragma HLS array_partition variable=a_loc cyclic factor=16
 
-    const Pack16 *in_p  = reinterpret_cast<const Pack16 *>(in);
-    const Pack16 *w_p   = reinterpret_cast<const Pack16 *>(weights);
-    Pack16       *out_p = reinterpret_cast<Pack16 *>(out);
-    uint32_t k_packs = in_dim / 16;
-
-    /* ---- Load the activation vector once (512-bit beats). ---- */
     gemv_load_a: for (uint32_t kp = 0; kp < k_packs; ++kp) {
     #pragma HLS loop_tripcount min=128 max=352
     #pragma HLS pipeline II=1
@@ -1517,8 +1524,6 @@ static void gdn_gemv(
         }
     }
 
-    /* ---- Stream weights: one output row at a time (contiguous burst), MAC
-     * against the resident vector, buffer 16 results, write one Pack16. ---- */
     Pack16 out_buf;
     gemv_o: for (uint32_t o = 0; o < out_dim; ++o) {
     #pragma HLS loop_tripcount min=8 max=5632
@@ -1528,13 +1533,12 @@ static void gdn_gemv(
         #pragma HLS unroll
             part[p] = 0.0f;
         }
-        size_t row_base = (size_t)w_pack_off + (size_t)o * k_packs;
         gemv_k: for (uint32_t kp = 0; kp < k_packs; ++kp) {
         #pragma HLS loop_tripcount min=128 max=352
         #pragma HLS pipeline II=1
-            Pack16 w = w_p[row_base + kp];
+            Pack16 w = wf.read();
             float lane = 0.0f;
-            gemv_mac: for (int kk = 0; kk < 16; ++kk) {
+            gemv_lane: for (int kk = 0; kk < 16; ++kk) {
             #pragma HLS unroll
                 lane += w.data[kk] * a_loc[kp * 16 + kk];
             }
@@ -1550,5 +1554,28 @@ static void gdn_gemv(
             out_p[o >> 4] = out_buf;
         }
     }
+}
+
+static void gdn_gemv(
+    float *out, const float *in, const float *weights, uint32_t w_pack_off,
+    uint32_t num_rows, uint32_t in_dim, uint32_t out_dim
+) {
+    #pragma HLS inline off
+    (void)num_rows;  /* decode GEMV: always the single token (row 0) */
+
+    const Pack16 *in_p  = reinterpret_cast<const Pack16 *>(in);
+    const Pack16 *w_p   = reinterpret_cast<const Pack16 *>(weights);
+    Pack16       *out_p = reinterpret_cast<Pack16 *>(out);
+    uint32_t k_packs = in_dim / 16;
+
+    /* Decouple the weight read from the MAC: gemv_read bursts the whole
+     * projection's weights into wf; gemv_compute drains it and MACs against the
+     * resident activation. The FIFO smooths the per-output reduce/init bubble so
+     * the weight port never idles between output rows. */
+    hls::stream<Pack16> wf;
+    #pragma HLS stream variable=wf depth=128
+    #pragma HLS dataflow
+    gemv_read(w_p, w_pack_off, out_dim * k_packs, wf);
+    gemv_compute(in_p, wf, out_p, out_dim, k_packs);
 }
 
