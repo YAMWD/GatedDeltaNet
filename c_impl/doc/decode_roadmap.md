@@ -92,16 +92,31 @@ is the lever, not MAC/cycle** — which is exactly why the grid stays 16×16.
 
 | Step | Weight BW | decode/token (FP32) | bottleneck |
 |------|----------:|--------------------:|-----------|
-| Today (1 weight master, 5.4 GB/s) | 5.4 GB/s | ~1.0 s | memory |
+| Baseline (re-prefill, O(n)) | — | 6.95 s median (4.2→9.7 s, grows) | re-forwards whole prefix |
+| Step 1 — single-token, state persistence (GEMM at 1 row) | ~2.2 GB/s eff. | 2.56 s, flat (on-card, bit-exact) | GEMM-shaped at num_rows=1 |
+| **Disaggregated decode-only GEMV — ON-CARD, bit-exact** | 2.87 GB/s eff. | **1.95 s, FLAT (1.31× over Step 1)** | weight burst broken per-output (read+MAC coupled) |
+| + decouple reader→MAC (one contiguous burst) | ~5.4 GB/s | ~1.0 s | memory (1 weight master) |
 | Multi-channel parallel weight readers (~8 masters) | ~100 GB/s | ~55 ms | memory (16×16 grid keeps pace) |
 | + INT8 weights (5.6 → 1.4 GB) | ~100 GB/s | ~14 ms | memory |
 | Toward HBM aggregate (~460 GB/s) | ~400 GB/s | ~3–10 ms | compute (only here widen) |
 
+**Architecture pivot — disaggregated decode-only** (full design:
+[decode_disaggregated_gemv.md](decode_disaggregated_gemv.md)). The GPU prefills
+the prompt and exports the constant-size recurrent+conv state to disk
+(`scripts/export_gdn_state.py` → `.gdnstate`, ~50 MB); the FPGA loads it and
+decodes through a new activation-stationary **`gdn_gemv`** engine. The prefill
+GEMM (`gdn_matmul_2d`), the `decode_flags` mode mux, and all prefill code were
+**removed** — the FPGA has one mode, decode. Native csim is bit-exact to the GPU
+golden over 32 tokens; on-card synthesis is in progress. This builds Step 1's
+unbuilt "GEMV datapath" half *and* frees the whole die from the prefill engine,
+de-risking the multi-reader (Step 2) routing.
+
 Work, in order:
 
-1. **GEMV decode datapath** — when `num_rows==1`, bypass the 2-D grid; stream
-   each weight row and dot it with the resident activation vector, pipelined.
-   Engine = "read weights as fast as HBM allows, MAC on the fly."
+1. **GEMV decode datapath — DONE (native bit-exact).** `gdn_gemv`: activation
+   vector resident on-chip, weights streamed contiguously one output-row at a
+   time (II=1 burst), adder-tree + partial banks. Recovers 2.56 s → ~1.0 s
+   single-port floor. Built as the decode-only kernel (no GEMM, no flags).
 2. **Multi-channel weight readers** — the dominant lever. One 512-bit master at
    100 MHz = 6.4 GB/s; 8+ masters across HBM channels aggregate toward HBM's
    ~460 GB/s. (Opposite of prefill, where one reused master sufficed.)

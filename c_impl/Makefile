@@ -21,8 +21,9 @@
 CXX            ?= c++
 # C++14 here matches the existing host testbench (gdn_eval etc.).
 # -Wno-unknown-pragmas silences the Vitis HLS #pragma directives that the
-# host gcc does not understand.
-CXXFLAGS       ?= -O3 -std=c++14 -Wall -Wextra -pedantic -Wno-unknown-pragmas
+# host gcc does not understand. -Wno-unused-label silences the HLS loop labels
+# (pipeline/unroll targets) that are intentionally unused in the native build.
+CXXFLAGS       ?= -O3 -std=c++14 -Wall -Wextra -pedantic -Wno-unknown-pragmas -Wno-unused-label
 
 # Vitis HLS install location — provides hls_stream.h used by the systolic
 # matmul kernel in gdn_model.cpp.
@@ -137,7 +138,10 @@ help:
 # ----------------------------------------------------------------------------
 # C++ host testbenches
 # ----------------------------------------------------------------------------
-host_tb: gdn_eval gdn_attn_test gdn_matmul_test
+# Decode-only build: gdn_eval is the native csim of the decode-only GEMV kernel.
+# The old gdn_attn_test / gdn_matmul_test exercised the removed prefill /
+# GEMM-matmul tops (gdn_attn_forward, gdn_matmul_top) and are retired.
+host_tb: gdn_eval
 
 gdn_eval: gdn_eval.cpp gdn_model.cpp gdn_model.h
 	$(CXX) $(CXXFLAGS) -I$(XILINX_HLS_INC) -o $@ gdn_eval.cpp gdn_model.cpp -lm

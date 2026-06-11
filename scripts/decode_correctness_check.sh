@@ -36,6 +36,12 @@ WEIGHTS="${C_IMPL}/artifacts/gdn-1.3b-f32.gdnw"
 FIXTURE="${C_IMPL}/fixtures_decode/decode.gdnreq"
 GOLDEN="${C_IMPL}/results_decode_golden/decode.decode.json"
 CHECKER="${REPO_ROOT}/scripts/check_gdn_c_parity.py"
+# Disaggregated decode: the FPGA never prefills. State (example 0's post-prompt
+# recurrent + conv window) is produced once by the GPU (scripts/export_gdn_state.py)
+# and lives on disk (gitignored, like the weight blob). The native decode-only
+# path loads it and decodes from the exported seed token — no prefill, no
+# re-prefill — and is gated bit-exact against the same cached golden.
+STATE="${C_IMPL}/fixtures_decode/decode_ex0.gdnstate"
 
 # --- parse args --------------------------------------------------------------
 MODE="full"
@@ -84,7 +90,7 @@ PYTHON_BIN="${PYTHON:-python3}"
 # --- preflight ---------------------------------------------------------------
 fail() { echo "FATAL: $*" >&2; exit 1; }
 
-for f in "${WEIGHTS}" "${FIXTURE}" "${GOLDEN}" "${CHECKER}"; do
+for f in "${WEIGHTS}" "${FIXTURE}" "${GOLDEN}" "${CHECKER}" "${STATE}"; do
     [[ -f "${f}" ]] || fail "required file not found: ${f}"
 done
 command -v "${PYTHON_BIN}" >/dev/null 2>&1 || fail "python interpreter not found: ${PYTHON_BIN}"
@@ -110,8 +116,8 @@ make -C "${C_IMPL}" gdn_eval
 # gdn_eval expects to find its relative default paths from inside c_impl; we use
 # an absolute output path so the cwd does not matter, but cd anyway to match the
 # documented invocation and to resolve any relative artifacts consistently.
-echo "==> Running native decode (~16 s/step on CPU; this takes a while)"
-echo "    cd ${C_IMPL} && ./gdn_eval <weights> <fixture> ${OUT_JSON} --decode --limit ${LIMIT} --decode-len ${DECODE_LEN}"
+echo "==> Running native decode-only from GPU state (no prefill / no re-prefill)"
+echo "    cd ${C_IMPL} && ./gdn_eval <weights> <fixture> ${OUT_JSON} --decode --decode-from-state ${STATE} --decode-len ${DECODE_LEN}"
 (
     cd "${C_IMPL}"
     ./gdn_eval \
@@ -119,7 +125,7 @@ echo "    cd ${C_IMPL} && ./gdn_eval <weights> <fixture> ${OUT_JSON} --decode --
         "${FIXTURE}" \
         "${OUT_JSON}" \
         --decode \
-        --limit "${LIMIT}" \
+        --decode-from-state "${STATE}" \
         --decode-len "${DECODE_LEN}"
 )
 

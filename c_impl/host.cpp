@@ -63,10 +63,10 @@ struct Options {
     std::string output = kDefaultOutput;
     unsigned int device_index = 0;
     uint32_t max_examples = 0;
-    // --decode mode: mirror the native gdn_eval decode benchmark on-card.
+    // Decode-only: load the GPU-exported post-prompt state and decode on-card.
     bool decode = false;
-    uint32_t decode_len = 0;    // 0 => use each example's cont_len
-    uint32_t decode_limit = 0;  // 0 => all examples
+    std::string state_path;     // --decode-from-state <.gdnstate> (required for --decode)
+    uint32_t decode_len = 0;    // 0 => use the fixture's golden cont_len
     bool output_set = false;    // whether an explicit positional output was given
 };
 
@@ -78,7 +78,7 @@ static void usage(const char *argv0) {
         << "       " << argv0
         << " <gdn_forward.xclbin> [weights.gdnw] [decode.gdnreq]"
         << " [output.json|-] [device_index] [max_examples]"
-        << " --decode [--decode-len N] [--limit E]\n\n"
+        << " --decode --decode-from-state <state.gdnstate> [--decode-len N]\n\n"
         << "defaults:\n"
         << "  weights      " << kDefaultWeights << "\n"
         << "  fixture      " << kDefaultFixture << "\n"
@@ -86,10 +86,10 @@ static void usage(const char *argv0) {
         << " (rolling) | " << kDefaultDecodeOutput << " (--decode)\n"
         << "  device_index 0\n"
         << "  max_examples 0 (all examples)\n\n"
-        << "--decode flags:\n"
-        << "  --decode         run the LL-kind (kind=2) decode benchmark\n"
-        << "  --decode-len N   cap decode length per example (0 => use cont_len)\n"
-        << "  --limit E        cap number of examples (0 => all)\n";
+        << "decode-only flags (the FPGA never prefills):\n"
+        << "  --decode                     run the on-card decode benchmark\n"
+        << "  --decode-from-state <file>   GPU-exported .gdnstate (recurrent+conv state); required\n"
+        << "  --decode-len N               cap decode length (0 => fixture golden cont_len)\n";
 }
 
 static uint32_t parse_u32(const char *text, const char *name) {
@@ -116,16 +116,17 @@ static Options parse_options(int argc, char **argv) {
         std::string arg = argv[arg_index];
         if (arg == "--decode") {
             opts.decode = true;
+        } else if (arg == "--decode-from-state") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error("--decode-from-state requires a .gdnstate path");
+            }
+            opts.state_path = argv[++arg_index];
+            opts.decode = true;
         } else if (arg == "--decode-len") {
             if (arg_index + 1 >= argc) {
                 throw std::runtime_error("--decode-len requires a value");
             }
             opts.decode_len = parse_u32(argv[++arg_index], "decode-len");
-        } else if (arg == "--limit") {
-            if (arg_index + 1 >= argc) {
-                throw std::runtime_error("--limit requires a value");
-            }
-            opts.decode_limit = parse_u32(argv[++arg_index], "limit");
         } else {
             positional.push_back(arg);
         }
@@ -514,6 +515,20 @@ public:
         return seconds;
     }
 
+    // Upload the GPU-exported post-prompt state into the resident state BOs.
+    // recurrent_state holds all layers (48 MB); head_buffer is the conv-tail
+    // store (~1.7 MB). The decode kernel restores from these at each layer start
+    // and saves the update at layer end, so they persist across token calls.
+    void upload_decode_state(const std::vector<float> &recurrent,
+                             const std::vector<float> &conv) {
+        size_t rbytes = recurrent.size() * sizeof(float);
+        size_t cbytes = conv.size() * sizeof(float);
+        recurrent_state_bo_.write(recurrent.data(), rbytes, 0);
+        sync_bo_chunked(recurrent_state_bo_, XCL_BO_SYNC_BO_TO_DEVICE, rbytes, 0);
+        head_buffer_bo_.write(conv.data(), cbytes, 0);
+        sync_bo_chunked(head_buffer_bo_, XCL_BO_SYNC_BO_TO_DEVICE, cbytes, 0);
+    }
+
     const float *hidden_row(uint32_t row) const {
         return x_norm_host_.data() + static_cast<size_t>(row) * hidden_;
     }
@@ -543,18 +558,24 @@ private:
                sizeof(float);
     }
 
+    // Decode persistence (mirrors gdn_run_state_init): recurrent_state holds
+    // ALL layers' states (24 x 8 x 256 x 256 fp32 = 48 MB) and head_buffer is
+    // the conv tail store (24 layers x 3 convs x (conv_size-1) rows x hidden
+    // ~ 1.7 MB). Prefill (decode_flags=0) never touches either.
     static size_t recurrent_state_bytes(const ModelData &model) {
         size_t value_dim = model.config.hidden_size / model.config.num_heads;
-        return static_cast<size_t>(model.config.num_heads) *
+        return static_cast<size_t>(model.config.num_layers) *
+               model.config.num_heads *
                model.config.head_dim *
                value_dim *
                sizeof(float);
     }
 
     static size_t head_buffer_bytes(const ModelData &model) {
-        size_t value_dim = model.config.hidden_size / model.config.num_heads;
-        size_t rounded = ((value_dim + 15) / 16) * 16;
-        return rounded * sizeof(float);
+        return static_cast<size_t>(model.config.num_layers) * 3 *
+               (model.config.conv_size - 1) *
+               model.config.hidden_size *
+               sizeof(float);
     }
 
     xrt::kernel kernel_;
@@ -612,82 +633,76 @@ static std::vector<DecodeExample> run_decode_hw(
     std::vector<float> &logits,
     const Fixture &fixture,
     uint32_t decode_len,
-    uint32_t limit
+    const std::string &state_path
 ) {
-    uint32_t example_count = fixture.num_examples;
-    if (limit != 0 && limit < example_count) {
-        example_count = limit;
+    // ---- Read the GPU-exported .gdnstate blob ----
+    std::ifstream f(state_path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open .gdnstate: " + state_path);
+    char magic[8];
+    f.read(magic, 8);
+    if (std::memcmp(magic, "GDNSTAT1", 8) != 0)
+        throw std::runtime_error(".gdnstate: bad magic (expected GDNSTAT1)");
+    uint32_t v[9];
+    f.read(reinterpret_cast<char *>(v), sizeof(v));
+    // v = {version, num_layers, H, K, V, hidden, W, prompt_len, seed_token}
+    uint32_t num_layers = v[1], H = v[2], Kk = v[3], Vv = v[4];
+    uint32_t hidden = v[5], W = v[6], prompt_len = v[7];
+    int32_t seed = static_cast<int32_t>(v[8]);
+    if (num_layers != model.config.num_layers || hidden != model.config.hidden_size ||
+        W != model.config.conv_size)
+        throw std::runtime_error(".gdnstate: dims do not match the loaded model");
+    f.seekg(static_cast<std::streamoff>(prompt_len) * sizeof(int32_t), std::ios::cur);
+    size_t rec_count  = (size_t)num_layers * H * Kk * Vv;
+    size_t conv_count = (size_t)num_layers * 3u * (W - 1u) * hidden;
+    std::vector<float> rec(rec_count), conv(conv_count);
+    f.read(reinterpret_cast<char *>(rec.data()),  rec_count  * sizeof(float));
+    f.read(reinterpret_cast<char *>(conv.data()), conv_count * sizeof(float));
+    if (!f) throw std::runtime_error(".gdnstate: truncated");
+    std::cerr << "[progress] loaded .gdnstate: layers=" << num_layers
+              << " hidden=" << hidden << " W=" << W << " seed=" << seed
+              << " (recurrent=" << (rec_count * sizeof(float) / 1e6) << " MB)\n";
+
+    // ---- Upload the post-prompt state to the resident BOs (once) ----
+    runner.upload_decode_state(rec, conv);
+
+    // ---- Decode length from the fixture's golden continuation (example 0) ----
+    if (fixture.num_examples == 0 || fixture.ll_examples.empty())
+        throw std::runtime_error("--decode-from-state needs an LL-kind fixture for the golden");
+    const PairReq &req = fixture.ll_examples[0];
+    uint32_t n = req.cont_len;
+    if (decode_len != 0 && decode_len < n) n = decode_len;
+    if (n == 0) throw std::runtime_error("--decode: zero decode length");
+
+    std::vector<DecodeExample> results(1);
+    DecodeExample &result = results[0];
+    result.n = n;
+    result.gen_traj.resize(n);
+    result.tf_argmax.resize(n);
+    result.per_step_tpot_ms.resize(n);
+    result.kernel_ms.resize(n);
+
+    // traj[0] = the GPU-exported seed (argmax of the prompt's last position);
+    // every later token is one O(1) decode step against the persistent state.
+    // The kernel restores the loaded state at each layer start and saves the
+    // update at layer end, so the state BO carries forward across calls.
+    result.gen_traj[0] = seed;
+    result.tf_argmax[0] = seed;
+    result.per_step_tpot_ms[0] = 0.0;
+    result.kernel_ms[0] = 0.0;
+    std::cerr << "[progress] decode-from-state seed=" << seed << " N=" << n << "\n";
+    for (uint32_t step = 1; step < n; ++step) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        std::vector<int32_t> tok(1, result.gen_traj[step - 1]);
+        double ksec = runner.run_forward(tok);
+        int next = argmax_logits(model, runner.hidden_row(0), logits);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        result.per_step_tpot_ms[step] =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        result.kernel_ms[step] = ksec * 1000.0;
+        result.gen_traj[step] = next;
+        result.tf_argmax[step] = next;
     }
-
-    std::vector<DecodeExample> results(example_count);
-
-    for (uint32_t example_index = 0; example_index < example_count; ++example_index) {
-        const PairReq &req = fixture.ll_examples[example_index];
-        uint32_t prompt_len = req.ctx_len;
-        if (prompt_len == 0) {
-            throw std::runtime_error("--decode: empty prompt (ctx_len == 0)");
-        }
-
-        uint32_t n = req.cont_len;
-        if (decode_len != 0 && decode_len < n) {
-            n = decode_len;
-        }
-        if (n == 0) {
-            throw std::runtime_error("--decode: zero decode length");
-        }
-        if (prompt_len + n - 1 > model.config.max_seq_len) {
-            throw std::runtime_error("--decode: prompt + decode_len exceeds max_seq_len");
-        }
-
-        DecodeExample &result = results[example_index];
-        result.n = n;
-        result.gen_traj.resize(n);
-        result.tf_argmax.resize(n);
-        result.per_step_tpot_ms.resize(n);
-        result.kernel_ms.resize(n);
-
-        std::cerr << "[progress] decode example " << (example_index + 1)
-                  << "/" << example_count
-                  << " prompt_len=" << prompt_len << " N=" << n << "\n";
-
-        // ---- Teacher-forced per-position argmax ----
-        // Tokens = prompt + golden[:-1]; length prompt_len + (n - 1). Position i
-        // predicts golden[i] from hidden row (prompt_len + i - 1).
-        {
-            uint32_t tf_total = prompt_len + n - 1;
-            std::vector<int32_t> tf_tokens(tf_total);
-            std::copy(req.ctx.begin(), req.ctx.begin() + prompt_len, tf_tokens.begin());
-            if (n > 1) {
-                std::copy(req.cont.begin(), req.cont.begin() + (n - 1),
-                          tf_tokens.begin() + prompt_len);
-            }
-            runner.run_forward(tf_tokens);
-            for (uint32_t i = 0; i < n; ++i) {
-                const float *hidden = runner.hidden_row(prompt_len + i - 1);
-                result.tf_argmax[i] = argmax_logits(model, hidden, logits);
-            }
-        }
-
-        // ---- Free-running greedy + per-step latency ----
-        std::vector<int32_t> prefix(req.ctx.begin(), req.ctx.begin() + prompt_len);
-        for (uint32_t step = 0; step < n; ++step) {
-            auto t0 = std::chrono::high_resolution_clock::now();
-            double ksec = runner.run_forward(prefix);
-            int next = argmax_logits(
-                model, runner.hidden_row(static_cast<uint32_t>(prefix.size() - 1)), logits);
-            auto t1 = std::chrono::high_resolution_clock::now();
-
-            result.per_step_tpot_ms[step] =
-                std::chrono::duration<double, std::milli>(t1 - t0).count();
-            result.kernel_ms[step] = ksec * 1000.0;
-            result.gen_traj[step] = next;
-            prefix.push_back(next);
-        }
-
-        std::cerr << "[progress] decode example " << (example_index + 1)
-                  << "/" << example_count << " complete\n";
-    }
-
+    std::cerr << "[progress] decode-from-state complete (" << n << " tokens)\n";
     return results;
 }
 
@@ -837,9 +852,13 @@ int main(int argc, char **argv) {
                   << " vocab=" << model.config.vocab_size << "\n";
 
         if (opts.decode) {
-            // On-card decode benchmark over an LL-kind (kind=2) fixture.
-            // Default output is results_decode_hw/decode.hw.json unless an
-            // explicit positional output was supplied.
+            // Decode-only: the FPGA never prefills. The post-prompt recurrent +
+            // conv state comes from the GPU export on disk (--decode-from-state);
+            // the fixture supplies only the golden continuation for comparison.
+            if (opts.state_path.empty()) {
+                throw std::runtime_error(
+                    "decode-only build: pass --decode-from-state <state.gdnstate>");
+            }
             std::string decode_out = opts.output_set ? opts.output : kDefaultDecodeOutput;
             std::cerr << "[progress] loading LL decode fixture from " << opts.fixture << "\n";
             Fixture fixture = load_ll_fixture(opts.fixture);
@@ -850,7 +869,8 @@ int main(int argc, char **argv) {
 
             std::vector<float> logits(model.config.vocab_size, 0.0f);
             std::vector<DecodeExample> results =
-                run_decode_hw(model, runner, logits, fixture, opts.decode_len, opts.decode_limit);
+                run_decode_hw(model, runner, logits, fixture, opts.decode_len,
+                              opts.state_path);
 
             write_decode_json(decode_out, opts.decode_len, results);
             std::cerr << "[progress] decode finished examples=" << results.size()

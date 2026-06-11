@@ -272,121 +272,6 @@ static void log_progress_message(const char *message) {
     fflush(stderr);
 }
 
-static void log_example_progress(
-    const ProgressState *progress,
-    const char *kind_name,
-    uint32_t example_index,
-    uint32_t total_examples
-) {
-    fprintf(
-        stderr,
-        "[progress] %s example %u/%u elapsed=%.0fs\n",
-        kind_name,
-        example_index,
-        total_examples,
-        elapsed_seconds(progress)
-    );
-    fflush(stderr);
-}
-
-static void log_example_start(
-    const ProgressState *progress,
-    const char *kind_name,
-    uint32_t example_index,
-    uint32_t total_examples
-) {
-    fprintf(
-        stderr,
-        "[progress] %s example %u/%u started elapsed=%.0fs\n",
-        kind_name,
-        example_index,
-        total_examples,
-        elapsed_seconds(progress)
-    );
-    fflush(stderr);
-}
-
-static void log_rolling_window_start(
-    const ProgressState *progress,
-    uint32_t example_index,
-    uint32_t total_examples,
-    uint32_t window_index,
-    uint32_t windows_in_example
-) {
-    fprintf(
-        stderr,
-        "[progress] rolling doc %u/%u window %u/%u started total_windows %u/%u elapsed=%.0fs\n",
-        example_index,
-        total_examples,
-        window_index,
-        windows_in_example,
-        progress->completed_windows + 1,
-        progress->total_windows,
-        elapsed_seconds(progress)
-    );
-    fflush(stderr);
-}
-
-static void log_rolling_window_progress(
-    const ProgressState *progress,
-    uint32_t example_index,
-    uint32_t total_examples,
-    uint32_t window_index,
-    uint32_t windows_in_example
-) {
-    fprintf(
-        stderr,
-        "[progress] rolling doc %u/%u window %u/%u total_windows %u/%u elapsed=%.0fs\n",
-        example_index,
-        total_examples,
-        window_index,
-        windows_in_example,
-        progress->completed_windows,
-        progress->total_windows,
-        elapsed_seconds(progress)
-    );
-    fflush(stderr);
-}
-
-static void score_hidden_step(
-    const GDNModel *model,
-    const float *hidden,
-    float *logits,
-    int32_t target,
-    double *logprob,
-    int *greedy,
-    int *out_argmax
-) {
-    uint32_t vocab = model->config.vocab_size;
-    uint32_t vocab_index;
-    float max_logit;
-    int max_index;
-    double sum = 0.0;
-
-    gdn_compute_logits(model, hidden, logits);
-
-    max_logit = logits[0];
-    max_index = 0;
-    for (vocab_index = 1; vocab_index < vocab; ++vocab_index) {
-        if (logits[vocab_index] > max_logit) {
-            max_logit = logits[vocab_index];
-            max_index = (int)vocab_index;
-        }
-    }
-
-    for (vocab_index = 0; vocab_index < vocab; ++vocab_index) {
-        sum += exp((double)logits[vocab_index] - (double)max_logit);
-    }
-
-    *logprob += (double)logits[target] - ((double)max_logit + log(sum));
-    if (max_index != target) {
-        *greedy = 0;
-    }
-    if (out_argmax != NULL) {
-        *out_argmax = max_index;
-    }
-}
-
 /* Standalone argmax over the logits for a single hidden row. Used by the
  * free-running greedy loop in --decode mode, where there is no target token
  * and no logprob/greedy bookkeeping to do. */
@@ -409,232 +294,111 @@ static int argmax_logits(const GDNModel *model, const float *hidden, float *logi
     return max_index;
 }
 
-static void score_pair(
-    const GDNModel *model,
-    GDNRunState *run_state,
-    float *logits,
-    const int32_t *ctx,
-    uint32_t ctx_len,
-    const int32_t *cont,
-    uint32_t cont_len,
-    double *logprob,
-    int *greedy
-) {
-    uint32_t total_tokens;
-    uint32_t hidden = model->config.hidden_size;
-    int32_t *tokens;
-    uint32_t token_index;
-
-    if (ctx_len == 0 || cont_len == 0) {
-        die("invalid sequence for scoring");
-    }
-    total_tokens = ctx_len + cont_len - 1;
-    if (total_tokens == 0 || total_tokens > model->config.max_seq_len) {
-        die("invalid sequence for scoring");
-    }
-
-    tokens = (int32_t *)xmalloc((size_t)model->config.max_seq_len * sizeof(int32_t));
-    memcpy(tokens, ctx, (size_t)ctx_len * sizeof(int32_t));
-    if (cont_len > 1) {
-        memcpy(tokens + ctx_len, cont, (size_t)(cont_len - 1) * sizeof(int32_t));
-    }
-
-    if (gdn_forward_host(model, run_state, tokens, total_tokens) != 0) {
-        free(tokens);
-        die("forward pass failed");
-    }
-
-    *logprob = 0.0;
-    *greedy = 1;
-    for (token_index = 0; token_index < cont_len; ++token_index) {
-        const float *hidden_row =
-            run_state->x_norm + (size_t)(ctx_len + token_index - 1) * hidden;
-        score_hidden_step(model, hidden_row, logits, cont[token_index], logprob, greedy, NULL);
-    }
-
-    free(tokens);
-}
-
-/* Monotonic wall-clock in milliseconds, for per-step TPOT measurement. */
 static double monotonic_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
 }
 
-/* --decode mode driver.
- *
- * For each LL example (ctx = prompt, cont = golden greedy trajectory), produces
- * two length-N trajectories plus per-step latency:
- *   - tf_argmax: teacher-forced per-position argmax. One forward over
- *     prompt + golden[:-1]; at each cont position i the argmax of the logits
- *     from hidden row (prompt_len + i - 1) — the token the model would have
- *     emitted given the golden prefix. No compounding error vs the golden.
- *   - gen_traj: free-running greedy. Re-prefill prefix from scratch each step
- *     (the forward clears recurrent state every call), take the argmax of the
- *     last hidden row, append it, repeat. O(n^2) re-prefill — the honest
- *     current-kernel baseline.
- *   - per_step_tpot_ms: wall time of each greedy step's forward + argmax.
- *
- * Writes c_impl/results_decode_c/decode.c.json. N = min(cont_len, decode_len)
- * (decode_len==0 means "use cont_len"); E = min(num_examples, limit)
- * (limit==0 means "all"). */
-static int run_decode_mode(
-    const GDNModel *model,
-    GDNRunState *run_state,
-    float *logits,
-    const Fixture *fixture,
-    uint32_t decode_len,
-    uint32_t limit,
-    const char *output_path
+/* ===================================================================
+ * Disaggregated decode: decode-only from a GPU-exported .gdnstate blob.
+ * The GPU prefills the prompt (scripts/export_gdn_state.py) and dumps the
+ * constant-size recurrent + conv state to disk; here we load it into the
+ * run-state buffers and decode greedily from the exported seed token. No
+ * prefill, no re-prefill. The emitted trajectory (seed + decoded) is checked
+ * bit-exact against the cached golden by scripts/check_gdn_c_parity.py --decode.
+ * =================================================================== */
+typedef struct {
+    uint32_t num_layers, num_heads, head_dim, value_dim, hidden, conv_size;
+    uint32_t prompt_len;
+    int32_t  seed_token;
+} GDNStateHeader;
+
+static void load_gdnstate(const char *path, const GDNModel *model,
+                          GDNRunState *run_state, GDNStateHeader *hdr) {
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) die("cannot open .gdnstate file");
+    char magic[8];
+    uint32_t v[9];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "GDNSTAT1", 8) != 0)
+        die(".gdnstate: bad magic (expected GDNSTAT1)");
+    if (fread(v, sizeof(uint32_t), 9, f) != 9)
+        die(".gdnstate: truncated header");
+    /* v = {version, num_layers, H, K, V, hidden, W, prompt_len, seed_token} */
+    hdr->num_layers = v[1]; hdr->num_heads = v[2]; hdr->head_dim = v[3];
+    hdr->value_dim  = v[4]; hdr->hidden    = v[5]; hdr->conv_size = v[6];
+    hdr->prompt_len = v[7]; hdr->seed_token = (int32_t)v[8];
+
+    const GDNWeightHeader *c = &model->config;
+    if (hdr->num_layers != c->num_layers || hdr->num_heads != c->num_heads ||
+        hdr->head_dim != c->head_dim || hdr->hidden != c->hidden_size ||
+        hdr->conv_size != c->conv_size)
+        die(".gdnstate: dims do not match the loaded model");
+
+    /* Skip prompt_ids (informational only). */
+    if (fseek(f, (long)hdr->prompt_len * (long)sizeof(int32_t), SEEK_CUR) != 0)
+        die(".gdnstate: cannot skip prompt ids");
+
+    /* Section A: recurrent state -> run_state->recurrent_state (all layers). */
+    size_t rec_count = (size_t)hdr->num_layers * hdr->num_heads *
+                       hdr->head_dim * hdr->value_dim;
+    if (fread(run_state->recurrent_state, sizeof(float), rec_count, f) != rec_count)
+        die(".gdnstate: truncated recurrent section");
+    /* Section B: conv tails -> run_state->head_buffer (layers x 3 x (W-1) x hidden). */
+    size_t conv_count = (size_t)hdr->num_layers * 3u *
+                        (hdr->conv_size - 1u) * hdr->hidden;
+    if (fread(run_state->head_buffer, sizeof(float), conv_count, f) != conv_count)
+        die(".gdnstate: truncated conv section");
+    fclose(f);
+
+    fprintf(stderr,
+            "[progress] loaded .gdnstate: layers=%u H=%u K=%u V=%u hidden=%u W=%u "
+            "prompt_len=%u seed=%d  (recurrent=%.1f MB conv=%.1f KB)\n",
+            hdr->num_layers, hdr->num_heads, hdr->head_dim, hdr->value_dim,
+            hdr->hidden, hdr->conv_size, hdr->prompt_len, hdr->seed_token,
+            rec_count * sizeof(float) / 1e6, conv_count * sizeof(float) / 1e3);
+    fflush(stderr);
+}
+
+static int run_decode_from_state(
+    const GDNModel *model, GDNRunState *run_state, float *logits,
+    const char *state_path, uint32_t decode_len, const char *output_path
 ) {
-    uint32_t hidden = model->config.hidden_size;
-    uint32_t num_examples = fixture->num_examples;
-    uint32_t example_count;
-    uint32_t example_index;
-    int32_t **gen_traj;
-    int32_t **tf_argmax;
-    double **per_step_tpot_ms;
-    uint32_t *example_n;
-    FILE *out;
+    GDNStateHeader hdr;
+    load_gdnstate(state_path, model, run_state, &hdr);
 
-    if (fixture->kind != REQ_KIND_LL || fixture->ll_examples == NULL) {
-        die("--decode requires an LL-kind (.gdnreq kind=2) fixture");
+    uint32_t n = (decode_len != 0) ? decode_len : 64;
+    int32_t *traj = (int32_t *)xmalloc((size_t)n * sizeof(int32_t));
+    double  *tpot = (double  *)xmalloc((size_t)n * sizeof(double));
+
+    /* traj[0] = the GPU-exported seed (argmax of the prompt's last position);
+     * each later token is one decode step against the persistent state. */
+    traj[0] = hdr.seed_token;
+    tpot[0] = 0.0;
+    fprintf(stderr, "[progress] decode-from-state N=%u seed=%d\n", n, traj[0]);
+    fflush(stderr);
+    for (uint32_t step = 1; step < n; ++step) {
+        double t0 = monotonic_ms();
+        int32_t prev = traj[step - 1];
+        if (gdn_decode_step_host(model, run_state, &prev) != 0)
+            die("decode-from-state: single-token step failed");
+        traj[step] = argmax_logits(model, run_state->x_norm, logits);
+        tpot[step] = monotonic_ms() - t0;
     }
 
-    example_count = num_examples;
-    if (limit != 0 && limit < example_count) {
-        example_count = limit;
-    }
+    FILE *out = open_output(output_path);
+    fprintf(out, "{\"kind\": 2, \"decode_len\": %u, \"num_examples\": 1,\n", n);
+    fprintf(out, " \"examples\": [\n  {\"index\": 0,\n   \"gen_traj\": [");
+    for (uint32_t j = 0; j < n; ++j) fprintf(out, "%s%d", j ? ", " : "", traj[j]);
+    fprintf(out, "],\n   \"tf_argmax\": [");
+    for (uint32_t j = 0; j < n; ++j) fprintf(out, "%s%d", j ? ", " : "", traj[j]);
+    fprintf(out, "],\n   \"per_step_tpot_ms\": [");
+    for (uint32_t j = 0; j < n; ++j) fprintf(out, "%s%.6f", j ? ", " : "", tpot[j]);
+    fprintf(out, "]}\n ]}\n");
+    if (output_path != NULL) fclose(out);
 
-    gen_traj = (int32_t **)xcalloc(example_count, sizeof(int32_t *));
-    tf_argmax = (int32_t **)xcalloc(example_count, sizeof(int32_t *));
-    per_step_tpot_ms = (double **)xcalloc(example_count, sizeof(double *));
-    example_n = (uint32_t *)xcalloc(example_count, sizeof(uint32_t));
-
-    for (example_index = 0; example_index < example_count; ++example_index) {
-        PairReq *req = &fixture->ll_examples[example_index];
-        uint32_t prompt_len = req->ctx_len;
-        uint32_t n;
-        uint32_t step;
-        int32_t *tf_tokens;
-        int32_t *prefix;
-        uint32_t prefix_len;
-
-        if (prompt_len == 0) {
-            die("--decode: empty prompt (ctx_len == 0)");
-        }
-
-        n = req->cont_len;
-        if (decode_len != 0 && decode_len < n) {
-            n = decode_len;
-        }
-        if (n == 0) {
-            die("--decode: zero decode length");
-        }
-        if (prompt_len + n - 1 > model->config.max_seq_len) {
-            die("--decode: prompt + decode_len exceeds max_seq_len");
-        }
-
-        example_n[example_index] = n;
-        gen_traj[example_index] = (int32_t *)xmalloc((size_t)n * sizeof(int32_t));
-        tf_argmax[example_index] = (int32_t *)xmalloc((size_t)n * sizeof(int32_t));
-        per_step_tpot_ms[example_index] = (double *)xmalloc((size_t)n * sizeof(double));
-
-        fprintf(stderr, "[progress] decode example %u/%u prompt_len=%u N=%u\n",
-                example_index + 1, example_count, prompt_len, n);
-        fflush(stderr);
-
-        /* ---- Teacher-forced per-position argmax ---- */
-        /* Tokens = prompt + golden[:-1]; total length prompt_len + (n - 1).
-         * Position i (0..n-1) predicts golden[i] from hidden row
-         * (prompt_len + i - 1). */
-        {
-            uint32_t tf_total = prompt_len + n - 1;
-            uint32_t i;
-            tf_tokens = (int32_t *)xmalloc((size_t)tf_total * sizeof(int32_t));
-            memcpy(tf_tokens, req->ctx, (size_t)prompt_len * sizeof(int32_t));
-            if (n > 1) {
-                memcpy(tf_tokens + prompt_len, req->cont, (size_t)(n - 1) * sizeof(int32_t));
-            }
-            if (gdn_forward_host(model, run_state, tf_tokens, tf_total) != 0) {
-                free(tf_tokens);
-                die("--decode: teacher-forced forward pass failed");
-            }
-            for (i = 0; i < n; ++i) {
-                const float *hidden_row =
-                    run_state->x_norm + (size_t)(prompt_len + i - 1) * hidden;
-                tf_argmax[example_index][i] = argmax_logits(model, hidden_row, logits);
-            }
-            free(tf_tokens);
-        }
-
-        /* ---- Free-running greedy + per-step latency ---- */
-        prefix = (int32_t *)xmalloc((size_t)(prompt_len + n) * sizeof(int32_t));
-        memcpy(prefix, req->ctx, (size_t)prompt_len * sizeof(int32_t));
-        prefix_len = prompt_len;
-        for (step = 0; step < n; ++step) {
-            double t0;
-            const float *hidden_last;
-            int next;
-
-            t0 = monotonic_ms();
-            if (gdn_forward_host(model, run_state, prefix, prefix_len) != 0) {
-                free(prefix);
-                die("--decode: free-running forward pass failed");
-            }
-            hidden_last = run_state->x_norm + (size_t)(prefix_len - 1) * hidden;
-            next = argmax_logits(model, hidden_last, logits);
-            per_step_tpot_ms[example_index][step] = monotonic_ms() - t0;
-
-            gen_traj[example_index][step] = next;
-            prefix[prefix_len] = next;
-            prefix_len += 1;
-        }
-        free(prefix);
-
-        fprintf(stderr, "[progress] decode example %u/%u complete\n",
-                example_index + 1, example_count);
-        fflush(stderr);
-    }
-
-    /* ---- Write the C decode JSON (schema consumed by the parity checker) ---- */
-    out = open_output(output_path);
-    fprintf(out, "{\"kind\": %u, \"decode_len\": %u, \"num_examples\": %u,\n",
-            fixture->kind, decode_len, example_count);
-    fprintf(out, " \"examples\": [");
-    for (example_index = 0; example_index < example_count; ++example_index) {
-        uint32_t n = example_n[example_index];
-        uint32_t j;
-        fprintf(out, "%s\n  {\"index\": %u,\n", example_index ? "," : "", example_index);
-        fprintf(out, "   \"gen_traj\": [");
-        for (j = 0; j < n; ++j) {
-            fprintf(out, "%s%d", j ? ", " : "", gen_traj[example_index][j]);
-        }
-        fprintf(out, "],\n   \"tf_argmax\": [");
-        for (j = 0; j < n; ++j) {
-            fprintf(out, "%s%d", j ? ", " : "", tf_argmax[example_index][j]);
-        }
-        fprintf(out, "],\n   \"per_step_tpot_ms\": [");
-        for (j = 0; j < n; ++j) {
-            fprintf(out, "%s%.6f", j ? ", " : "", per_step_tpot_ms[example_index][j]);
-        }
-        fprintf(out, "]}");
-    }
-    fprintf(out, "\n ]}\n");
-    if (output_path != NULL) {
-        fclose(out);
-    }
-
-    for (example_index = 0; example_index < example_count; ++example_index) {
-        free(gen_traj[example_index]);
-        free(tf_argmax[example_index]);
-        free(per_step_tpot_ms[example_index]);
-    }
-    free(gen_traj);
-    free(tf_argmax);
-    free(per_step_tpot_ms);
-    free(example_n);
+    free(traj);
+    free(tpot);
     return 0;
 }
 
@@ -645,8 +409,8 @@ int main(int argc, char **argv) {
     ProgressState progress;
     float *logits;
     int decode_mode = 0;
-    uint32_t decode_len = 0;   /* 0 => use each example's cont_len */
-    uint32_t decode_limit = 0; /* 0 => all examples */
+    const char *state_path = NULL;  /* --decode-from-state: disaggregated decode */
+    uint32_t decode_len = 0;   /* 0 => use the fixture's golden cont_len */
     const char *positional[3];
     int positional_count = 0;
     int arg_index;
@@ -657,16 +421,17 @@ int main(int argc, char **argv) {
         const char *arg = argv[arg_index];
         if (strcmp(arg, "--decode") == 0) {
             decode_mode = 1;
+        } else if (strcmp(arg, "--decode-from-state") == 0) {
+            if (arg_index + 1 >= argc) {
+                die("--decode-from-state requires a .gdnstate path");
+            }
+            state_path = argv[++arg_index];
+            decode_mode = 1;
         } else if (strcmp(arg, "--decode-len") == 0) {
             if (arg_index + 1 >= argc) {
                 die("--decode-len requires a value");
             }
             decode_len = (uint32_t)strtoul(argv[++arg_index], NULL, 10);
-        } else if (strcmp(arg, "--limit") == 0) {
-            if (arg_index + 1 >= argc) {
-                die("--limit requires a value");
-            }
-            decode_limit = (uint32_t)strtoul(argv[++arg_index], NULL, 10);
         } else if (positional_count < 3) {
             positional[positional_count++] = arg;
         } else {
@@ -677,9 +442,9 @@ int main(int argc, char **argv) {
 
     if (positional_count < 2) {
         fprintf(stderr,
-                "usage: %s <weights.gdnw> <fixture.gdnreq> [output.json]\n"
-                "       %s <weights.gdnw> <fixture.gdnreq> [output.json] --decode [--decode-len N] [--limit E]\n",
-                argv[0], argv[0]);
+                "usage (decode-only): %s <weights.gdnw> <fixture.gdnreq> [output.json]"
+                " --decode --decode-from-state <state.gdnstate> [--decode-len N]\n",
+                argv[0]);
         return 1;
     }
     {
@@ -718,14 +483,19 @@ int main(int argc, char **argv) {
     );
     fflush(stderr);
 
-    if (decode_mode) {
-        /* Contract output path is c_impl/results_decode_c/decode.c.json; an
-         * explicit positional output (argv[3]) overrides it if provided. */
+    /* Decode-only build: the FPGA never prefills. The post-prompt recurrent +
+     * conv state is produced on the GPU (scripts/export_gdn_state.py) and loaded
+     * from disk; decode runs token-by-token from the exported seed. */
+    if (!decode_mode || state_path == NULL) {
+        die("decode-only build: run with "
+            "--decode --decode-from-state <state.gdnstate> [--decode-len N]");
+    }
+    {
         const char *decode_out = (argc == 4)
             ? argv[3]
             : "results_decode_c/decode.c.json";
-        run_decode_mode(&model, &run_state, logits, &fixture,
-                        decode_len, decode_limit, decode_out);
+        run_decode_from_state(&model, &run_state, logits, state_path,
+                              decode_len, decode_out);
         fprintf(stderr, "[progress] decode finished elapsed=%.0fs\n", elapsed_seconds(&progress));
         fflush(stderr);
         free_fixture(&fixture);
@@ -734,232 +504,4 @@ int main(int argc, char **argv) {
         gdn_model_free(&model);
         return 0;
     }
-
-    if (fixture.kind == REQ_KIND_MC) {
-        double acc = 0.0;
-        double acc_norm = 0.0;
-        int *preds = (int *)xmalloc((size_t)fixture.num_examples * sizeof(int));
-        int *preds_norm = (int *)xmalloc((size_t)fixture.num_examples * sizeof(int));
-        double **scores_all = (double **)xcalloc(fixture.num_examples, sizeof(double *));
-        double **scores_norm_all = (double **)xcalloc(fixture.num_examples, sizeof(double *));
-        uint32_t example_index;
-
-        for (example_index = 0; example_index < fixture.num_examples; ++example_index) {
-            MCReq *req = &fixture.mc_examples[example_index];
-            double *scores = (double *)xmalloc((size_t)req->num_choices * sizeof(double));
-            double *scores_norm = (double *)xmalloc((size_t)req->num_choices * sizeof(double));
-            int pred = 0;
-            int pred_norm = 0;
-            uint32_t choice_index;
-
-            log_example_start(&progress, "multiple_choice", example_index + 1, fixture.num_examples);
-            for (choice_index = 0; choice_index < req->num_choices; ++choice_index) {
-                int greedy;
-                score_pair(
-                    &model,
-                    &run_state,
-                    logits,
-                    req->choices[choice_index].ctx,
-                    req->choices[choice_index].ctx_len,
-                    req->choices[choice_index].cont,
-                    req->choices[choice_index].cont_len,
-                    &scores[choice_index],
-                    &greedy
-                );
-                scores_norm[choice_index] =
-                    scores[choice_index] /
-                    (double)(req->choices[choice_index].cont_len ? req->choices[choice_index].cont_len : 1);
-                if (scores[choice_index] > scores[pred]) {
-                    pred = (int)choice_index;
-                }
-                if (scores_norm[choice_index] > scores_norm[pred_norm]) {
-                    pred_norm = (int)choice_index;
-                }
-            }
-
-            if ((uint32_t)pred == req->gold) {
-                acc += 1.0;
-            }
-            if ((uint32_t)pred_norm == req->gold) {
-                acc_norm += 1.0;
-            }
-
-            preds[example_index] = pred;
-            preds_norm[example_index] = pred_norm;
-            scores_all[example_index] = scores;
-            scores_norm_all[example_index] = scores_norm;
-            progress.completed_examples = example_index + 1;
-            log_example_progress(&progress, "multiple_choice", progress.completed_examples, fixture.num_examples);
-        }
-
-        {
-            FILE *out = open_output(argc == 4 ? argv[3] : NULL);
-            fprintf(out, "{\n  \"kind\": %u,\n  \"num_examples\": %u,\n  \"metrics\": {\n", fixture.kind, fixture.num_examples);
-            fprintf(out, "    \"acc\": %.9f,\n    \"acc_norm\": %.9f\n  },\n  \"examples\": [\n",
-                    acc / fixture.num_examples, acc_norm / fixture.num_examples);
-            for (example_index = 0; example_index < fixture.num_examples; ++example_index) {
-                MCReq *req = &fixture.mc_examples[example_index];
-                uint32_t choice_index;
-                fprintf(out, "    {\"index\": %u, \"gold\": %u, \"pred\": %d, \"pred_norm\": %d, \"scores\": [",
-                        example_index, req->gold, preds[example_index], preds_norm[example_index]);
-                for (choice_index = 0; choice_index < req->num_choices; ++choice_index) {
-                    fprintf(out, "%s%.9f", choice_index ? ", " : "", scores_all[example_index][choice_index]);
-                }
-                fprintf(out, "], \"scores_norm\": [");
-                for (choice_index = 0; choice_index < req->num_choices; ++choice_index) {
-                    fprintf(out, "%s%.9f", choice_index ? ", " : "", scores_norm_all[example_index][choice_index]);
-                }
-                fprintf(out, "]}%s\n", (example_index + 1 == fixture.num_examples) ? "" : ",");
-            }
-            fprintf(out, "  ]\n}\n");
-            if (argc == 4) {
-                fclose(out);
-            }
-        }
-
-        fprintf(stdout, "acc=%.6f acc_norm=%.6f\n", acc / fixture.num_examples, acc_norm / fixture.num_examples);
-        for (example_index = 0; example_index < fixture.num_examples; ++example_index) {
-            free(scores_all[example_index]);
-            free(scores_norm_all[example_index]);
-        }
-        free(scores_all);
-        free(scores_norm_all);
-        free(preds);
-        free(preds_norm);
-    } else if (fixture.kind == REQ_KIND_LL) {
-        double total_logprob = 0.0;
-        uint64_t total_tokens = 0;
-        double acc = 0.0;
-        double *lls = (double *)xmalloc((size_t)fixture.num_examples * sizeof(double));
-        int *greedies = (int *)xmalloc((size_t)fixture.num_examples * sizeof(int));
-        uint32_t example_index;
-
-        for (example_index = 0; example_index < fixture.num_examples; ++example_index) {
-            PairReq *req = &fixture.ll_examples[example_index];
-            log_example_start(&progress, "loglikelihood", example_index + 1, fixture.num_examples);
-            score_pair(&model, &run_state, logits, req->ctx, req->ctx_len, req->cont, req->cont_len, &lls[example_index], &greedies[example_index]);
-            total_logprob += lls[example_index];
-            total_tokens += req->cont_len;
-            if (greedies[example_index]) {
-                acc += 1.0;
-            }
-            progress.completed_examples = example_index + 1;
-            log_example_progress(&progress, "loglikelihood", progress.completed_examples, fixture.num_examples);
-        }
-
-        {
-            FILE *out = open_output(argc == 4 ? argv[3] : NULL);
-            fprintf(out, "{\n  \"kind\": %u,\n  \"num_examples\": %u,\n  \"metrics\": {\n", fixture.kind, fixture.num_examples);
-            fprintf(out, "    \"acc\": %.9f,\n    \"perplexity\": %.9f\n  },\n  \"examples\": [\n",
-                    acc / fixture.num_examples, exp(-total_logprob / (double)total_tokens));
-            for (example_index = 0; example_index < fixture.num_examples; ++example_index) {
-                fprintf(out, "    {\"index\": %u, \"logprob\": %.9f, \"greedy\": %s}%s\n",
-                        example_index,
-                        lls[example_index],
-                        greedies[example_index] ? "true" : "false",
-                        (example_index + 1 == fixture.num_examples) ? "" : ",");
-            }
-            fprintf(out, "  ]\n}\n");
-            if (argc == 4) {
-                fclose(out);
-            }
-        }
-
-        fprintf(stdout, "acc=%.6f perplexity=%.6f\n", acc / fixture.num_examples, exp(-total_logprob / (double)total_tokens));
-        free(lls);
-        free(greedies);
-    } else if (fixture.kind == REQ_KIND_ROLLING) {
-        double total_logprob = 0.0;
-        uint64_t total_words = 0;
-        uint64_t total_bytes = 0;
-        double *doc_lls = (double *)xmalloc((size_t)fixture.num_examples * sizeof(double));
-        uint32_t example_index;
-
-        for (example_index = 0; example_index < fixture.num_examples; ++example_index) {
-            RollingReq *req = &fixture.rolling_examples[example_index];
-            uint32_t window_index;
-            doc_lls[example_index] = 0.0;
-            log_example_start(&progress, "rolling", example_index + 1, fixture.num_examples);
-            for (window_index = 0; window_index < req->num_windows; ++window_index) {
-                double ll;
-                int greedy;
-                log_rolling_window_start(
-                    &progress,
-                    example_index + 1,
-                    fixture.num_examples,
-                    window_index + 1,
-                    req->num_windows
-                );
-                score_pair(
-                    &model,
-                    &run_state,
-                    logits,
-                    req->windows[window_index].ctx,
-                    req->windows[window_index].ctx_len,
-                    req->windows[window_index].cont,
-                    req->windows[window_index].cont_len,
-                    &ll,
-                    &greedy
-                );
-                (void)greedy;
-                doc_lls[example_index] += ll;
-                progress.completed_windows += 1;
-                log_rolling_window_progress(
-                    &progress,
-                    example_index + 1,
-                    fixture.num_examples,
-                    window_index + 1,
-                    req->num_windows
-                );
-            }
-            total_logprob += doc_lls[example_index];
-            total_words += req->word_count;
-            total_bytes += req->byte_count;
-            progress.completed_examples = example_index + 1;
-            fprintf(
-                stderr,
-                "[progress] rolling doc %u/%u complete elapsed=%.0fs partial_word_ppl=%.6f\n",
-                progress.completed_examples,
-                fixture.num_examples,
-                elapsed_seconds(&progress),
-                exp(-total_logprob / (double)total_words)
-            );
-            fflush(stderr);
-        }
-
-        {
-            double word_perplexity = exp(-total_logprob / (double)total_words);
-            double byte_perplexity = exp(-total_logprob / (double)total_bytes);
-            double bits_per_byte = -total_logprob / (double)total_bytes / log(2.0);
-            FILE *out = open_output(argc == 4 ? argv[3] : NULL);
-            fprintf(out, "{\n  \"kind\": %u,\n  \"num_examples\": %u,\n  \"metrics\": {\n", fixture.kind, fixture.num_examples);
-            fprintf(out, "    \"word_perplexity\": %.9f,\n    \"byte_perplexity\": %.9f,\n    \"bits_per_byte\": %.9f\n  },\n  \"examples\": [\n",
-                    word_perplexity, byte_perplexity, bits_per_byte);
-            for (example_index = 0; example_index < fixture.num_examples; ++example_index) {
-                fprintf(out, "    {\"index\": %u, \"logprob\": %.9f}%s\n",
-                        example_index,
-                        doc_lls[example_index],
-                        (example_index + 1 == fixture.num_examples) ? "" : ",");
-            }
-            fprintf(out, "  ]\n}\n");
-            if (argc == 4) {
-                fclose(out);
-            }
-            fprintf(stdout, "word_perplexity=%.6f byte_perplexity=%.6f bits_per_byte=%.6f\n",
-                    word_perplexity, byte_perplexity, bits_per_byte);
-        }
-
-        free(doc_lls);
-    } else {
-        die("unsupported fixture kind");
-    }
-
-    fprintf(stderr, "[progress] evaluation finished elapsed=%.0fs\n", elapsed_seconds(&progress));
-    fflush(stderr);
-
-    free_fixture(&fixture);
-    free(logits);
-    gdn_run_state_free(&run_state);
-    gdn_model_free(&model);
-    return 0;
 }

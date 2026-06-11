@@ -79,6 +79,11 @@ void gdn_model_free(GDNModel *model);
 int gdn_run_state_init(GDNRunState *state, const GDNModel *model, uint32_t max_tokens);
 void gdn_run_state_free(GDNRunState *state);
 
+/* Decode-only forward (the kernel top). Forwards exactly one token (num_tokens
+ * must be 1) through the GEMV datapath against the persistent per-layer recurrent
+ * + conv state in recurrent_state / head_buffer (loaded from the GPU .gdnstate
+ * export). The state is restored at each layer's start and saved at its end —
+ * there is no prefill / no GEMM / no mode flag. */
 int gdn_forward(
     const GDNWeightHeader *config,
     const float *weight_data,
@@ -101,70 +106,12 @@ int gdn_forward(
     uint32_t num_tokens,
     const float *weight_data_mm   /* alias of weight_data on a dedicated 512-bit AXI bundle */
 );
-int gdn_forward_host(const GDNModel *model, GDNRunState *state, const int32_t *tokens, uint32_t num_tokens);
+
+/* Single-token decode step (the only host entry): gdn_forward with num_tokens=1
+ * against the persistent per-layer recurrent/conv state in the run-state buffers
+ * (loaded from the GPU .gdnstate export). */
+int gdn_decode_step_host(const GDNModel *model, GDNRunState *state, const int32_t *token);
 void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logits_out);
-
-int gdn_attn_forward(
-    const GDNWeightHeader *config,
-    const float *weight_data,
-    uint32_t layer_index,
-    const float *input,
-    float *output,
-    float *q,
-    float *k,
-    float *v,
-    float *a,
-    float *b,
-    float *gate,
-    float *attn,
-    float *tmp_hidden,
-    float *recurrent_state,
-    float *head_buffer,
-    uint32_t num_tokens
-);
-
-int gdn_attn_forward_layer(
-    const GDNModel *model,
-    GDNRunState *state,
-    uint32_t layer_index,
-    const float *input,
-    float *output,
-    uint32_t num_tokens
-);
-
-/* HLS top for the systolic matmul: out = in * weights^T.
- *   in       is num_rows x in_dim   (row-major)
- *   weights  is out_dim x in_dim    (row-major)
- *   out      is num_rows x out_dim  (row-major)
- * Each pointer maps to its own AXI master bundle (mem_in, mem_weights,
- * mem_out) so ReadA / ReadB / WriteC_chain in the dataflow region each
- * have a dedicated AXI port. Used by test_matmul.tcl (csim + csynth) and
- * gdn_matmul_test.cpp (host parity); wraps the same in-file
- * gdn_matmul_systolic kernel that gdn_forward and gdn_attn_forward call
- * directly. Returns 0 on success. */
-int gdn_matmul_top(
-    float *out,
-    const float *in,
-    const float *weights,
-    uint32_t num_rows,
-    uint32_t in_dim,
-    uint32_t out_dim
-);
-
-/* HLS top for the *standard* tiled output-stationary systolic matmul
- * (gdn_matmul_2d) — the canonical Vitis "mmult" triple-loop form, adapted
- * to FP32 + tiling. Same interface and AXI bundle layout as gdn_matmul_top
- * so test_matmul2d.tcl / gdn_matmul2d_test.cpp can synthesize and parity-
- * check it head-to-head against the gdn_matmul_systolic chain. Returns 0 on
- * success, negative on an unsupported shape. */
-int gdn_matmul2d_top(
-    float *out,
-    const float *in,
-    const float *weights,
-    uint32_t num_rows,
-    uint32_t in_dim,
-    uint32_t out_dim
-);
 
 #ifdef __cplusplus
 }  /* extern "C" */
