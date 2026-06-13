@@ -274,23 +274,45 @@ measured 600 ms (~60 ms over). Four readers contend more on the shared HBM
 crossbar and the per-shard bursts are smaller, so effective per-reader bandwidth
 drops. The 2.57× cumulative is real, but each doubling now returns less.
 
+## 6e. Stage 2c — N=8 readers (on-card, bit-exact)
+
+Eight parallel readers (`GEMV_CHANNELS=8`): eight 2-bank shards on disjoint HBM
+groups (HBM[4:19]) + weight_data (HBM[20:30]) + activations on 1 bank each — 31 of
+32 banks, **12 HBM masters**. Only the explicit kernel-arg / host-BO / hw.cfg
+surface changed; the generalised PE body scaled untouched. Bit-exact (top1 100%,
+first_div −1).
+
+**The full bandwidth ladder (kernel TPOT, flat / O(1), all bit-exact):**
+
+| readers | kernel ms | step | cumulative | hbm_aclk |
+|---:|---:|---:|---:|---:|
+| 1 (singleport) | 1543 | — | 1× | +3.77 ns |
+| 2 | 875 | 1.76× | 1.76× | −0.044 ns, benign |
+| 4 | 600 | 1.46× | 2.57× | +0.081 ns |
+| **8** | **462** | **1.30×** | **3.34×** | −0.008 ns, benign |
+
+kernel-clock WNS stayed clean throughout (+0.342 ns at N=8); build 4 h 29 m.
+
+**The lever is spent.** Each doubling returns less (1.76 → 1.46 → 1.30×) — the
+serial floor S grows as a share of TPOT and the HBM crossbar contends more with
+every added master. Re-fitting S on the N=4/N=8 points gives S ≈ 325 ms (vs the
+N=1/N=2 fit's 207 ms — the gap is the sub-linear W). N=16 would need ~20 masters
+(likely unroutable) for ~1.2×. **N=8 (3.34×) is the practical end of the
+weight-bandwidth roadmap.**
+
 ## 7. Next
 
-Decode-only is bit-exact and flat at **600 ms/token kernel (662 ms incl. host)**,
-**2.57× over the single-port Stage 1**. The bandwidth lever is now deep into
-diminishing returns (N=2→N=4 returned 1.46×, not 2×). Remaining levers:
+Decode-only is bit-exact and flat at **462 ms/token kernel (525 ms incl. host)**,
+**3.34× over the single-port Stage 1** — and the weight-bandwidth lever is now
+exhausted (§6e). The remaining gains are elsewhere:
 
-- **N=8 weight readers** — same structure, `GEMV_CHANNELS=8`, eight 2-bank shards
-  (16 weight banks) + weight_data; reclaim more activation/free banks. The
-  16×16-derived MAC width already covers it. But sub-linear scaling + the
-  S ≈ 207 ms serial floor cap the upside at perhaps ~480–520 ms kernel — modest,
-  and 8 masters stress the HBM crossbar further. Marginal.
-- **Attack the S ≈ 207 ms serial floor** (now the larger share of TPOT): the
-  recurrent-attention state R/W (~50 MB/token over HBM[0]) and the a/b
-  `gdn_matmul_tiled`. This — not more readers — is where the next real gain is.
-- **INT8 weights** (deferred): 4× less weight data attacks W *and* relieves the
-  HBM crossbar instead of loading it; the highest-leverage remaining move, at the
-  cost of a tolerance-based parity gate (no longer bit-exact).
+- **Attack the serial floor S** (now the dominant share of TPOT): the
+  recurrent-attention state R/W (~50 MB/token over HBM[0], on ONE master) and the
+  a/b `gdn_matmul_tiled`. Spreading the state across channels or overlapping its
+  R/W with the gemv stream is the next bit-exact-preserving lever.
+- **INT8 weights** (deferred all-fp32 plan): 4× less weight data attacks W *and*
+  relieves the crossbar (could even cut the reader count) — the highest-leverage
+  move, at the cost of a tolerance-based parity gate (no longer bit-exact).
 
 ## 8. References
 

@@ -10,7 +10,7 @@
  * equal the count of weight_data_mm* kernel args, the host shard BOs, and the
  * hw.cfg weight_data_mm* channel groups. Defined here so the kernel, the host
  * shard builder, and the run-state all agree on one value. */
-#define GEMV_CHANNELS 4
+#define GEMV_CHANNELS 8
 
 #ifdef __cplusplus
 extern "C" {

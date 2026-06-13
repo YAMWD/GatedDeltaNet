@@ -441,6 +441,10 @@ public:
           weight_bo_mm1_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(20)),
           weight_bo_mm2_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(21)),
           weight_bo_mm3_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(22)),
+          weight_bo_mm4_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(23)),
+          weight_bo_mm5_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(24)),
+          weight_bo_mm6_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(25)),
+          weight_bo_mm7_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(26)),
           x_norm_host_(static_cast<size_t>(max_tokens_) * hidden_, 0.0f) {
         std::cerr << "[progress] upload config and weights to device\n";
         config_bo_.write(&model.config, sizeof(GDNWeightHeader), 0);
@@ -464,7 +468,9 @@ public:
             }
             gdn_build_weight_shards(model.weight_data.data(), &model.config, shards);
             xrt::bo *mm[GEMV_CHANNELS] = { &weight_bo_mm0_, &weight_bo_mm1_,
-                                           &weight_bo_mm2_, &weight_bo_mm3_ };
+                                           &weight_bo_mm2_, &weight_bo_mm3_,
+                                           &weight_bo_mm4_, &weight_bo_mm5_,
+                                           &weight_bo_mm6_, &weight_bo_mm7_ };
             for (int c = 0; c < GEMV_CHANNELS; ++c) {
                 mm[c]->write(shards[c], shard_bytes, 0);
                 sync_bo_chunked(*mm[c], XCL_BO_SYNC_BO_TO_DEVICE, shard_bytes, 0);
@@ -522,7 +528,11 @@ public:
             weight_bo_mm0_,
             weight_bo_mm1_,
             weight_bo_mm2_,
-            weight_bo_mm3_
+            weight_bo_mm3_,
+            weight_bo_mm4_,
+            weight_bo_mm5_,
+            weight_bo_mm6_,
+            weight_bo_mm7_
         );
         auto start = std::chrono::high_resolution_clock::now();
         run.wait();
@@ -626,6 +636,10 @@ private:
     xrt::bo weight_bo_mm1_;
     xrt::bo weight_bo_mm2_;
     xrt::bo weight_bo_mm3_;
+    xrt::bo weight_bo_mm4_;
+    xrt::bo weight_bo_mm5_;
+    xrt::bo weight_bo_mm6_;
+    xrt::bo weight_bo_mm7_;
     std::vector<float> x_norm_host_;
     double total_kernel_seconds_ = 0.0;
     uint64_t kernel_runs_ = 0;

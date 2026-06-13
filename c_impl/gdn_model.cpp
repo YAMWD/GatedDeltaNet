@@ -1273,7 +1273,9 @@ static void gdn_swiglu_inplace(float *gate, const float *up, size_t count) {
 static void gdn_gemv(
     float *out, const float *in,
     const float *weights0, const float *weights1,
-    const float *weights2, const float *weights3, uint32_t w_pack_off,
+    const float *weights2, const float *weights3,
+    const float *weights4, const float *weights5,
+    const float *weights6, const float *weights7, uint32_t w_pack_off,
     uint32_t num_rows, uint32_t in_dim, uint32_t out_dim);
 
 int gdn_forward(
@@ -1298,8 +1300,12 @@ int gdn_forward(
     uint32_t num_tokens,
     const float *weight_data_mm,   /* gemv shard 0 reader */
     const float *weight_data_mm2,  /* gemv shard 1 reader */
-    const float *weight_data_mm3,  /* gemv shard 2 reader (Stage 2b: N=4) */
-    const float *weight_data_mm4   /* gemv shard 3 reader */
+    const float *weight_data_mm3,  /* gemv shard 2 reader */
+    const float *weight_data_mm4,  /* gemv shard 3 reader */
+    const float *weight_data_mm5,  /* gemv shard 4 reader (Stage 2c: N=8) */
+    const float *weight_data_mm6,  /* gemv shard 5 reader */
+    const float *weight_data_mm7,  /* gemv shard 6 reader */
+    const float *weight_data_mm8   /* gemv shard 7 reader */
 ) {
     /* Depths match gdn-1.3b-f32.gdnw: hidden=2048 heads=8 head_dim=256
     intermediate=5632 layers=24 conv=4 max_seq_len=2048 vocab=32000 */
@@ -1331,6 +1337,13 @@ int gdn_forward(
      * bandwidth). hw.cfg maps mem_weights_mm3/mm4 to DISJOINT HBM bank groups. */
     #pragma HLS interface m_axi port=weight_data_mm3 depth=1466343808 offset=slave bundle=mem_weights_mm3 max_widen_bitwidth=512 max_read_burst_length=64
     #pragma HLS interface m_axi port=weight_data_mm4 depth=1466343808 offset=slave bundle=mem_weights_mm4 max_widen_bitwidth=512 max_read_burst_length=64
+    /* Stage 2c (N=8): shards 4-7 on their OWN bundles/masters — eight disjoint
+     * weight readers total (~8× weight read bandwidth, sub-linear in practice).
+     * hw.cfg maps mem_weights_mm5..mm8 to DISJOINT HBM bank groups. */
+    #pragma HLS interface m_axi port=weight_data_mm5 depth=1466343808 offset=slave bundle=mem_weights_mm5 max_widen_bitwidth=512 max_read_burst_length=64
+    #pragma HLS interface m_axi port=weight_data_mm6 depth=1466343808 offset=slave bundle=mem_weights_mm6 max_widen_bitwidth=512 max_read_burst_length=64
+    #pragma HLS interface m_axi port=weight_data_mm7 depth=1466343808 offset=slave bundle=mem_weights_mm7 max_widen_bitwidth=512 max_read_burst_length=64
+    #pragma HLS interface m_axi port=weight_data_mm8 depth=1466343808 offset=slave bundle=mem_weights_mm8 max_widen_bitwidth=512 max_read_burst_length=64
     /* Phase B: activations split across distinct AXI bundles -> distinct HBM
      * channels (hw.cfg), so each stage's input-read master and output-write
      * master run concurrently instead of contending on one gmem port (HBM[0]).
@@ -1436,12 +1449,12 @@ int gdn_forward(
         size_t soff = (size_t)layer_index * shard_per_layer;
 
         gdn_rmsnorm_rows(x_norm, x, layer_attn_norm, num_tokens, hidden, config->norm_eps);
-        gdn_gemv(q, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
-        gdn_gemv(k, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
-        gdn_gemv(v, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
+        gdn_gemv(q, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
+        gdn_gemv(k, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
+        gdn_gemv(v, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
         gdn_matmul_tiled(a, x_norm, layer_a_proj, num_tokens, hidden, num_heads);
         gdn_matmul_tiled(b, x_norm, layer_b_proj, num_tokens, hidden, num_heads);
-        gdn_gemv(gate, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, hidden, hidden); soff += shard_hh;
+        gdn_gemv(gate, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden); soff += shard_hh;
 
         /* Per-(layer, conv) slice of the persistent conv tail in head_buffer:
          * 3 convs/layer × (conv_size-1) rows × hidden floats. */
@@ -1475,14 +1488,14 @@ int gdn_forward(
             layer_index
         );
         gdn_output_norm_and_gate(attn, gate, layer_o_norm, num_tokens, num_heads, head_dim, config->norm_eps);
-        gdn_gemv(tmp_hidden, attn, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, hidden, hidden); soff += shard_hh;
+        gdn_gemv(tmp_hidden, attn, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden); soff += shard_hh;
         gdn_pack16_add_inplace(x, tmp_hidden, hidden_count);
 
         gdn_rmsnorm_rows(x_norm, x, layer_mlp_norm, num_tokens, hidden, config->norm_eps);
-        gdn_gemv(mlp_gate, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, hidden, intermediate); soff += shard_ih;
-        gdn_gemv(mlp_up, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, hidden, intermediate);   soff += shard_ih;
+        gdn_gemv(mlp_gate, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, intermediate); soff += shard_ih;
+        gdn_gemv(mlp_up, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, intermediate);   soff += shard_ih;
         gdn_swiglu_inplace(mlp_gate, mlp_up, mlp_count);
-        gdn_gemv(tmp_hidden, mlp_gate, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, intermediate, hidden);
+        gdn_gemv(tmp_hidden, mlp_gate, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, intermediate, hidden);
         gdn_pack16_add_inplace(x, tmp_hidden, hidden_count);
     }
 
@@ -1515,10 +1528,10 @@ int gdn_decode_step_host(const GDNModel *model, GDNRunState *state, const int32_
         state->head_buffer,
         token,
         1u,
-        state->weight_shards[0],  /* gemv shard 0 (512-bit master / HBM group A) */
-        state->weight_shards[1],  /* gemv shard 1 (master / HBM group B) */
-        state->weight_shards[2],  /* gemv shard 2 (master / HBM group C) */
-        state->weight_shards[3]   /* gemv shard 3 (master / HBM group D) */
+        state->weight_shards[0], state->weight_shards[1],  /* gemv shards 0,1 */
+        state->weight_shards[2], state->weight_shards[3],  /* gemv shards 2,3 */
+        state->weight_shards[4], state->weight_shards[5],  /* gemv shards 4,5 */
+        state->weight_shards[6], state->weight_shards[7]   /* gemv shards 6,7 */
     );
 }
 
@@ -1697,7 +1710,9 @@ static void gemv_collect(hls::stream<float> of[GEMV_CHANNELS], Pack16 *out_p,
 static void gdn_gemv(
     float *out, const float *in,
     const float *shard0, const float *shard1,
-    const float *shard2, const float *shard3, uint32_t shard_off,
+    const float *shard2, const float *shard3,
+    const float *shard4, const float *shard5,
+    const float *shard6, const float *shard7, uint32_t shard_off,
     uint32_t num_rows, uint32_t in_dim, uint32_t out_dim
 ) {
     #pragma HLS inline off
@@ -1710,6 +1725,10 @@ static void gdn_gemv(
     sh[1] = reinterpret_cast<const Pack16 *>(shard1);
     sh[2] = reinterpret_cast<const Pack16 *>(shard2);
     sh[3] = reinterpret_cast<const Pack16 *>(shard3);
+    sh[4] = reinterpret_cast<const Pack16 *>(shard4);
+    sh[5] = reinterpret_cast<const Pack16 *>(shard5);
+    sh[6] = reinterpret_cast<const Pack16 *>(shard6);
+    sh[7] = reinterpret_cast<const Pack16 *>(shard7);
     Pack16 *out_p = reinterpret_cast<Pack16 *>(out);
 
     uint32_t k_packs      = in_dim / 16;
