@@ -184,17 +184,71 @@ master. The decouple's *purpose* (burst efficiency) was met and exceeded:
 (`num_read_outstanding`) has <0.1 s of headroom (latency already hidden under
 4 KB bursts) — the lever that breaks the floor is multi-port.
 
+## 6c. Stage 2 — multi-channel weight readers, N=2 (on-card, bit-exact)
+
+The weight stream is split across **two parallel 512-bit HBM readers**. The
+projection weights are **compact-sharded**: each projection's output rows are cut
+into N stripes, shard *c* holds stripe *c* of every projection (one copy split N
+ways — no replication). The two shards sit on **disjoint HBM channels**, so the
+two readers' bursts hit different channels concurrently. `gdn_gemv` is now a
+dataflow of **one PE per channel**: `gemv_pe_bcast` reads the resident activation
+once and fans it to the PEs; each `gemv_pe_mac` MACs its shard's stripe; a single
+MAC-free `gemv_collect` writes the output. The bit-exactness is preserved (same
+resident `a_loc`, same beat order, same partial-bank adder-tree reduction).
+
+| metric | singleport (Stage 1) | **N=2 (Stage 2)** |
+|---|---:|---:|
+| kernel TPOT (flat) | 1543 ms | **875 ms** (1.76×) |
+| TPOT incl. host | 1540 ms | **937 ms** (1.64×) |
+| weight readers | 1 × 512-bit | **2 × 512-bit, disjoint HBM** |
+| decode bit-exact (1×64) | ✓ | **✓ top1 100%, first_div −1** |
+| kernel timing (WNS) | +3.77 ns | **+0.506 ns, 0 failing** |
+| shell `hbm_aclk` | 0 failing | −0.044 ns, 23 ep (**benign** — bit-exact) |
+| build | — | xo (PE) 3 h 50 m + relink 3 h 24 m |
+
+**Two routing/allocation walls, both load-bearing for N≥2:**
+
+1. **PE distribution (routing).** A *monolithic* 2-wide consumer (one module doing
+   both channels' 16-wide fp32 reductions) failed `route_design` **twice** —
+   partially-conflicted `full_dsp` fp-adder nets, congestion level 7, after ~7 h
+   routes. Splitting into **one independent dataflow PE per channel** (each with
+   the Stage-1 single-port density that routed) lets Vivado place them apart;
+   `SSI_SpreadLogic_high` + a LUT-fabric `bind_op` on the lane adds did the rest.
+   Closed at WNS **+0.506 ns**, 0 failing kernel endpoints.
+
+2. **Disjoint HBM bank map (allocation).** The first disjoint-sharding map put the
+   shards on **narrow HBM groups that overlap** weight_data's wide group
+   (`mm:HBM[10:20]` ⊂ `weight_data:HBM[10:31]`). XRT 2022.1 allocates each `xrt::bo`
+   bottom-up/contiguous, so weight_data (5.46 GiB → 11 banks) takes banks 10–20
+   and the shard's HBM[10:20] group is left with **zero free banks → `std::bad_alloc`**.
+   `probe_alloc.cpp` pinned it (weight_data OK, shard0 FAIL as the 2nd bo). Fix:
+   **dedicated, non-overlapping bank ranges** — `weight_data:HBM[20:31]` (12 banks),
+   `weight_data_mm:HBM[10:14]`, `weight_data_mm2:HBM[15:19]` (5 each). 12+5+5 = 22 =
+   HBM[10:31] exactly; activations stay on HBM[0:9]. Link-only change (the PE `.xo`
+   is unchanged), so the second build was a relink.
+
+**Why 1.76× and not 2×, and the path past it.** Amdahl on the kernel:
+`1543 = W + S`, `875 = W/2 + S` ⇒ **W ≈ 1336 ms** (parallel weight streaming) and
+**S ≈ 207 ms** serial floor — recurrent-attention state R/W, the a/b
+`gdn_matmul_tiled`, conv, and the scalar `weight_data` master (notably the 256 MB
+`lm_head` read per token). The readers halved W exactly; S is untouched. Extending
+to more readers (W/N + S): **N=4 → ~540 ms, N=8 → ~374 ms** kernel — after which
+S dominates and becomes the target.
+
 ## 7. Next
 
-Decode-only is bit-exact and flat at **1.54 s/token** (1.66× over Step 1), with
-the single weight port at 83% of peak. The remaining lever:
+Decode-only is bit-exact and flat at **875 ms/token kernel (937 ms incl. host)**,
+1.76× over the single-port Stage 1. The remaining levers, in order:
 
-- **Step 2 — N parallel HBM weight readers (~55 ms).** Replicate `gemv_read`
-  across HBM pseudo-channels (weights already span HBM[10:31]) with on-chip
-  partial accumulation (Serpens [4] pattern); the MAC lanes widen to keep pace.
-  This multiplies the 5.30 GB/s by the channel count, collapsing the 1.06 s gemv
-  portion well below the 0.48 s non-gemv floor (which then becomes the next
-  target — recurrent-attention state I/O and the a/b projection).
+- **N=4 then N=8 weight readers.** Same compact-shard + per-PE-channel structure,
+  more stripes (`GEMV_CHANNELS` 4, 8). The shards stay one copy split N ways
+  (total weight HBM constant ~10.4 GiB), so plan the **disjoint bank ranges** up
+  front (reclaim the tiny activation channels HBM[1:9] for the extra shards). The
+  16×16-derived MAC width already covers N=8. Expected ~540 / ~374 ms.
+- **Attack the S ≈ 207 ms serial floor.** Once readers collapse W, the next
+  targets are recurrent-attention state I/O (50 MB R/W per token), the a/b
+  projection, and moving the per-token `lm_head` read off the shared scalar
+  master (or computing logits host-side).
 
 ## 8. References
 

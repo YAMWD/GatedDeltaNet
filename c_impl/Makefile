@@ -189,9 +189,12 @@ $(XCLBIN): $(XO) $(HW_CFG)
 # ----------------------------------------------------------------------------
 host: $(HOST_BIN)
 
-$(HOST_BIN): $(HOST_SRC) gdn_model.h
-	$(CXX) -O2 -std=c++17 -Wall -Wno-unknown-pragmas \
-	    $(HOST_INC) -o $@ $(HOST_SRC) $(HOST_LIB)
+# Links gdn_model.cpp for the host-side weight-shard builder
+# (gdn_build_weight_shards / gdn_weight_shard_floats). gdn_model.cpp needs the
+# Vitis HLS include for hls_stream.h; -lm for the libm calls it pulls in.
+$(HOST_BIN): $(HOST_SRC) gdn_model.cpp gdn_model.h
+	$(CXX) -O2 -std=c++17 -Wall -Wno-unknown-pragmas -Wno-unused-label \
+	    $(HOST_INC) -I$(XILINX_HLS_INC) -o $@ $(HOST_SRC) gdn_model.cpp $(HOST_LIB) -lm
 
 
 # ----------------------------------------------------------------------------

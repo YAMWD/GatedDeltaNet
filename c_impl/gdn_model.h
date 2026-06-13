@@ -71,7 +71,15 @@ typedef struct {
     float *mlp_up;
     float *recurrent_state;
     float *head_buffer;
+    float *weight_shard0;   /* compact gemv weight shard 0 (built from weight_data) */
+    float *weight_shard1;   /* compact gemv weight shard 1 */
 } GDNRunState;
+
+/* Build the GEMV_CHANNELS compact weight shards from the flat weight blob; both
+ * shard buffers are gdn_weight_shard_floats(config) floats. Host-only. */
+size_t gdn_weight_shard_floats(const GDNWeightHeader *config);
+void gdn_build_weight_shards(const float *weight_data, const GDNWeightHeader *config,
+                             float *shard0, float *shard1);
 
 int gdn_model_load(GDNModel *model, const char *path);
 void gdn_model_free(GDNModel *model);
@@ -104,7 +112,8 @@ int gdn_forward(
     float *head_buffer,
     const int32_t *tokens,
     uint32_t num_tokens,
-    const float *weight_data_mm   /* alias of weight_data on a dedicated 512-bit AXI bundle */
+    const float *weight_data_mm,   /* alias of weight_data on a dedicated 512-bit AXI master */
+    const float *weight_data_mm2   /* 2nd alias on a distinct master (Stage 2: parallel readers) */
 );
 
 /* Single-token decode step (the only host entry): gdn_forward with num_tokens=1

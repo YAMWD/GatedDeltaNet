@@ -14,6 +14,7 @@
 #define GDN_DK    256   /* head_dim = query/key dimension */
 #define GDN_DV    256   /* value_dim = hidden/num_heads   */
 #define GDN_PK     16   /* column parallelism factor      */
+#define GEMV_CHANNELS 2 /* parallel HBM weight readers (decode GEMV, output-stripe split) */
 
 /* Pack16 = 16 FP32 values = 64 bytes = 512 bits. Used both by the systolic
  * matmul (as the stream word) and by the element-wise Pack16 helpers
@@ -122,6 +123,50 @@ static size_t gdn_layer_weight_offset(const GDNWeightHeader *config, uint32_t la
 
 static size_t gdn_final_norm_offset(const GDNWeightHeader *config) {
     return gdn_layer_weight_offset(config, config->num_layers);
+}
+
+/* ---- Compact weight shards for the multi-channel decode GEMV (Stage 2) ----
+ * Each gemv projection's output rows are split into GEMV_CHANNELS stripes; shard
+ * c holds stripe c of every projection, packed per layer in the order
+ * q,k,v,gate,o,mlp_gate,mlp_up,mlp_down — exactly the order gdn_forward threads
+ * its compact shard offset (soff). Total across all shards = one copy of the
+ * projection weights (no replication), so the parallel 512-bit readers fit the
+ * same HBM budget as the old single weight_data_mm copy. Host-only (memcpy). */
+size_t gdn_weight_shard_floats(const GDNWeightHeader *config) {
+    size_t H = config->hidden_size, I = config->intermediate_size;
+    size_t per_layer = 5 * (H / GEMV_CHANNELS) * H     /* q,k,v,gate,o */
+                     + 2 * (I / GEMV_CHANNELS) * H     /* mlp_gate, mlp_up */
+                     +     (H / GEMV_CHANNELS) * I;     /* mlp_down */
+    return (size_t)config->num_layers * per_layer;
+}
+
+void gdn_build_weight_shards(const float *wd, const GDNWeightHeader *config,
+                             float *shard0, float *shard1) {
+    size_t H = config->hidden_size, I = config->intermediate_size;
+    size_t nh = config->num_heads, hd = config->head_dim, cs = config->conv_size;
+    size_t soff = 0;  /* running float offset into each shard */
+    uint32_t L;
+    for (L = 0; L < config->num_layers; ++L) {
+        size_t base = gdn_layer_weight_offset(config, L);
+        size_t q  = base + H + 2 * nh;                       /* past attn_norm,a_log,dt_bias */
+        size_t k  = q + H * H;
+        size_t v  = k + H * H;
+        size_t g  = v + H * H + 2 * nh * H + 3 * H * cs;     /* past a/b proj + 3 convs */
+        size_t o  = g + H * H + hd;                          /* past g_proj + o_norm */
+        size_t mg = o + H * H + H;                           /* past o_proj + mlp_norm */
+        size_t mu = mg + I * H;
+        size_t md = mu + I * H;
+        size_t poff[8] = { q, k, v, g, o, mg, mu, md };
+        size_t pout[8] = { H, H, H, H, H, I, I, H };
+        size_t pin [8] = { H, H, H, H, H, H, H, I };
+        int p;
+        for (p = 0; p < 8; ++p) {
+            size_t s0 = (pout[p] / GEMV_CHANNELS) * pin[p];  /* one stripe (floats) */
+            memcpy(shard0 + soff, wd + poff[p],      s0 * sizeof(float));
+            memcpy(shard1 + soff, wd + poff[p] + s0, s0 * sizeof(float));
+            soff += s0;
+        }
+    }
 }
 
 static int gdn_validate_config(const GDNWeightHeader *config) {
@@ -302,6 +347,17 @@ int gdn_run_state_init(GDNRunState *state, const GDNModel *model, uint32_t max_t
     if (gdn_alloc_run_buffer(&state->head_buffer,
             (size_t)model->config.num_layers * 3 * (model->config.conv_size - 1) * hidden) != 0) return -1;
 
+    /* Stage 2: build the GEMV_CHANNELS compact weight shards (split the gemv
+     * projection weights by output stripe) the decode datapath reads in
+     * parallel. Same total size as one weight copy — no replication. */
+    {
+        size_t shard_floats = gdn_weight_shard_floats(&model->config);
+        if (gdn_alloc_run_buffer(&state->weight_shard0, shard_floats) != 0) return -1;
+        if (gdn_alloc_run_buffer(&state->weight_shard1, shard_floats) != 0) return -1;
+        gdn_build_weight_shards(model->weight_data, &model->config,
+                                state->weight_shard0, state->weight_shard1);
+    }
+
     return 0;
 }
 
@@ -320,6 +376,8 @@ void gdn_run_state_free(GDNRunState *state) {
     free(state->mlp_up);
     free(state->recurrent_state);
     free(state->head_buffer);
+    free(state->weight_shard0);
+    free(state->weight_shard1);
     memset(state, 0, sizeof(*state));
 }
 
@@ -1203,11 +1261,12 @@ static void gdn_swiglu_inplace(float *gate, const float *up, size_t count) {
 }
 
 
-/* Forward decl: the decode-only GEMV engine (num_rows==1). Same call signature
- * as gdn_matmul_2d so the projection call sites swap 1:1. Defined below next to
- * the IN_DIM_MAX / Pack16 machinery it shares. */
+/* Forward decl: the decode-only GEMV engine (num_rows==1) with GEMV_CHANNELS
+ * parallel HBM weight readers; weights0/weights1 alias the same blob on distinct
+ * m_axi masters. Defined below next to the IN_DIM_MAX / Pack16 machinery. */
 static void gdn_gemv(
-    float *out, const float *in, const float *weights, uint32_t w_pack_off,
+    float *out, const float *in,
+    const float *weights0, const float *weights1, uint32_t w_pack_off,
     uint32_t num_rows, uint32_t in_dim, uint32_t out_dim);
 
 int gdn_forward(
@@ -1230,7 +1289,8 @@ int gdn_forward(
     float *head_buffer,
     const int32_t *tokens,
     uint32_t num_tokens,
-    const float *weight_data_mm
+    const float *weight_data_mm,
+    const float *weight_data_mm2   /* 2nd weight reader (aliases weight_data_mm, distinct HBM master) */
 ) {
     /* Depths match gdn-1.3b-f32.gdnw: hidden=2048 heads=8 head_dim=256
     intermediate=5632 layers=24 conv=4 max_seq_len=2048 vocab=32000 */
@@ -1253,6 +1313,10 @@ int gdn_forward(
      * port at ~388 MB/s (32-bit) on hardware. The host binds the same weight
      * buffer to both ports (read-only alias); hw.cfg maps both to HBM[10:31]. */
     #pragma HLS interface m_axi port=weight_data_mm depth=1466343808 offset=slave bundle=mem_weights_mm max_widen_bitwidth=512 max_read_burst_length=64
+    /* 2nd weight reader on its OWN bundle/master so the HBM crossbar serves it
+     * concurrently with mem_weights_mm (Stage 2: ~2× weight read bandwidth).
+     * Aliases the same blob; hw.cfg maps mem_weights_mm2 across HBM[10:31]. */
+    #pragma HLS interface m_axi port=weight_data_mm2 depth=1466343808 offset=slave bundle=mem_weights_mm2 max_widen_bitwidth=512 max_read_burst_length=64
     /* Phase B: activations split across distinct AXI bundles -> distinct HBM
      * channels (hw.cfg), so each stage's input-read master and output-write
      * master run concurrently instead of contending on one gmem port (HBM[0]).
@@ -1301,6 +1365,15 @@ int gdn_forward(
     hidden_count = (size_t)num_tokens * hidden;
     mlp_count = (size_t)num_tokens * intermediate;
 
+    /* Compact-shard geometry (Pack16 units): each gemv projection's output stripe
+     * (out_dim/GEMV_CHANNELS rows) occupies stripe_packs in every shard, packed
+     * per layer in the order q,k,v,gate,o,mlp_gate,mlp_up,mlp_down — matching
+     * gdn_build_weight_shards. shard0/shard1 are passed as weight_data_mm/_mm2. */
+    size_t shard_hh = (size_t)(hidden / GEMV_CHANNELS) * (hidden / 16);
+    size_t shard_ih = (size_t)(intermediate / GEMV_CHANNELS) * (hidden / 16);
+    size_t shard_di = (size_t)(hidden / GEMV_CHANNELS) * (intermediate / 16);
+    size_t shard_per_layer = 5 * shard_hh + 2 * shard_ih + shard_di;
+
     gdn_embed_tokens(x, embeddings, tokens, num_tokens, hidden, config->vocab_size);
     layer_loop: for (layer_index = 0; layer_index < config->num_layers; ++layer_index) {
     #pragma HLS loop_tripcount min=24 max=24  /* num_layers=24 */
@@ -1308,33 +1381,25 @@ int gdn_forward(
         const float *layer_attn_norm = weight_data + layer_offset;
         const float *layer_a_log;
         const float *layer_dt_bias;
-        const float *layer_q_proj;
-        const float *layer_k_proj;
-        const float *layer_v_proj;
         const float *layer_a_proj;
         const float *layer_b_proj;
         const float *layer_q_conv;
         const float *layer_k_conv;
         const float *layer_v_conv;
-        const float *layer_g_proj;
         const float *layer_o_norm;
-        const float *layer_o_proj;
         const float *layer_mlp_norm;
-        const float *layer_mlp_gate_proj;
-        const float *layer_mlp_up_proj;
-        const float *layer_mlp_down_proj;
 
-        layer_offset += hidden;
+        /* Scalar weights stay in weight_data (full blob); the gemv projection
+         * weights live in the compact shards. layer_offset still advances past
+         * the projections so the following scalar offsets stay correct. */
+        layer_offset += hidden;                          /* past attn_norm */
         layer_a_log = weight_data + layer_offset;
         layer_offset += num_heads;
         layer_dt_bias = weight_data + layer_offset;
         layer_offset += num_heads;
-        layer_q_proj = weight_data_mm + layer_offset;
-        layer_offset += (size_t)hidden * hidden;
-        layer_k_proj = weight_data_mm + layer_offset;
-        layer_offset += (size_t)hidden * hidden;
-        layer_v_proj = weight_data_mm + layer_offset;
-        layer_offset += (size_t)hidden * hidden;
+        layer_offset += (size_t)hidden * hidden;         /* past q_proj (shards) */
+        layer_offset += (size_t)hidden * hidden;         /* past k_proj */
+        layer_offset += (size_t)hidden * hidden;         /* past v_proj */
         layer_a_proj = weight_data + layer_offset;
         layer_offset += (size_t)num_heads * hidden;
         layer_b_proj = weight_data + layer_offset;
@@ -1345,27 +1410,24 @@ int gdn_forward(
         layer_offset += (size_t)hidden * config->conv_size;
         layer_v_conv = weight_data + layer_offset;
         layer_offset += (size_t)hidden * config->conv_size;
-        layer_g_proj = weight_data_mm + layer_offset;
-        layer_offset += (size_t)hidden * hidden;
+        layer_offset += (size_t)hidden * hidden;         /* past g_proj (shards) */
         layer_o_norm = weight_data + layer_offset;
         layer_offset += head_dim;
-        layer_o_proj = weight_data_mm + layer_offset;
-        layer_offset += (size_t)hidden * hidden;
+        layer_offset += (size_t)hidden * hidden;         /* past o_proj (shards) */
         layer_mlp_norm = weight_data + layer_offset;
-        layer_offset += hidden;
-        layer_mlp_gate_proj = weight_data_mm + layer_offset;
-        layer_offset += (size_t)intermediate * hidden;
-        layer_mlp_up_proj = weight_data_mm + layer_offset;
-        layer_offset += (size_t)intermediate * hidden;
-        layer_mlp_down_proj = weight_data_mm + layer_offset;
+        /* mlp_gate/up/down projection weights live in the shards. */
+
+        /* Running compact-shard offset (Pack16); order q,k,v,gate,o,mlp_gate,
+         * mlp_up,mlp_down — matches gdn_build_weight_shards. */
+        size_t soff = (size_t)layer_index * shard_per_layer;
 
         gdn_rmsnorm_rows(x_norm, x, layer_attn_norm, num_tokens, hidden, config->norm_eps);
-        gdn_gemv(q, x_norm, weight_data_mm, (uint32_t)((layer_q_proj - weight_data_mm) / 16), num_tokens, hidden, hidden);
-        gdn_gemv(k, x_norm, weight_data_mm, (uint32_t)((layer_k_proj - weight_data_mm) / 16), num_tokens, hidden, hidden);
-        gdn_gemv(v, x_norm, weight_data_mm, (uint32_t)((layer_v_proj - weight_data_mm) / 16), num_tokens, hidden, hidden);
+        gdn_gemv(q, x_norm, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
+        gdn_gemv(k, x_norm, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
+        gdn_gemv(v, x_norm, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
         gdn_matmul_tiled(a, x_norm, layer_a_proj, num_tokens, hidden, num_heads);
         gdn_matmul_tiled(b, x_norm, layer_b_proj, num_tokens, hidden, num_heads);
-        gdn_gemv(gate, x_norm, weight_data_mm, (uint32_t)((layer_g_proj - weight_data_mm) / 16), num_tokens, hidden, hidden);
+        gdn_gemv(gate, x_norm, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, hidden, hidden); soff += shard_hh;
 
         /* Per-(layer, conv) slice of the persistent conv tail in head_buffer:
          * 3 convs/layer × (conv_size-1) rows × hidden floats. */
@@ -1399,14 +1461,14 @@ int gdn_forward(
             layer_index
         );
         gdn_output_norm_and_gate(attn, gate, layer_o_norm, num_tokens, num_heads, head_dim, config->norm_eps);
-        gdn_gemv(tmp_hidden, attn, weight_data_mm, (uint32_t)((layer_o_proj - weight_data_mm) / 16), num_tokens, hidden, hidden);
+        gdn_gemv(tmp_hidden, attn, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, hidden, hidden); soff += shard_hh;
         gdn_pack16_add_inplace(x, tmp_hidden, hidden_count);
 
         gdn_rmsnorm_rows(x_norm, x, layer_mlp_norm, num_tokens, hidden, config->norm_eps);
-        gdn_gemv(mlp_gate, x_norm, weight_data_mm, (uint32_t)((layer_mlp_gate_proj - weight_data_mm) / 16), num_tokens, hidden, intermediate);
-        gdn_gemv(mlp_up, x_norm, weight_data_mm, (uint32_t)((layer_mlp_up_proj - weight_data_mm) / 16), num_tokens, hidden, intermediate);
+        gdn_gemv(mlp_gate, x_norm, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, hidden, intermediate); soff += shard_ih;
+        gdn_gemv(mlp_up, x_norm, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, hidden, intermediate);   soff += shard_ih;
         gdn_swiglu_inplace(mlp_gate, mlp_up, mlp_count);
-        gdn_gemv(tmp_hidden, mlp_gate, weight_data_mm, (uint32_t)((layer_mlp_down_proj - weight_data_mm) / 16), num_tokens, intermediate, hidden);
+        gdn_gemv(tmp_hidden, mlp_gate, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, intermediate, hidden);
         gdn_pack16_add_inplace(x, tmp_hidden, hidden_count);
     }
 
@@ -1439,7 +1501,8 @@ int gdn_decode_step_host(const GDNModel *model, GDNRunState *state, const int32_
         state->head_buffer,
         token,
         1u,
-        model->weight_data  /* weight_data_mm: same blob, dedicated 512-bit AXI bundle on HW */
+        state->weight_shard0,  /* gemv shard 0 (512-bit master / HBM channels A) */
+        state->weight_shard1   /* gemv shard 1 (512-bit master / HBM channels B) */
     );
 }
 
@@ -1488,94 +1551,170 @@ void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logit
  * vs the 2.56 s the GEMM datapath spent at num_rows=1 (255/256 of its array
  * idle). Widening to N HBM weight readers scales this toward HBM aggregate.
  * ======================================================================= */
-#define GEMV_PARTIAL 8       /* power of two; >= FP32 fadd latency in cycles */
-#define IN_DIM_MAX   5632    /* max in_dim (intermediate=5632) — sizes a_loc */
+#define GEMV_PARTIAL  8      /* power of two; >= FP32 fadd latency in cycles */
+#define IN_DIM_MAX    5632   /* max in_dim (intermediate=5632) — sizes a_loc */
+#define GEMV_CHANNELS 2      /* parallel HBM weight readers (output-stripe split) */
 
-/* Producer: stream a projection's weights as ONE contiguous burst. The address
- * is a single monotonic sweep (w_pack_off .. +total_packs), so HLS issues one
- * long 512-bit burst that never breaks between output rows — the fix for the
- * read+MAC-coupled version that chopped the stream into out_dim latency-bound
- * reads (45% of port BW). */
-static void gemv_read(const Pack16 *w_p, uint32_t w_pack_off,
-                      uint32_t total_packs, hls::stream<Pack16> &wf) {
-    gemv_rd: for (uint32_t i = 0; i < total_packs; ++i) {
-    #pragma HLS loop_tripcount min=262144 max=720896
+/* Producer (one HBM channel): stream this channel's output stripe as ONE
+ * contiguous burst (base .. base+n_packs, a single monotonic sweep). The N
+ * readers run on distinct m_axi weight masters, so the HBM crossbar serves
+ * their bursts concurrently → ~N× the single-port 5.30 GB/s. */
+static void gemv_read_ch(const Pack16 *w_p, size_t base, uint32_t n_packs,
+                         hls::stream<Pack16> &wf) {
+    gemv_rd: for (uint32_t i = 0; i < n_packs; ++i) {
+    #pragma HLS loop_tripcount min=131072 max=360448
     #pragma HLS pipeline II=1
-        wf.write(w_p[(size_t)w_pack_off + i]);
+        wf.write(w_p[base + i]);
     }
 }
 
-/* Consumer: load the resident activation vector (cyclic/16 for 16 parallel
- * lanes), then MAC each output row against it from the weight FIFO; adder tree
- * + GEMV_PARTIAL banks hold II=1; emit one Pack16 per 16 outputs. Runs in
- * parallel with gemv_read under #pragma HLS dataflow. */
-static void gemv_compute(const Pack16 *in_p, hls::stream<Pack16> &wf,
-                         Pack16 *out_p, uint32_t out_dim, uint32_t k_packs) {
-    float a_loc[IN_DIM_MAX];
-    #pragma HLS array_partition variable=a_loc cyclic factor=16
+/* ---- Per-channel processing elements (Stage-2 routing fix) -------------
+ * The monolithic 2-wide consumer (one module doing BOTH channels' 16-wide
+ * fp32 reductions) packed a single region densely enough to fail routing
+ * twice: partially-conflicted full_dsp fp-adder nets, congestion level 7.
+ * The fix is one PE per channel — each gemv_pe_mac is its own dataflow
+ * process with exactly the Stage-1 single-port density (which routed), so
+ * Vivado places the N PEs in separate regions instead of one hot-spot. A
+ * single MAC-free gemv_collect is the only writer to `out` (no two-writers-
+ * to-one-port hazard). Bit-exactness holds: same resident a_loc, same beat
+ * order, same partial-bank adder-tree reduction as the monolithic version. */
 
-    gemv_load_a: for (uint32_t kp = 0; kp < k_packs; ++kp) {
+/* Activation fan-out: read the resident activation once (single reader of the
+ * `in` m_axi port → clean dataflow) and broadcast each beat to all N PEs, which
+ * keep private a_loc copies for parallel random access. */
+static void gemv_pe_bcast(const Pack16 *in_p, hls::stream<Pack16> af[GEMV_CHANNELS],
+                          uint32_t k_packs) {
+    gemv_bc: for (uint32_t kp = 0; kp < k_packs; ++kp) {
     #pragma HLS loop_tripcount min=128 max=352
     #pragma HLS pipeline II=1
         Pack16 v = in_p[kp];
-        gemv_la_un: for (int kk = 0; kk < 16; ++kk) {
+        gemv_bc_un: for (int c = 0; c < GEMV_CHANNELS; ++c) {
+        #pragma HLS unroll
+            af[c].write(v);
+        }
+    }
+}
+
+/* One PE (one channel): drain the broadcast activation into a private a_loc
+ * (cyclic/16 → 16 parallel lanes), then MAC this channel's `stripe` output rows,
+ * consuming its weight FIFO at II=1. GEMV_PARTIAL rotating banks + an adder tree
+ * hide FP32 fadd latency; each dot product is emitted as a scalar to `of`. One
+ * PE == the Stage-1 single-port datapath that routed. */
+static void gemv_pe_mac(hls::stream<Pack16> &af, hls::stream<Pack16> &wf,
+                        hls::stream<float> &of, uint32_t stripe, uint32_t k_packs) {
+    float a_loc[IN_DIM_MAX];
+    #pragma HLS array_partition variable=a_loc cyclic factor=16
+
+    gemv_pe_load_a: for (uint32_t kp = 0; kp < k_packs; ++kp) {
+    #pragma HLS loop_tripcount min=128 max=352
+    #pragma HLS pipeline II=1
+        Pack16 v = af.read();
+        gemv_pe_la_un: for (int kk = 0; kk < 16; ++kk) {
         #pragma HLS unroll
             a_loc[kp * 16 + kk] = v.data[kk];
         }
     }
 
-    Pack16 out_buf;
-    gemv_o: for (uint32_t o = 0; o < out_dim; ++o) {
-    #pragma HLS loop_tripcount min=8 max=5632
+    gemv_pe_o: for (uint32_t i = 0; i < stripe; ++i) {
+    #pragma HLS loop_tripcount min=512 max=2816
         float part[GEMV_PARTIAL];
         #pragma HLS array_partition variable=part complete
-        gemv_init: for (int p = 0; p < GEMV_PARTIAL; ++p) {
+        gemv_pe_init: for (int p = 0; p < GEMV_PARTIAL; ++p) {
         #pragma HLS unroll
             part[p] = 0.0f;
         }
-        gemv_k: for (uint32_t kp = 0; kp < k_packs; ++kp) {
+        gemv_pe_k: for (uint32_t kp = 0; kp < k_packs; ++kp) {
         #pragma HLS loop_tripcount min=128 max=352
         #pragma HLS pipeline II=1
             Pack16 w = wf.read();
             float lane = 0.0f;
-            gemv_lane: for (int kk = 0; kk < 16; ++kk) {
+            /* Reduce in LUT fabric, not DSP: keeps the full_dsp fp-adders out of
+             * the (DSP-dense) multiply region — the partially-conflicted-net
+             * congestion that failed the monolithic build. */
+            #pragma HLS bind_op variable=lane op=fadd impl=fabric
+            gemv_pe_lane: for (int kk = 0; kk < 16; ++kk) {
             #pragma HLS unroll
                 lane += w.data[kk] * a_loc[kp * 16 + kk];
             }
             part[kp & (GEMV_PARTIAL - 1)] += lane;
         }
-        /* reduce GEMV_PARTIAL banks (balanced tree) */
         float s0 = part[0] + part[1];
         float s1 = part[2] + part[3];
         float s2 = part[4] + part[5];
         float s3 = part[6] + part[7];
-        out_buf.data[o & 15] = (s0 + s1) + (s2 + s3);
-        if ((o & 15) == 15) {
-            out_p[o >> 4] = out_buf;
+        of.write((s0 + s1) + (s2 + s3));
+    }
+}
+
+/* Collector: the single writer to `out`. Packs 16 consecutive dot products of
+ * each channel into one 512-bit beat written to that channel's output stripe.
+ * MAC-free (no DSP) → adds no congestion to the PE regions. */
+static void gemv_collect(hls::stream<float> of[GEMV_CHANNELS], Pack16 *out_p,
+                         uint32_t stripe, uint32_t stripe_packs) {
+    Pack16 buf[GEMV_CHANNELS];
+    #pragma HLS array_partition variable=buf complete
+    gemv_col: for (uint32_t i = 0; i < stripe; ++i) {
+    #pragma HLS loop_tripcount min=512 max=2816
+        gemv_col_rd: for (int c = 0; c < GEMV_CHANNELS; ++c) {
+        #pragma HLS unroll
+            buf[c].data[i & 15] = of[c].read();
+        }
+        if ((i & 15) == 15) {
+            gemv_col_wr: for (int c = 0; c < GEMV_CHANNELS; ++c) {
+            #pragma HLS unroll
+                out_p[(size_t)c * stripe_packs + (i >> 4)] = buf[c];
+            }
         }
     }
 }
 
+/* Decode GEMV with GEMV_CHANNELS parallel HBM weight readers, COMPACT-SHARDED.
+ * shard c is a distinct buffer on its own m_axi master/HBM channels holding
+ * output stripe c (rows [c*stripe,(c+1)*stripe)) of every projection, packed
+ * back-to-back. All shards share one layout, so this projection's stripe sits at
+ * the SAME `shard_off` (Pack16) in every shard. Reader c streams its stripe from
+ * shard c into PE c; the PEs run as independent dataflow processes (placed apart
+ * → routable) and gemv_collect writes their outputs. Shards are built by
+ * gdn_build_weight_shards (host) in the same projection order gdn_forward threads
+ * `shard_off`. out_dim % (16*GEMV_CHANNELS) == 0 for every projection (2048,
+ * 5632), so stripe boundaries are Pack16-aligned. */
 static void gdn_gemv(
-    float *out, const float *in, const float *weights, uint32_t w_pack_off,
+    float *out, const float *in,
+    const float *shard0, const float *shard1, uint32_t shard_off,
     uint32_t num_rows, uint32_t in_dim, uint32_t out_dim
 ) {
     #pragma HLS inline off
     (void)num_rows;  /* decode GEMV: always the single token (row 0) */
 
-    const Pack16 *in_p  = reinterpret_cast<const Pack16 *>(in);
-    const Pack16 *w_p   = reinterpret_cast<const Pack16 *>(weights);
-    Pack16       *out_p = reinterpret_cast<Pack16 *>(out);
-    uint32_t k_packs = in_dim / 16;
+    const Pack16 *in_p = reinterpret_cast<const Pack16 *>(in);
+    const Pack16 *sh[GEMV_CHANNELS];
+    #pragma HLS array_partition variable=sh complete
+    sh[0] = reinterpret_cast<const Pack16 *>(shard0);
+    sh[1] = reinterpret_cast<const Pack16 *>(shard1);
+    Pack16 *out_p = reinterpret_cast<Pack16 *>(out);
 
-    /* Decouple the weight read from the MAC: gemv_read bursts the whole
-     * projection's weights into wf; gemv_compute drains it and MACs against the
-     * resident activation. The FIFO smooths the per-output reduce/init bubble so
-     * the weight port never idles between output rows. */
-    hls::stream<Pack16> wf;
+    uint32_t k_packs      = in_dim / 16;
+    uint32_t stripe       = out_dim / GEMV_CHANNELS;  /* 16-aligned for our shapes */
+    uint32_t stripe_packs = stripe >> 4;              /* output packs per channel */
+    uint32_t burst_packs  = stripe * k_packs;         /* weight packs per channel */
+
+    hls::stream<Pack16> af[GEMV_CHANNELS];
+    hls::stream<Pack16> wf[GEMV_CHANNELS];
+    hls::stream<float>  of[GEMV_CHANNELS];
+    #pragma HLS array_partition variable=af complete
+    #pragma HLS array_partition variable=wf complete
+    #pragma HLS array_partition variable=of complete
+    #pragma HLS stream variable=af depth=512
     #pragma HLS stream variable=wf depth=128
+    #pragma HLS stream variable=of depth=64
+
     #pragma HLS dataflow
-    gemv_read(w_p, w_pack_off, out_dim * k_packs, wf);
-    gemv_compute(in_p, wf, out_p, out_dim, k_packs);
+    gemv_pe_bcast(in_p, af, k_packs);
+    gemv_pe: for (int c = 0; c < GEMV_CHANNELS; ++c) {
+    #pragma HLS unroll
+        gemv_read_ch(sh[c], (size_t)shard_off, burst_packs, wf[c]);
+        gemv_pe_mac(af[c], wf[c], of[c], stripe, k_packs);
+    }
+    gemv_collect(of, out_p, stripe, stripe_packs);
 }
 
