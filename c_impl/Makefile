@@ -72,7 +72,13 @@ VPP_FLAGS      += --kernel_frequency $(FREQ)
 
 VPP_LDFLAGS    := --config $(HW_CFG)
 VPP_LDFLAGS    += --vivado.synth.jobs $(JOBS) --vivado.impl.jobs $(JOBS)
-VPP_LDFLAGS    += --profile.data all:all:all
+# --profile.data inserts the DPA hardware trace IP (trace buffer on HBM[0]).
+# At N=4 (8+ HBM masters spanning SLR0/1/2) that trace infrastructure crashes
+# design-init: "HADAFileSet::getSrcOptions() : NULL pointer". We measure TPOT
+# from host-side timing and correctness from the decode output, so the on-card
+# profiling trace is not needed — leave it off. Re-enable (with
+# --profile.trace_memory <bank>:<SLR>) only if port-bandwidth telemetry is wanted.
+# VPP_LDFLAGS  += --profile.data all:all:all
 
 
 # ----------------------------------------------------------------------------

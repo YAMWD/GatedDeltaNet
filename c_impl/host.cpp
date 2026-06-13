@@ -439,6 +439,8 @@ public:
           // size = one copy of the projection weights (no replication).
           weight_bo_mm0_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(19)),
           weight_bo_mm1_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(20)),
+          weight_bo_mm2_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(21)),
+          weight_bo_mm3_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(22)),
           x_norm_host_(static_cast<size_t>(max_tokens_) * hidden_, 0.0f) {
         std::cerr << "[progress] upload config and weights to device\n";
         config_bo_.write(&model.config, sizeof(GDNWeightHeader), 0);
@@ -446,19 +448,27 @@ public:
         const size_t weight_bytes = model.weight_data.size() * sizeof(float);
         weight_bo_.write(model.weight_data.data(), weight_bytes, 0);
         sync_bo_chunked(weight_bo_, XCL_BO_SYNC_BO_TO_DEVICE, weight_bytes, 0);
-        // Build the two compact gemv weight shards (split projection output rows)
-        // and upload each to its own master/HBM channels for parallel reads.
+        // Build the GEMV_CHANNELS compact gemv weight shards (split projection
+        // output rows) and upload each to its own master / HBM banks for parallel
+        // reads. Total = one copy of the projection weights (no replication).
         {
-            std::cerr << "[progress] building + uploading 2 gemv weight shards\n";
+            std::cerr << "[progress] building + uploading " << GEMV_CHANNELS
+                      << " gemv weight shards\n";
             size_t shard_floats = gdn_weight_shard_floats(&model.config);
             size_t shard_bytes = shard_floats * sizeof(float);
-            std::vector<float> s0(shard_floats), s1(shard_floats);
-            gdn_build_weight_shards(model.weight_data.data(), &model.config,
-                                    s0.data(), s1.data());
-            weight_bo_mm0_.write(s0.data(), shard_bytes, 0);
-            sync_bo_chunked(weight_bo_mm0_, XCL_BO_SYNC_BO_TO_DEVICE, shard_bytes, 0);
-            weight_bo_mm1_.write(s1.data(), shard_bytes, 0);
-            sync_bo_chunked(weight_bo_mm1_, XCL_BO_SYNC_BO_TO_DEVICE, shard_bytes, 0);
+            std::vector<float> sbuf[GEMV_CHANNELS];
+            float *shards[GEMV_CHANNELS];
+            for (int c = 0; c < GEMV_CHANNELS; ++c) {
+                sbuf[c].resize(shard_floats);
+                shards[c] = sbuf[c].data();
+            }
+            gdn_build_weight_shards(model.weight_data.data(), &model.config, shards);
+            xrt::bo *mm[GEMV_CHANNELS] = { &weight_bo_mm0_, &weight_bo_mm1_,
+                                           &weight_bo_mm2_, &weight_bo_mm3_ };
+            for (int c = 0; c < GEMV_CHANNELS; ++c) {
+                mm[c]->write(shards[c], shard_bytes, 0);
+                sync_bo_chunked(*mm[c], XCL_BO_SYNC_BO_TO_DEVICE, shard_bytes, 0);
+            }
         }
     }
 
@@ -510,7 +520,9 @@ public:
             tokens_bo_,
             static_cast<uint32_t>(tokens.size()),
             weight_bo_mm0_,
-            weight_bo_mm1_
+            weight_bo_mm1_,
+            weight_bo_mm2_,
+            weight_bo_mm3_
         );
         auto start = std::chrono::high_resolution_clock::now();
         run.wait();
@@ -612,6 +624,8 @@ private:
     xrt::bo tokens_bo_;
     xrt::bo weight_bo_mm0_;
     xrt::bo weight_bo_mm1_;
+    xrt::bo weight_bo_mm2_;
+    xrt::bo weight_bo_mm3_;
     std::vector<float> x_norm_host_;
     double total_kernel_seconds_ = 0.0;
     uint64_t kernel_runs_ = 0;

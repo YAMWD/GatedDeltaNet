@@ -227,28 +227,70 @@ resident `a_loc`, same beat order, same partial-bank adder-tree reduction).
    HBM[10:31] exactly; activations stay on HBM[0:9]. Link-only change (the PE `.xo`
    is unchanged), so the second build was a relink.
 
-**Why 1.76× and not 2×, and the path past it.** Amdahl on the kernel:
-`1543 = W + S`, `875 = W/2 + S` ⇒ **W ≈ 1336 ms** (parallel weight streaming) and
-**S ≈ 207 ms** serial floor — recurrent-attention state R/W, the a/b
-`gdn_matmul_tiled`, conv, and the scalar `weight_data` master (notably the 256 MB
-`lm_head` read per token). The readers halved W exactly; S is untouched. Extending
-to more readers (W/N + S): **N=4 → ~540 ms, N=8 → ~374 ms** kernel — after which
-S dominates and becomes the target.
+**Why 1.76× and not 2×.** Amdahl on the kernel: `1543 = W + S`, `875 = W/2 + S`
+⇒ **W ≈ 1336 ms** (parallel weight streaming) and **S ≈ 207 ms** serial floor —
+recurrent-attention state R/W (~50 MB/token), the a/b `gdn_matmul_tiled`, conv,
+and the per-layer scalar `weight_data` reads (norms / conv / a-b proj). Logits are
+computed **host-side** (`host.cpp:compute_logits` reads `lm_head` from host RAM),
+so `lm_head` is *not* a kernel cost. The readers halved W exactly; S is untouched.
+Adding readers (W/N + S) is the next lever — realised at N=4 in §6d.
+
+## 6d. Stage 2b — N=4 readers (on-card, bit-exact)
+
+Four parallel readers: `GEMV_CHANNELS=4`, four compact shards on four disjoint HBM
+bank groups, two more m_axi masters (`mem_weights_mm3/mm4`). The shard builder,
+run-state, and `gdn_gemv` were generalised to an N-element shard array, so the
+only N-specific surface is the kernel arg count, the host BO count, and the hw.cfg
+bank map. Bit-exactness holds (each output row is still one PE's identical reduction).
+
+| metric | N=2 | **N=4 (Stage 2b)** |
+|---|---:|---:|
+| kernel TPOT (flat) | 875 ms | **600 ms** (1.46× over N=2; **2.57× over Stage 1**) |
+| TPOT incl. host | 937 ms | **662 ms** |
+| weight readers | 2 | **4 × 512-bit, disjoint HBM** |
+| decode bit-exact (1×64) | ✓ | **✓ top1 100%, first_div −1** |
+| kernel timing (WNS) | +0.506 ns | **+0.104 ns, 0 failing** |
+| shell `hbm_aclk` | −0.044 ns, 23 ep | **+0.081 ns, 0 failing** (clean) |
+| build | xo + relink | **relink-only 3 h 22 m** (xo reused) |
+
+**Two non-obvious build issues, both fixed:**
+
+1. **HBM bank budget.** weight_data (11 banks) + 4 shards (3 banks each = 12) = 23
+   weight banks > the 22 of HBM[10:31]. Decode reads activations once per token,
+   so the 3 gmem masters collapse to **1 bank each** (HBM[1:3]), freeing HBM[4:9].
+   Final disjoint map: shards HBM[4:6]/[7:9]/[10:12]/[13:15], weight_data
+   HBM[16:26], activations HBM[1:3], control HBM[0] — 27 of 32 banks, no overlap.
+
+2. **Profiling IP crashed design-init.** The first N=4 link aborted in Vivado
+   design-init — `HADAFileSet::getSrcOptions() : NULL pointer` — inside the DPA
+   trace s2mm IP that `--profile.data all:all:all` inserts (trace buffer on
+   HBM[0]). With 8+ HBM masters spanning SLR0/1/2 it could not initialise.
+   Dropping `--profile.data` removed that trace master: the relink not only built
+   but **improved `hbm_aclk`** (−0.044 → +0.081 ns) by taking the writer off
+   HBM[0]. TPOT (host timing) + bit-exactness need no on-card trace.
+
+**Scaling is sub-linear past 2 readers.** Ideal W/N + S predicts N=4 ≈ 541 ms;
+measured 600 ms (~60 ms over). Four readers contend more on the shared HBM
+crossbar and the per-shard bursts are smaller, so effective per-reader bandwidth
+drops. The 2.57× cumulative is real, but each doubling now returns less.
 
 ## 7. Next
 
-Decode-only is bit-exact and flat at **875 ms/token kernel (937 ms incl. host)**,
-1.76× over the single-port Stage 1. The remaining levers, in order:
+Decode-only is bit-exact and flat at **600 ms/token kernel (662 ms incl. host)**,
+**2.57× over the single-port Stage 1**. The bandwidth lever is now deep into
+diminishing returns (N=2→N=4 returned 1.46×, not 2×). Remaining levers:
 
-- **N=4 then N=8 weight readers.** Same compact-shard + per-PE-channel structure,
-  more stripes (`GEMV_CHANNELS` 4, 8). The shards stay one copy split N ways
-  (total weight HBM constant ~10.4 GiB), so plan the **disjoint bank ranges** up
-  front (reclaim the tiny activation channels HBM[1:9] for the extra shards). The
-  16×16-derived MAC width already covers N=8. Expected ~540 / ~374 ms.
-- **Attack the S ≈ 207 ms serial floor.** Once readers collapse W, the next
-  targets are recurrent-attention state I/O (50 MB R/W per token), the a/b
-  projection, and moving the per-token `lm_head` read off the shared scalar
-  master (or computing logits host-side).
+- **N=8 weight readers** — same structure, `GEMV_CHANNELS=8`, eight 2-bank shards
+  (16 weight banks) + weight_data; reclaim more activation/free banks. The
+  16×16-derived MAC width already covers it. But sub-linear scaling + the
+  S ≈ 207 ms serial floor cap the upside at perhaps ~480–520 ms kernel — modest,
+  and 8 masters stress the HBM crossbar further. Marginal.
+- **Attack the S ≈ 207 ms serial floor** (now the larger share of TPOT): the
+  recurrent-attention state R/W (~50 MB/token over HBM[0]) and the a/b
+  `gdn_matmul_tiled`. This — not more readers — is where the next real gain is.
+- **INT8 weights** (deferred): 4× less weight data attacks W *and* relieves the
+  HBM crossbar instead of loading it; the highest-leverage remaining move, at the
+  cost of a tolerance-based parity gate (no longer bit-exact).
 
 ## 8. References
 

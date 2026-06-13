@@ -14,7 +14,8 @@
 #define GDN_DK    256   /* head_dim = query/key dimension */
 #define GDN_DV    256   /* value_dim = hidden/num_heads   */
 #define GDN_PK     16   /* column parallelism factor      */
-#define GEMV_CHANNELS 2 /* parallel HBM weight readers (decode GEMV, output-stripe split) */
+/* GEMV_CHANNELS lives in gdn_model.h (shared by the kernel and the host shard
+ * builder / run-state); do not redefine it here. */
 
 /* Pack16 = 16 FP32 values = 64 bytes = 512 bits. Used both by the systolic
  * matmul (as the stream word) and by the element-wise Pack16 helpers
@@ -141,7 +142,7 @@ size_t gdn_weight_shard_floats(const GDNWeightHeader *config) {
 }
 
 void gdn_build_weight_shards(const float *wd, const GDNWeightHeader *config,
-                             float *shard0, float *shard1) {
+                             float *const shards[]) {
     size_t H = config->hidden_size, I = config->intermediate_size;
     size_t nh = config->num_heads, hd = config->head_dim, cs = config->conv_size;
     size_t soff = 0;  /* running float offset into each shard */
@@ -161,10 +162,13 @@ void gdn_build_weight_shards(const float *wd, const GDNWeightHeader *config,
         size_t pin [8] = { H, H, H, H, H, H, H, I };
         int p;
         for (p = 0; p < 8; ++p) {
-            size_t s0 = (pout[p] / GEMV_CHANNELS) * pin[p];  /* one stripe (floats) */
-            memcpy(shard0 + soff, wd + poff[p],      s0 * sizeof(float));
-            memcpy(shard1 + soff, wd + poff[p] + s0, s0 * sizeof(float));
-            soff += s0;
+            /* output rows split into GEMV_CHANNELS stripes; stripe c = rows
+             * [c*out/N,(c+1)*out/N) → floats [poff + c*s, ...) → shards[c]. */
+            size_t s = (pout[p] / GEMV_CHANNELS) * pin[p];   /* one stripe (floats) */
+            int c;
+            for (c = 0; c < GEMV_CHANNELS; ++c)
+                memcpy(shards[c] + soff, wd + poff[p] + (size_t)c * s, s * sizeof(float));
+            soff += s;
         }
     }
 }
@@ -352,10 +356,10 @@ int gdn_run_state_init(GDNRunState *state, const GDNModel *model, uint32_t max_t
      * parallel. Same total size as one weight copy — no replication. */
     {
         size_t shard_floats = gdn_weight_shard_floats(&model->config);
-        if (gdn_alloc_run_buffer(&state->weight_shard0, shard_floats) != 0) return -1;
-        if (gdn_alloc_run_buffer(&state->weight_shard1, shard_floats) != 0) return -1;
-        gdn_build_weight_shards(model->weight_data, &model->config,
-                                state->weight_shard0, state->weight_shard1);
+        int c;
+        for (c = 0; c < GEMV_CHANNELS; ++c)
+            if (gdn_alloc_run_buffer(&state->weight_shards[c], shard_floats) != 0) return -1;
+        gdn_build_weight_shards(model->weight_data, &model->config, state->weight_shards);
     }
 
     return 0;
@@ -376,8 +380,10 @@ void gdn_run_state_free(GDNRunState *state) {
     free(state->mlp_up);
     free(state->recurrent_state);
     free(state->head_buffer);
-    free(state->weight_shard0);
-    free(state->weight_shard1);
+    {
+        int c;
+        for (c = 0; c < GEMV_CHANNELS; ++c) free(state->weight_shards[c]);
+    }
     memset(state, 0, sizeof(*state));
 }
 
@@ -1262,11 +1268,12 @@ static void gdn_swiglu_inplace(float *gate, const float *up, size_t count) {
 
 
 /* Forward decl: the decode-only GEMV engine (num_rows==1) with GEMV_CHANNELS
- * parallel HBM weight readers; weights0/weights1 alias the same blob on distinct
- * m_axi masters. Defined below next to the IN_DIM_MAX / Pack16 machinery. */
+ * parallel HBM weight readers; weights0..weights3 are the compact shards, each on
+ * its own m_axi master. Defined below next to the IN_DIM_MAX / Pack16 machinery. */
 static void gdn_gemv(
     float *out, const float *in,
-    const float *weights0, const float *weights1, uint32_t w_pack_off,
+    const float *weights0, const float *weights1,
+    const float *weights2, const float *weights3, uint32_t w_pack_off,
     uint32_t num_rows, uint32_t in_dim, uint32_t out_dim);
 
 int gdn_forward(
@@ -1289,8 +1296,10 @@ int gdn_forward(
     float *head_buffer,
     const int32_t *tokens,
     uint32_t num_tokens,
-    const float *weight_data_mm,
-    const float *weight_data_mm2   /* 2nd weight reader (aliases weight_data_mm, distinct HBM master) */
+    const float *weight_data_mm,   /* gemv shard 0 reader */
+    const float *weight_data_mm2,  /* gemv shard 1 reader */
+    const float *weight_data_mm3,  /* gemv shard 2 reader (Stage 2b: N=4) */
+    const float *weight_data_mm4   /* gemv shard 3 reader */
 ) {
     /* Depths match gdn-1.3b-f32.gdnw: hidden=2048 heads=8 head_dim=256
     intermediate=5632 layers=24 conv=4 max_seq_len=2048 vocab=32000 */
@@ -1317,6 +1326,11 @@ int gdn_forward(
      * concurrently with mem_weights_mm (Stage 2: ~2× weight read bandwidth).
      * Aliases the same blob; hw.cfg maps mem_weights_mm2 across HBM[10:31]. */
     #pragma HLS interface m_axi port=weight_data_mm2 depth=1466343808 offset=slave bundle=mem_weights_mm2 max_widen_bitwidth=512 max_read_burst_length=64
+    /* Stage 2b (N=4): shards 2 and 3 on their OWN bundles/masters so the HBM
+     * crossbar serves all four shard streams concurrently (~4× weight read
+     * bandwidth). hw.cfg maps mem_weights_mm3/mm4 to DISJOINT HBM bank groups. */
+    #pragma HLS interface m_axi port=weight_data_mm3 depth=1466343808 offset=slave bundle=mem_weights_mm3 max_widen_bitwidth=512 max_read_burst_length=64
+    #pragma HLS interface m_axi port=weight_data_mm4 depth=1466343808 offset=slave bundle=mem_weights_mm4 max_widen_bitwidth=512 max_read_burst_length=64
     /* Phase B: activations split across distinct AXI bundles -> distinct HBM
      * channels (hw.cfg), so each stage's input-read master and output-write
      * master run concurrently instead of contending on one gmem port (HBM[0]).
@@ -1422,12 +1436,12 @@ int gdn_forward(
         size_t soff = (size_t)layer_index * shard_per_layer;
 
         gdn_rmsnorm_rows(x_norm, x, layer_attn_norm, num_tokens, hidden, config->norm_eps);
-        gdn_gemv(q, x_norm, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
-        gdn_gemv(k, x_norm, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
-        gdn_gemv(v, x_norm, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
+        gdn_gemv(q, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
+        gdn_gemv(k, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
+        gdn_gemv(v, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
         gdn_matmul_tiled(a, x_norm, layer_a_proj, num_tokens, hidden, num_heads);
         gdn_matmul_tiled(b, x_norm, layer_b_proj, num_tokens, hidden, num_heads);
-        gdn_gemv(gate, x_norm, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, hidden, hidden); soff += shard_hh;
+        gdn_gemv(gate, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, hidden, hidden); soff += shard_hh;
 
         /* Per-(layer, conv) slice of the persistent conv tail in head_buffer:
          * 3 convs/layer × (conv_size-1) rows × hidden floats. */
@@ -1461,14 +1475,14 @@ int gdn_forward(
             layer_index
         );
         gdn_output_norm_and_gate(attn, gate, layer_o_norm, num_tokens, num_heads, head_dim, config->norm_eps);
-        gdn_gemv(tmp_hidden, attn, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, hidden, hidden); soff += shard_hh;
+        gdn_gemv(tmp_hidden, attn, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, hidden, hidden); soff += shard_hh;
         gdn_pack16_add_inplace(x, tmp_hidden, hidden_count);
 
         gdn_rmsnorm_rows(x_norm, x, layer_mlp_norm, num_tokens, hidden, config->norm_eps);
-        gdn_gemv(mlp_gate, x_norm, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, hidden, intermediate); soff += shard_ih;
-        gdn_gemv(mlp_up, x_norm, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, hidden, intermediate);   soff += shard_ih;
+        gdn_gemv(mlp_gate, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, hidden, intermediate); soff += shard_ih;
+        gdn_gemv(mlp_up, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, hidden, intermediate);   soff += shard_ih;
         gdn_swiglu_inplace(mlp_gate, mlp_up, mlp_count);
-        gdn_gemv(tmp_hidden, mlp_gate, weight_data_mm, weight_data_mm2, (uint32_t)soff, num_tokens, intermediate, hidden);
+        gdn_gemv(tmp_hidden, mlp_gate, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, (uint32_t)soff, num_tokens, intermediate, hidden);
         gdn_pack16_add_inplace(x, tmp_hidden, hidden_count);
     }
 
@@ -1501,8 +1515,10 @@ int gdn_decode_step_host(const GDNModel *model, GDNRunState *state, const int32_
         state->head_buffer,
         token,
         1u,
-        state->weight_shard0,  /* gemv shard 0 (512-bit master / HBM channels A) */
-        state->weight_shard1   /* gemv shard 1 (512-bit master / HBM channels B) */
+        state->weight_shards[0],  /* gemv shard 0 (512-bit master / HBM group A) */
+        state->weight_shards[1],  /* gemv shard 1 (master / HBM group B) */
+        state->weight_shards[2],  /* gemv shard 2 (master / HBM group C) */
+        state->weight_shards[3]   /* gemv shard 3 (master / HBM group D) */
     );
 }
 
@@ -1553,7 +1569,7 @@ void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logit
  * ======================================================================= */
 #define GEMV_PARTIAL  8      /* power of two; >= FP32 fadd latency in cycles */
 #define IN_DIM_MAX    5632   /* max in_dim (intermediate=5632) — sizes a_loc */
-#define GEMV_CHANNELS 2      /* parallel HBM weight readers (output-stripe split) */
+/* GEMV_CHANNELS lives in gdn_model.h (shared by the kernel and the host). */
 
 /* Producer (one HBM channel): stream this channel's output stripe as ONE
  * contiguous burst (base .. base+n_packs, a single monotonic sweep). The N
@@ -1680,7 +1696,8 @@ static void gemv_collect(hls::stream<float> of[GEMV_CHANNELS], Pack16 *out_p,
  * 5632), so stripe boundaries are Pack16-aligned. */
 static void gdn_gemv(
     float *out, const float *in,
-    const float *shard0, const float *shard1, uint32_t shard_off,
+    const float *shard0, const float *shard1,
+    const float *shard2, const float *shard3, uint32_t shard_off,
     uint32_t num_rows, uint32_t in_dim, uint32_t out_dim
 ) {
     #pragma HLS inline off
@@ -1691,6 +1708,8 @@ static void gdn_gemv(
     #pragma HLS array_partition variable=sh complete
     sh[0] = reinterpret_cast<const Pack16 *>(shard0);
     sh[1] = reinterpret_cast<const Pack16 *>(shard1);
+    sh[2] = reinterpret_cast<const Pack16 *>(shard2);
+    sh[3] = reinterpret_cast<const Pack16 *>(shard3);
     Pack16 *out_p = reinterpret_cast<Pack16 *>(out);
 
     uint32_t k_packs      = in_dim / 16;
