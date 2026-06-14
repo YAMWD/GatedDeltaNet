@@ -382,7 +382,11 @@ static int run_decode_from_state(
         int32_t prev = traj[step - 1];
         if (gdn_decode_step_host(model, run_state, &prev) != 0)
             die("decode-from-state: single-token step failed");
-        traj[step] = argmax_logits(model, run_state->x_norm, logits);
+        /* lm_head + greedy argmax now run on-chip (gdn_forward) and write the
+         * next token id into x_norm[0] — read it directly instead of recomputing
+         * host-side, so native matches the kernel exactly. */
+        traj[step] = (int32_t)run_state->x_norm[0];
+        (void)logits;
         tpot[step] = monotonic_ms() - t0;
     }
 

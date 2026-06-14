@@ -445,6 +445,7 @@ public:
           weight_bo_mm5_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(24)),
           weight_bo_mm6_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(25)),
           weight_bo_mm7_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(26)),
+          logits_bo_(device, static_cast<size_t>(model.config.vocab_size) * sizeof(float), kernel_.group_id(27)),
           x_norm_host_(static_cast<size_t>(max_tokens_) * hidden_, 0.0f) {
         std::cerr << "[progress] upload config and weights to device\n";
         config_bo_.write(&model.config, sizeof(GDNWeightHeader), 0);
@@ -532,7 +533,8 @@ public:
             weight_bo_mm4_,
             weight_bo_mm5_,
             weight_bo_mm6_,
-            weight_bo_mm7_
+            weight_bo_mm7_,
+            logits_bo_
         );
         auto start = std::chrono::high_resolution_clock::now();
         run.wait();
@@ -640,6 +642,7 @@ private:
     xrt::bo weight_bo_mm5_;
     xrt::bo weight_bo_mm6_;
     xrt::bo weight_bo_mm7_;
+    xrt::bo logits_bo_;
     std::vector<float> x_norm_host_;
     double total_kernel_seconds_ = 0.0;
     uint64_t kernel_runs_ = 0;
@@ -735,7 +738,10 @@ static std::vector<DecodeExample> run_decode_hw(
         auto t0 = std::chrono::high_resolution_clock::now();
         std::vector<int32_t> tok(1, result.gen_traj[step - 1]);
         double ksec = runner.run_forward(tok);
-        int next = argmax_logits(model, runner.hidden_row(0), logits);
+        /* lm_head + greedy argmax run on-chip now; the kernel writes the next
+         * token id into x_norm[0] (read back by run_forward). No host logits. */
+        int next = (int32_t)runner.hidden_row(0)[0];
+        (void)logits; (void)model;
         auto t1 = std::chrono::high_resolution_clock::now();
         result.per_step_tpot_ms[step] =
             std::chrono::duration<double, std::milli>(t1 - t0).count();

@@ -80,6 +80,7 @@ typedef struct {
     float *recurrent_state;
     float *head_buffer;
     float *weight_shards[GEMV_CHANNELS];  /* compact gemv weight shards (built from weight_data) */
+    float *logits;                        /* [vocab] lm_head gemv scratch (decode argmax → x_norm[0]) */
 } GDNRunState;
 
 /* Build the GEMV_CHANNELS compact weight shards from the flat weight blob; each
@@ -120,10 +121,15 @@ int gdn_forward(
     float *head_buffer,
     const int32_t *tokens,
     uint32_t num_tokens,
-    const float *weight_data_mm,   /* gemv weight shard 0 on a dedicated 512-bit AXI master */
-    const float *weight_data_mm2,  /* shard 1 on a distinct master (Stage 2: parallel readers) */
-    const float *weight_data_mm3,  /* shard 2 (Stage 2b: N=4 readers) */
-    const float *weight_data_mm4   /* shard 3 */
+    const float *weight_data_mm,   /* gemv weight shard 0 (dedicated 512-bit master) */
+    const float *weight_data_mm2,  /* shard 1 (Stage 2: parallel readers) */
+    const float *weight_data_mm3,  /* shard 2 (Stage 2b: N=4) */
+    const float *weight_data_mm4,  /* shard 3 */
+    const float *weight_data_mm5,  /* shard 4 (Stage 2c: N=8) */
+    const float *weight_data_mm6,  /* shard 5 */
+    const float *weight_data_mm7,  /* shard 6 */
+    const float *weight_data_mm8,  /* shard 7 */
+    float *logits                  /* [vocab] lm_head gemv scratch; argmax → x_norm[0] */
 );
 
 /* Single-token decode step (the only host entry): gdn_forward with num_tokens=1

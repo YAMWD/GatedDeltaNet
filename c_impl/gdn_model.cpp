@@ -134,11 +134,13 @@ static size_t gdn_final_norm_offset(const GDNWeightHeader *config) {
  * projection weights (no replication), so the parallel 512-bit readers fit the
  * same HBM budget as the old single weight_data_mm copy. Host-only (memcpy). */
 size_t gdn_weight_shard_floats(const GDNWeightHeader *config) {
-    size_t H = config->hidden_size, I = config->intermediate_size;
+    size_t H = config->hidden_size, I = config->intermediate_size, V = config->vocab_size;
     size_t per_layer = 5 * (H / GEMV_CHANNELS) * H     /* q,k,v,gate,o */
                      + 2 * (I / GEMV_CHANNELS) * H     /* mlp_gate, mlp_up */
                      +     (H / GEMV_CHANNELS) * I;     /* mlp_down */
-    return (size_t)config->num_layers * per_layer;
+    /* + lm_head [V,H], appended once after all layers so the decode kernel can
+     * emit logits (and argmax) on-chip. V % GEMV_CHANNELS == 0 (32000/8). */
+    return (size_t)config->num_layers * per_layer + (V / GEMV_CHANNELS) * H;
 }
 
 void gdn_build_weight_shards(const float *wd, const GDNWeightHeader *config,
@@ -170,6 +172,18 @@ void gdn_build_weight_shards(const float *wd, const GDNWeightHeader *config,
                 memcpy(shards[c] + soff, wd + poff[p] + (size_t)c * s, s * sizeof(float));
             soff += s;
         }
+    }
+    /* lm_head [V,H] (global): split its rows into GEMV_CHANNELS stripes appended
+     * after every layer's projections — the order gdn_forward threads for the
+     * final logits gemv. lm_head sits right after final_norm (H floats) in the blob. */
+    {
+        size_t V = config->vocab_size;
+        size_t lmh = gdn_final_norm_offset(config) + H;   /* past final_norm */
+        size_t s = (V / GEMV_CHANNELS) * H;               /* one stripe (floats) */
+        int c;
+        for (c = 0; c < GEMV_CHANNELS; ++c)
+            memcpy(shards[c] + soff, wd + lmh + (size_t)c * s, s * sizeof(float));
+        soff += s;
     }
 }
 
@@ -361,6 +375,8 @@ int gdn_run_state_init(GDNRunState *state, const GDNModel *model, uint32_t max_t
             if (gdn_alloc_run_buffer(&state->weight_shards[c], shard_floats) != 0) return -1;
         gdn_build_weight_shards(model->weight_data, &model->config, state->weight_shards);
     }
+    /* lm_head gemv scratch (decode writes logits here, argmaxes to x_norm[0]). */
+    if (gdn_alloc_run_buffer(&state->logits, model->config.vocab_size) != 0) return -1;
 
     return 0;
 }
@@ -1278,6 +1294,10 @@ static void gdn_gemv(
     const float *weights6, const float *weights7, uint32_t w_pack_off,
     uint32_t num_rows, uint32_t in_dim, uint32_t out_dim);
 
+/* On-chip greedy argmax over the [vocab] logits (first-max tie-break); writes the
+ * token id as a float into out_token_f[0]. Defined below near gdn_gemv. */
+static void gdn_argmax(float *out_token_f, const float *logits, uint32_t vocab);
+
 int gdn_forward(
     const GDNWeightHeader *config,
     const float *weight_data,
@@ -1305,7 +1325,8 @@ int gdn_forward(
     const float *weight_data_mm5,  /* gemv shard 4 reader (Stage 2c: N=8) */
     const float *weight_data_mm6,  /* gemv shard 5 reader */
     const float *weight_data_mm7,  /* gemv shard 6 reader */
-    const float *weight_data_mm8   /* gemv shard 7 reader */
+    const float *weight_data_mm8,  /* gemv shard 7 reader */
+    float *logits                  /* [vocab] scratch: lm_head gemv output (argmax → x_norm[0]) */
 ) {
     /* Depths match gdn-1.3b-f32.gdnw: hidden=2048 heads=8 head_dim=256
     intermediate=5632 layers=24 conv=4 max_seq_len=2048 vocab=32000 */
@@ -1364,6 +1385,9 @@ int gdn_forward(
     #pragma HLS interface m_axi port=tmp_hidden depth=4194304 offset=slave max_widen_bitwidth=512 bundle=gmem_x
     #pragma HLS interface m_axi port=mlp_gate depth=11534336 offset=slave max_widen_bitwidth=512 bundle=gmem_mlp
     #pragma HLS interface m_axi port=mlp_up depth=11534336 offset=slave max_widen_bitwidth=512 bundle=gmem_mlp
+    /* lm_head logits scratch shares the gmem_mlp master (written once per token by
+     * the final gemv, then read by the on-chip argmax) — no extra HBM master. */
+    #pragma HLS interface m_axi port=logits depth=32000 offset=slave max_widen_bitwidth=512 bundle=gmem_mlp
     /* Decode persistence: recurrent_state holds num_layers × 2 MB = 48 MB of
      * per-layer state (RESTORE/SAVE); head_buffer is repurposed as the per-layer
      * conv tail (24 layers × 3 convs × (conv-1) rows × hidden = ~1.7 MB). */
@@ -1500,6 +1524,20 @@ int gdn_forward(
     }
 
     gdn_rmsnorm_rows(x_norm, x, final_norm, num_tokens, hidden, config->norm_eps);
+    /* lm_head on-chip: logits[vocab] = x_norm @ lm_head via the same 8-reader
+     * sharded gemv (lm_head's stripe is appended after every layer in each shard,
+     * so its offset is num_layers*shard_per_layer). Then greedy argmax → next
+     * token id, written into x_norm[0] — x_norm is done as an activation, so it
+     * doubles as the 1-int output (no extra port). This makes the kernel emit a
+     * complete decode step (token in → token out), matching what the GPU times. */
+    {
+        size_t lm_soff = (size_t)config->num_layers * shard_per_layer;
+        gdn_gemv(logits, x_norm,
+                 weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4,
+                 weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8,
+                 (uint32_t)lm_soff, num_tokens, hidden, config->vocab_size);
+        gdn_argmax(x_norm, logits, config->vocab_size);
+    }
     return 0;
 }
 
@@ -1531,7 +1569,8 @@ int gdn_decode_step_host(const GDNModel *model, GDNRunState *state, const int32_
         state->weight_shards[0], state->weight_shards[1],  /* gemv shards 0,1 */
         state->weight_shards[2], state->weight_shards[3],  /* gemv shards 2,3 */
         state->weight_shards[4], state->weight_shards[5],  /* gemv shards 4,5 */
-        state->weight_shards[6], state->weight_shards[7]   /* gemv shards 6,7 */
+        state->weight_shards[6], state->weight_shards[7],  /* gemv shards 6,7 */
+        state->logits                                      /* lm_head scratch; token → x_norm[0] */
     );
 }
 
@@ -1754,5 +1793,25 @@ static void gdn_gemv(
         gemv_pe_mac(af[c], wf[c], of[c], stripe, k_packs);
     }
     gemv_collect(of, out_p, stripe, stripe_packs);
+}
+
+/* On-chip greedy argmax over the [vocab] logits the lm_head gemv wrote to HBM.
+ * First-max tie-break (strict >), matching the host gdn_compute_logits /
+ * argmax_logits the decode golden was validated against. Reads Pack16 bursts;
+ * writes the token id as a float into out_token_f[0] (= x_norm[0]), the kernel's
+ * 1-int decode output. ~vocab cycles — negligible vs the layer gemvs. */
+static void gdn_argmax(float *out_token_f, const float *logits, uint32_t vocab) {
+    const Pack16 *lp = reinterpret_cast<const Pack16 *>(logits);
+    uint32_t n_packs = vocab >> 4;             /* vocab % 16 == 0 (32000) */
+    float best = -3.402823466e38f;             /* -FLT_MAX */
+    uint32_t best_i = 0;
+    argmax_pk: for (uint32_t p = 0; p < n_packs; ++p) {
+    #pragma HLS loop_tripcount min=2000 max=2000
+        Pack16 v = lp[p];
+        argmax_j: for (int j = 0; j < 16; ++j) {
+            if (v.data[j] > best) { best = v.data[j]; best_i = (p << 4) + (uint32_t)j; }
+        }
+    }
+    out_token_f[0] = (float)best_i;
 }
 

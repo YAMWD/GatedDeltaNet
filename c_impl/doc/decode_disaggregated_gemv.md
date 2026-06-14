@@ -300,19 +300,55 @@ N=1/N=2 fit's 207 ms — the gap is the sub-linear W). N=16 would need ~20 maste
 (likely unroutable) for ~1.2×. **N=8 (3.34×) is the practical end of the
 weight-bandwidth roadmap.**
 
+## 6f. On-chip lm_head + argmax — a complete decode step (on-card, bit-exact)
+
+The kernel now emits the next token id directly (token in → token out) instead of
+returning the hidden vector for the host to project and argmax. `lm_head` is a 9th
+**sharded gemv** (out_dim = vocab = 32000, reusing the 8-reader engine; its [V,H]
+rows split into 8 stripes appended after every layer's projections in each shard).
+A greedy **on-chip argmax** (`gdn_argmax`, first-max tie-break matching the host)
+reduces the 32000 logits and writes the token id into `x_norm[0]` — x_norm is spent
+as an activation by then, so it doubles as the 1-int output (no extra port). The
+logits scratch shares the `gmem_mlp` master (no 13th HBM master).
+
+| metric | N=8 (host logits) | **N=8 + on-chip lm_head/argmax** |
+|---|---:|---:|
+| kernel ms/tok | 462 | **470** (+8: lm_head gemv + argmax) |
+| TPOT incl. host | 525 | **470** (host `compute_logits` removed: −55 ms) |
+| kernel WNS / hbm_aclk | +0.342 / −0.008 | +0.169 / **+0.001** (clean) |
+| decode bit-exact (1×64) | ✓ | **✓ top1 100%, first_div −1** |
+
+Two results: (1) the complete-decode TPOT *drops* 525 → 470 ms — the single-threaded
+host lm_head matmul (~65 M MAC/token) cost more than the ~8 ms on-chip gemv; (2) the
+number is now **fair** — the kernel does forward + lm_head + argmax, exactly what the
+GPU TPOT measures.
+
+**Fair GPU comparison (both fp32, both forward + lm_head + argmax).** A100 GDN decode
+is launch-overhead-bound at 1.3B / batch-1 — flat ~33.5 ms fp32 ≈ bf16 (doubling the
+weight bytes costs ~0, proving it is *not* bandwidth-bound). FPGA 470 ms ⇒ **~14×**
+slower, dominated by the ~325 ms serial floor (recurrent-attention state I/O +
+compute), which the GPU pays ~nothing for. fp32↔fp32 normalisation does **not** close
+the gap (the GPU is idle, not byte-limited). The FPGA's defensible angle is perf/Watt
+(~50–75 W vs ~250–300 W), which needs the latency gap down to <~4–5×, not <1×.
+
 ## 7. Next
 
-Decode-only is bit-exact and flat at **462 ms/token kernel (525 ms incl. host)**,
-**3.34× over the single-port Stage 1** — and the weight-bandwidth lever is now
-exhausted (§6e). The remaining gains are elsewhere:
+Decode-only is bit-exact and flat at **470 ms/token** *complete* decode steps
+(forward + lm_head + argmax all on-chip), **~3.3× over the single-port Stage 1**.
+The weight-bandwidth lever is exhausted (§6e); the dominant cost is now the **serial
+floor S ≈ 325 ms** (recurrent-attention state I/O on one HBM[0] master + the gated-
+delta-rule update), and the FPGA is ~14× the A100's launch-bound 33.5 ms. Levers:
 
-- **Attack the serial floor S** (now the dominant share of TPOT): the
-  recurrent-attention state R/W (~50 MB/token over HBM[0], on ONE master) and the
-  a/b `gdn_matmul_tiled`. Spreading the state across channels or overlapping its
-  R/W with the gemv stream is the next bit-exact-preserving lever.
-- **INT8 weights** (deferred all-fp32 plan): 4× less weight data attacks W *and*
-  relieves the crossbar (could even cut the reader count) — the highest-leverage
-  move, at the cost of a tolerance-based parity gate (no longer bit-exact).
+- **Raise the kernel clock** (the shared BW + compute lever). Each 512-bit master is
+  6.4 GB/s at 100 MHz (~11% of HBM); 100→200 MHz ~doubles weight BW *and* recurrent
+  throughput with no extra masters. Needs the fp-reduction pipelined, DSP adders, and
+  an SLR pblock — the routability hacks (fabric adders, no pblock) fight Fmax. The
+  N=8+lm_head kernel closes at 100 MHz with WNS +0.169 ns ⇒ Fmax ≈ 102 MHz, so a
+  higher clock requires re-pipelining (recompile at the higher target — see Build B).
+- **Attack S** (bit-exact): spread the 50 MB/tok state across channels, parallelise
+  the gated-delta-rule update, overlap state R/W with the weight stream.
+- **INT8 weights** (deferred all-fp32 plan): 4× less W + relieves the crossbar; the
+  biggest single lever, at the cost of bit-exactness (tolerance gate).
 
 ## 8. References
 
