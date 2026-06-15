@@ -495,11 +495,16 @@ int main(int argc, char **argv) {
             "--decode --decode-from-state <state.gdnstate> [--decode-len N]");
     }
     {
-        const char *decode_out = (argc == 4)
-            ? argv[3]
-            : "results_decode_c/decode.c.json";
-        run_decode_from_state(&model, &run_state, logits, state_path,
-                              decode_len, decode_out);
+        uint32_t n = decode_len;
+        if (n == 0) {
+            if (fixture.kind != REQ_KIND_LL || fixture.num_examples == 0 || fixture.ll_examples == NULL) {
+                die("decode-from-state requires an LL-kind fixture with at least 1 example");
+            }
+            n = fixture.ll_examples[0].cont_len;
+        }
+        if (n == 0) die("decode-from-state: zero decode length");
+        const char *decode_out = (argc == 4) ? argv[3] : "results_decode_c/decode.c.json";
+        run_decode_from_state(&model, &run_state, logits, state_path, n, decode_out);
         fprintf(stderr, "[progress] decode finished elapsed=%.0fs\n", elapsed_seconds(&progress));
         fflush(stderr);
         free_fixture(&fixture);
