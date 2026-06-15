@@ -21,8 +21,9 @@
 CXX            ?= c++
 # C++14 here matches the existing host testbench (gdn_eval etc.).
 # -Wno-unknown-pragmas silences the Vitis HLS #pragma directives that the
-# host gcc does not understand.
-CXXFLAGS       ?= -O3 -std=c++14 -Wall -Wextra -pedantic -Wno-unknown-pragmas
+# host gcc does not understand. -Wno-unused-label silences the HLS loop labels
+# (pipeline/unroll targets) that are intentionally unused in the native build.
+CXXFLAGS       ?= -O3 -std=c++14 -Wall -Wextra -pedantic -Wno-unknown-pragmas -Wno-unused-label
 
 # Vitis HLS install location — provides hls_stream.h used by the systolic
 # matmul kernel in gdn_model.cpp.
@@ -71,7 +72,13 @@ VPP_FLAGS      += --kernel_frequency $(FREQ)
 
 VPP_LDFLAGS    := --config $(HW_CFG)
 VPP_LDFLAGS    += --vivado.synth.jobs $(JOBS) --vivado.impl.jobs $(JOBS)
-VPP_LDFLAGS    += --profile.data all:all:all
+# --profile.data inserts the DPA hardware trace IP (trace buffer on HBM[0]).
+# At N=4 (8+ HBM masters spanning SLR0/1/2) that trace infrastructure crashes
+# design-init: "HADAFileSet::getSrcOptions() : NULL pointer". We measure TPOT
+# from host-side timing and correctness from the decode output, so the on-card
+# profiling trace is not needed — leave it off. Re-enable (with
+# --profile.trace_memory <bank>:<SLR>) only if port-bandwidth telemetry is wanted.
+# VPP_LDFLAGS  += --profile.data all:all:all
 
 
 # ----------------------------------------------------------------------------
@@ -137,7 +144,10 @@ help:
 # ----------------------------------------------------------------------------
 # C++ host testbenches
 # ----------------------------------------------------------------------------
-host_tb: gdn_eval gdn_attn_test gdn_matmul_test
+# Decode-only build: gdn_eval is the native csim of the decode-only GEMV kernel.
+# The old gdn_attn_test / gdn_matmul_test exercised the removed prefill /
+# GEMM-matmul tops (gdn_attn_forward, gdn_matmul_top) and are retired.
+host_tb: gdn_eval
 
 gdn_eval: gdn_eval.cpp gdn_model.cpp gdn_model.h
 	$(CXX) $(CXXFLAGS) -I$(XILINX_HLS_INC) -o $@ gdn_eval.cpp gdn_model.cpp -lm
@@ -185,9 +195,12 @@ $(XCLBIN): $(XO) $(HW_CFG)
 # ----------------------------------------------------------------------------
 host: $(HOST_BIN)
 
-$(HOST_BIN): $(HOST_SRC) gdn_model.h
-	$(CXX) -O2 -std=c++17 -Wall -Wno-unknown-pragmas \
-	    $(HOST_INC) -o $@ $(HOST_SRC) $(HOST_LIB)
+# Links gdn_model.cpp for the host-side weight-shard builder
+# (gdn_build_weight_shards / gdn_weight_shard_floats). gdn_model.cpp needs the
+# Vitis HLS include for hls_stream.h; -lm for the libm calls it pulls in.
+$(HOST_BIN): $(HOST_SRC) gdn_model.cpp gdn_model.h
+	$(CXX) -O2 -std=c++17 -Wall -Wno-unknown-pragmas -Wno-unused-label \
+	    $(HOST_INC) -I$(XILINX_HLS_INC) -o $@ $(HOST_SRC) gdn_model.cpp $(HOST_LIB) -lm
 
 
 # ----------------------------------------------------------------------------

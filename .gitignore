@@ -2,11 +2,11 @@ c_impl/artifacts/*.gdnw
 
 # Vitis HLS / v++ work directories and reports
 c_impl/_x/
-c_impl/_x.failed.*/
-c_impl/_x.routed_error.*/
+c_impl/_x.*/
 c_impl/build.host/
 c_impl/build.hw/
-c_impl/build.hw.failed.*/
+c_impl/build.hw.*/
+c_impl/_decode_*_backup*/
 c_impl/GDN/
 c_impl/GDN_matmul/
 c_impl/GDN_matmul.broken.*/
@@ -47,3 +47,17 @@ c_impl/host.exe
 c_impl/hw_*.json
 c_impl/results_smoke_c/
 c_impl/results_smoke_parity.json
+c_impl/results_decode_c/
+c_impl/results_decode_hw/
+
+# XRT on-card run artefacts (regenerable profiling output)
+c_impl/device_trace_*.csv
+c_impl/summary.csv
+c_impl/xrt.run_summary
+c_impl/xclbin_*.log
+scripts/__pycache__/
+
+# Disaggregated decode: GPU-exported state blobs (large, regenerable)
+c_impl/fixtures_decode/*.gdnstate
+c_impl/probe_alloc
+c_impl/hw_decode*.json

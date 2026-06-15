@@ -24,7 +24,9 @@ namespace {
 constexpr const char *kDefaultWeights = "artifacts/gdn-1.3b-f32.gdnw";
 constexpr const char *kDefaultFixture = "fixtures_full/wikitext.gdnreq";
 constexpr const char *kDefaultOutput = "hw_wikitext_results.json";
+constexpr const char *kDefaultDecodeOutput = "results_decode_hw/decode.hw.json";
 constexpr const char *kDefaultXrt = "/opt/xilinx/xrt";
+constexpr uint32_t kReqKindLL = 2;
 constexpr uint32_t kReqKindRolling = 3;
 constexpr size_t kWeightHeaderBytes = 60;
 
@@ -45,6 +47,7 @@ struct Fixture {
     uint32_t kind = 0;
     uint32_t num_examples = 0;
     std::vector<RollingReq> rolling_examples;
+    std::vector<PairReq> ll_examples;
 };
 
 struct ModelData {
@@ -60,19 +63,33 @@ struct Options {
     std::string output = kDefaultOutput;
     unsigned int device_index = 0;
     uint32_t max_examples = 0;
+    // Decode-only: load the GPU-exported post-prompt state and decode on-card.
+    bool decode = false;
+    std::string state_path;     // --decode-from-state <.gdnstate> (required for --decode)
+    uint32_t decode_len = 0;    // 0 => use the fixture's golden cont_len
+    bool output_set = false;    // whether an explicit positional output was given
 };
 
 static void usage(const char *argv0) {
     std::cerr
         << "usage: " << argv0
-        << " <gdn_forward.xclbin> [weights.gdnw] [wikitext.gdnreq]"
-        << " [output.json|-] [device_index] [max_examples]\n\n"
+        << " <gdn_forward.xclbin> [weights.gdnw] [fixture.gdnreq]"
+        << " [output.json|-] [device_index] [max_examples]\n"
+        << "       " << argv0
+        << " <gdn_forward.xclbin> [weights.gdnw] [decode.gdnreq]"
+        << " [output.json|-] [device_index] [max_examples]"
+        << " --decode --decode-from-state <state.gdnstate> [--decode-len N]\n\n"
         << "defaults:\n"
         << "  weights      " << kDefaultWeights << "\n"
         << "  fixture      " << kDefaultFixture << "\n"
-        << "  output       " << kDefaultOutput << "\n"
+        << "  output       " << kDefaultOutput
+        << " (rolling) | " << kDefaultDecodeOutput << " (--decode)\n"
         << "  device_index 0\n"
-        << "  max_examples 0 (all examples)\n";
+        << "  max_examples 0 (all examples)\n\n"
+        << "decode-only flags (the FPGA never prefills):\n"
+        << "  --decode                     run the on-card decode benchmark\n"
+        << "  --decode-from-state <file>   GPU-exported .gdnstate (recurrent+conv state); required\n"
+        << "  --decode-len N               cap decode length (0 => fixture golden cont_len)\n";
 }
 
 static uint32_t parse_u32(const char *text, const char *name) {
@@ -86,16 +103,48 @@ static uint32_t parse_u32(const char *text, const char *name) {
 
 static Options parse_options(int argc, char **argv) {
     Options opts;
-    if (argc < 2 || argc > 7 || std::strcmp(argv[1], "--help") == 0) {
+    if (argc < 2 || std::strcmp(argv[1], "--help") == 0) {
         usage(argv[0]);
         std::exit(argc < 2 ? 1 : 0);
     }
-    opts.xclbin = argv[1];
-    if (argc > 2) opts.weights = argv[2];
-    if (argc > 3) opts.fixture = argv[3];
-    if (argc > 4) opts.output = argv[4];
-    if (argc > 5) opts.device_index = parse_u32(argv[5], "device_index");
-    if (argc > 6) opts.max_examples = parse_u32(argv[6], "max_examples");
+
+    // Separate optional --decode flags from the positional arguments. Without
+    // any --decode flag the positional contract is unchanged:
+    //   <xclbin> [weights] [fixture] [output] [device_index] [max_examples]
+    std::vector<std::string> positional;
+    for (int arg_index = 1; arg_index < argc; ++arg_index) {
+        std::string arg = argv[arg_index];
+        if (arg == "--decode") {
+            opts.decode = true;
+        } else if (arg == "--decode-from-state") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error("--decode-from-state requires a .gdnstate path");
+            }
+            opts.state_path = argv[++arg_index];
+            opts.decode = true;
+        } else if (arg == "--decode-len") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error("--decode-len requires a value");
+            }
+            opts.decode_len = parse_u32(argv[++arg_index], "decode-len");
+        } else {
+            positional.push_back(arg);
+        }
+    }
+
+    if (positional.empty() || positional.size() > 6) {
+        usage(argv[0]);
+        std::exit(1);
+    }
+    opts.xclbin = positional[0];
+    if (positional.size() > 1) opts.weights = positional[1];
+    if (positional.size() > 2) opts.fixture = positional[2];
+    if (positional.size() > 3) {
+        opts.output = positional[3];
+        opts.output_set = true;
+    }
+    if (positional.size() > 4) opts.device_index = parse_u32(positional[4].c_str(), "device_index");
+    if (positional.size() > 5) opts.max_examples = parse_u32(positional[5].c_str(), "max_examples");
     return opts;
 }
 
@@ -181,6 +230,39 @@ static Fixture load_rolling_fixture(const std::string &path) {
             pair.ctx = read_i32_array(blob, offset, pair.ctx_len);
             pair.cont = read_i32_array(blob, offset, pair.cont_len);
         }
+    }
+
+    return fixture;
+}
+
+// Loader for the LL-kind (REQ_KIND_LL = 2) decode fixture. Mirrors the native
+// gdn_eval LL branch: each example is a (ctx, cont) pair where ctx is the
+// prompt token ids and cont is the golden greedy trajectory.
+static Fixture load_ll_fixture(const std::string &path) {
+    std::vector<uint8_t> blob = read_binary_file(path);
+    if (blob.size() < 20 || std::memcmp(blob.data(), "GDNREQ1", 7) != 0) {
+        throw std::runtime_error("unsupported fixture file: " + path);
+    }
+
+    size_t offset = 8;
+    uint32_t version = read_u32(blob, offset);
+    Fixture fixture;
+    fixture.kind = read_u32(blob, offset);
+    fixture.num_examples = read_u32(blob, offset);
+    if (version != 1) {
+        throw std::runtime_error("unsupported fixture version");
+    }
+    if (fixture.kind != kReqKindLL) {
+        throw std::runtime_error("--decode requires an LL-kind (.gdnreq kind=2) fixture");
+    }
+
+    fixture.ll_examples.resize(fixture.num_examples);
+    for (uint32_t example_index = 0; example_index < fixture.num_examples; ++example_index) {
+        PairReq &pair = fixture.ll_examples[example_index];
+        pair.ctx_len = read_u32(blob, offset);
+        pair.cont_len = read_u32(blob, offset);
+        pair.ctx = read_i32_array(blob, offset, pair.ctx_len);
+        pair.cont = read_i32_array(blob, offset, pair.cont_len);
     }
 
     return fixture;
@@ -278,6 +360,24 @@ static void compute_logits(const ModelData &model, const float *hidden, std::vec
     }
 }
 
+// Argmax of the logits for a hidden row. Reuses compute_logits (the same
+// vocab loop the scoring path uses) and breaks ties toward the first (lowest)
+// index via strict '>', matching the native gdn_eval argmax_logits exactly.
+static int argmax_logits(const ModelData &model, const float *hidden, std::vector<float> &logits) {
+    uint32_t vocab = model.config.vocab_size;
+    compute_logits(model, hidden, logits);
+
+    float max_logit = logits[0];
+    int max_index = 0;
+    for (uint32_t vocab_index = 1; vocab_index < vocab; ++vocab_index) {
+        if (logits[vocab_index] > max_logit) {
+            max_logit = logits[vocab_index];
+            max_index = static_cast<int>(vocab_index);
+        }
+    }
+    return max_index;
+}
+
 static double score_hidden_step(
     const ModelData &model,
     const float *hidden,
@@ -334,11 +434,18 @@ public:
           recurrent_state_bo_(device, recurrent_state_bytes(model), kernel_.group_id(15)),
           head_buffer_bo_(device, head_buffer_bytes(model), kernel_.group_id(16)),
           tokens_bo_(device, static_cast<size_t>(max_tokens_) * sizeof(int32_t), kernel_.group_id(17)),
-          // weight_data_mm is the last kernel arg (index 19): the matmul's
-          // dedicated 512-bit weight bundle. Separate bo holding the same
-          // weights, so it binds correctly regardless of which HBM bank v++
-          // assigns the bundle to.
-          weight_bo_mm_(device, model.weight_data.size() * sizeof(float), kernel_.group_id(19)),
+          // Stage 2: two compact gemv weight shards (kernel args 19, 20), each on
+          // its own 512-bit master / HBM channel group, read in parallel. Total
+          // size = one copy of the projection weights (no replication).
+          weight_bo_mm0_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(19)),
+          weight_bo_mm1_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(20)),
+          weight_bo_mm2_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(21)),
+          weight_bo_mm3_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(22)),
+          weight_bo_mm4_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(23)),
+          weight_bo_mm5_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(24)),
+          weight_bo_mm6_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(25)),
+          weight_bo_mm7_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(26)),
+          logits_bo_(device, static_cast<size_t>(model.config.vocab_size) * sizeof(float), kernel_.group_id(27)),
           x_norm_host_(static_cast<size_t>(max_tokens_) * hidden_, 0.0f) {
         std::cerr << "[progress] upload config and weights to device\n";
         config_bo_.write(&model.config, sizeof(GDNWeightHeader), 0);
@@ -346,9 +453,30 @@ public:
         const size_t weight_bytes = model.weight_data.size() * sizeof(float);
         weight_bo_.write(model.weight_data.data(), weight_bytes, 0);
         sync_bo_chunked(weight_bo_, XCL_BO_SYNC_BO_TO_DEVICE, weight_bytes, 0);
-        // Same weights into the matmul's dedicated bundle.
-        weight_bo_mm_.write(model.weight_data.data(), weight_bytes, 0);
-        sync_bo_chunked(weight_bo_mm_, XCL_BO_SYNC_BO_TO_DEVICE, weight_bytes, 0);
+        // Build the GEMV_CHANNELS compact gemv weight shards (split projection
+        // output rows) and upload each to its own master / HBM banks for parallel
+        // reads. Total = one copy of the projection weights (no replication).
+        {
+            std::cerr << "[progress] building + uploading " << GEMV_CHANNELS
+                      << " gemv weight shards\n";
+            size_t shard_floats = gdn_weight_shard_floats(&model.config);
+            size_t shard_bytes = shard_floats * sizeof(float);
+            std::vector<float> sbuf[GEMV_CHANNELS];
+            float *shards[GEMV_CHANNELS];
+            for (int c = 0; c < GEMV_CHANNELS; ++c) {
+                sbuf[c].resize(shard_floats);
+                shards[c] = sbuf[c].data();
+            }
+            gdn_build_weight_shards(model.weight_data.data(), &model.config, shards);
+            xrt::bo *mm[GEMV_CHANNELS] = { &weight_bo_mm0_, &weight_bo_mm1_,
+                                           &weight_bo_mm2_, &weight_bo_mm3_,
+                                           &weight_bo_mm4_, &weight_bo_mm5_,
+                                           &weight_bo_mm6_, &weight_bo_mm7_ };
+            for (int c = 0; c < GEMV_CHANNELS; ++c) {
+                mm[c]->write(shards[c], shard_bytes, 0);
+                sync_bo_chunked(*mm[c], XCL_BO_SYNC_BO_TO_DEVICE, shard_bytes, 0);
+            }
+        }
     }
 
     // On this xocl/xdma driver (XRT 2022.1, U55C) the per-call sync transfer
@@ -398,7 +526,15 @@ public:
             head_buffer_bo_,
             tokens_bo_,
             static_cast<uint32_t>(tokens.size()),
-            weight_bo_mm_
+            weight_bo_mm0_,
+            weight_bo_mm1_,
+            weight_bo_mm2_,
+            weight_bo_mm3_,
+            weight_bo_mm4_,
+            weight_bo_mm5_,
+            weight_bo_mm6_,
+            weight_bo_mm7_,
+            logits_bo_
         );
         auto start = std::chrono::high_resolution_clock::now();
         run.wait();
@@ -413,6 +549,20 @@ public:
         x_norm_bo_.read(x_norm_host_.data(), x_norm_bytes, 0);
 
         return seconds;
+    }
+
+    // Upload the GPU-exported post-prompt state into the resident state BOs.
+    // recurrent_state holds all layers (48 MB); head_buffer is the conv-tail
+    // store (~1.7 MB). The decode kernel restores from these at each layer start
+    // and saves the update at layer end, so they persist across token calls.
+    void upload_decode_state(const std::vector<float> &recurrent,
+                             const std::vector<float> &conv) {
+        size_t rbytes = recurrent.size() * sizeof(float);
+        size_t cbytes = conv.size() * sizeof(float);
+        recurrent_state_bo_.write(recurrent.data(), rbytes, 0);
+        sync_bo_chunked(recurrent_state_bo_, XCL_BO_SYNC_BO_TO_DEVICE, rbytes, 0);
+        head_buffer_bo_.write(conv.data(), cbytes, 0);
+        sync_bo_chunked(head_buffer_bo_, XCL_BO_SYNC_BO_TO_DEVICE, cbytes, 0);
     }
 
     const float *hidden_row(uint32_t row) const {
@@ -444,18 +594,24 @@ private:
                sizeof(float);
     }
 
+    // Decode persistence (mirrors gdn_run_state_init): recurrent_state holds
+    // ALL layers' states (24 x 8 x 256 x 256 fp32 = 48 MB) and head_buffer is
+    // the conv tail store (24 layers x 3 convs x (conv_size-1) rows x hidden
+    // ~ 1.7 MB). Prefill (decode_flags=0) never touches either.
     static size_t recurrent_state_bytes(const ModelData &model) {
         size_t value_dim = model.config.hidden_size / model.config.num_heads;
-        return static_cast<size_t>(model.config.num_heads) *
+        return static_cast<size_t>(model.config.num_layers) *
+               model.config.num_heads *
                model.config.head_dim *
                value_dim *
                sizeof(float);
     }
 
     static size_t head_buffer_bytes(const ModelData &model) {
-        size_t value_dim = model.config.hidden_size / model.config.num_heads;
-        size_t rounded = ((value_dim + 15) / 16) * 16;
-        return rounded * sizeof(float);
+        return static_cast<size_t>(model.config.num_layers) * 3 *
+               (model.config.conv_size - 1) *
+               model.config.hidden_size *
+               sizeof(float);
     }
 
     xrt::kernel kernel_;
@@ -478,11 +634,166 @@ private:
     xrt::bo recurrent_state_bo_;
     xrt::bo head_buffer_bo_;
     xrt::bo tokens_bo_;
-    xrt::bo weight_bo_mm_;
+    xrt::bo weight_bo_mm0_;
+    xrt::bo weight_bo_mm1_;
+    xrt::bo weight_bo_mm2_;
+    xrt::bo weight_bo_mm3_;
+    xrt::bo weight_bo_mm4_;
+    xrt::bo weight_bo_mm5_;
+    xrt::bo weight_bo_mm6_;
+    xrt::bo weight_bo_mm7_;
+    xrt::bo logits_bo_;
     std::vector<float> x_norm_host_;
     double total_kernel_seconds_ = 0.0;
     uint64_t kernel_runs_ = 0;
 };
+
+// Per-example results of the on-card decode benchmark. Mirrors the native
+// gdn_eval schema plus an on-card kernel_ms series.
+struct DecodeExample {
+    uint32_t n = 0;                          // decode length used for this example
+    std::vector<int32_t> gen_traj;           // free-running greedy trajectory (N)
+    std::vector<int32_t> tf_argmax;          // teacher-forced per-position argmax (N)
+    std::vector<double> per_step_tpot_ms;    // wall ms per greedy step (N)
+    std::vector<double> kernel_ms;           // on-card kernel ms per greedy step (N)
+};
+
+// --decode driver: decode-only from a GPU-exported .gdnstate blob.
+//
+// The fixture provides the golden continuation length (and example indices).
+// The device starts from the exported seed token and performs one single-token
+// decode step per call, updating persistent recurrent/conv state in device memory.
+//   - gen_traj / per_step_tpot_ms / kernel_ms: free-running greedy. The forward
+//     clears recurrent state every call, so each step re-prefills the whole
+//     growing prefix (O(n^2) — the honest current-kernel baseline). per-step
+//     wall time is chrono around the run_forward + argmax; kernel_ms is the
+//     on-card kernel time run_forward returns (seconds * 1000).
+//
+// N = min(cont_len, decode_len) (decode_len == 0 means use cont_len);
+// E = min(num_examples, limit) (limit == 0 means all).
+static std::vector<DecodeExample> run_decode_hw(
+    const ModelData &model,
+    HwRunner &runner,
+    std::vector<float> &logits,
+    const Fixture &fixture,
+    uint32_t decode_len,
+    const std::string &state_path
+) {
+    // ---- Read the GPU-exported .gdnstate blob ----
+    std::ifstream f(state_path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open .gdnstate: " + state_path);
+    char magic[8];
+    f.read(magic, 8);
+    if (std::memcmp(magic, "GDNSTAT1", 8) != 0)
+        throw std::runtime_error(".gdnstate: bad magic (expected GDNSTAT1)");
+    uint32_t v[9];
+    f.read(reinterpret_cast<char *>(v), sizeof(v));
+    // v = {version, num_layers, H, K, V, hidden, W, prompt_len, seed_token}
+    uint32_t num_layers = v[1], H = v[2], Kk = v[3], Vv = v[4];
+    uint32_t hidden = v[5], W = v[6], prompt_len = v[7];
+    int32_t seed = static_cast<int32_t>(v[8]);
+    if (num_layers != model.config.num_layers || hidden != model.config.hidden_size ||
+        W != model.config.conv_size)
+        throw std::runtime_error(".gdnstate: dims do not match the loaded model");
+    f.seekg(static_cast<std::streamoff>(prompt_len) * sizeof(int32_t), std::ios::cur);
+    size_t rec_count  = (size_t)num_layers * H * Kk * Vv;
+    size_t conv_count = (size_t)num_layers * 3u * (W - 1u) * hidden;
+    std::vector<float> rec(rec_count), conv(conv_count);
+    f.read(reinterpret_cast<char *>(rec.data()),  rec_count  * sizeof(float));
+    f.read(reinterpret_cast<char *>(conv.data()), conv_count * sizeof(float));
+    if (!f) throw std::runtime_error(".gdnstate: truncated");
+    std::cerr << "[progress] loaded .gdnstate: layers=" << num_layers
+              << " hidden=" << hidden << " W=" << W << " seed=" << seed
+              << " (recurrent=" << (rec_count * sizeof(float) / 1e6) << " MB)\n";
+
+    // ---- Upload the post-prompt state to the resident BOs (once) ----
+    runner.upload_decode_state(rec, conv);
+
+    // ---- Decode length from the fixture's golden continuation (example 0) ----
+    if (fixture.num_examples == 0 || fixture.ll_examples.empty())
+        throw std::runtime_error("--decode-from-state needs an LL-kind fixture for the golden");
+    const PairReq &req = fixture.ll_examples[0];
+    uint32_t n = req.cont_len;
+    if (decode_len != 0 && decode_len < n) n = decode_len;
+    if (n == 0) throw std::runtime_error("--decode: zero decode length");
+
+    std::vector<DecodeExample> results(1);
+    DecodeExample &result = results[0];
+    result.n = n;
+    result.gen_traj.resize(n);
+    result.tf_argmax.resize(n);
+    result.per_step_tpot_ms.resize(n);
+    result.kernel_ms.resize(n);
+
+    // traj[0] = the GPU-exported seed (argmax of the prompt's last position);
+    // every later token is one O(1) decode step against the persistent state.
+    // The kernel restores the loaded state at each layer start and saves the
+    // update at layer end, so the state BO carries forward across calls.
+    result.gen_traj[0] = seed;
+    result.tf_argmax[0] = seed;
+    result.per_step_tpot_ms[0] = 0.0;
+    result.kernel_ms[0] = 0.0;
+    std::cerr << "[progress] decode-from-state seed=" << seed << " N=" << n << "\n";
+    for (uint32_t step = 1; step < n; ++step) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        std::vector<int32_t> tok(1, result.gen_traj[step - 1]);
+        double ksec = runner.run_forward(tok);
+        /* lm_head + greedy argmax run on-chip now; the kernel writes the next
+         * token id into x_norm[0] (read back by run_forward). No host logits. */
+        int next = (int32_t)runner.hidden_row(0)[0];
+        (void)logits; (void)model;
+        auto t1 = std::chrono::high_resolution_clock::now();
+        result.per_step_tpot_ms[step] =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        result.kernel_ms[step] = ksec * 1000.0;
+        result.gen_traj[step] = next;
+        result.tf_argmax[step] = next;
+    }
+    std::cerr << "[progress] decode-from-state complete (" << n << " tokens)\n";
+    return results;
+}
+
+// Writes the on-card decode JSON. Schema is the native gdn_eval decode schema
+// plus a per-step kernel_ms series.
+static void write_decode_json(
+    const std::string &output_path,
+    uint32_t decode_len,
+    const std::vector<DecodeExample> &results
+) {
+    std::ofstream file(output_path);
+    if (!file) {
+        throw std::runtime_error("failed to open output: " + output_path);
+    }
+
+    file << std::fixed << std::setprecision(6);
+    file << "{\"kind\": " << kReqKindLL
+         << ", \"decode_len\": " << decode_len
+         << ", \"num_examples\": " << results.size() << ",\n";
+    file << " \"examples\": [";
+    for (size_t example_index = 0; example_index < results.size(); ++example_index) {
+        const DecodeExample &result = results[example_index];
+        uint32_t n = result.n;
+        file << (example_index ? "," : "") << "\n  {\"index\": " << example_index << ",\n";
+        file << "   \"gen_traj\": [";
+        for (uint32_t j = 0; j < n; ++j) {
+            file << (j ? ", " : "") << result.gen_traj[j];
+        }
+        file << "],\n   \"tf_argmax\": [";
+        for (uint32_t j = 0; j < n; ++j) {
+            file << (j ? ", " : "") << result.tf_argmax[j];
+        }
+        file << "],\n   \"per_step_tpot_ms\": [";
+        for (uint32_t j = 0; j < n; ++j) {
+            file << (j ? ", " : "") << result.per_step_tpot_ms[j];
+        }
+        file << "],\n   \"kernel_ms\": [";
+        for (uint32_t j = 0; j < n; ++j) {
+            file << (j ? ", " : "") << result.kernel_ms[j];
+        }
+        file << "]}";
+    }
+    file << "\n ]}\n";
+}
 
 static double score_pair_hw(
     const ModelData &model,
@@ -586,6 +897,35 @@ int main(int argc, char **argv) {
                   << " layers=" << model.config.num_layers
                   << " max_seq_len=" << model.config.max_seq_len
                   << " vocab=" << model.config.vocab_size << "\n";
+
+        if (opts.decode) {
+            // Decode-only: the FPGA never prefills. The post-prompt recurrent +
+            // conv state comes from the GPU export on disk (--decode-from-state);
+            // the fixture supplies only the golden continuation for comparison.
+            if (opts.state_path.empty()) {
+                throw std::runtime_error(
+                    "decode-only build: pass --decode-from-state <state.gdnstate>");
+            }
+            std::string decode_out = opts.output_set ? opts.output : kDefaultDecodeOutput;
+            std::cerr << "[progress] loading LL decode fixture from " << opts.fixture << "\n";
+            Fixture fixture = load_ll_fixture(opts.fixture);
+            std::cerr << "[progress] fixture examples=" << fixture.num_examples << "\n";
+
+            std::cerr << "[progress] allocate XRT buffers\n";
+            HwRunner runner(device, uuid, model);
+
+            std::vector<float> logits(model.config.vocab_size, 0.0f);
+            std::vector<DecodeExample> results =
+                run_decode_hw(model, runner, logits, fixture, opts.decode_len,
+                              opts.state_path);
+
+            write_decode_json(decode_out, opts.decode_len, results);
+            std::cerr << "[progress] decode finished examples=" << results.size()
+                      << " avg_kernel_ms=" << std::fixed << std::setprecision(3)
+                      << (runner.average_kernel_seconds() * 1000.0)
+                      << " output=" << decode_out << "\n";
+            return EXIT_SUCCESS;
+        }
 
         std::cerr << "[progress] loading rolling Wikitext fixture from " << opts.fixture << "\n";
         Fixture fixture = load_rolling_fixture(opts.fixture);
