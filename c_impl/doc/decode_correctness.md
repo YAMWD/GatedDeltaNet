@@ -79,9 +79,9 @@ bash scripts/decode_correctness_check.sh --fast          # ~1-2 min, used by the
 
 # 3. on-card spot-check (U55C)
 cd c_impl && ./host.exe build.hw/gdn_forward.xclbin artifacts/gdn-1.3b-f32.gdnw \
-    fixtures_decode/decode.gdnreq results_decode_hw/decode.hw.json 0 --decode --limit 1 --decode-len 64
+    fixtures_decode/decode.gdnreq results_decode_hw/decode.hw.json 0 1 --decode --decode-from-state fixtures_decode/decode_ex0.gdnstate --decode-len 64
 python ../scripts/check_gdn_c_parity.py --decode \
-    --golden results_decode_golden/decode.decode.json --c results_decode_hw/decode_full.hw.json
+    --golden results_decode_golden/decode.decode.json --c results_decode_hw/decode.hw.json
 ```
 
 ## Standing workflow hook
