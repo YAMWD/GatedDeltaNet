@@ -658,11 +658,11 @@ struct DecodeExample {
     std::vector<double> kernel_ms;           // on-card kernel ms per greedy step (N)
 };
 
-// --decode driver, on-card analogue of gdn_eval's run_decode_mode.
+// --decode driver: decode-only from a GPU-exported .gdnstate blob.
 //
-// For each LL example (ctx = prompt, cont = golden greedy trajectory):
-//   - tf_argmax: ONE forward over prompt + golden[:-1]; argmax of hidden row
-//     (prompt_len + i - 1) for each i in 0..N-1.
+// The fixture provides the golden continuation length (and example indices).
+// The device starts from the exported seed token and performs one single-token
+// decode step per call, updating persistent recurrent/conv state in device memory.
 //   - gen_traj / per_step_tpot_ms / kernel_ms: free-running greedy. The forward
 //     clears recurrent state every call, so each step re-prefills the whole
 //     growing prefix (O(n^2) — the honest current-kernel baseline). per-step
