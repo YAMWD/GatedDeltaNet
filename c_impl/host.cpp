@@ -15,6 +15,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -68,6 +69,7 @@ struct Options {
     std::string state_path;     // --decode-from-state <.gdnstate> (required for --decode)
     uint32_t decode_len = 0;    // 0 => use the fixture's golden cont_len
     bool output_set = false;    // whether an explicit positional output was given
+    bool profile_ops = false;   // --profile-ops: per-op on-card latency breakdown (Option A)
 };
 
 static void usage(const char *argv0) {
@@ -127,6 +129,9 @@ static Options parse_options(int argc, char **argv) {
                 throw std::runtime_error("--decode-len requires a value");
             }
             opts.decode_len = parse_u32(argv[++arg_index], "decode-len");
+        } else if (arg == "--profile-ops") {
+            opts.profile_ops = true;
+            opts.decode = true;  // profiling drives the decode datapath from .gdnstate
         } else {
             positional.push_back(arg);
         }
@@ -491,7 +496,8 @@ public:
         }
     }
 
-    double run_forward(const std::vector<int32_t> &tokens) {
+    double run_forward(const std::vector<int32_t> &tokens,
+                       int32_t prof_layer = -1, int32_t prof_op = GDN_OP_ALL) {
         if (tokens.empty() || tokens.size() > max_tokens_) {
             throw std::runtime_error("invalid token sequence length for hardware run");
         }
@@ -534,7 +540,9 @@ public:
             weight_bo_mm5_,
             weight_bo_mm6_,
             weight_bo_mm7_,
-            logits_bo_
+            logits_bo_,
+            prof_layer,
+            prof_op
         );
         auto start = std::chrono::high_resolution_clock::now();
         run.wait();
@@ -881,6 +889,104 @@ static void write_json(
 
 }  // namespace
 
+// --profile-ops (Option A): launch each sub-op of one decode step as its own CU
+// invocation and time it via XRT, then print a per-op-type latency breakdown.
+// Every activation lives in a persistent HBM BO, so each op reads/writes exactly
+// the buffers a fused run would — same schedule, just observed one op at a time.
+static void run_profile_ops_hw(const ModelData &model, HwRunner &runner,
+                               const std::string &state_path) {
+    // ---- load the GPU-exported post-prompt state (same layout as run_decode_hw) ----
+    std::ifstream f(state_path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open .gdnstate: " + state_path);
+    char magic[8]; f.read(magic, 8);
+    if (std::memcmp(magic, "GDNSTAT1", 8) != 0)
+        throw std::runtime_error(".gdnstate: bad magic (expected GDNSTAT1)");
+    uint32_t v[9]; f.read(reinterpret_cast<char *>(v), sizeof(v));
+    uint32_t num_layers = v[1], H = v[2], Kk = v[3], Vv = v[4];
+    uint32_t hidden = v[5], W = v[6], prompt_len = v[7];
+    int32_t seed = static_cast<int32_t>(v[8]);
+    if (num_layers != model.config.num_layers || hidden != model.config.hidden_size ||
+        W != model.config.conv_size)
+        throw std::runtime_error(".gdnstate: dims do not match the loaded model");
+    f.seekg(static_cast<std::streamoff>(prompt_len) * sizeof(int32_t), std::ios::cur);
+    size_t rec_count  = (size_t)num_layers * H * Kk * Vv;
+    size_t conv_count = (size_t)num_layers * 3u * (W - 1u) * hidden;
+    std::vector<float> rec(rec_count), conv(conv_count);
+    f.read(reinterpret_cast<char *>(rec.data()),  rec_count  * sizeof(float));
+    f.read(reinterpret_cast<char *>(conv.data()), conv_count * sizeof(float));
+    if (!f) throw std::runtime_error(".gdnstate: truncated");
+
+    const std::vector<int32_t> seed_tok(1, seed);
+    const int kWarm = 3, kBase = 30;
+
+    // ---- fused reference (one full forward), warmed up; then reset the state ----
+    runner.upload_decode_state(rec, conv);
+    for (int i = 0; i < kWarm; ++i) runner.run_forward(seed_tok, -1, GDN_OP_NOP);
+    double fused_ms = runner.run_forward(seed_tok) * 1000.0;   // prof_op = GDN_OP_ALL
+    int fused_tok = (int)runner.hidden_row(0)[0];
+    runner.upload_decode_state(rec, conv);                     // reset for the phased pass
+
+    // ---- launch-overhead baseline (GDN_OP_NOP returns before any work) ----
+    double ovh_ms = 0.0;
+    for (int i = 0; i < kBase; ++i) ovh_ms += runner.run_forward(seed_tok, -1, GDN_OP_NOP) * 1000.0;
+    ovh_ms /= kBase;
+
+    // ---- time each op once, in forward order; accumulate per coarse op-type ----
+    struct Bucket { double ms = 0.0; int count = 0; };
+    std::map<std::string, Bucket> by_type;
+    auto timed = [&](int32_t layer, int32_t op, const char *type) {
+        double ms = runner.run_forward(seed_tok, layer, op) * 1000.0 - ovh_ms;
+        if (ms < 0.0) ms = 0.0;
+        Bucket &b = by_type[type];
+        b.ms += ms; b.count += 1;
+    };
+
+    timed(-1, GDN_OP_EMBED, "embed");
+    int n_per = 0; const GDNProfOpInfo *ops = gdn_profile_perlayer_ops(&n_per);
+    for (uint32_t L = 0; L < num_layers; ++L)
+        for (int i = 0; i < n_per; ++i) timed((int32_t)L, ops[i].op, ops[i].type);
+    timed(-1, GDN_OP_FINALNORM, "rmsnorm");
+    timed(-1, GDN_OP_LMHEAD,    "gemv");
+    timed(-1, GDN_OP_ARGMAX,    "argmax");
+    int phased_tok = (int)runner.hidden_row(0)[0];
+
+    // ---- report ----
+    double phased_sum = 0.0;
+    for (auto &kv : by_type) phased_sum += kv.second.ms;
+    std::vector<std::pair<std::string, Bucket>> rows(by_type.begin(), by_type.end());
+    std::sort(rows.begin(), rows.end(),
+              [](const std::pair<std::string, Bucket> &a,
+                 const std::pair<std::string, Bucket> &b) { return a.second.ms > b.second.ms; });
+
+    std::cout << std::fixed;
+    std::cout << "\n==== on-card per-op latency breakdown (Option A, one decode step) ====\n";
+    std::cout << "  seed token         : " << seed << "\n";
+    std::cout << "  fused full kernel  : " << std::setprecision(3) << fused_ms
+              << " ms  (next token=" << fused_tok << ")\n";
+    std::cout << "  launch overhead/op : " << ovh_ms << " ms  (NOP baseline, subtracted below)\n";
+    std::cout << "  phased next token  : " << phased_tok
+              << (phased_tok == fused_tok ? "   [MATCHES fused]" : "   [** MISMATCH **]") << "\n";
+    std::cout << "  -----------------------------------------------------------------\n";
+    std::cout << "  " << std::left << std::setw(16) << "op-type" << std::right
+              << std::setw(7) << "calls" << std::setw(13) << "total_ms"
+              << std::setw(11) << "avg_ms" << std::setw(8) << "%" << "\n";
+    for (auto &r : rows) {
+        double pct = phased_sum > 0.0 ? 100.0 * r.second.ms / phased_sum : 0.0;
+        std::cout << "  " << std::left << std::setw(16) << r.first << std::right
+                  << std::setw(7) << r.second.count
+                  << std::setw(13) << std::setprecision(3) << r.second.ms
+                  << std::setw(11) << (r.second.count ? r.second.ms / r.second.count : 0.0)
+                  << std::setw(7) << std::setprecision(1) << pct << "%" << "\n";
+    }
+    std::cout << "  -----------------------------------------------------------------\n";
+    std::cout << "  phased sum (overhead-subtracted): " << std::setprecision(3) << phased_sum << " ms\n";
+    std::cout << "  NOTE: the percentages are the real per-op split. The phased SUM exceeds\n"
+                 "        the fused kernel because per-op CU launches lose cross-op overlap\n"
+                 "        and add per-launch handshakes — expected for Option A.\n";
+    if (phased_tok != fused_tok)
+        std::cerr << "[warn] phased token != fused token: per-op schedule diverged — investigate.\n";
+}
+
 int main(int argc, char **argv) {
     try {
         Options opts = parse_options(argc, argv);
@@ -913,6 +1019,11 @@ int main(int argc, char **argv) {
 
             std::cerr << "[progress] allocate XRT buffers\n";
             HwRunner runner(device, uuid, model);
+
+            if (opts.profile_ops) {
+                run_profile_ops_hw(model, runner, opts.state_path);
+                return EXIT_SUCCESS;
+            }
 
             std::vector<float> logits(model.config.vocab_size, 0.0f);
             std::vector<DecodeExample> results =

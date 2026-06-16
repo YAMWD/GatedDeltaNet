@@ -406,6 +406,91 @@ static int run_decode_from_state(
     return 0;
 }
 
+/* ---- Option-A per-op profiling (native CPU) ----------------------------------
+ * Validate that the phased per-op schedule reproduces the fused token, and print
+ * a CPU-side per-op-type shape. The REAL per-op latencies come from
+ * host.exe --profile-ops on hardware; this off-board path proves the per-op
+ * mechanism + op schedule are correct (so a multi-hour hardware build is not
+ * wasted on a broken refactor). */
+#define GDN_PROF_NTYPES 9
+static const char *const k_prof_type_names[GDN_PROF_NTYPES] = {
+    "gemv", "recurrent", "conv", "rmsnorm", "matmul_tiled",
+    "output_norm", "swiglu", "embed", "argmax"
+};
+static int prof_type_index(const char *type) {
+    int i;
+    for (i = 0; i < GDN_PROF_NTYPES; ++i)
+        if (strcmp(type, k_prof_type_names[i]) == 0) return i;
+    return -1;
+}
+
+static int run_profile_ops_native(const GDNModel *model, GDNRunState *run_state,
+                                  const char *state_path) {
+    GDNStateHeader hdr;
+    double ms[GDN_PROF_NTYPES];
+    int    cnt[GDN_PROF_NTYPES];
+    int    order[GDN_PROF_NTYPES];
+    int i, n_per = 0, fused_tok, phased_tok;
+    uint32_t L;
+    double total = 0.0;
+    const GDNProfOpInfo *ops;
+
+    for (i = 0; i < GDN_PROF_NTYPES; ++i) { ms[i] = 0.0; cnt[i] = 0; }
+
+    /* fused reference token (one full forward; mutates the persistent state) */
+    load_gdnstate(state_path, model, run_state, &hdr);
+    if (gdn_decode_step_host(model, run_state, &hdr.seed_token) != 0)
+        die("profile-ops: fused decode step failed");
+    fused_tok = (int)run_state->x_norm[0];
+
+    /* reset the state, then replay the SAME step one op at a time, timing each */
+    load_gdnstate(state_path, model, run_state, &hdr);
+    ops = gdn_profile_perlayer_ops(&n_per);
+
+    #define GDN_PROF_TIME(layer, op, type) do {                              \
+        int _ti = prof_type_index(type);                                     \
+        double _t0 = monotonic_ms();                                         \
+        if (gdn_decode_step_op_host(model, run_state, &hdr.seed_token,       \
+                                    (layer), (op)) != 0)                     \
+            die("profile-ops: per-op decode step failed");                   \
+        if (_ti >= 0) { ms[_ti] += monotonic_ms() - _t0; cnt[_ti] += 1; }    \
+    } while (0)
+
+    GDN_PROF_TIME(-1, GDN_OP_EMBED, "embed");
+    for (L = 0; L < model->config.num_layers; ++L)
+        for (i = 0; i < n_per; ++i)
+            GDN_PROF_TIME((int32_t)L, ops[i].op, ops[i].type);
+    GDN_PROF_TIME(-1, GDN_OP_FINALNORM, "rmsnorm");
+    GDN_PROF_TIME(-1, GDN_OP_LMHEAD,    "gemv");
+    GDN_PROF_TIME(-1, GDN_OP_ARGMAX,    "argmax");
+    #undef GDN_PROF_TIME
+    phased_tok = (int)run_state->x_norm[0];
+
+    /* sort type indices by total descending (selection sort over 9 entries) */
+    for (i = 0; i < GDN_PROF_NTYPES; ++i) { order[i] = i; total += ms[i]; }
+    for (i = 0; i < GDN_PROF_NTYPES; ++i) {
+        int j, best = i, tmp;
+        for (j = i + 1; j < GDN_PROF_NTYPES; ++j)
+            if (ms[order[j]] > ms[order[best]]) best = j;
+        tmp = order[i]; order[i] = order[best]; order[best] = tmp;
+    }
+
+    printf("\n==== native per-op breakdown (CPU; validates the per-op mechanism) ====\n");
+    printf("  fused token=%d   phased token=%d   %s\n", fused_tok, phased_tok,
+           (phased_tok == fused_tok) ? "[MATCH]" : "[** MISMATCH **]");
+    printf("  %-14s %7s %13s %8s\n", "op-type", "calls", "total_ms", "%");
+    for (i = 0; i < GDN_PROF_NTYPES; ++i) {
+        int t = order[i];
+        if (cnt[t] == 0) continue;
+        printf("  %-14s %7d %13.2f %7.1f%%\n", k_prof_type_names[t], cnt[t], ms[t],
+               total > 0.0 ? 100.0 * ms[t] / total : 0.0);
+    }
+    printf("  NOTE: CPU times — shape only. REAL per-op hardware latencies come from:\n");
+    printf("        ./host.exe <xclbin> <weights> <fixture> - 0 "
+           "--decode-from-state <state.gdnstate> --profile-ops\n");
+    return (phased_tok == fused_tok) ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     GDNModel model;
     GDNRunState run_state;
@@ -413,6 +498,7 @@ int main(int argc, char **argv) {
     ProgressState progress;
     float *logits;
     int decode_mode = 0;
+    int profile_ops = 0;            /* --profile-ops: per-op breakdown (Option A) */
     const char *state_path = NULL;  /* --decode-from-state: disaggregated decode */
     uint32_t decode_len = 0;   /* 0 => use the fixture's golden cont_len */
     const char *positional[3];
@@ -436,6 +522,9 @@ int main(int argc, char **argv) {
                 die("--decode-len requires a value");
             }
             decode_len = (uint32_t)strtoul(argv[++arg_index], NULL, 10);
+        } else if (strcmp(arg, "--profile-ops") == 0) {
+            profile_ops = 1;
+            decode_mode = 1;
         } else if (positional_count < 3) {
             positional[positional_count++] = arg;
         } else {
@@ -493,6 +582,14 @@ int main(int argc, char **argv) {
     if (!decode_mode || state_path == NULL) {
         die("decode-only build: run with "
             "--decode --decode-from-state <state.gdnstate> [--decode-len N]");
+    }
+    if (profile_ops) {
+        int rc = run_profile_ops_native(&model, &run_state, state_path);
+        free_fixture(&fixture);
+        free(logits);
+        gdn_run_state_free(&run_state);
+        gdn_model_free(&model);
+        return rc;
     }
     {
         uint32_t n = decode_len;

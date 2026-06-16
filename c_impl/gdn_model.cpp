@@ -1326,7 +1326,9 @@ int gdn_forward(
     const float *weight_data_mm6,  /* gemv shard 5 reader */
     const float *weight_data_mm7,  /* gemv shard 6 reader */
     const float *weight_data_mm8,  /* gemv shard 7 reader */
-    float *logits                  /* [vocab] scratch: lm_head gemv output (argmax → x_norm[0]) */
+    float *logits,                 /* [vocab] scratch: lm_head gemv output (argmax → x_norm[0]) */
+    int32_t prof_layer,            /* per-op profiling target layer (used only when prof_op is 0..17) */
+    int32_t prof_op                /* GDN_OP_ALL(-1) = full fused forward; else run one GDN_OP_* sub-op */
 ) {
     /* Depths match gdn-1.3b-f32.gdnw: hidden=2048 heads=8 head_dim=256
     intermediate=5632 layers=24 conv=4 max_seq_len=2048 vocab=32000 */
@@ -1396,6 +1398,8 @@ int gdn_forward(
     #pragma HLS interface m_axi port=tokens depth=2048 offset=slave
     #pragma HLS interface s_axilite port=max_tokens
     #pragma HLS interface s_axilite port=num_tokens
+    #pragma HLS interface s_axilite port=prof_layer
+    #pragma HLS interface s_axilite port=prof_op
     #pragma HLS interface s_axilite port=return
 
     uint32_t hidden = config->hidden_size;
@@ -1413,6 +1417,14 @@ int gdn_forward(
         return -1;
     }
 
+    /* Per-op profiling (Option A): prof_op==GDN_OP_ALL runs the full fused forward
+     * (the normal decode path — every GDN_RUN below is true, so it stays bit-exact);
+     * otherwise exactly one sub-op runs so the host can time each on hardware.
+     * GDN_OP_NOP returns immediately — the host's launch-overhead baseline. */
+    const bool full = (prof_op == GDN_OP_ALL);
+    if (prof_op == GDN_OP_NOP) return 0;
+    #define GDN_RUN(code) (full || prof_op == (code))
+
     hidden_count = (size_t)num_tokens * hidden;
     mlp_count = (size_t)num_tokens * intermediate;
 
@@ -1425,9 +1437,16 @@ int gdn_forward(
     size_t shard_di = (size_t)(hidden / GEMV_CHANNELS) * (intermediate / 16);
     size_t shard_per_layer = 5 * shard_hh + 2 * shard_ih + shard_di;
 
-    gdn_embed_tokens(x, embeddings, tokens, num_tokens, hidden, config->vocab_size);
+    if (full || prof_op == GDN_OP_EMBED)
+        gdn_embed_tokens(x, embeddings, tokens, num_tokens, hidden, config->vocab_size);
     layer_loop: for (layer_index = 0; layer_index < config->num_layers; ++layer_index) {
     #pragma HLS loop_tripcount min=24 max=24  /* num_layers=24 */
+        /* Per-op mode: run only the target layer of a per-layer op (codes 0..17);
+         * skip the rest (offsets derive directly from layer_index, so a skipped
+         * iteration is side-effect free). Full mode never skips. */
+        if (!full && !(prof_op >= 0 && prof_op < GDN_OP_PERLAYER_COUNT &&
+                       (int32_t)layer_index == prof_layer))
+            continue;
         size_t layer_offset = gdn_layer_weight_offset(config, layer_index);
         const float *layer_attn_norm = weight_data + layer_offset;
         const float *layer_a_log;
@@ -1472,13 +1491,17 @@ int gdn_forward(
          * mlp_up,mlp_down — matches gdn_build_weight_shards. */
         size_t soff = (size_t)layer_index * shard_per_layer;
 
-        gdn_rmsnorm_rows(x_norm, x, layer_attn_norm, num_tokens, hidden, config->norm_eps);
-        gdn_gemv(q, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
-        gdn_gemv(k, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
-        gdn_gemv(v, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
-        gdn_matmul_tiled(a, x_norm, layer_a_proj, num_tokens, hidden, num_heads);
-        gdn_matmul_tiled(b, x_norm, layer_b_proj, num_tokens, hidden, num_heads);
-        gdn_gemv(gate, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden); soff += shard_hh;
+        if (GDN_RUN(GDN_OP_RMSNORM1)) gdn_rmsnorm_rows(x_norm, x, layer_attn_norm, num_tokens, hidden, config->norm_eps);
+        if (GDN_RUN(GDN_OP_GEMV_Q)) gdn_gemv(q, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden);
+        soff += shard_hh;
+        if (GDN_RUN(GDN_OP_GEMV_K)) gdn_gemv(k, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden);
+        soff += shard_hh;
+        if (GDN_RUN(GDN_OP_GEMV_V)) gdn_gemv(v, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden);
+        soff += shard_hh;
+        if (GDN_RUN(GDN_OP_MATMUL_A)) gdn_matmul_tiled(a, x_norm, layer_a_proj, num_tokens, hidden, num_heads);
+        if (GDN_RUN(GDN_OP_MATMUL_B)) gdn_matmul_tiled(b, x_norm, layer_b_proj, num_tokens, hidden, num_heads);
+        if (GDN_RUN(GDN_OP_GEMV_GATE)) gdn_gemv(gate, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden);
+        soff += shard_hh;
 
         /* Per-(layer, conv) slice of the persistent conv tail in head_buffer:
          * 3 convs/layer × (conv_size-1) rows × hidden floats. */
@@ -1487,14 +1510,20 @@ int gdn_forward(
         float *k_tail = head_buffer + ((size_t)layer_index * 3 + 1) * tail_stride;
         float *v_tail = head_buffer + ((size_t)layer_index * 3 + 2) * tail_stride;
 
-        gdn_depthwise_conv_silu(tmp_hidden, q, layer_q_conv, q_tail, num_tokens, hidden, config->conv_size);
-        gdn_pack16_copy(q, tmp_hidden, hidden_count);
-        gdn_depthwise_conv_silu(tmp_hidden, k, layer_k_conv, k_tail, num_tokens, hidden, config->conv_size);
-        gdn_pack16_copy(k, tmp_hidden, hidden_count);
-        gdn_depthwise_conv_silu(tmp_hidden, v, layer_v_conv, v_tail, num_tokens, hidden, config->conv_size);
-        gdn_pack16_copy(v, tmp_hidden, hidden_count);
+        if (GDN_RUN(GDN_OP_CONV_Q)) {
+            gdn_depthwise_conv_silu(tmp_hidden, q, layer_q_conv, q_tail, num_tokens, hidden, config->conv_size);
+            gdn_pack16_copy(q, tmp_hidden, hidden_count);
+        }
+        if (GDN_RUN(GDN_OP_CONV_K)) {
+            gdn_depthwise_conv_silu(tmp_hidden, k, layer_k_conv, k_tail, num_tokens, hidden, config->conv_size);
+            gdn_pack16_copy(k, tmp_hidden, hidden_count);
+        }
+        if (GDN_RUN(GDN_OP_CONV_V)) {
+            gdn_depthwise_conv_silu(tmp_hidden, v, layer_v_conv, v_tail, num_tokens, hidden, config->conv_size);
+            gdn_pack16_copy(v, tmp_hidden, hidden_count);
+        }
 
-        gdn_recurrent_attention(
+        if (GDN_RUN(GDN_OP_RECURRENT)) gdn_recurrent_attention(
             attn,
             recurrent_state,
             head_buffer,
@@ -1511,19 +1540,26 @@ int gdn_forward(
             num_tokens,
             layer_index
         );
-        gdn_output_norm_and_gate(attn, gate, layer_o_norm, num_tokens, num_heads, head_dim, config->norm_eps);
-        gdn_gemv(tmp_hidden, attn, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden); soff += shard_hh;
-        gdn_pack16_add_inplace(x, tmp_hidden, hidden_count);
+        if (GDN_RUN(GDN_OP_ONORM)) gdn_output_norm_and_gate(attn, gate, layer_o_norm, num_tokens, num_heads, head_dim, config->norm_eps);
+        if (GDN_RUN(GDN_OP_GEMV_O)) {
+            gdn_gemv(tmp_hidden, attn, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden);
+            gdn_pack16_add_inplace(x, tmp_hidden, hidden_count);
+        }
+        soff += shard_hh;
 
-        gdn_rmsnorm_rows(x_norm, x, layer_mlp_norm, num_tokens, hidden, config->norm_eps);
-        gdn_gemv(mlp_gate, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, intermediate); soff += shard_ih;
-        gdn_gemv(mlp_up, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, intermediate);   soff += shard_ih;
-        gdn_swiglu_inplace(mlp_gate, mlp_up, mlp_count);
-        gdn_gemv(tmp_hidden, mlp_gate, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, intermediate, hidden);
-        gdn_pack16_add_inplace(x, tmp_hidden, hidden_count);
+        if (GDN_RUN(GDN_OP_RMSNORM2)) gdn_rmsnorm_rows(x_norm, x, layer_mlp_norm, num_tokens, hidden, config->norm_eps);
+        if (GDN_RUN(GDN_OP_GEMV_MLPG)) gdn_gemv(mlp_gate, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, intermediate);
+        soff += shard_ih;
+        if (GDN_RUN(GDN_OP_GEMV_MLPU)) gdn_gemv(mlp_up, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, intermediate);
+        soff += shard_ih;
+        if (GDN_RUN(GDN_OP_SWIGLU)) gdn_swiglu_inplace(mlp_gate, mlp_up, mlp_count);
+        if (GDN_RUN(GDN_OP_GEMV_MLPD)) {
+            gdn_gemv(tmp_hidden, mlp_gate, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, intermediate, hidden);
+            gdn_pack16_add_inplace(x, tmp_hidden, hidden_count);
+        }
     }
 
-    gdn_rmsnorm_rows(x_norm, x, final_norm, num_tokens, hidden, config->norm_eps);
+    if (GDN_RUN(GDN_OP_FINALNORM)) gdn_rmsnorm_rows(x_norm, x, final_norm, num_tokens, hidden, config->norm_eps);
     /* lm_head on-chip: logits[vocab] = x_norm @ lm_head via the same 8-reader
      * sharded gemv (lm_head's stripe is appended after every layer in each shard,
      * so its offset is num_layers*shard_per_layer). Then greedy argmax → next
@@ -1532,12 +1568,13 @@ int gdn_forward(
      * complete decode step (token in → token out), matching what the GPU times. */
     {
         size_t lm_soff = (size_t)config->num_layers * shard_per_layer;
-        gdn_gemv(logits, x_norm,
+        if (GDN_RUN(GDN_OP_LMHEAD)) gdn_gemv(logits, x_norm,
                  weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4,
                  weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8,
                  (uint32_t)lm_soff, num_tokens, hidden, config->vocab_size);
-        gdn_argmax(x_norm, logits, config->vocab_size);
+        if (GDN_RUN(GDN_OP_ARGMAX)) gdn_argmax(x_norm, logits, config->vocab_size);
     }
+    #undef GDN_RUN
     return 0;
 }
 
@@ -1545,7 +1582,8 @@ int gdn_forward(
  * per-layer recurrent + conv state held in the run-state buffers (loaded from
  * the GPU .gdnstate export). gdn_forward is decode-only — it restores each
  * layer's state at the start and saves the update at the end. */
-int gdn_decode_step_host(const GDNModel *model, GDNRunState *state, const int32_t *token) {
+int gdn_decode_step_op_host(const GDNModel *model, GDNRunState *state,
+                            const int32_t *token, int32_t prof_layer, int32_t prof_op) {
     return gdn_forward(
         &model->config,
         model->weight_data,
@@ -1570,8 +1608,42 @@ int gdn_decode_step_host(const GDNModel *model, GDNRunState *state, const int32_
         state->weight_shards[2], state->weight_shards[3],  /* gemv shards 2,3 */
         state->weight_shards[4], state->weight_shards[5],  /* gemv shards 4,5 */
         state->weight_shards[6], state->weight_shards[7],  /* gemv shards 6,7 */
-        state->logits                                      /* lm_head scratch; token → x_norm[0] */
+        state->logits,                                     /* lm_head scratch; token → x_norm[0] */
+        prof_layer, prof_op
     );
+}
+
+/* Full fused decode step (the normal path): run every op (prof_op==GDN_OP_ALL). */
+int gdn_decode_step_host(const GDNModel *model, GDNRunState *state, const int32_t *token) {
+    return gdn_decode_step_op_host(model, state, token, -1, GDN_OP_ALL);
+}
+
+/* Host-only op schedule for the Option-A per-op profiler — the 18 per-layer ops
+ * in gdn_forward execution order. Not synthesized (gdn_forward never calls it). */
+static const GDNProfOpInfo k_gdn_perlayer_ops[] = {
+    { GDN_OP_RMSNORM1,  "rmsnorm_attn",   "rmsnorm"      },
+    { GDN_OP_GEMV_Q,    "gemv_q",         "gemv"         },
+    { GDN_OP_GEMV_K,    "gemv_k",         "gemv"         },
+    { GDN_OP_GEMV_V,    "gemv_v",         "gemv"         },
+    { GDN_OP_MATMUL_A,  "matmul_a",       "matmul_tiled" },
+    { GDN_OP_MATMUL_B,  "matmul_b",       "matmul_tiled" },
+    { GDN_OP_GEMV_GATE, "gemv_gate",      "gemv"         },
+    { GDN_OP_CONV_Q,    "conv_q",         "conv"         },
+    { GDN_OP_CONV_K,    "conv_k",         "conv"         },
+    { GDN_OP_CONV_V,    "conv_v",         "conv"         },
+    { GDN_OP_RECURRENT, "recurrent_attn", "recurrent"    },
+    { GDN_OP_ONORM,     "output_norm",    "output_norm"  },
+    { GDN_OP_GEMV_O,    "gemv_o",         "gemv"         },
+    { GDN_OP_RMSNORM2,  "rmsnorm_mlp",    "rmsnorm"      },
+    { GDN_OP_GEMV_MLPG, "gemv_mlp_gate",  "gemv"         },
+    { GDN_OP_GEMV_MLPU, "gemv_mlp_up",    "gemv"         },
+    { GDN_OP_SWIGLU,    "swiglu",         "swiglu"       },
+    { GDN_OP_GEMV_MLPD, "gemv_mlp_down",  "gemv"         },
+};
+
+const GDNProfOpInfo *gdn_profile_perlayer_ops(int *count) {
+    if (count) *count = (int)(sizeof(k_gdn_perlayer_ops) / sizeof(k_gdn_perlayer_ops[0]));
+    return k_gdn_perlayer_ops;
 }
 
 void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logits_out) {

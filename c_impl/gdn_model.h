@@ -12,6 +12,41 @@
  * shard builder, and the run-state all agree on one value. */
 #define GEMV_CHANNELS 8
 
+/* ---- Per-op profiling selector for gdn_forward (Option A: per-op CU launches) --
+ * gdn_forward normally runs the full fused forward (prof_op == GDN_OP_ALL). For
+ * on-card per-op latency profiling, the host launches the kernel once per
+ * (prof_layer, prof_op): the kernel runs exactly ONE sub-op — reading inputs
+ * from / writing outputs to the persistent HBM activation BOs — and returns, so
+ * XRT times each op individually. Codes 0..17 are per-layer ops (need prof_layer
+ * in [0,num_layers)); GDN_OP_EMBED/FINALNORM/LMHEAD/ARGMAX are global (prof_layer
+ * ignored); GDN_OP_NOP returns immediately (launch-overhead baseline the host
+ * subtracts). Codes 0..17 MUST match the call order in gdn_forward's body. */
+#define GDN_OP_ALL        (-1)
+#define GDN_OP_RMSNORM1     0   /* attn rmsnorm */
+#define GDN_OP_GEMV_Q       1
+#define GDN_OP_GEMV_K       2
+#define GDN_OP_GEMV_V       3
+#define GDN_OP_MATMUL_A     4   /* a-gate (gdn_matmul_tiled) */
+#define GDN_OP_MATMUL_B     5   /* b-gate (gdn_matmul_tiled) */
+#define GDN_OP_GEMV_GATE    6
+#define GDN_OP_CONV_Q       7   /* depthwise conv+silu + pack16_copy */
+#define GDN_OP_CONV_K       8
+#define GDN_OP_CONV_V       9
+#define GDN_OP_RECURRENT   10
+#define GDN_OP_ONORM       11   /* output norm + gate */
+#define GDN_OP_GEMV_O      12   /* o-proj gemv + residual add */
+#define GDN_OP_RMSNORM2    13   /* mlp rmsnorm */
+#define GDN_OP_GEMV_MLPG   14
+#define GDN_OP_GEMV_MLPU   15
+#define GDN_OP_SWIGLU      16
+#define GDN_OP_GEMV_MLPD   17   /* mlp_down gemv + residual add */
+#define GDN_OP_PERLAYER_COUNT 18
+#define GDN_OP_EMBED      100
+#define GDN_OP_FINALNORM  101
+#define GDN_OP_LMHEAD     102
+#define GDN_OP_ARGMAX     103
+#define GDN_OP_NOP        104
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -129,13 +164,28 @@ int gdn_forward(
     const float *weight_data_mm6,  /* shard 5 */
     const float *weight_data_mm7,  /* shard 6 */
     const float *weight_data_mm8,  /* shard 7 */
-    float *logits                  /* [vocab] lm_head gemv scratch; argmax → x_norm[0] */
+    float *logits,                 /* [vocab] lm_head gemv scratch; argmax → x_norm[0] */
+    int32_t prof_layer,            /* per-op profiling: target layer for a per-layer op (ignored unless prof_op is 0..17) */
+    int32_t prof_op                /* GDN_OP_ALL(-1) = full fused forward; else run exactly one GDN_OP_* sub-op */
 );
 
 /* Single-token decode step (the only host entry): gdn_forward with num_tokens=1
  * against the persistent per-layer recurrent/conv state in the run-state buffers
  * (loaded from the GPU .gdnstate export). */
 int gdn_decode_step_host(const GDNModel *model, GDNRunState *state, const int32_t *token);
+/* Per-op profiling variant: run exactly one (prof_layer, prof_op) sub-op of the
+ * decode step against the persistent run-state (Option A). prof_op==GDN_OP_ALL is
+ * the full fused step (== gdn_decode_step_host). */
+int gdn_decode_step_op_host(const GDNModel *model, GDNRunState *state,
+                            const int32_t *token, int32_t prof_layer, int32_t prof_op);
+
+/* Host-only op schedule for the Option-A per-op profiler: the 18 per-layer
+ * sub-ops in gdn_forward execution order (op code + label + coarse type for the
+ * breakdown). The embed (pre) and final_norm/lm_head/argmax (post) globals are
+ * driven separately by the profiler. */
+typedef struct { int32_t op; const char *name; const char *type; } GDNProfOpInfo;
+const GDNProfOpInfo *gdn_profile_perlayer_ops(int *count);
+
 void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logits_out);
 
 #ifdef __cplusplus
