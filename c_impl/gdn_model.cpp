@@ -603,7 +603,7 @@ static void gdn_rmsnorm_rows(
 #define MM_TILE_C 16   /* columns (out_dim dimension) */
 #define MM_TILE_K 16   /* reduction (in_dim dimension) */
 
-static void gdn_matmul_tiled(
+static void gdn_gemv_tiny(
     float *out,
     const float *in,
     const float *weights,
@@ -611,157 +611,55 @@ static void gdn_matmul_tiled(
     uint32_t in_dim,
     uint32_t out_dim
 ) {
-    uint32_t tr, tc, tk;   /* tile indices */
-    uint32_t r, c, k;      /* intra-tile indices */
-    float local_in[MM_TILE_R][MM_TILE_K];
-    float local_wt[MM_TILE_K][MM_TILE_C];
-    float local_out[MM_TILE_R][MM_TILE_C];
-    #pragma HLS array_partition variable=local_in  dim=2 complete
-    #pragma HLS array_partition variable=local_wt  dim=1 complete
-    #pragma HLS array_partition variable=local_out dim=2 complete
+    /* Decode-shape GEMV (only caller: the tiny a/b gate projections —
+     * num_rows=1, in_dim=hidden=2048, out_dim=num_heads=8). The previous body
+     * was a 16x16x16 tiled GEMM that ran its 256-lane compute tile at ~3%
+     * utilisation for a 1x8 output (~2.2 ms/call on-card, ~22% of the decode
+     * step). This computes exactly the real outputs and is BIT-EXACT to the old
+     * reduction order: per output, the K dimension is walked in 16-wide chunks,
+     * each chunk reduced by the SAME balanced 4-level adder tree, and the chunks
+     * accumulated sequentially (matches the old `local_out[r][c] += dot` over
+     * increasing K-tiles). in_dim is a multiple of 16 for every call. */
+    const Pack16 *in_p = reinterpret_cast<const Pack16 *>(in);
+    const Pack16 *w_p  = reinterpret_cast<const Pack16 *>(weights);
+    uint32_t k_packs = in_dim / 16;   /* 128 for in_dim=2048 */
+    uint32_t r, c, kc, i;
 
-    /* Zero the output buffer — replacement for memset so HLS can estimate latency */
-    mm_zero_row: for (r = 0; r < num_rows; ++r) {
-    #pragma HLS loop_tripcount min=1 max=2048  /* num_tokens: 1..max_seq_len */
-        mm_zero_col: for (c = 0; c < out_dim; ++c) {
-    #pragma HLS loop_tripcount min=8 max=5632  /* out_dim: num_heads=8 to intermediate=5632 */
-    #pragma HLS pipeline II=1
-            out[(size_t)r * out_dim + c] = 0.0f;
+    gvt_row: for (r = 0; r < num_rows; ++r) {
+    #pragma HLS loop_tripcount min=1 max=1   /* decode: single token */
+        gvt_out: for (c = 0; c < out_dim; ++c) {
+        #pragma HLS loop_tripcount min=8 max=8   /* a/b gates: out_dim=num_heads=8 */
+            float acc = 0.0f;
+            gvt_k: for (kc = 0; kc < k_packs; ++kc) {
+            #pragma HLS loop_tripcount min=128 max=128
+            #pragma HLS pipeline II=1
+                Pack16 a = in_p[(size_t)r * k_packs + kc];
+                Pack16 w = w_p[(size_t)c * k_packs + kc];   /* weights row-major [out_dim][in_dim] */
+                float p[16];
+                #pragma HLS array_partition variable=p complete
+                gvt_mul: for (i = 0; i < 16; ++i) {
+                #pragma HLS unroll
+                    p[i] = a.data[i] * w.data[i];
+                }
+                /* Balanced 4-level adder tree: 16 -> 8 -> 4 -> 2 -> 1 (identical
+                 * to the old per-K-tile reduction, so the result is bit-exact). */
+                float s2_0 = p[0]  + p[1],  s2_1 = p[2]  + p[3];
+                float s2_2 = p[4]  + p[5],  s2_3 = p[6]  + p[7];
+                float s2_4 = p[8]  + p[9],  s2_5 = p[10] + p[11];
+                float s2_6 = p[12] + p[13], s2_7 = p[14] + p[15];
+                float s4_0 = s2_0 + s2_1, s4_1 = s2_2 + s2_3;
+                float s4_2 = s2_4 + s2_5, s4_3 = s2_6 + s2_7;
+                float s8_0 = s4_0 + s4_1, s8_1 = s4_2 + s4_3;
+                float dot  = s8_0 + s8_1;
+                acc += dot;   /* sequential chunk accumulation == old local_out += dot */
+            }
+            out[(size_t)r * out_dim + c] = acc;
         }
     }
-
-    /* Tiled matrix multiply: out[R][C] += in[R][K] * weights[C][K]^T
-       Weight layout is row-major with weights[out_index] being one row of
-       length in_dim, i.e. weights is (out_dim x in_dim). */
-    mm_tile_r: for (tr = 0; tr < num_rows; tr += MM_TILE_R) {
-    #pragma HLS loop_tripcount min=1 max=128  /* ceil(2048/16) */
-        mm_tile_k: for (tk = 0; tk < in_dim; tk += MM_TILE_K) {
-    #pragma HLS loop_tripcount min=128 max=128  /* a/b_proj only: in_dim=2048, ceil(2048/16)=128 */
-
-            /* Load input tile: local_in[r][k] = in[tr+r][tk+k] */
-            mm_load_in_r: for (r = 0; r < MM_TILE_R; ++r) {
-            #pragma HLS loop_tripcount min=16 max=16
-                mm_load_in_k: for (k = 0; k < MM_TILE_K; ++k) {
-                #pragma HLS loop_tripcount min=16 max=16
-                #pragma HLS pipeline II=1
-                    uint32_t gr = tr + r;
-                    uint32_t gk = tk + k;
-                    local_in[r][k] = (gr < num_rows && gk < in_dim)
-                        ? in[(size_t)gr * in_dim + gk] : 0.0f;
-                }
-            }
-
-            mm_tile_c: for (tc = 0; tc < out_dim; tc += MM_TILE_C) {
-            #pragma HLS loop_tripcount min=1 max=1  /* a/b_proj only: out_dim=8 < MM_TILE_C=16, single iter */
-
-                /* Load weight tile: local_wt[k][c] = weights[tc+c][tk+k] */
-                mm_load_wt_c: for (c = 0; c < MM_TILE_C; ++c) {
-                #pragma HLS loop_tripcount min=16 max=16
-                    mm_load_wt_k: for (k = 0; k < MM_TILE_K; ++k) {
-                    #pragma HLS loop_tripcount min=16 max=16
-                    #pragma HLS pipeline II=1
-                        uint32_t gc = tc + c;
-                        uint32_t gk = tk + k;
-                        local_wt[k][c] = (gc < out_dim && gk < in_dim)
-                            ? weights[(size_t)gc * in_dim + gk] : 0.0f;
-                    }
-                }
-
-                /* Load partial sums (only on the first K-tile) */
-                if (tk == 0) {
-                    mm_load_out_r: for (r = 0; r < MM_TILE_R; ++r) {
-                    #pragma HLS loop_tripcount min=16 max=16
-                        mm_load_out_c: for (c = 0; c < MM_TILE_C; ++c) {
-                        #pragma HLS loop_tripcount min=16 max=16
-                        #pragma HLS pipeline II=1
-                            local_out[r][c] = 0.0f;
-                        }
-                    }
-                } else {
-                    mm_reload_out_r: for (r = 0; r < MM_TILE_R; ++r) {
-                    #pragma HLS loop_tripcount min=16 max=16
-                        mm_reload_out_c: for (c = 0; c < MM_TILE_C; ++c) {
-                        #pragma HLS loop_tripcount min=16 max=16
-                        #pragma HLS pipeline II=1
-                            uint32_t gr = tr + r;
-                            uint32_t gc = tc + c;
-                            local_out[r][c] = (gr < num_rows && gc < out_dim)
-                                ? out[(size_t)gr * out_dim + gc] : 0.0f;
-                        }
-                    }
-                }
-
-                /* Compute: local_out[r][c] += sum_k local_in[r][k] * local_wt[k][c]
-                 *
-                 * Manually flattened (R x C) loop: HLS won't auto-flatten the
-                 * mm_comp_r/mm_comp_c nest (the warning "outer loop is not a
-                 * perfect loop" appears because the surrounding tile loop has
-                 * statements before/after this pair). Manual flatten avoids
-                 * 16x pipeline-fill overhead (each fill costs ~30 cycles).
-                 *
-                 * Within the loop body:
-                 *   - mm_comp_k is fully unrolled into 16 parallel fmuls.
-                 *   - The 16 partial products are reduced through a balanced
-                 *     4-level fadd tree (paired sums), so the critical path is
-                 *     log2(16) fadd stages instead of a 16-deep serial chain
-                 *     (which is what HLS auto-generated from `dot += ...` and
-                 *     stretched the iteration latency to 55 cycles).
-                 *   - dependence false on local_out: the carried dep is
-                 *     genuinely false because each iteration touches a unique
-                 *     (r, c) pair, and dim 2 complete partition makes each c
-                 *     a distinct register bank.
-                 */
-                mm_comp_rc: for (uint32_t rc = 0; rc < MM_TILE_R * MM_TILE_C; ++rc) {
-                #pragma HLS loop_tripcount min=256 max=256
-                #pragma HLS pipeline II=1
-                #pragma HLS dependence variable=local_out type=inter direction=RAW false
-                    uint32_t r = rc / MM_TILE_C;
-                    uint32_t c = rc % MM_TILE_C;
-
-                    float p[MM_TILE_K];
-                    mm_comp_k: for (k = 0; k < MM_TILE_K; ++k) {
-                    #pragma HLS loop_tripcount min=16 max=16
-                    #pragma HLS unroll
-                        p[k] = local_in[r][k] * local_wt[k][c];
-                    }
-
-                    /* Balanced 4-level adder tree: 16 -> 8 -> 4 -> 2 -> 1 */
-                    float s2_0 = p[0]  + p[1],  s2_1 = p[2]  + p[3];
-                    float s2_2 = p[4]  + p[5],  s2_3 = p[6]  + p[7];
-                    float s2_4 = p[8]  + p[9],  s2_5 = p[10] + p[11];
-                    float s2_6 = p[12] + p[13], s2_7 = p[14] + p[15];
-
-                    float s4_0 = s2_0 + s2_1, s4_1 = s2_2 + s2_3;
-                    float s4_2 = s2_4 + s2_5, s4_3 = s2_6 + s2_7;
-
-                    float s8_0 = s4_0 + s4_1, s8_1 = s4_2 + s4_3;
-
-                    float dot  = s8_0 + s8_1;
-
-                    local_out[r][c] += dot;
-                }
-
-                /* Store output tile back to DRAM */
-                mm_store_r: for (r = 0; r < MM_TILE_R; ++r) {
-                #pragma HLS loop_tripcount min=16 max=16
-                    mm_store_c: for (c = 0; c < MM_TILE_C; ++c) {
-                    #pragma HLS loop_tripcount min=16 max=16
-                    #pragma HLS pipeline II=1
-                        uint32_t gr = tr + r;
-                        uint32_t gc = tc + c;
-                        if (gr < num_rows && gc < out_dim) {
-                            out[(size_t)gr * out_dim + gc] = local_out[r][c];
-                        }
-                    }
-                }
-
-            } /* mm_tile_c */
-        } /* mm_tile_k */
-    } /* mm_tile_r */
 }
 
 /* No dispatch wrapper — gdn_forward calls gdn_gemv directly for the large
- * decode projections (defined below) and gdn_matmul_tiled for the small
+ * decode projections (defined below) and gdn_gemv_tiny for the small
  * a/b_proj shapes (out_dim=8). Direct calls let HLS allocate and report only
  * the path actually used. */
 
@@ -1476,8 +1374,8 @@ int gdn_forward(
         gdn_gemv(q, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
         gdn_gemv(k, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
         gdn_gemv(v, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden);    soff += shard_hh;
-        gdn_matmul_tiled(a, x_norm, layer_a_proj, num_tokens, hidden, num_heads);
-        gdn_matmul_tiled(b, x_norm, layer_b_proj, num_tokens, hidden, num_heads);
+        gdn_gemv_tiny(a, x_norm, layer_a_proj, num_tokens, hidden, num_heads);
+        gdn_gemv_tiny(b, x_norm, layer_b_proj, num_tokens, hidden, num_heads);
         gdn_gemv(gate, x_norm, weight_data_mm, weight_data_mm2, weight_data_mm3, weight_data_mm4, weight_data_mm5, weight_data_mm6, weight_data_mm7, weight_data_mm8, (uint32_t)soff, num_tokens, hidden, hidden); soff += shard_hh;
 
         /* Per-(layer, conv) slice of the persistent conv tail in head_buffer:
