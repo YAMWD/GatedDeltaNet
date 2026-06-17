@@ -1312,7 +1312,13 @@ int gdn_forward(
      * per-layer state (RESTORE/SAVE); head_buffer is repurposed as the per-layer
      * conv tail (24 layers × 3 convs × (conv-1) rows × hidden = ~1.7 MB). */
     #pragma HLS interface m_axi port=recurrent_state depth=12582912 offset=slave max_widen_bitwidth=512
-    #pragma HLS interface m_axi port=head_buffer depth=442368 offset=slave max_widen_bitwidth=512
+    /* head_buffer holds the per-(layer,conv) tail; the conv-tail SAVE writes ~384
+     * Pack16 beats/call. With default m_axi write params those writes were
+     * write-response-latency bound (~170 cyc/beat, 0.65 ms/call = 69% of conv),
+     * while the same-structure tail RESTORE (a read) was 5x faster. Widen the write
+     * burst and raise outstanding writes so the B-response latency is hidden (reads
+     * bumped too, to speed restore). Interface-only — bit-exact. */
+    #pragma HLS interface m_axi port=head_buffer depth=442368 offset=slave max_widen_bitwidth=512 num_write_outstanding=64 num_read_outstanding=64 max_write_burst_length=64 max_read_burst_length=64
     #pragma HLS interface m_axi port=tokens depth=2048 offset=slave
     #pragma HLS interface s_axilite port=max_tokens
     #pragma HLS interface s_axilite port=num_tokens
