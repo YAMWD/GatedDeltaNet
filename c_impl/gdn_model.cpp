@@ -697,13 +697,35 @@ static void gdn_depthwise_conv_silu(
     uint32_t col_packs = num_cols / 16;
     uint32_t col, row, k;
 
-    /* Load all weights once: weights[col * kernel_size + k] for col=0..num_cols-1, k=0..kernel_size-1. */
-    conv_load_w_col: for (col = 0; col < num_cols; ++col) {
-    #pragma HLS loop_tripcount min=2048 max=2048
-        conv_load_w_k: for (k = 0; k < kernel_size; ++k) {
-        #pragma HLS loop_tripcount min=4 max=4
+    /* Load all conv weights once. weights[col*ks + k] is contiguous, so read it as
+     * 512-bit Pack16 bursts (16 floats/beat) instead of one 32-bit scalar/cycle:
+     * the scalar form was HBM-latency-bound at ~1.6 ms/call on-card (65% of conv,
+     * measured) — the Pack16 burst is the pattern gemv_tiny uses. For conv_size=4
+     * (always, in decode) each beat carries 4 cols x 4 taps; w_loc dim1 is cyclic16
+     * and dim2 complete, so the 16 lane writes hit distinct banks at II=1. Bit-exact:
+     * identical w_loc. (Scalar fallback kept for kernel_size != 4.) */
+    if (kernel_size == 4) {
+        const Pack16 *w_src = reinterpret_cast<const Pack16 *>(weights);
+        conv_load_w_b: for (uint32_t cb = 0; cb < num_cols / 4; ++cb) {
+        #pragma HLS loop_tripcount min=512 max=512
         #pragma HLS pipeline II=1
-            w_loc[col][k] = weights[(size_t)col * kernel_size + k];
+            Pack16 wp = w_src[cb];
+            conv_load_w_j: for (int j = 0; j < 4; ++j) {
+            #pragma HLS unroll
+                conv_load_w_kk: for (int kk = 0; kk < 4; ++kk) {
+                #pragma HLS unroll
+                    w_loc[cb * 4 + (uint32_t)j][kk] = wp.data[j * 4 + kk];
+                }
+            }
+        }
+    } else {
+        conv_load_w_col: for (col = 0; col < num_cols; ++col) {
+        #pragma HLS loop_tripcount min=2048 max=2048
+            conv_load_w_k: for (k = 0; k < kernel_size; ++k) {
+            #pragma HLS loop_tripcount min=4 max=4
+            #pragma HLS pipeline II=1
+                w_loc[col][k] = weights[(size_t)col * kernel_size + k];
+            }
         }
     }
 
