@@ -596,12 +596,10 @@ static void gdn_rmsnorm_rows(
 }
 
 
-/* Tile sizes for tiled matmul — chosen to divide evenly into hidden=2048
-   and intermediate=5632 (=16*352).  out_dim=8 (a/b proj) is smaller than
-   TILE_C but handled by the boundary guard inside the inner loops. */
-#define MM_TILE_R 16   /* rows (num_tokens dimension) */
-#define MM_TILE_C 16   /* columns (out_dim dimension) */
-#define MM_TILE_K 16   /* reduction (in_dim dimension) */
+/* Compile-time bounds for gdn_gemv_tiny's on-chip buffers (the a/b gate
+ * projections: out_dim = num_heads = 8, in_dim = hidden = 2048). */
+#define GDN_GEMV_TINY_OUT_MAX 8
+#define GDN_GEMV_TINY_IN_MAX  2048
 
 static void gdn_gemv_tiny(
     float *out,
@@ -611,50 +609,84 @@ static void gdn_gemv_tiny(
     uint32_t in_dim,
     uint32_t out_dim
 ) {
-    /* Decode-shape GEMV (only caller: the tiny a/b gate projections —
-     * num_rows=1, in_dim=hidden=2048, out_dim=num_heads=8). The previous body
-     * was a 16x16x16 tiled GEMM that ran its 256-lane compute tile at ~3%
-     * utilisation for a 1x8 output (~2.2 ms/call on-card, ~22% of the decode
-     * step). This computes exactly the real outputs and is BIT-EXACT to the old
-     * reduction order: per output, the K dimension is walked in 16-wide chunks,
-     * each chunk reduced by the SAME balanced 4-level adder tree, and the chunks
-     * accumulated sequentially (matches the old `local_out[r][c] += dot` over
-     * increasing K-tiles). in_dim is a multiple of 16 for every call. */
+    /* Decode-shape GEMV for the tiny a/b gate projections (num_rows=1,
+     * in_dim=hidden=2048, out_dim=num_heads=8). Three II=1 steps:
+     *   1. load the single activation row into resident a_loc (read once);
+     *   2. preload all out_dim weight rows to BRAM as one CONTIGUOUS burst (a/b are
+     *      [out_dim][in_dim] row-major) — avoids the per-(c,kc) strided HBM reads;
+     *   3. one k-pass computing all out_dim outputs in PARALLEL, each with its own
+     *      accumulator + the SAME balanced-tree-per-16-chunk sequential reduction.
+     * Bit-exact to the prior per-output reduction (each acc[c] keeps the chunk
+     * order); removes the 8x per-output pipeline restart + redundant activation
+     * reads that made the prior form ~0.18 ms/call. */
     const Pack16 *in_p = reinterpret_cast<const Pack16 *>(in);
     const Pack16 *w_p  = reinterpret_cast<const Pack16 *>(weights);
     uint32_t k_packs = in_dim / 16;   /* 128 for in_dim=2048 */
-    uint32_t r, c, kc, i;
+    uint32_t c, kc, i;
+    (void)num_rows;  /* decode: always the single token (row 0) */
 
-    gvt_row: for (r = 0; r < num_rows; ++r) {
-    #pragma HLS loop_tripcount min=1 max=1   /* decode: single token */
-        gvt_out: for (c = 0; c < out_dim; ++c) {
-        #pragma HLS loop_tripcount min=8 max=8   /* a/b gates: out_dim=num_heads=8 */
-            float acc = 0.0f;
-            gvt_k: for (kc = 0; kc < k_packs; ++kc) {
-            #pragma HLS loop_tripcount min=128 max=128
-            #pragma HLS pipeline II=1
-                Pack16 a = in_p[(size_t)r * k_packs + kc];
-                Pack16 w = w_p[(size_t)c * k_packs + kc];   /* weights row-major [out_dim][in_dim] */
-                float p[16];
-                #pragma HLS array_partition variable=p complete
-                gvt_mul: for (i = 0; i < 16; ++i) {
-                #pragma HLS unroll
-                    p[i] = a.data[i] * w.data[i];
-                }
-                /* Balanced 4-level adder tree: 16 -> 8 -> 4 -> 2 -> 1 (identical
-                 * to the old per-K-tile reduction, so the result is bit-exact). */
-                float s2_0 = p[0]  + p[1],  s2_1 = p[2]  + p[3];
-                float s2_2 = p[4]  + p[5],  s2_3 = p[6]  + p[7];
-                float s2_4 = p[8]  + p[9],  s2_5 = p[10] + p[11];
-                float s2_6 = p[12] + p[13], s2_7 = p[14] + p[15];
-                float s4_0 = s2_0 + s2_1, s4_1 = s2_2 + s2_3;
-                float s4_2 = s2_4 + s2_5, s4_3 = s2_6 + s2_7;
-                float s8_0 = s4_0 + s4_1, s8_1 = s4_2 + s4_3;
-                float dot  = s8_0 + s8_1;
-                acc += dot;   /* sequential chunk accumulation == old local_out += dot */
-            }
-            out[(size_t)r * out_dim + c] = acc;
+    /* (1) resident activation — read the token's in[] once, reused by every output */
+    float a_loc[GDN_GEMV_TINY_IN_MAX];
+    #pragma HLS array_partition variable=a_loc cyclic factor=16
+    gvt_la: for (kc = 0; kc < k_packs; ++kc) {
+    #pragma HLS loop_tripcount min=128 max=128
+    #pragma HLS pipeline II=1
+        Pack16 a = in_p[kc];
+        gvt_la_i: for (i = 0; i < 16; ++i) {
+        #pragma HLS unroll
+            a_loc[kc * 16 + i] = a.data[i];
         }
+    }
+
+    /* (2) preload weights to BRAM — one contiguous burst over [out_dim][in_dim] */
+    float w_loc[GDN_GEMV_TINY_OUT_MAX][GDN_GEMV_TINY_IN_MAX];
+    #pragma HLS array_partition variable=w_loc dim=1 complete
+    #pragma HLS array_partition variable=w_loc dim=2 cyclic factor=16
+    gvt_lw_c: for (c = 0; c < out_dim; ++c) {
+    #pragma HLS loop_tripcount min=8 max=8
+        gvt_lw_kc: for (kc = 0; kc < k_packs; ++kc) {
+        #pragma HLS loop_tripcount min=128 max=128
+        #pragma HLS pipeline II=1
+            Pack16 w = w_p[(size_t)c * k_packs + kc];
+            gvt_lw_i: for (i = 0; i < 16; ++i) {
+            #pragma HLS unroll
+                w_loc[c][kc * 16 + i] = w.data[i];
+            }
+        }
+    }
+
+    /* (3) one k-pass, all outputs in parallel; per-output sequential reduction */
+    float acc[GDN_GEMV_TINY_OUT_MAX];
+    #pragma HLS array_partition variable=acc complete
+    gvt_init: for (c = 0; c < out_dim; ++c) {
+    #pragma HLS unroll
+        acc[c] = 0.0f;
+    }
+    gvt_k: for (kc = 0; kc < k_packs; ++kc) {
+    #pragma HLS loop_tripcount min=128 max=128
+    #pragma HLS pipeline II=1
+        gvt_c: for (c = 0; c < out_dim; ++c) {
+        #pragma HLS unroll
+            float p[16];
+            #pragma HLS array_partition variable=p complete
+            gvt_mul: for (i = 0; i < 16; ++i) {
+            #pragma HLS unroll
+                p[i] = a_loc[kc * 16 + i] * w_loc[c][kc * 16 + i];
+            }
+            /* Balanced 4-level adder tree (same per-chunk reduction as before). */
+            float s2_0 = p[0]  + p[1],  s2_1 = p[2]  + p[3];
+            float s2_2 = p[4]  + p[5],  s2_3 = p[6]  + p[7];
+            float s2_4 = p[8]  + p[9],  s2_5 = p[10] + p[11];
+            float s2_6 = p[12] + p[13], s2_7 = p[14] + p[15];
+            float s4_0 = s2_0 + s2_1, s4_1 = s2_2 + s2_3;
+            float s4_2 = s2_4 + s2_5, s4_3 = s2_6 + s2_7;
+            float s8_0 = s4_0 + s4_1, s8_1 = s4_2 + s4_3;
+            acc[c] += s8_0 + s8_1;
+        }
+    }
+    gvt_st: for (c = 0; c < out_dim; ++c) {
+    #pragma HLS unroll
+        out[c] = acc[c];
     }
 }
 
@@ -729,17 +761,11 @@ static void gdn_depthwise_conv_silu(
         }
     }
 
-    /* Zero the sliding window so the first (kernel_size-1) rows automatically
-     * skip out-of-bounds source rows (no conditional needed). */
-    conv_init_win_k: for (k = 0; k < kernel_size; ++k) {
-    #pragma HLS loop_tripcount min=4 max=4
-    #pragma HLS unroll
-        conv_init_win_col: for (col = 0; col < num_cols; ++col) {
-        #pragma HLS loop_tripcount min=2048 max=2048
-        #pragma HLS pipeline II=1
-            in_window[k][col] = 0.0f;
-        }
-    }
+    /* (Decode) The sliding-window zero-init was DROPPED — it is redundant: the
+     * tail restore below fills window slots 1..kernel_size-1, and the row-0 load
+     * shifts them down (slot0<-slot1, ...), so all kernel_size slots are defined
+     * before the compute reads them; the pre-restore values are never read.
+     * Removing the 4x2048 zeroing saved ~0.08 ms/call (~6 ms/token). Bit-exact. */
 
     {
         /* Decode (the only mode): pre-load the last (kernel_size-1) prefix rows
@@ -1260,7 +1286,10 @@ int gdn_forward(
      * instead of 16 narrow ones. Lifts ReadB from II=16 → II=1 on the
      * weight side and similarly drops the per-element II of swiglu / the
      * residual adds / matmul output stores from ~150 to ~10. */
-    #pragma HLS interface m_axi port=weight_data depth=1466343808 offset=slave bundle=mem_weights max_widen_bitwidth=512 max_read_burst_length=64
+    /* num_read_outstanding bumped (default 16): the conv weight load (load_w) and
+     * the a/b gemv_tiny both read this scalar master and were read-latency-bound;
+     * more outstanding reads keep the 64-beat bursts in flight. Interface-only. */
+    #pragma HLS interface m_axi port=weight_data depth=1466343808 offset=slave bundle=mem_weights max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=64
     /* weight_data_mm aliases the same HBM weight blob but on a DEDICATED bundle
      * read only by the matmul (gdn_matmul_2d, all Pack16). Splitting it off the
      * scalar weight readers (rmsnorm/conv/onorm/embed, which share mem_weights)
