@@ -331,6 +331,59 @@ compute), which the GPU pays ~nothing for. fp32↔fp32 normalisation does **not*
 the gap (the GPU is idle, not byte-limited). The FPGA's defensible angle is perf/Watt
 (~50–75 W vs ~250–300 W), which needs the latency gap down to <~4–5×, not <1×.
 
+## 6g. Clock re-synth — 100 → 150 MHz (on-card, bit-exact)
+
+The kernel re-pipelines cleanly to ~200 MHz-class paths (csynth est. 3.837 ns at a 5 ns
+target), but two things had to line up, each caught at a cheap gate before an expensive one.
+
+**(1) Over-synthesize for routing margin.** The congested route adds ~2.7 ns of overhead,
+so building *and* linking at the same higher freq misses (the uncertainty reserve shrinks
+faster than the overhead). Synthesize the xo at a tighter target than you run:
+```
+make xo FREQ=200 && make xclbin FREQ=150
+```
+The 3.837 ns logic linked at 150 MHz (6.67 ns budget) leaves ~2.83 ns for routing — just over
+the ~2.7 ns overhead — so it closes (WNS +0.003 ns, all constraints met). A naive same-freq
+build (150-target xo @ 150) would miss; v++ accepts the synth/link freq split.
+
+**(2) A faster clock breaks the gemv MAC's II=1 — the fix is a loop restructure, not a pragma.**
+fp-add latency is ~constant in ns, so its latency *in cycles* = latency_ns ÷ clock_period: a
+~1-cycle fadd at 100 MHz becomes ~3 cycles at 150 MHz, and any *carried* accumulator dependency
+inflates II directly. `gemv_pe_k`'s rotating accumulator `part[kp & 7] += lane` reuses each of 8
+banks every 8 iters (so the fadd really has 8 cycles), but the **runtime** index makes HLS treat
+it as distance-1 → II inflates → the dominant gemv slows more than the clock gains (a naive
+150 MHz build measured **309 ms**, *worse* than 212.5). A `#pragma HLS dependence` hint did not
+convince HLS. Fix (commit `8b70225`): **unroll the k-loop by `GEMV_PARTIAL`** so each `part[p]`
+has a compile-time-fixed index → 8 independent fadd chains; the 8 stream reads/iter floor the
+outer loop at II=8 = 1 pack/cycle (same cycle count as the old II=1 over `k_packs`) but robust
+to the multi-cycle fadd. **Bit-exact**: `part[p]` still sums exactly the `kp ≡ p (mod 8)` lanes
+in order. The same break hits the smaller fp-reductions (`rmsnorm_sq`, `onorm_sq`, `gvt_k`,
+II=2–3) — left as-is (≈2.3 ms total, see below).
+
+| metric | Build A @ 100 MHz | **restructured @ 150 MHz** |
+|---|---:|---:|
+| TPOT ms/tok (on-card, 1×64) | 212.5 | **165.6** |
+| speedup | — | **1.28× (2.84× over the 470 original)** |
+| decode bit-exact | ✓ | **✓ 64/64** |
+| routed WNS / timing | +0.003 | **+0.003, all met (clean)** |
+
+**Per-op breakdown @ 150 MHz (per-op profiler) — the gemv is sliding toward HBM-bound.**
+
+| op | ms | % | scaled |
+|---|---:|---:|---|
+| gemv | 119.0 | 71.5% | **~1.19×** (not 1.5) |
+| recurrent | 26.9 | 16.2% | ~1.45× |
+| conv | 10.9 | 6.5% | ~1.5× |
+| gemv_tiny | 6.8 | 4.1% | ~ok |
+| rmsnorm / onorm / swiglu | 2.3 | 1.3% | the II loops — negligible |
+
+The compute/latency-bound ops (recurrent, conv) scaled with the clock; the **gemv (72%) only
+sped up 1.19×**. 5.6 GB ÷ 119 ms = ~47 GB/s across 8 ports = ~61% of the 76.8 GB/s the kernel
+now requests (8×512-bit×150 MHz), down from ~76% at 100 MHz: the faster clock asks HBM for packs
+faster than the read pipeline (burst gaps + 8-channel crossbar contention + HBM latency) delivers.
+So more clock now buys diminishing gemv returns — the dominant op's ceiling is HBM **efficiency/
+bandwidth**, addressed only by more channels (§6e, exhausted) or less traffic (INT8), not Fmax.
+
 ## 7. Next
 
 Decode-only is bit-exact and flat at **470 ms/token** *complete* decode steps
@@ -339,12 +392,13 @@ The weight-bandwidth lever is exhausted (§6e); the dominant cost is now the **s
 floor S ≈ 325 ms** (recurrent-attention state I/O on one HBM[0] master + the gated-
 delta-rule update), and the FPGA is ~14× the A100's launch-bound 33.5 ms. Levers:
 
-- **Raise the kernel clock** (the shared BW + compute lever). Each 512-bit master is
-  6.4 GB/s at 100 MHz (~11% of HBM); 100→200 MHz ~doubles weight BW *and* recurrent
-  throughput with no extra masters. Needs the fp-reduction pipelined, DSP adders, and
-  an SLR pblock — the routability hacks (fabric adders, no pblock) fight Fmax. The
-  N=8+lm_head kernel closes at 100 MHz with WNS +0.169 ns ⇒ Fmax ≈ 102 MHz, so a
-  higher clock requires re-pipelining (recompile at the higher target — see Build B).
+- **Raise the kernel clock** — DONE to 150 MHz (§6g): 1.28× / 165.6 ms, bit-exact, via
+  over-synth (xo@200, link@150) + the gemv-MAC unroll restructure. But it revealed the
+  gemv (72%) only scales ~1.19× because it slides toward **HBM-read-efficiency-bound** at
+  the faster request rate — so more clock now buys diminishing gemv returns. Remaining
+  clock headroom (≥175 MHz) mainly helps the compute/latency-bound ops (recurrent, conv).
+  Fixing the small fp-reduction II loops (rmsnorm/onorm/gvt_k, ≈2.3 ms) is the same unroll
+  trick but near-negligible; rmsnorm/onorm reorder the sum (token-exactness risk).
 - **Attack S** (bit-exact): spread the 50 MB/tok state across channels, parallelise
   the gated-delta-rule update, overlap state R/W with the weight stream.
 - **INT8 weights** (deferred all-fp32 plan): 4× less W + relieves the crossbar; the
