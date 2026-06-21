@@ -1646,20 +1646,31 @@ static void gemv_pe_mac(hls::stream<Pack16> &af, hls::stream<Pack16> &wf,
         #pragma HLS unroll
             part[p] = 0.0f;
         }
-        gemv_pe_k: for (uint32_t kp = 0; kp < k_packs; ++kp) {
-        #pragma HLS loop_tripcount min=128 max=352
-        #pragma HLS pipeline II=1
-            Pack16 w = wf.read();
-            float lane = 0.0f;
-            /* Reduce in LUT fabric, not DSP: keeps the full_dsp fp-adders out of
-             * the (DSP-dense) multiply region — the partially-conflicted-net
-             * congestion that failed the monolithic build. */
-            #pragma HLS bind_op variable=lane op=fadd impl=fabric
-            gemv_pe_lane: for (int kk = 0; kk < 16; ++kk) {
+        /* k-loop unrolled by GEMV_PARTIAL so each accumulator part[p] has a
+         * COMPILE-TIME-FIXED index → GEMV_PARTIAL independent fadd chains, each with
+         * a full outer iteration (GEMV_PARTIAL cycles) to retire its carried fadd.
+         * This holds throughput at 1 pack/cycle (8 stream reads per 8-cycle outer
+         * iteration) and stays robust when the fabric fadd spans several cycles at a
+         * faster clock — the prior part[kp & 7] used a runtime index HLS treats as a
+         * distance-1 dependency, inflating II once the clock rises. Bit-exact: part[p]
+         * still accumulates exactly the kp ≡ p (mod GEMV_PARTIAL) lanes in kp order.
+         * k_packs is a multiple of GEMV_PARTIAL for all shapes (128, 352). */
+        gemv_pe_k: for (uint32_t kg = 0; kg < k_packs; kg += GEMV_PARTIAL) {
+        #pragma HLS loop_tripcount min=16 max=44
+        #pragma HLS pipeline II=8
+            gemv_pe_p: for (int p = 0; p < GEMV_PARTIAL; ++p) {
             #pragma HLS unroll
-                lane += w.data[kk] * a_loc[kp * 16 + kk];
+                Pack16 w = wf.read();
+                float lane = 0.0f;
+                /* Reduce in LUT fabric, not DSP: keeps the full_dsp fp-adders out of
+                 * the (DSP-dense) multiply region. */
+                #pragma HLS bind_op variable=lane op=fadd impl=fabric
+                gemv_pe_lane: for (int kk = 0; kk < 16; ++kk) {
+                #pragma HLS unroll
+                    lane += w.data[kk] * a_loc[(kg + (uint32_t)p) * 16 + kk];
+                }
+                part[p] += lane;
             }
-            part[kp & (GEMV_PARTIAL - 1)] += lane;
         }
         float s0 = part[0] + part[1];
         float s1 = part[2] + part[3];
