@@ -1638,44 +1638,83 @@ static void gemv_pe_mac(hls::stream<Pack16> &af, hls::stream<Pack16> &wf,
         }
     }
 
-    gemv_pe_o: for (uint32_t i = 0; i < stripe; ++i) {
-    #pragma HLS loop_tripcount min=512 max=2816
-        float part[GEMV_PARTIAL];
-        #pragma HLS array_partition variable=part complete
-        gemv_pe_init: for (int p = 0; p < GEMV_PARTIAL; ++p) {
+    /* FLATTENED MAC: one continuous II=8 pipeline over the whole (stripe x k_packs)
+     * shard, so the read/MAC pipeline never goes cold between output rows. Previously
+     * the row loop (gemv_pe_o) was sequential and ran the inner k-pipeline start→drain
+     * per row, paying the ~73-cycle reduction-tree fill on EVERY row; that per-row fill
+     * (plus ~19-cycle reduce/emit) was the 92-cycle/row overhead that capped port BW at
+     * ~58% (k_packs=128) and ~79% (k_packs=352): eff = k_packs/(k_packs+92). Flattened,
+     * the fill is paid ONCE per call → eff ≈ stripe*k_packs/(stripe*k_packs+92) ~99%.
+     *
+     * Each accumulator part[buf][p] keeps a COMPILE-TIME-FIXED p index → GEMV_PARTIAL
+     * independent fadd chains, each retiring its carried fadd over a full 8-cycle outer
+     * iteration (1 pack/cycle, robust to a multi-cycle fabric fadd at a faster clock).
+     * The runtime `cur` only selects between two register banks (ping-pong), it does NOT
+     * shorten the per-chain recurrence — distinct from the old part[kp & 7] runtime index
+     * that created a distance-1 dependency and inflated II.
+     *
+     * Ping-pong + one-row-deferred emit: a completed row is read for reduce/emit only
+     * after a full next row has elapsed, so its partials are fully retired AND live in
+     * the OTHER buffer (cur ^ 1) than the row currently accumulating → no row-boundary
+     * RAW stall, II stays 8. Bit-exact: part[p] still sums the kp ≡ p (mod 8) lanes in
+     * kp order, and the emit keeps the same ((p0+p1)+(p2+p3))+((p4+p5)+(p6+p7)) tree.
+     * k_packs is a multiple of GEMV_PARTIAL for all shapes (128, 352). */
+    uint32_t groups_per_row = k_packs / GEMV_PARTIAL;
+    uint32_t total_groups   = stripe * groups_per_row;
+
+    float part[2][GEMV_PARTIAL];
+    #pragma HLS array_partition variable=part complete dim=0
+
+    uint32_t g_in_row = 0;       /* group index within the current output row */
+    uint32_t a_base   = 0;       /* = g_in_row * GEMV_PARTIAL (pack base into a_loc) */
+    uint32_t cur      = 0;       /* ping-pong buffer for the row being accumulated */
+    bool     have_prev = false;  /* a completed row awaits emit in buffer (cur ^ 1) */
+
+    gemv_pe_flat: for (uint32_t g = 0; g < total_groups; ++g) {
+    #pragma HLS loop_tripcount min=4096 max=64000
+    #pragma HLS pipeline II=8
+        bool row_start = (g_in_row == 0);
+        bool row_end   = (g_in_row == groups_per_row - 1);
+
+        gemv_pe_p: for (int p = 0; p < GEMV_PARTIAL; ++p) {
         #pragma HLS unroll
-            part[p] = 0.0f;
-        }
-        /* k-loop unrolled by GEMV_PARTIAL so each accumulator part[p] has a
-         * COMPILE-TIME-FIXED index → GEMV_PARTIAL independent fadd chains, each with
-         * a full outer iteration (GEMV_PARTIAL cycles) to retire its carried fadd.
-         * This holds throughput at 1 pack/cycle (8 stream reads per 8-cycle outer
-         * iteration) and stays robust when the fabric fadd spans several cycles at a
-         * faster clock — the prior part[kp & 7] used a runtime index HLS treats as a
-         * distance-1 dependency, inflating II once the clock rises. Bit-exact: part[p]
-         * still accumulates exactly the kp ≡ p (mod GEMV_PARTIAL) lanes in kp order.
-         * k_packs is a multiple of GEMV_PARTIAL for all shapes (128, 352). */
-        gemv_pe_k: for (uint32_t kg = 0; kg < k_packs; kg += GEMV_PARTIAL) {
-        #pragma HLS loop_tripcount min=16 max=44
-        #pragma HLS pipeline II=8
-            gemv_pe_p: for (int p = 0; p < GEMV_PARTIAL; ++p) {
+            Pack16 w = wf.read();
+            float lane = 0.0f;
+            /* Reduce in LUT fabric, not DSP: keeps the full_dsp fp-adders out of the
+             * (DSP-dense) multiply region. */
+            #pragma HLS bind_op variable=lane op=fadd impl=fabric
+            gemv_pe_lane: for (int kk = 0; kk < 16; ++kk) {
             #pragma HLS unroll
-                Pack16 w = wf.read();
-                float lane = 0.0f;
-                /* Reduce in LUT fabric, not DSP: keeps the full_dsp fp-adders out of
-                 * the (DSP-dense) multiply region. */
-                #pragma HLS bind_op variable=lane op=fadd impl=fabric
-                gemv_pe_lane: for (int kk = 0; kk < 16; ++kk) {
-                #pragma HLS unroll
-                    lane += w.data[kk] * a_loc[(kg + (uint32_t)p) * 16 + kk];
-                }
-                part[p] += lane;
+                lane += w.data[kk] * a_loc[(a_base + (uint32_t)p) * 16 + kk];
             }
+            part[cur][p] = (row_start ? 0.0f : part[cur][p]) + lane;
         }
-        float s0 = part[0] + part[1];
-        float s1 = part[2] + part[3];
-        float s2 = part[4] + part[5];
-        float s3 = part[6] + part[7];
+
+        if (row_end) {
+            if (have_prev) {
+                /* buffer (cur ^ 1) holds the row completed one row ago — retired */
+                float s0 = part[cur ^ 1][0] + part[cur ^ 1][1];
+                float s1 = part[cur ^ 1][2] + part[cur ^ 1][3];
+                float s2 = part[cur ^ 1][4] + part[cur ^ 1][5];
+                float s3 = part[cur ^ 1][6] + part[cur ^ 1][7];
+                of.write((s0 + s1) + (s2 + s3));
+            }
+            have_prev = true;
+            cur ^= 1;
+            g_in_row = 0;
+            a_base   = 0;
+        } else {
+            g_in_row += 1;
+            a_base   += GEMV_PARTIAL;
+        }
+    }
+
+    /* drain: emit the final completed row (left in buffer cur ^ 1) */
+    if (have_prev) {
+        float s0 = part[cur ^ 1][0] + part[cur ^ 1][1];
+        float s1 = part[cur ^ 1][2] + part[cur ^ 1][3];
+        float s2 = part[cur ^ 1][4] + part[cur ^ 1][5];
+        float s3 = part[cur ^ 1][6] + part[cur ^ 1][7];
         of.write((s0 + s1) + (s2 + s3));
     }
 }
