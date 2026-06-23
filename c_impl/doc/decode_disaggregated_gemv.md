@@ -383,22 +383,69 @@ now requests (8×512-bit×150 MHz), down from ~76% at 100 MHz: the faster clock 
 faster than the read pipeline (burst gaps + 8-channel crossbar contention + HBM latency) delivers.
 So more clock now buys diminishing gemv returns — the dominant op's ceiling is HBM **efficiency/
 bandwidth**, addressed only by more channels (§6e, exhausted) or less traffic (INT8), not Fmax.
+**[Superseded by §6h: this HBM-bound read was *wrong*. The 61% was the gemv MAC's per-output-row
+pipeline fill, not HBM. Flattening the loop recovered it for a further 1.36×.]**
+
+## 6h. gemv loop-flatten — the "HBM ceiling" was the per-row pipeline fill (on-card, bit-exact)
+
+§6g blamed the gemv's ~61% port utilisation on HBM read efficiency. **That diagnosis was wrong.**
+A per-projection breakdown (one CU launch per projection) showed utilisation tracking `k_packs`,
+not bandwidth:
+
+| projection | k_packs | measured BW/port | port util |
+|---|---:|---:|---:|
+| q/k/v/o, mlp_gate, mlp_up, lm_head | 128 | ~5.6 GB/s | ~59% |
+| **mlp_down** | **352** | **~7.5 GB/s** | **~78%** |
+
+If HBM were the wall, the high-`k_packs` projection could not pull *more* per port. The real
+cause: `gemv_pe_o` (the output-row loop) was **sequential** (csynth `Pipelined: no`), running the
+inner `gemv_pe_k` read/MAC pipeline start→drain **per row**. Each row paid a fixed ~92-cycle tax —
+the ~81-stage fadd-reduction-tree fill (Depth) + ~19-cycle reduce/emit — on top of `k_packs`
+cycles of useful weight reads. So util = `k_packs / (k_packs + 92)`: 128 → 58%, 352 → 79%,
+matching the measured BW to <1%. The weight port idled during the fill; HBM was never the wall.
+
+**Fix (commit `abe46f4`): flatten the loop nest** into one continuous II=8 `gemv_pe_flat` pipeline
+over the whole `stripe × k_packs` shard, so the read/MAC pipeline never goes cold between rows —
+fill paid **once per call**, not per row. (You cannot just `#pragma HLS pipeline` the outer loop:
+that fully unrolls the inner k-loop → resource blowup. The restructure is real.)
+- **Ping-pong partials** `part[2][8]` + a **one-row-deferred emit**: a finished row is reduced/
+  written only after the next row has fully elapsed, so its accumulators are retired *and* live in
+  the other buffer than the row currently accumulating → no row-boundary RAW stall, II stays 8.
+  Runtime `cur` selects between two register banks only; the per-`p` index stays compile-time (the
+  8 independent fadd chains from §6g are unchanged).
+- **Bit-exact**: each `part[p]` still sums the `kp ≡ p (mod 8)` lanes in order, same
+  `((p0+p1)+(p2+p3))+((p4+p5)+(p6+p7))` tree. Per-row tax 92 → ~0 cyc; port util ~59% → ~99%.
+
+| metric | restructured @150 (§6g) | **flatten @150** |
+|---|---:|---:|
+| TPOT ms/tok (on-card, 1×64) | 165.6 | **121.4** |
+| speedup over §6g | — | **1.36× (−27%)** |
+| gemv total | ~109 ms | **~68 ms** |
+| decode bit-exact | ✓ 64/64 | **✓ 64/64** |
+
+csynth: II=8 holds (depth 98→109, **paid once**); +6.6K LUT total. The denser netlist needed
+**FREQ=250** over-synth (vs 200) to close at 150 MHz — routed **WNS +0.025 ns, 0 failing
+endpoints**. The failing path at xo@200 was a high-fanout loop-control reg → fadd clock-enables
+(route-dominated, −0.298 ns); the tighter 4 ns synthesis re-placed/replicated it closed. (The
+xo@200 build ran bit-exact at **129 ms** despite −0.298 — the violation was benign — but a
+negative-WNS bitstream is not committed.)
 
 ## 7. Next
 
-Decode-only is bit-exact and flat at **470 ms/token** *complete* decode steps
-(forward + lm_head + argmax all on-chip), **~3.3× over the single-port Stage 1**.
-The weight-bandwidth lever is exhausted (§6e); the dominant cost is now the **serial
-floor S ≈ 325 ms** (recurrent-attention state I/O on one HBM[0] master + the gated-
-delta-rule update), and the FPGA is ~14× the A100's launch-bound 33.5 ms. Levers:
+Decode-only is bit-exact and flat at **121.4 ms/token** *complete* decode steps
+(forward + lm_head + argmax all on-chip), **~3.9× over the 470 ms baseline** (§6f).
+After the loop-flatten (§6h) the gemv is ~68 ms (~56%); the remainder is the **serial
+floor** — recurrent-attention state I/O on one HBM[0] master + the gated-delta-rule
+update (~27 ms) + conv/tiny — and the FPGA is now ~3.6× the A100's launch-bound 33.5 ms. Levers:
 
 - **Raise the kernel clock** — DONE to 150 MHz (§6g): 1.28× / 165.6 ms, bit-exact, via
-  over-synth (xo@200, link@150) + the gemv-MAC unroll restructure. But it revealed the
-  gemv (72%) only scales ~1.19× because it slides toward **HBM-read-efficiency-bound** at
-  the faster request rate — so more clock now buys diminishing gemv returns. Remaining
-  clock headroom (≥175 MHz) mainly helps the compute/latency-bound ops (recurrent, conv).
-  Fixing the small fp-reduction II loops (rmsnorm/onorm/gvt_k, ≈2.3 ms) is the same unroll
-  trick but near-negligible; rmsnorm/onorm reorder the sum (token-exactness risk).
+  over-synth (xo@200, link@150) + the gemv-MAC unroll restructure.
+- **Flatten the gemv loop** — DONE (§6h, `abe46f4`): a further **1.36× / 121.4 ms**, bit-exact.
+  §6g's "gemv is HBM-bound" was a misread — the 61% was the per-output-row pipeline fill, killed
+  by folding the row loop into one continuous II=8 pipeline. Needed **FREQ=250** over-synth to
+  close the denser netlist (WNS +0.025). Fixing the small fp-reduction II loops (rmsnorm/onorm/
+  gvt_k, ≈2.3 ms) is the same unroll trick but near-negligible; rmsnorm/onorm reorder the sum
+  (token-exactness risk).
 - **Attack S** (bit-exact): spread the 50 MB/tok state across channels, parallelise
   the gated-delta-rule update, overlap state R/W with the weight stream.
 - **INT8 weights** (deferred all-fp32 plan): 4× less W + relieves the crossbar; the
