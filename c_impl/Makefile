@@ -35,6 +35,7 @@ XILINX_HLS_INC ?= /tools/Xilinx/Vitis_HLS/2022.1/include
 # ----------------------------------------------------------------------------
 XILINX_VITIS   ?= /tools/Xilinx/Vitis/2022.1
 XILINX_XRT     ?= /opt/xilinx/xrt
+VPP            ?= $(XILINX_VITIS)/bin/v++
 
 
 # ----------------------------------------------------------------------------
@@ -171,7 +172,7 @@ xo: $(XO)
 
 $(XO): $(KERNEL_SRC)
 	@mkdir -p $(BUILD_DIR)
-	v++ $(VPP_FLAGS) -k $(KERNEL) -c -o $@ $(filter %.cpp,$(KERNEL_SRC)) \
+	$(VPP) $(VPP_FLAGS) -k $(KERNEL) -c -o $@ $(filter %.cpp,$(KERNEL_SRC)) \
 	    2>&1 | tee $(BUILD_DIR)/$(KERNEL)_compile.log
 
 
@@ -182,7 +183,7 @@ xclbin: $(XCLBIN)
 
 $(XCLBIN): $(XO) $(HW_CFG)
 	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && v++ -l $(VPP_FLAGS) $(VPP_LDFLAGS) \
+	cd $(BUILD_DIR) && $(VPP) -l $(VPP_FLAGS) $(VPP_LDFLAGS) \
 	    --temp_dir _x_temp/ \
 	    --report_dir reports/ \
 	    -o $(KERNEL).xclbin \
