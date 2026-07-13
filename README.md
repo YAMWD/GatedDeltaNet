@@ -209,8 +209,8 @@ The HLS path consumes the resulting checkpoint via `scripts/export_gdn_c.py`.
 
 - [`c_impl/doc/architecture.md`](c_impl/doc/architecture.md) — top-level
   HLS overview, file map, AXI bundle topology, optimisation history table.
-- [`c_impl/doc/tiled_matmul.md`](c_impl/doc/tiled_matmul.md) — manual-flat
-  R×C compute, explicit balanced fadd tree, dependence-false on `local_out`.
+- [`c_impl/doc/decode_disaggregated_gemv.md`](c_impl/doc/decode_disaggregated_gemv.md) —
+  decode-only GEMV architecture, multi-reader scaling, and on-card results.
 - [`c_impl/doc/depthwise_conv.md`](c_impl/doc/depthwise_conv.md) — pre-buffered
   weights, 4-row sliding window, two-phase per-row split (load vs compute).
 - [`c_impl/doc/recurrent_attention.md`](c_impl/doc/recurrent_attention.md) —

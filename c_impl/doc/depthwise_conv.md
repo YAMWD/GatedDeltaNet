@@ -1,6 +1,9 @@
 # Depthwise 1D Convolution + SiLU (`gdn_depthwise_conv_silu`)
 
-**Location:** `gdn_model.cpp:1037`
+**Status:** Active decode compute block. Synthesis tables below are from the
+historical prefill top unless stated otherwise.
+
+**Location:** `gdn_model.cpp` (`gdn_depthwise_conv_silu`, static helper)
 
 ## Overview
 
@@ -12,7 +15,10 @@ activation:
 out[r][c] = SiLU( Σ_k in[r - 3 + k][c] * weights[c][k] )    for k in 0..3
 ```
 
-with zero padding for `r - 3 + k < 0`.
+where rows before the current token come from the persistent convolution tail.
+For the first decode token that tail is imported from the GPU prefill state;
+after every call the newest three input rows are written back for the next
+token.
 
 The function is called three times per layer (Q, K, V) — once per parameter
 tensor — and operates on `(num_rows × num_cols)` activation tensors with
@@ -146,7 +152,7 @@ The 4-tap MAC is a balanced expression `(a + b) + (c + d)` — HLS schedules
 this as two parallel adds followed by one final add (depth ≈ 2 fadd stages),
 not as a 4-deep serial accumulator chain.
 
-## Synthesis Results (single-layer, U55C @ 100 MHz)
+## Historical Synthesis Results (single-layer, U55C @ 100 MHz)
 
 Per-call latency, from `solution2/syn/report/csynth.rpt`:
 
@@ -167,7 +173,7 @@ Total per call:
 For the three calls (Q, K, V) per attention layer, total conv cost is ~26.2 M
 cycles — <0.02 % of `gdn_attn_forward`.
 
-## Resource Cost (per instance, U55C)
+## Historical Resource Cost (per instance, U55C)
 
 | Resource | conv_silu_1 (mem_q out) | conv_silu_2 (mem_k / gmem out) |
 |----------|------------------------:|--------------------------------:|

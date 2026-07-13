@@ -1,15 +1,17 @@
 # Disaggregated Decode-Only Accelerator (GEMV datapath)
 
+**Status:** Current integrated eight-port decode architecture and its measured
+optimization history. The routed 32-port GEMV remains a standalone
+microbenchmark; see [`../microbench/gemv_tile/README.md`](../microbench/gemv_tile/README.md).
+
 This documents the pivot to a **decode-only** GatedDeltaNet accelerator: the GPU
 prefills the prompt and exports a constant-size recurrent + conv state to disk;
 the FPGA loads that state and decodes token-by-token through a new **GEMV**
 datapath. The prefill GEMM, the prefill/decode mode flags, and all prefill code
 were removed — the FPGA's only job is decode.
 
-Supersedes the dual-mode Step-1 design in
-[decode_step1_single_token.md](decode_step1_single_token.md) (which kept the
-prefill GEMM and a `decode_flags` mux). Follows the decode roadmap in
-[decode_roadmap.md](decode_roadmap.md).
+This supersedes the intermediate dual-mode design, which kept the prefill GEMM
+and selected decode through a `decode_flags` mux.
 
 ## 1. Why disaggregate
 
@@ -94,11 +96,11 @@ array idle, weights not streamed back-to-back). The next lever (roadmap Step 2)
 replicates the reader across N HBM channels toward HBM's ~460 GB/s aggregate.
 
 All eight large projections (q/k/v/gate/o, mlp gate/up/down) use `gdn_gemv`; the
-two tiny gate projections (a/b, out_dim=8) keep `gdn_matmul_tiled`.
+two tiny gate projections (a/b, out_dim=8) use `gdn_gemv_tiny`.
 
 ## 4. What was removed
 
-- **`gdn_matmul_2d`** (the weight-stationary 16×16 GEMM) and `gdn_matmul2d_top`.
+- **`gdn_matmul_2d`**, `gdn_matmul_tiled`, and their prefill test tops.
 - **`decode_flags` / `GDN_DECODE_RESTORE` / `GDN_DECODE_SAVE`** — there is one
   mode. The conv and recurrent attention always restore state at the start and
   save at the end; `gdn_forward` always forwards exactly one token.
@@ -113,13 +115,13 @@ two tiny gate projections (a/b, out_dim=8) keep `gdn_matmul_tiled`.
 kernel top. `hw.cfg` is unchanged (the flag was an s_axilite scalar, not a memory
 port; all `sp=` port names are identical).
 
-## 5. Files
+## 5. Files at the Initial Decode-Only Pivot
 
 | File | Change |
 |---|---|
 | `scripts/export_gdn_state.py` | **new** — GPU prefill → `.gdnstate` export + self-check |
 | `gdn_model.cpp` | `gdn_gemv` engine; decode-only `gdn_forward` (no GEMM/flags); conv + attention always restore/save; single `gdn_decode_step_host` |
-| `gdn_model.h` | decode-only `gdn_forward` (20 args); flag macros + prefill/matmul decls removed |
+| `gdn_model.h` | decode-only `gdn_forward` (20 args at this stage); flag macros + prefill/matmul decls removed |
 | `gdn_eval.cpp` | `--decode-from-state` loader + decode loop; MC/LL/re-prefill modes removed |
 | `host.cpp` | `upload_decode_state` into the resident BOs; `run_decode_hw` decodes from `.gdnstate`; `--decode-from-state`; 20-arg kernel call |
 | `scripts/decode_correctness_check.sh` | gates on the decode-only-from-state path |
@@ -176,7 +178,7 @@ resident activation. The burst no longer breaks between output rows.
 **1.54 s is the single-port floor**, and the decouple reached it. XRT shows the
 port reads 5.6 GB/token at 5.30 GB/s ⇒ **~1.06 s of weight streaming**; the
 kernel is 1.54 s ⇒ **~0.48 s is non-gemv serial work** (recurrent-attention state
-R/W, the a/b `gdn_matmul_tiled`, conv) during which the weight port idles. So
+R/W, the a/b `gdn_gemv_tiny`, conv) during which the weight port idles. So
 `1.06 (gemv @ 83% of one port) + 0.48 (non-gemv) = 1.54 s`. The ~1.0 s target had
 assumed a full 6.4 GB/s port *and* zero non-gemv — neither reachable on one
 master. The decouple's *purpose* (burst efficiency) was met and exceeded:
@@ -229,7 +231,7 @@ resident `a_loc`, same beat order, same partial-bank adder-tree reduction).
 
 **Why 1.76× and not 2×.** Amdahl on the kernel: `1543 = W + S`, `875 = W/2 + S`
 ⇒ **W ≈ 1336 ms** (parallel weight streaming) and **S ≈ 207 ms** serial floor —
-recurrent-attention state R/W (~50 MB/token), the a/b `gdn_matmul_tiled`, conv,
+recurrent-attention state R/W (~50 MB/token), the a/b `gdn_gemv_tiny`, conv,
 and the per-layer scalar `weight_data` reads (norms / conv / a-b proj). Logits are
 computed **host-side** (`host.cpp:compute_logits` reads `lm_head` from host RAM),
 so `lm_head` is *not* a kernel cost. The readers halved W exactly; S is untouched.
@@ -430,13 +432,19 @@ endpoints**. The failing path at xo@200 was a high-fanout loop-control reg → f
 xo@200 build ran bit-exact at **129 ms** despite −0.298 — the violation was benign — but a
 negative-WNS bitstream is not committed.)
 
-## 7. Next
+## 7. Current Integrated Result and Next Step
 
 Decode-only is bit-exact and flat at **121.4 ms/token** *complete* decode steps
 (forward + lm_head + argmax all on-chip), **~3.9× over the 470 ms baseline** (§6f).
 After the loop-flatten (§6h) the gemv is ~68 ms (~56%); the remainder is the **serial
 floor** — recurrent-attention state I/O on one HBM[0] master + the gated-delta-rule
 update (~27 ms) + conv/tiny — and the FPGA is now ~3.6× the A100's launch-bound 33.5 ms. Levers:
+
+The standalone 32-port mono-kernel has since routed and sustained 263.063 GB/s
+at an achieved 130.6 MHz. That result proves the weight path, not full-model
+integration: `gdn_forward` still uses the eight-reader engine described above.
+Integration must preserve the clustered physical hierarchy without crowding
+the recurrent, convolution, activation, and state datapaths.
 
 - **Raise the kernel clock** — DONE to 150 MHz (§6g): 1.28× / 165.6 ms, bit-exact, via
   over-synth (xo@200, link@150) + the gemv-MAC unroll restructure.

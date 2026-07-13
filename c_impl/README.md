@@ -46,7 +46,8 @@ max sequence length 2048, vocab 32 000.
 | File | Content |
 |------|---------|
 | [`doc/architecture.md`](doc/architecture.md) | Top-level overview, file map, AXI bundle topology, optimisation history |
-| [`doc/tiled_matmul.md`](doc/tiled_matmul.md) | `gdn_matmul`: tile strategy, manual flatten + explicit fadd tree, latency breakdown |
+| [`doc/decode_disaggregated_gemv.md`](doc/decode_disaggregated_gemv.md) | Decode-only GEMV engine, multi-reader scaling, and on-card results |
+| [`doc/decode_premise.md`](doc/decode_premise.md) | GPU measurements motivating the decode-only accelerator |
 | [`doc/depthwise_conv.md`](doc/depthwise_conv.md) | `gdn_depthwise_conv_silu`: pre-buffered weights, sliding window, two-phase split |
 | [`doc/recurrent_attention.md`](doc/recurrent_attention.md) | `gdn_recurrent_attention`: persistent BRAM state, fused two-pass, P_K=16, delta_drain split, tree-reduce, q/k bundle split |
 | [`doc/output_norm.md`](doc/output_norm.md) | `gdn_output_norm_and_gate`: on-chip buffers, tree-reduced sum-of-squares |
@@ -188,8 +189,8 @@ so it runs without sourcing `setup.sh`. (You still need `source
 Bit-equivalent to the Python golden modulo FP32 noise. The first
 multi-minute hardware kernel run was ~33.7 min wall, ≈ 1.56× the
 129.7 G-cycle synth estimate at 100 MHz — consistent with the known
-`ReadB` II = 16 in the synthesis report (see
-[`doc/systolic_matmul.md`](doc/systolic_matmul.md), known limitations).
+`ReadB` II = 16 in the historical synthesis report (see
+[`doc/optimization_log.md`](doc/optimization_log.md)).
 
 ### Cleaning hardware build artefacts
 

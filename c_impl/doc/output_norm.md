@@ -1,6 +1,8 @@
 # Output Norm + Gate (`gdn_output_norm_and_gate`)
 
-**Location:** `gdn_model.cpp:1349`
+**Status:** Active decode compute block. Synthesis tables below are historical.
+
+**Location:** `gdn_model.cpp` (`gdn_output_norm_and_gate`, static helper)
 
 ## Overview
 
@@ -112,7 +114,7 @@ A naive `for j unroll: sum += arr[j]` does not help here — HLS unrolls but
 emits a 256-deep linear adder chain instead of a balanced tree. v5 made that
 mistake; v6 introduced the explicit tree helper.
 
-## Synthesis Results (U55C @ 100 MHz)
+## Historical Synthesis Results (U55C @ 100 MHz)
 
 From `solution2/syn/report/csynth.rpt` for the v7 design.
 
@@ -135,7 +137,7 @@ For a full 2048-token sequence × 8 heads = 16,384 calls:
 
 That's **40× faster** than v0 and **19 % faster** than v4.
 
-## Resource Cost (U55C)
+## Historical Resource Cost (U55C)
 
 | Resource | Value |
 |----------|------:|

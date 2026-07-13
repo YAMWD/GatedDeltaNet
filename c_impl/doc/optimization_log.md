@@ -1,32 +1,29 @@
-# GDN HLS Optimisation Log (single-layer attention)
+# GDN HLS Optimisation Log
 
-This document records the iterative optimisation passes applied to
-`gdn_attn_forward` (single-layer GDN attention, top function in `gdn_model.cpp`).
-Each pass is verified by C-level parity against the Python golden reference and
-by Vitis HLS 2022.1 csynth on the canonical target `xcu55c-fsvh2892-2L-e`
-(Alveo U55C) at a 10 ns target clock, run via `test_single_GDN_attn.tcl`.
-Section dates are taken from this file's git history where available.
+This document is a chronological record. The v1-v7 and prefill sections retain
+their original context, but they do not describe the current kernel. The active
+`gdn_forward` is decode-only and uses sharded GEMV; see
+[architecture.md](architecture.md). Section dates are taken from this file's
+git history where available.
 
-## Current post-v7 architecture update
+## Current decode architecture
 
-*Logged: 2026-05-11; later metrics updated through 2026-06-02.*
+*Updated: 2026-07-13.*
 
-The v1-v7 log below describes the pre-systolic design, whose final state used
-the optimized tiled GEMM. The current architecture has since replaced the large
-projection tiled GEMMs with a systolic/dataflow matmul kernel. The tiled kernel
-remains as a fallback for A/B projections (`out_dim=8`).
+The current FPGA path forwards one token at a time from GPU-exported recurrent
+and convolution state. Eight compact weight shards feed eight independent
+512-bit HBM readers in `gdn_gemv`. All large layer projections and `lm_head`
+use GEMV; A/B use `gdn_gemv_tiny`. No tiled, systolic, or weight-stationary
+matmul is called by `gdn_forward`.
 
-Current docs:
+Documentation map:
 
-- [architecture.md](architecture.md) -- current top-level architecture and
-  synthesis snapshot.
-- [systolic_matmul.md](systolic_matmul.md) -- systolic-array matmul (1-D PE
-  chain); still used by `gdn_attn_forward` / `gdn_matmul_top`.
-- [weight_stationary_matmul.md](weight_stationary_matmul.md) -- **current**
-  matmul in `gdn_forward`: activation-stationary blocking + bursting, designed
-  from on-card profiling. **25.9 min -> 6.5 min on hardware (4.0x).**
-- [tiled_matmul.md](tiled_matmul.md) -- legacy/fallback tiled GEMM and the
-  pre-systolic baseline.
+- [README.md](README.md) -- current versus historical document index.
+- [architecture.md](architecture.md) -- authoritative decode architecture.
+- [decode_disaggregated_gemv.md](decode_disaggregated_gemv.md) -- integrated
+  GEMV evolution and measured decode results.
+- The remaining sections in this file retain the retired tiled, systolic, and
+  weight-stationary prefill results as historical measurements.
 
 ## Decode GEMV routing weakness: high-fanout dataflow
 
@@ -138,16 +135,15 @@ grid kept at 16×16) because the target shifted to **decode**, where grid width
 is the wrong lever (decode is weight-bandwidth-bound, and the 16×16 grid is
 already ~19x over-provisioned for the available weight bandwidth).
 
-See **[decode_roadmap.md](decode_roadmap.md)** for the decode analysis, why the
-grid stays 16×16, and the decode plan (GEMV datapath + multi-channel weight
-readers + INT8). Of all the above, only Stage 2's 512-bit weight read transfers
-to decode; the rest is prefill-specific.
+The subsequent decode pivot replaced the grid with a GEMV datapath and
+multi-channel weight readers. Of all the above, only Stage 2's 512-bit weight
+read transfers to decode; the rest is prefill-specific.
 
-Current single-attention synthesis snapshot:
+Historical post-v7 single-attention synthesis snapshot:
 
 *Snapshot date: 2026-05-11.*
 
-| Metric | v7 tiled matmul | Current systolic matmul |
+| Metric | v7 tiled matmul | Systolic matmul experiment |
 |--------|----------------:|------------------------:|
 | Top-level latency | 141.03 G cycles | 3.976 G cycles |
 | Speedup | 1.0x | 35.5x vs v7 |
@@ -157,11 +153,11 @@ Current single-attention synthesis snapshot:
 | FF | 209.8 k (8 %) | 848.9 k (32 %) |
 | LUT | 237.0 k (18 %) | 932.0 k (71 %) |
 
-Current full-model synthesis snapshot:
+Historical pre-decode full-model synthesis snapshot:
 
 *Snapshot date: 2026-05-11.*
 
-| Metric | Current `gdn_forward` |
+| Metric | Prefill-era `gdn_forward` |
 |--------|----------------------:|
 | Top-level latency | 129.686 G cycles |
 | Timing slack | -0.04 ns |
@@ -351,10 +347,8 @@ the 100 MHz target — the design closes timing with zero margin.
 
 *Logged: 2026-05-07; item 1 updated on 2026-05-11.*
 
-1. **Streaming/dataflow GEMM** — completed for large projections by the current
-   systolic matmul design. See [systolic_matmul.md](systolic_matmul.md). The
-   remaining matmul follow-up is improving the integrated `ReadB` schedule,
-   which currently reports II=16 in the single-attention systolic report.
+1. **Streaming/dataflow GEMM** -- historically completed by the systolic
+   experiment, then superseded by the decode-only GEMV pivot.
 2. **`gdn_attn_forward` macro-stage dataflow** — wrap the body
    (matmul → conv → recurrent → onorm → matmul) in a `dataflow` region with
    `hls::stream` between stages. Eliminates the three `attn_conv_copy_*` AXI
