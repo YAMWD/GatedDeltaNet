@@ -5,8 +5,11 @@ This document records the iterative optimisation passes applied to
 Each pass is verified by C-level parity against the Python golden reference and
 by Vitis HLS 2022.1 csynth on the canonical target `xcu55c-fsvh2892-2L-e`
 (Alveo U55C) at a 10 ns target clock, run via `test_single_GDN_attn.tcl`.
+Section dates are taken from this file's git history where available.
 
 ## Current post-v7 architecture update
+
+*Logged: 2026-05-11; later metrics updated through 2026-06-02.*
 
 The v1-v7 log below describes the pre-systolic design, whose final state used
 the optimized tiled GEMM. The current architecture has since replaced the large
@@ -25,7 +28,53 @@ Current docs:
 - [tiled_matmul.md](tiled_matmul.md) -- legacy/fallback tiled GEMM and the
   pre-systolic baseline.
 
+## Decode GEMV routing weakness: high-fanout dataflow
+
+*Logged: 2026-07-04.*
+
+The current decode GEMV experiments expose a routing weakness that C-synthesis
+throughput estimates do not capture. A load/compute/store dataflow GEMV can look
+clean architecturally, but it creates high-fanout activation distribution and
+wide inter-process wiring: the loaded activation vector must reach many parallel
+HBM reader/MAC lanes or tiles, while the store/collector side adds cross-region
+control and stream paths.
+
+This is a pain point for the current GDN design. A monolithic load -> compute
+-> store GEMV dataflow region tends to concentrate broadcast, stream, and AXI
+control routing around the GEMV tile array, so it can be hard to route even at
+small tile counts such as `N=16`. Future GEMV designs should treat routing as a
+primary constraint, preferring physically local tiles, SLR-local activation
+broadcast or local activation copies, direct per-bank weight reads, and minimal
+global collectors over one large fanout network.
+
+## Routed 32-port mono-kernel GEMV milestone
+
+*Logged: 2026-07-13.*
+
+The isolated `c_impl/microbench/gemv_tile/gemv_full` design resolves the earlier
+unroutable topology. It retains all 32 independent 512-bit HBM weight ports but
+groups compute into eight four-port clusters, distributes those clusters 2/3/3
+across SLR0/1/2, leaves AXI adapters at their natural HMSS placement, and merges
+outputs through SLR-local collectors. Vivado completed routing with zero routing
+errors and zero unrouted nets.
+
+The 150 MHz implementation missed setup timing by 0.985 ns and was encoded at
+130.6 MHz. On U55C it sustained **263.063 GB/s** and **131.531 GFLOP/s** on the
+large saturation shape, or **98.353%** of the 267.469 GB/s clock-rate ceiling.
+Synthetic parity and real layer-0 `q_proj` parity both passed with zero maximum
+absolute error. The small real projection reached 139.964 GB/s host-visible
+throughput because launch/completion overhead is significant for a 16.8 MB GEMV.
+
+The remaining timing problem is physical, not arithmetic: SLR1 uses 90.47% of
+CLBs and 96.88% of BRAM, the SLR0-SLR1 boundary uses 95.03% of available SLLs,
+and the worst setup path is 97.4% routing delay. Driver replication is therefore
+unlikely to be safe. A future 150 MHz attempt should split each four-port cluster
+into smaller independently controlled clusters while preserving the 32-port
+read rate.
+
 ## Weight-traffic optimization (on-card, hardware-measured)
+
+*Logged: 2026-06-01; next-bottleneck note updated on 2026-06-02.*
 
 The csynth latency above is a fixed-latency estimate that hides HBM bandwidth
 stalls. The real U55C run was **memory bound on weight traffic**: the systolic
@@ -55,6 +104,8 @@ writes).
 
 ## Activation-memory phases A & B (on-card, hardware-measured)
 
+*Logged: 2026-06-02.*
+
 | Metric | Stage 2 | Phase A | Phase B |
 |--------|--------:|--------:|--------:|
 | Application runtime | 5.2 min | 4.4 min | **4.2 min** |
@@ -77,6 +128,8 @@ Net A+B: kernel 207 → 141 s; end-to-end (with Stages 1/2) 25.9 min → 4.2 min
 
 ## Phase C (PE-grid widening) — attempted, reverted
 
+*Logged: 2026-06-02.*
+
 Phase C widened the 16×16 grid (256 MAC/cycle) to cut the prefill compute floor.
 Both configs built were design-valid (csynth II=1, parity PASS) but failed on
 infrastructure: **32×32** → BRAM 4054 > 4032 RAMB18; **32×16** → `route_design`
@@ -92,6 +145,8 @@ to decode; the rest is prefill-specific.
 
 Current single-attention synthesis snapshot:
 
+*Snapshot date: 2026-05-11.*
+
 | Metric | v7 tiled matmul | Current systolic matmul |
 |--------|----------------:|------------------------:|
 | Top-level latency | 141.03 G cycles | 3.976 G cycles |
@@ -103,6 +158,8 @@ Current single-attention synthesis snapshot:
 | LUT | 237.0 k (18 %) | 932.0 k (71 %) |
 
 Current full-model synthesis snapshot:
+
+*Snapshot date: 2026-05-11.*
 
 | Metric | Current `gdn_forward` |
 |--------|----------------------:|
@@ -117,6 +174,8 @@ The full-model report is a reused hardware datapath over a 24-iteration layer
 loop. It does not instantiate 24 physical copies of the layer.
 
 ## Headline numbers
+
+*Logged: 2026-05-07.*
 
 | Metric                          | Baseline (v0) | Final (v7) | Δ |
 |---------------------------------|---------------|------------|---|
@@ -152,6 +211,8 @@ What v1–v7 *did* achieve (U55C v7 vs v0 baseline):
   state mapping on U55C than it did on the prior VU11P iteration runs.
 
 ## Iteration map (per pass)
+
+*Logged: 2026-05-07.*
 
 Each iteration was verified for parity (`gdn_attn_test`) before re-running
 `vitis_hls -f test_single_GDN_attn.tcl`. Numbers below are after the change
@@ -262,6 +323,8 @@ of that iteration only.
 
 ## Per-loop II status, before vs after
 
+*Logged: 2026-05-07.*
+
 | Loop                     | v0 II | v7 II | Notes |
 |--------------------------|------:|------:|-------|
 | `mm_comp_k`/`mm_comp_rc` | 2     | **1** | Manual flatten + explicit tree + dep false |
@@ -285,6 +348,8 @@ warnings (HLS 200-960, harmless). Top-level timing slack is **0.00 ns** at
 the 100 MHz target — the design closes timing with zero margin.
 
 ## Critical follow-ups after v7
+
+*Logged: 2026-05-07; item 1 updated on 2026-05-11.*
 
 1. **Streaming/dataflow GEMM** — completed for large projections by the current
    systolic matmul design. See [systolic_matmul.md](systolic_matmul.md). The
