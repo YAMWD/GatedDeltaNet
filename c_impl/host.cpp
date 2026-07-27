@@ -415,52 +415,49 @@ class HwRunner {
 public:
     HwRunner(xrt::device &device, const xrt::uuid &uuid, const ModelData &model)
         : kernel_(open_gdn_kernel(device, uuid)),
-          max_tokens_(model.config.max_seq_len),
+          max_tokens_(1),
           hidden_(model.config.hidden_size),
-          config_bo_(device, sizeof(GDNWeightHeader), kernel_.group_id(0)),
-          weight_bo_(device, model.weight_data.size() * sizeof(float), kernel_.group_id(1)),
-          x_bo_(device, hidden_bytes(model), kernel_.group_id(3)),
-          x_norm_bo_(device, hidden_bytes(model), kernel_.group_id(4)),
-          q_bo_(device, hidden_bytes(model), kernel_.group_id(5)),
-          k_bo_(device, hidden_bytes(model), kernel_.group_id(6)),
-          v_bo_(device, hidden_bytes(model), kernel_.group_id(7)),
-          a_bo_(device, head_bytes(model), kernel_.group_id(8)),
-          b_bo_(device, head_bytes(model), kernel_.group_id(9)),
-          gate_bo_(device, hidden_bytes(model), kernel_.group_id(10)),
-          attn_bo_(device, hidden_bytes(model), kernel_.group_id(11)),
-          tmp_hidden_bo_(device, hidden_bytes(model), kernel_.group_id(12)),
-          mlp_gate_bo_(device, mlp_bytes(model), kernel_.group_id(13)),
-          mlp_up_bo_(device, mlp_bytes(model), kernel_.group_id(14)),
-          recurrent_state_bo_(device, recurrent_state_bytes(model), kernel_.group_id(15)),
-          head_buffer_bo_(device, head_buffer_bytes(model), kernel_.group_id(16)),
-          tokens_bo_(device, static_cast<size_t>(max_tokens_) * sizeof(int32_t), kernel_.group_id(17)),
-          // Stage 2: two compact gemv weight shards (kernel args 19, 20), each on
-          // its own 512-bit master / HBM channel group, read in parallel. Total
-          // size = one copy of the projection weights (no replication).
-          weight_bo_mm0_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(19)),
-          weight_bo_mm1_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(20)),
-          weight_bo_mm2_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(21)),
-          weight_bo_mm3_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(22)),
-          weight_bo_mm4_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(23)),
-          weight_bo_mm5_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(24)),
-          weight_bo_mm6_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(25)),
-          weight_bo_mm7_(device, gdn_weight_shard_floats(&model.config) * sizeof(float), kernel_.group_id(26)),
-          logits_bo_(device, static_cast<size_t>(model.config.vocab_size) * sizeof(float), kernel_.group_id(27)),
-          x_norm_host_(static_cast<size_t>(max_tokens_) * hidden_, 0.0f) {
-        std::cerr << "[progress] upload config and weights to device\n";
-        config_bo_.write(&model.config, sizeof(GDNWeightHeader), 0);
-        sync_bo_chunked(config_bo_, XCL_BO_SYNC_BO_TO_DEVICE, sizeof(GDNWeightHeader), 0);
-        const size_t weight_bytes = model.weight_data.size() * sizeof(float);
-        weight_bo_.write(model.weight_data.data(), weight_bytes, 0);
-        sync_bo_chunked(weight_bo_, XCL_BO_SYNC_BO_TO_DEVICE, weight_bytes, 0);
-        // Build the GEMV_CHANNELS compact gemv weight shards (split projection
-        // output rows) and upload each to its own master / HBM banks for parallel
-        // reads. Total = one copy of the projection weights (no replication).
+          vocab_(model.config.vocab_size),
+          embeddings_(model.weight_data.data()),
+          x_norm_host_(hidden_, 0.0f) {
+        const size_t shard_floats = gdn_weight_shard_floats(&model.config);
+        const size_t shard_bytes = shard_floats * sizeof(float);
+        const size_t aux_floats = gdn_aux_weight_floats(&model.config);
+        const size_t aux_bytes = aux_floats * sizeof(float);
+        // step 4 Stage B arg order: 0=aux_weights, 1=workspace, 2..33=weight_mm0..31.
+        weight_bos_.reserve(GEMV_CHANNELS);
+        for (int c = 0; c < GEMV_CHANNELS; ++c) {
+            size_t extra_bytes = c == 0 ? aux_bytes : 0;
+            weight_bos_.emplace_back(device, shard_bytes + extra_bytes,
+                                     kernel_.group_id(2 + c));
+        }
+        aux_weight_bo_ = xrt::bo(weight_bos_[0], aux_bytes, shard_bytes);
+
+        // step 4 Stage B: ONE HBM0 workspace BO holds all 15 activation/state
+        // buffers at the GDN_WS_OFF_* byte offsets (kernel derives its pointers to
+        // match). config is hardcoded in the kernel, so no config BO. The layout
+        // static_asserts against the model dims in gdn_model.cpp; assert here too
+        // that the loaded model matches the compiled-in shape.
+        // The GDN_WSF_* workspace sizes (gdn_model.h) encode the compiled-in shape;
+        // recurrent_state/head_buffer sizes fold in layers/heads/conv, so matching
+        // these catches any wrong model dimension.
+        if (model.config.hidden_size != GDN_WSF_HID ||
+            model.config.intermediate_size != GDN_WSF_MLP ||
+            model.config.vocab_size != GDN_WSF_LOGITS ||
+            recurrent_state_bytes(model) != static_cast<size_t>(GDN_WSF_STATE) * sizeof(float) ||
+            head_buffer_bytes(model) != static_cast<size_t>(GDN_WSF_HEADBUF) * sizeof(float)) {
+            throw std::runtime_error("loaded model shape != compiled-in GDN-1.3B kernel shape");
+        }
+        workspace_bo_ = xrt::bo(device,
+            static_cast<size_t>(GDN_WS_FLOATS) * sizeof(float), kernel_.group_id(1));
+
+        std::cerr << "[progress] upload weights to device\n";
+        // Each shard BO occupies one HBM bank. The compact auxiliary weights use
+        // a sub-buffer in the unused tail of shard 0. Embeddings stay on the host;
+        // only the selected 8 KiB row is uploaded into x for each decode call.
         {
             std::cerr << "[progress] building + uploading " << GEMV_CHANNELS
-                      << " gemv weight shards\n";
-            size_t shard_floats = gdn_weight_shard_floats(&model.config);
-            size_t shard_bytes = shard_floats * sizeof(float);
+                      << " gemv weight shards and compact auxiliary weights\n";
             std::vector<float> sbuf[GEMV_CHANNELS];
             float *shards[GEMV_CHANNELS];
             for (int c = 0; c < GEMV_CHANNELS; ++c) {
@@ -468,14 +465,15 @@ public:
                 shards[c] = sbuf[c].data();
             }
             gdn_build_weight_shards(model.weight_data.data(), &model.config, shards);
-            xrt::bo *mm[GEMV_CHANNELS] = { &weight_bo_mm0_, &weight_bo_mm1_,
-                                           &weight_bo_mm2_, &weight_bo_mm3_,
-                                           &weight_bo_mm4_, &weight_bo_mm5_,
-                                           &weight_bo_mm6_, &weight_bo_mm7_ };
             for (int c = 0; c < GEMV_CHANNELS; ++c) {
-                mm[c]->write(shards[c], shard_bytes, 0);
-                sync_bo_chunked(*mm[c], XCL_BO_SYNC_BO_TO_DEVICE, shard_bytes, 0);
+                weight_bos_[c].write(shards[c], shard_bytes, 0);
+                sync_bo_chunked(weight_bos_[c], XCL_BO_SYNC_BO_TO_DEVICE,
+                                shard_bytes, 0);
             }
+            std::vector<float> aux(aux_floats);
+            gdn_build_aux_weights(model.weight_data.data(), &model.config, aux.data());
+            aux_weight_bo_.write(aux.data(), aux_bytes, 0);
+            sync_bo_chunked(aux_weight_bo_, XCL_BO_SYNC_BO_TO_DEVICE, aux_bytes, 0);
         }
     }
 
@@ -496,46 +494,29 @@ public:
             throw std::runtime_error("invalid token sequence length for hardware run");
         }
 
-        size_t token_bytes = tokens.size() * sizeof(int32_t);
-        tokens_bo_.write(tokens.data(), token_bytes, 0);
-        sync_bo_chunked(tokens_bo_, XCL_BO_SYNC_BO_TO_DEVICE, token_bytes, 0);
+        int32_t token = tokens[0];
+        if (token < 0 || static_cast<uint32_t>(token) >= vocab_) {
+            throw std::runtime_error("token id out of range for hardware run");
+        }
+        size_t x_bytes = tokens.size() * static_cast<size_t>(hidden_) * sizeof(float);
+        const float *embedding = embeddings_ + static_cast<size_t>(token) * hidden_;
+        const size_t x_off = GDN_WS_OFF_X * sizeof(float);
+        workspace_bo_.write(embedding, x_bytes, x_off);
+        sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_TO_DEVICE, x_bytes, x_off);
 
-        // Kernel-call construction sets ~18 AXI-Lite arg registers and writes
+        // Kernel-call construction sets the AXI-Lite argument registers and writes
         // ap_start (host-side PCIe overhead, ~100-200 µs, scales with arg
         // count). Start the clock AFTER that so kernel_ms reflects only FPGA
         // execution. The kernel has actually been running for a few µs by the
         // time `start` is sampled, but that skew is <1 part in 10^6 of a
         // multi-minute run and is dwarfed by host-clock resolution anyway.
-        auto run = kernel_(
-            config_bo_,
-            weight_bo_,
-            max_tokens_,
-            x_bo_,
-            x_norm_bo_,
-            q_bo_,
-            k_bo_,
-            v_bo_,
-            a_bo_,
-            b_bo_,
-            gate_bo_,
-            attn_bo_,
-            tmp_hidden_bo_,
-            mlp_gate_bo_,
-            mlp_up_bo_,
-            recurrent_state_bo_,
-            head_buffer_bo_,
-            tokens_bo_,
-            static_cast<uint32_t>(tokens.size()),
-            weight_bo_mm0_,
-            weight_bo_mm1_,
-            weight_bo_mm2_,
-            weight_bo_mm3_,
-            weight_bo_mm4_,
-            weight_bo_mm5_,
-            weight_bo_mm6_,
-            weight_bo_mm7_,
-            logits_bo_
-        );
+        xrt::run run(kernel_);
+        run.set_arg(0, aux_weight_bo_);
+        run.set_arg(1, workspace_bo_);
+        for (int c = 0; c < GEMV_CHANNELS; ++c) {
+            run.set_arg(2 + c, weight_bos_[c]);
+        }
+        run.start();
         auto start = std::chrono::high_resolution_clock::now();
         run.wait();
         auto end = std::chrono::high_resolution_clock::now();
@@ -545,8 +526,9 @@ public:
         kernel_runs_ += 1;
 
         size_t x_norm_bytes = tokens.size() * static_cast<size_t>(hidden_) * sizeof(float);
-        sync_bo_chunked(x_norm_bo_, XCL_BO_SYNC_BO_FROM_DEVICE, x_norm_bytes, 0);
-        x_norm_bo_.read(x_norm_host_.data(), x_norm_bytes, 0);
+        const size_t xn_off = GDN_WS_OFF_X_NORM * sizeof(float);
+        sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_FROM_DEVICE, x_norm_bytes, xn_off);
+        workspace_bo_.read(x_norm_host_.data(), x_norm_bytes, xn_off);
 
         return seconds;
     }
@@ -559,10 +541,12 @@ public:
                              const std::vector<float> &conv) {
         size_t rbytes = recurrent.size() * sizeof(float);
         size_t cbytes = conv.size() * sizeof(float);
-        recurrent_state_bo_.write(recurrent.data(), rbytes, 0);
-        sync_bo_chunked(recurrent_state_bo_, XCL_BO_SYNC_BO_TO_DEVICE, rbytes, 0);
-        head_buffer_bo_.write(conv.data(), cbytes, 0);
-        sync_bo_chunked(head_buffer_bo_, XCL_BO_SYNC_BO_TO_DEVICE, cbytes, 0);
+        const size_t rec_off = GDN_WS_OFF_REC_STATE * sizeof(float);
+        const size_t hb_off  = GDN_WS_OFF_HEAD_BUF * sizeof(float);
+        workspace_bo_.write(recurrent.data(), rbytes, rec_off);
+        sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_TO_DEVICE, rbytes, rec_off);
+        workspace_bo_.write(conv.data(), cbytes, hb_off);
+        sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_TO_DEVICE, cbytes, hb_off);
     }
 
     const float *hidden_row(uint32_t row) const {
@@ -577,21 +561,15 @@ public:
 
 private:
     static size_t hidden_bytes(const ModelData &model) {
-        return static_cast<size_t>(model.config.max_seq_len) *
-               model.config.hidden_size *
-               sizeof(float);
+        return static_cast<size_t>(model.config.hidden_size) * sizeof(float);
     }
 
     static size_t head_bytes(const ModelData &model) {
-        return static_cast<size_t>(model.config.max_seq_len) *
-               model.config.num_heads *
-               sizeof(float);
+        return static_cast<size_t>(model.config.num_heads) * sizeof(float);
     }
 
     static size_t mlp_bytes(const ModelData &model) {
-        return static_cast<size_t>(model.config.max_seq_len) *
-               model.config.intermediate_size *
-               sizeof(float);
+        return static_cast<size_t>(model.config.intermediate_size) * sizeof(float);
     }
 
     // Decode persistence (mirrors gdn_run_state_init): recurrent_state holds
@@ -617,32 +595,15 @@ private:
     xrt::kernel kernel_;
     uint32_t max_tokens_ = 0;
     uint32_t hidden_ = 0;
-    xrt::bo config_bo_;
-    xrt::bo weight_bo_;
-    xrt::bo x_bo_;
-    xrt::bo x_norm_bo_;
-    xrt::bo q_bo_;
-    xrt::bo k_bo_;
-    xrt::bo v_bo_;
-    xrt::bo a_bo_;
-    xrt::bo b_bo_;
-    xrt::bo gate_bo_;
-    xrt::bo attn_bo_;
-    xrt::bo tmp_hidden_bo_;
-    xrt::bo mlp_gate_bo_;
-    xrt::bo mlp_up_bo_;
-    xrt::bo recurrent_state_bo_;
-    xrt::bo head_buffer_bo_;
-    xrt::bo tokens_bo_;
-    xrt::bo weight_bo_mm0_;
-    xrt::bo weight_bo_mm1_;
-    xrt::bo weight_bo_mm2_;
-    xrt::bo weight_bo_mm3_;
-    xrt::bo weight_bo_mm4_;
-    xrt::bo weight_bo_mm5_;
-    xrt::bo weight_bo_mm6_;
-    xrt::bo weight_bo_mm7_;
-    xrt::bo logits_bo_;
+    uint32_t vocab_ = 0;
+    const float *embeddings_ = nullptr;
+    // step 4 Stage B: the 15 activation/state buffers are packed into one HBM[0]
+    // workspace BO at the GDN_WS_OFF_* byte offsets; the host writes/reads/syncs
+    // ranges of it and passes it as the single kernel `workspace` arg. config is
+    // hardcoded (no BO); aux_weights stays a sub-buffer of weight shard 0.
+    xrt::bo aux_weight_bo_;
+    xrt::bo workspace_bo_;
+    std::vector<xrt::bo> weight_bos_;
     std::vector<float> x_norm_host_;
     double total_kernel_seconds_ = 0.0;
     uint64_t kernel_runs_ = 0;

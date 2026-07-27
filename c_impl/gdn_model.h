@@ -10,7 +10,9 @@
  * equal the count of weight_data_mm* kernel args, the host shard BOs, and the
  * hw.cfg weight_data_mm* channel groups. Defined here so the kernel, the host
  * shard builder, and the run-state all agree on one value. */
-#define GEMV_CHANNELS 8
+#define GEMV_CHANNELS 32
+#define GEMV_CLUSTERS 16
+#define GEMV_CHANNELS_PER_CLUSTER 2
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,6 +34,36 @@ typedef struct {
     int32_t eos_token_id;
     float norm_eps;
 } GDNWeightHeader;
+
+/* step 4 Stage B: the 15 activation/state buffers packed into one HBM[0]
+ * `workspace` pointer, replacing 15 separate kernel args (and their control_s_axi
+ * base-address registers). Offsets are in FLOATS and each is 16-float (512-bit)
+ * aligned so max_widen_bitwidth=512 still applies (heads=8 padded to 16). Both
+ * the kernel (gdn_model.cpp) and both hosts (gdn_run_state_init csim +
+ * host.cpp on-card) derive from this ONE layout, so it cannot drift; gdn_model.cpp
+ * static_asserts the sizes against the GDN_* dim macros. */
+#define GDN_WSF_HID     2048u        /* hidden buffers: x x_norm q k v gate attn tmp */
+#define GDN_WSF_HEAD    16u          /* a,b: 8 heads padded to a 512-bit line */
+#define GDN_WSF_MLP     5632u        /* mlp_gate, mlp_up */
+#define GDN_WSF_STATE   12582912u    /* recurrent_state: 24*8*256*256 */
+#define GDN_WSF_HEADBUF 442368u      /* head_buffer: 24*3*3*2048 */
+#define GDN_WSF_LOGITS  32000u       /* logits */
+#define GDN_WS_OFF_X          ((size_t)0)
+#define GDN_WS_OFF_X_NORM     (GDN_WS_OFF_X         + GDN_WSF_HID)
+#define GDN_WS_OFF_Q          (GDN_WS_OFF_X_NORM    + GDN_WSF_HID)
+#define GDN_WS_OFF_K          (GDN_WS_OFF_Q         + GDN_WSF_HID)
+#define GDN_WS_OFF_V          (GDN_WS_OFF_K         + GDN_WSF_HID)
+#define GDN_WS_OFF_A          (GDN_WS_OFF_V         + GDN_WSF_HID)
+#define GDN_WS_OFF_B          (GDN_WS_OFF_A         + GDN_WSF_HEAD)
+#define GDN_WS_OFF_GATE       (GDN_WS_OFF_B         + GDN_WSF_HEAD)
+#define GDN_WS_OFF_ATTN       (GDN_WS_OFF_GATE      + GDN_WSF_HID)
+#define GDN_WS_OFF_TMP_HIDDEN (GDN_WS_OFF_ATTN      + GDN_WSF_HID)
+#define GDN_WS_OFF_MLP_GATE   (GDN_WS_OFF_TMP_HIDDEN + GDN_WSF_HID)
+#define GDN_WS_OFF_MLP_UP     (GDN_WS_OFF_MLP_GATE  + GDN_WSF_MLP)
+#define GDN_WS_OFF_REC_STATE  (GDN_WS_OFF_MLP_UP    + GDN_WSF_MLP)
+#define GDN_WS_OFF_HEAD_BUF   (GDN_WS_OFF_REC_STATE + GDN_WSF_STATE)
+#define GDN_WS_OFF_LOGITS     (GDN_WS_OFF_HEAD_BUF  + GDN_WSF_HEADBUF)
+#define GDN_WS_FLOATS         (GDN_WS_OFF_LOGITS    + GDN_WSF_LOGITS)
 
 typedef struct {
     const float *attn_norm;
@@ -65,6 +97,8 @@ typedef struct {
 
 typedef struct {
     uint32_t max_tokens;
+    float *workspace;   /* step 4 Stage B: one HBM[0] alloc (GDN_WS_FLOATS); the
+                         * 15 pointers below are views into it at GDN_WS_OFF_*. */
     float *x;
     float *x_norm;
     float *q;
@@ -80,6 +114,7 @@ typedef struct {
     float *recurrent_state;
     float *head_buffer;
     float *weight_shards[GEMV_CHANNELS];  /* compact gemv weight shards (built from weight_data) */
+    float *aux_weights;                   /* compact per-layer non-GEMV weights */
     float *logits;                        /* [vocab] lm_head gemv scratch (decode argmax → x_norm[0]) */
 } GDNRunState;
 
@@ -89,6 +124,9 @@ typedef struct {
 size_t gdn_weight_shard_floats(const GDNWeightHeader *config);
 void gdn_build_weight_shards(const float *weight_data, const GDNWeightHeader *config,
                              float *const shards[]);
+size_t gdn_aux_weight_floats(const GDNWeightHeader *config);
+void gdn_build_aux_weights(const float *weight_data, const GDNWeightHeader *config,
+                           float *aux_weights);
 
 int gdn_model_load(GDNModel *model, const char *path);
 void gdn_model_free(GDNModel *model);
@@ -102,34 +140,40 @@ void gdn_run_state_free(GDNRunState *state);
  * export). The state is restored at each layer's start and saved at its end —
  * there is no prefill / no GEMM / no mode flag. */
 int gdn_forward(
-    const GDNWeightHeader *config,
-    const float *weight_data,
-    uint32_t max_tokens,
-    float *x,
-    float *x_norm,
-    float *q,
-    float *k,
-    float *v,
-    float *a,
-    float *b,
-    float *gate,
-    float *attn,
-    float *tmp_hidden,
-    float *mlp_gate,
-    float *mlp_up,
-    float *recurrent_state,
-    float *head_buffer,
-    const int32_t *tokens,
-    uint32_t num_tokens,
-    const float *weight_data_mm,   /* gemv weight shard 0 (dedicated 512-bit master) */
-    const float *weight_data_mm2,  /* shard 1 (Stage 2: parallel readers) */
-    const float *weight_data_mm3,  /* shard 2 (Stage 2b: N=4) */
-    const float *weight_data_mm4,  /* shard 3 */
-    const float *weight_data_mm5,  /* shard 4 (Stage 2c: N=8) */
-    const float *weight_data_mm6,  /* shard 5 */
-    const float *weight_data_mm7,  /* shard 6 */
-    const float *weight_data_mm8,  /* shard 7 */
-    float *logits                  /* [vocab] lm_head gemv scratch; argmax → x_norm[0] */
+    const float *aux_weights,
+    float *workspace,   /* step 4 Stage B: 15 activation/state buffers at GDN_WS_OFF_* */
+    const float *weight_data_mm0,
+    const float *weight_data_mm1,
+    const float *weight_data_mm2,
+    const float *weight_data_mm3,
+    const float *weight_data_mm4,
+    const float *weight_data_mm5,
+    const float *weight_data_mm6,
+    const float *weight_data_mm7,
+    const float *weight_data_mm8,
+    const float *weight_data_mm9,
+    const float *weight_data_mm10,
+    const float *weight_data_mm11,
+    const float *weight_data_mm12,
+    const float *weight_data_mm13,
+    const float *weight_data_mm14,
+    const float *weight_data_mm15,
+    const float *weight_data_mm16,
+    const float *weight_data_mm17,
+    const float *weight_data_mm18,
+    const float *weight_data_mm19,
+    const float *weight_data_mm20,
+    const float *weight_data_mm21,
+    const float *weight_data_mm22,
+    const float *weight_data_mm23,
+    const float *weight_data_mm24,
+    const float *weight_data_mm25,
+    const float *weight_data_mm26,
+    const float *weight_data_mm27,
+    const float *weight_data_mm28,
+    const float *weight_data_mm29,
+    const float *weight_data_mm30,
+    const float *weight_data_mm31
 );
 
 /* Single-token decode step (the only host entry): gdn_forward with num_tokens=1
