@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Core Principle: Real-Data-Based Conclusions
+
+**Every conclusion must be grounded in actual data observed from a runtime — a real build, synthesis, place-and-route, or on-card run — not inferred from previous logs, prior builds, or plausible reasoning.** When the available logs do not contain the specific fact needed, do not extrapolate from a similar earlier run: instrument and re-run to observe the real behavior directly. Concretely:
+
+- **Reproduce and instrument** rather than infer. If a failure's root cause is not explicit in the log, re-run the exact failing step with added verbosity/introspection (e.g. a copied Vivado `link_design` wrapper with `-verbose` + `report_ip_status`) and read what actually happened. Triangulating from other builds is a hypothesis, not a conclusion.
+- **Use the tool's own reports for design decisions.** Diagnose place-and-route/resource problems from `report_design_analysis -congestion`, `report_qor_suggestions`, and `report_utilization` on the actual (failed) checkpoint — not from an estimate or a past run. Let the measured numbers (per-SLR BRAM/URAM/LUT, congestion level, SLL crossing) pick the fix.
+- **Change one variable, then measure.** Attribute an outcome only after a controlled run isolates that variable (e.g. a clean-cache relink to rule out stale state; a tool-version swap to confirm a tool bug).
+- **State the evidence boundary.** Distinguish what a run *proves* from what it merely *suggests*, and say plainly when a fact is not obtainable from the current artifacts (so the answer is "not tool-exposed; needs an instrumented run," not a guess).
+
+This is load-bearing: the 32-port `link_design` crash was pinned only by an instrumented rerun (a Vivado 2022.1 use-after-free, fixed in 2022.2), and the routing fix (recurrent state BRAM→URAM) came straight from `report_qor_suggestions`/`report_design_analysis` output — both would have been mis-diagnosed by inference from prior logs.
+
 ## Project Overview
 
 **Hardware accelerator (Vitis HLS) for GatedDeltaNet inference**, based on the paper *Gated Delta Networks: Improving Mamba2 with Delta Rule* (ICLR '25, NVIDIA). The primary development target is `c_impl/`, which contains the HLS-synthesizable **C++** implementation of the GatedDeltaNet forward pass and the on-card hardware flow for the **Xilinx Alveo U55C**. The Python code (`lit_gpt/`, `pretrain.py`, `scripts/`) and the original Triton/FLA kernels serve as **golden references** for correctness verification.
@@ -13,18 +24,7 @@ For the **current decode-only accelerator**, start with `c_impl/doc/architecture
 
 ## Model Configuration (GatedDeltaNet-1.3B)
 
-| Parameter       | Value |
-|-----------------|-------|
-| Hidden dim      | 2048  |
-| Heads           | 8     |
-| Head dim (Q/K)  | 256   |
-| Value dim       | 256   |
-| Intermediate    | 5632  |
-| Layers          | 24    |
-| Conv size       | 4     |
-| Max seq len     | 2048  |
-| Vocab size      | 32000 |
-
+Dimensions live in `c_impl/gdn_model.h` (the `GDN_*` constants) and `lit_gpt/config.py`.
 Recurrent state per layer: 8 heads × 256 × 256 FP32 = 2 MB. Full weight blob ≈ 5.6 GB.
 
 ## Build & Run Commands
@@ -88,26 +88,13 @@ python scripts/fla_lm_eval.py               # lm-eval-harness evaluation
 ## Architecture
 
 ### HLS Accelerator (`c_impl/`) — primary target
-- **`gdn_model.cpp` / `gdn_model.h`** — all HLS-synthesizable compute and one **decode-only** kernel top:
-  - `gdn_forward` — 24-layer, **one token per call** (token id in → next token id out); restores the recurrent+conv state at entry, saves it at exit. Takes the `weight_data` scalar-weight master plus `GEMV_CHANNELS` (=8) `weight_data_mm*` masters that stream the sharded projection weights in parallel.
-  - `gdn_gemv` — the decode compute engine: **activation-stationary** GEMV — the activation vector is resident on-chip and weights stream from HBM once and are never cached (an HLS `dataflow` of one reader→MAC PE per HBM channel, with the projection weights compact-sharded across the 8 channels). It replaces the prefill weight-stationary systolic GEMM (`gdn_matmul_2d`), which was removed. `gdn_argmax` does the on-chip greedy argmax over the `lm_head` logits.
-  - Submodules: `gdn_embed_tokens`, `gdn_rmsnorm_rows`, `gdn_gemv` (all large projections incl. `lm_head`) / `gdn_gemv_tiny` (the two tiny a/b gate projections), `gdn_depthwise_conv_silu`, `gdn_recurrent_attention` (gated delta rule with HBM-backed BRAM working state), `gdn_output_norm_and_gate`, SwiGLU.
-  - Pragmas: `#pragma HLS array_partition`, `pipeline II=1`, `unroll`, `dataflow` (the gemv reader/MAC split); every loop carries a `loop_tripcount` pragma. `memcpy`/`memset` in synthesized paths are replaced with explicit labeled loops for accurate latency estimation.
-- **`gdn_eval.cpp`** — the decode-only host testbench (loads weights + `.gdnstate`, runs the decode loop, writes/checks JSON). `gdn_attn_test.cpp` / `gdn_matmul_test.cpp` remain on disk but are retired (their tops were removed).
-- **`host.cpp`** — XRT host program for on-card execution: builds the `GEMV_CHANNELS` compact weight shards from the flat blob, allocates one `xrt::bo` per kernel arg (weight shards on disjoint HBM banks — overlapping ranges `std::bad_alloc`), uploads the 5.6 GB of weights in 16 MiB chunks (`sync_bo_chunked` works around the XRT 2022.1 ~16 MiB sync cap), loads the `.gdnstate` into the resident state BOs, then decodes token-by-token from the seed, emitting the same JSON schema as `gdn_eval`.
-- **`hw.cfg`, `pblock_pe_split.tcl`** — v++ link config (HBM bank map for the 8 GEMV readers) and the now-disabled prefill SLR floorplan (see the `FREQ=100` note above).
-- **Formats**: `.gdnw` (flat F32 weights), `.gdnstate` (GPU-exported recurrent+conv decode state, ~50 MB — the prefill→decode handoff), `.gdnreq` (pretokenized eval fixtures), `.gdnblk` (single-layer attention fixture — retired with the prefill harness).
-- **`doc/`** — current architecture and submodule docs, `optimization_log.md` for historical results, and **`decode_disaggregated_gemv.md`** for the integrated GEMV scaling ladder and on-card results.
+Per-file internals (kernel top, `gdn_gemv`, submodules, pragma conventions, `host.cpp`, formats)
+live in `c_impl/CLAUDE.md`, which loads automatically when working under `c_impl/`.
 
 ### Golden Reference: Python Model (`lit_gpt/`)
-- **`model.py`** — `GPT`, `Block`, `MBlock`, `CausalSelfAttention`, `LLaMAMLP`.
-- **`gated_delta_net.py`** — GatedDeltaNet layer: chunk-based linear attention with gated delta rule.
-- **`config.py`** — model configs (0.4B, 1.3B, H1 variants).
-- **`gated_delta_rule_ops/`** — Triton and FLA kernels; the `fla_version/` kernels are preferred for golden runs. The HLS C++ mirrors these function-for-function (mapping table in `README.md` / `c_impl/README.md`).
-- **`rmsnorm.py`, `fused_rotary_embedding.py`, `fused_cross_entropy.py`** — fused-op golden references.
-
-### Training Infrastructure (produces golden weights)
-- **`pretrain.py`** — PyTorch Lightning Fabric + FSDP, BF16 mixed precision. **`packed_dataset.py`** — tokenized data loading (SlimPajama). Not exercised by the synthesis flow.
+Prefer the `gated_delta_rule_ops/fla_version/` kernels for golden runs — the HLS C++ mirrors them
+function-for-function (mapping table in `README.md` / `c_impl/README.md`). `pretrain.py` and
+`packed_dataset.py` are training-only and not exercised by the synthesis flow.
 
 ## Key Design Patterns & Current Focus
 
@@ -124,4 +111,4 @@ python scripts/fla_lm_eval.py               # lm-eval-harness evaluation
 
 **Native C++ build**: any C++14 compiler + `libm`, plus the Vitis HLS include dir for `hls_stream.h`. No BLAS.
 
-**Python (golden reference)**: container-based (see `Dockerfile`). Key deps: PyTorch 2.3.1+CUDA 12.1, Lightning 2.1.2, Triton 2.3.0, flash-attn, mamba-ssm, causal-conv1d, flash-linear-attention (FLA), lm-eval 0.4.1.
+**Python (golden reference)**: container-based — see `Dockerfile` for the pinned versions.
