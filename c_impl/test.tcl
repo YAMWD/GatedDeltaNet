@@ -9,9 +9,8 @@ add_files -tb fixtures_parity
 add_files -tb fixtures_smoke
 open_solution "solution1" -flow_target vitis
 set_part {xcu55c-fsvh2892-2L-e}
-create_clock -period 10 -name default
-config_interface -m_axi_alignment_byte_size 64 -m_axi_latency 64 -m_axi_max_widen_bitwidth 512
-config_rtl -register_reset_num 3
+create_clock -period 6.667 -name default
+source ./hls_gdn_forward.tcl
 #source "./GDN/solution1/directives.tcl"
 # Decode-only csim requires a GPU-exported .gdnstate (gitignored/regenerable).
 # Uncomment and ensure fixtures_decode/decode_ex0.gdnstate exists locally before running csim.
