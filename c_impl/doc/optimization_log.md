@@ -1056,6 +1056,368 @@ The full source-to-XCLBIN command took 39,582 seconds (10 h 59 m 42 s), includin
 - detailed implementation log:
   `build.hw.gdn32x2p4auxsharec8s1eastdmaf64v2.f130.o8.v2022_2/_x_temp/link/vivado/vpl/prj/prj.runs/impl_1/runme.log`.
 
+### iter27 — selective hardware-counter profiling
+
+*Launched 2026-07-27 12:31 +03; requested kernel frequency: 130 MHz.
+Diagnostic build:
+`build.hw.profile.iter27.selective6.f130.o8.v2022_2/`.*
+
+The production iter26 XCLBIN was first measured on card without implementation
+instrumentation. A 64-token decode-from-state run was exact for all 64 tokens;
+the 63 timed kernel calls averaged **1610.693 ms**, with a 1610.660–1610.997 ms
+range. The result is stored under
+`diagnostics/iter27_profile/baseline130/`. This is effectively identical to the
+prior iter24b 109 MHz latency despite iter26 reporting requested and achieved
+`DATA_CLK=130 MHz`, which is strong evidence that long dynamic stalls, rather
+than clock-scaled arithmetic latency, dominate the integrated kernel.
+
+The first profiling link reuses the exact iter26 HLS object
+(`33e3a6cf504833b7058659f510b08c2bd49ddcd280012b395be3975ac70dd7c5`)
+and the same connectivity, floorplan, fanout, place, physical-optimization and
+route inputs. It changes only link-time instrumentation:
+
+- AXI performance counters on `M_AXI_MEM_WEIGHTS_MM0`, `MM1`, `MM8`, `MM16`,
+  `MM24`, and `MM31`;
+- `:counters` mode only, which also supplies CU execution accounting;
+- no `-g`, no device trace request, and no all-interface profiling.
+
+The selected ports cover shared HBM0 and spatially distributed GEMV shards
+without paying the area/routing cost of 32 monitors. Build PID, wrapper log,
+exit marker and manifest are under
+`diagnostics/iter27_profile/selective6_f130/`. The detailed implementation log
+is
+`build.hw.profile.iter27.selective6.f130.o8.v2022_2/_x_temp/link/vivado/vpl/prj/prj.runs/impl_1/runme.log`.
+Before accepting hardware measurements, the diagnostic image must still route,
+meet 130 MHz, contain no trace S2MM, and remain close to the uninstrumented
+1610.693 ms control latency.
+
+The generated debug layout contains exactly one `ACCEL_MONITOR` and six
+`AXI_MM_MONITOR` entries and no trace IP. A detached completion monitor (PID
+stored in `on_card_monitor.pid`) will automatically run eight decode tokens on
+device 0 after a successful link and preserve correctness and kernel-latency
+results under `diagnostics/iter27_profile/selective6_f130/on_card/`. It records
+a skip marker instead if implementation fails. The final single-call profile
+summary and XRT run summary are retained separately under `on_card_single/`.
+
+**Result:** iter27 completed successfully at 22:05 +03 after approximately
+9 h 34 m. Routing finished with zero unrouted nets and zero final node
+overlaps; final setup WNS/TNS was **+0.003 ns / 0.000 ns**, hold WHS/THS was
+**+0.009 ns / 0.000 ns**, and the XCLBIN retained an achieved 130 MHz
+`DATA_CLK`. The 78,366,732-byte artifact has SHA-256
+`b455113913b56b063423f30af55bf083f0b9017e30177150f48e366135143787`.
+
+The eight-token automatic run was exact and averaged **1610.670 ms** across
+seven timed calls, only 0.023 ms below the uninstrumented 1610.693 ms control.
+The counter instrumentation therefore caused no measurable runtime
+perturbation. A follow-up one-call capture, saved under
+`diagnostics/iter27_profile/selective6_f130/on_card_single/`, avoids aggregate
+counter overflow and provides the decisive bottleneck evidence:
+
+| Port / direction | Transfers per token | Average transfer | Transfer rate | Average latency |
+|---|---:|---:|---:|---:|
+| HBM1 read | 42,704 | 4.096 KB | 8,272.71 MB/s | 232.342 ns |
+| HBM8 read | 42,704 | 4.096 KB | 8,282.51 MB/s | 266.541 ns |
+| HBM16 read | 42,704 | 4.096 KB | 8,282.80 MB/s | 261.972 ns |
+| HBM24 read | 42,704 | 4.096 KB | 8,280.74 MB/s | 259.228 ns |
+| HBM31 read | 42,704 | 4.096 KB | 8,278.17 MB/s | 266.015 ns |
+| **shared HBM0 write** | **13,211,489** | **0.004 KB** | **40.6776 MB/s** | **552.754 ns** |
+
+Each monitored normal weight port reads 174,915,584 bytes per token and
+sustains approximately **8.28 GB/s** while active, essentially matching the
+263.063 GB/s / 32 = 8.22 GB/s per-port standalone GEMV result. Thus the
+integrated GEMV weight path is healthy and consumes only about **21.1 ms** of
+active transfer time per token. The bottleneck is the shared HBM0 path,
+especially its **13.21 million scalar four-byte writes per token**. It writes
+57.3998 MB at only 40.68 MB/s and accounts for roughly 1.41 seconds of
+transfer-active time. The next architecture change should burst/vectorize the
+recurrent state save path (and its matching restore path), not modify the GEMV
+MM2S/cluster engine.
+
+### iter28 — explicit Pack16 recurrent-state transfers
+
+*Started 2026-07-27; requested kernel frequency: 130 MHz.*
+
+Iter27 proved that the integrated GEMV datapath is healthy while the recurrent
+state path issues millions of scalar AXI requests. Iter28 changes only the HBM
+restore/save loops in `gdn_recurrent_attention`: both now cast the recurrent
+state view to `Pack16 *`, issue one explicitly indexed 512-bit word per loop
+iteration, and unpack/pack its 16 FP32 lanes into/from the existing eight-bank
+dual-port URAM working state. The arithmetic, FP32 state representation,
+workspace layout, 32-port GEMV, MM2S/FIFO decoupling, and physical implementation
+recipe are unchanged.
+
+Expected transaction-count change per token:
+
+| Direction | iter27 scalar requests | iter28 Pack16 requests | Reduction |
+|---|---:|---:|---:|
+| State restore | 12,582,912 × 4 B | 786,432 × 64 B | 16× |
+| State save | 12,582,912 × 4 B | 786,432 × 64 B | 16× |
+
+Acceptance gates are: native decode exact match; HLS reports one wide external
+request per packed iteration rather than 16 scalar requests; successful route
+and timing using the retained iter24b/iter26 130 MHz configuration; exact
+on-card decode; and a material reduction from the iter27 **1610.693 ms/token**
+uninstrumented baseline. Final synthesis, implementation, and on-card results
+will be appended here when available.
+
+An isolated csynth probe of the exact Pack16/eight-bank-URAM transfer pattern
+completed in 24 seconds and confirmed the intended AXI structure before the
+full-kernel synthesis finished:
+
+- inferred restore and save bursts are both **512 bits/beat**;
+- the scheduled external restore operation is one `read i512`, and both
+  `m_axi` `RDATA` and `WDATA` are 512 bits;
+- one layer uses 32,768 packed beats in each direction;
+- restore achieves **II=2** because each Pack16 needs two writes into each of
+  the eight 1R1W URAM banks; save achieves **II=1**;
+- estimated one-layer latency is 65,539 restore + 32,771 save = 98,310 cycles,
+  versus approximately 524,359 + 524,359 cycles for the scalar implementation.
+
+Thus csynth predicts a **10.7× state-copy cycle reduction** while definitively
+eliminating four-byte external state transactions. The full integrated csynth
+remains the gate for shared-mm0 scheduling, and hardware counters remain the
+final confirmation of realized transfers and latency.
+
+**Implementation result:** iter28 compiled and routed completely, but VPL
+rejected the image on the fixed 250 MHz `dma_ip_axi_aclk_1` platform clock.
+Setup WNS/TNS was **-0.205 ns / -2.749 ns** across 34 endpoints. The critical
+path was wholly inside the HMSS response FIFO at
+`path_12/slice0_12/inst/r15.r_multi`: `fifoaddr_reg[5]` drove 521 loads and the
+path spent 3.843 ns of 4.048 ns (**94.9%**) in routing, including 3.580 ns on
+that one high-fanout net. The prior iter23 constraint still ran, but it targets
+the older `state[1]` reset net; generated implementation Tcl also confirmed
+that explicit post-route physical optimization was disabled. Consequently no
+XCLBIN was emitted and the automatic on-card test was correctly skipped.
+
+The Pack16 kernel itself became smaller (423,115 LUTs and 541,519 registers),
+but placement shifted: SLR0 reached 99.06% CLB utilization while SLR1 and SLR2
+were 75.99% and 58.38%. Iter28 therefore remains a routing-complete kernel
+architecture with one narrowly identified fixed-platform timing failure, not
+a recurrence of the earlier unrouted-net congestion wall.
+
+### iter29 — localize the DMA address net and run post-route phys-opt
+
+*Started 2026-07-28 11:55 +03; requested kernel frequency: 130 MHz.*
+
+Iter29 reuses the exact verified iter28 XO (SHA-256
+`8421d5dea9ddfe0920f66013d6be44acab9bad6e8d4ee4a41a2a5d3fa9fe0823`);
+there is no HLS source or topology change. A strict pre-place hook retains the
+successful iter23 reset-net treatment and additionally selects only the
+measured `path_12/slice0_12/r15` `fifoaddr_reg[5]` net, verifies its expected
+400–600-load range, and applies clock-region-aware `FORCE_MAX_FANOUT=64`.
+The implementation recipe also enables
+`POST_ROUTE_PHYS_OPT_DESIGN=AggressiveExplore`, while preserving the 32 HBM
+mapping, iter22 cluster-8 floorplan, placement directive, and 130 MHz kernel
+clock.
+
+This deliberately stacks two independent timing levers in one costly build:
+pre-placement replication shortens the critical branches by construction, and
+post-route physical optimization can repair the remaining measured wire delay
+after routing. Acceptance requires zero unrouted nets, non-negative WNS on all
+system clocks (especially `dma_ip_axi_aclk_1`), exact eight-token on-card
+decode, and a material speedup over the iter27 1610.693 ms/token baseline.
+
+**Result:** iter29 exited 1 at 23:45 +03 after 11 h 50 m. Routing was fully
+legal with zero final node overlaps and zero unrouted nets. The new constraint
+matched the intended 521-load `r15/fifoaddr_reg[5]` net and caused 260
+replicas, so that path disappeared from the leading failures. It also
+perturbed an already saturated placement: SLR0 remained **99.06%** occupied by
+CLBs, SLR0↔SLR1 traffic rose to 16,922 SLLs (73.45%), and the kernel route
+finished at WNS/TNS **-1.384 ns / -8666.314 ns**.
+
+Explicit post-route `AggressiveExplore` ran for 2 h 23 m. It optimized 109
+critical nets and recovered 0.383 ns, finishing at overall WNS/TNS
+**-1.002 ns / -8246.182 ns**. The scalable kernel group accounted for
+-1.002 ns / -8234.270 ns across 19,102 endpoints. The fatal unscalable
+`dma_ip_axi_aclk_1` group finished at **-0.223 ns / -11.913 ns** across 127
+endpoints, so VPL emitted no XCLBIN and the automatic on-card test skipped.
+
+The worst DMA path moved to the `w15` write-response FIFO's
+`asyncclear_state1_inst` → `mesg_reg_reg[250]` cone. Its 582-load `state[1]`
+net consumed 3.816 ns, and routing was 3.888 ns of the 4.063 ns data path
+(95.7%). This is evidence against chasing another individual fanout net:
+iter29 moved the bottleneck and worsened global placement. The next experiment
+must remove the iter29 constraint and create real whitespace in SLR0.
+
+### iter30 — move boundary cluster 9 to SLR1, Pack16 at 100 MHz
+
+*Started 2026-07-29 00:29 +03; requested kernel frequency: 100 MHz.*
+
+Iter30 again reuses the bit-identical iter28 Pack16 XO. It removes only
+iter29's `fifoaddr_reg[5]` replication, retains the successful iter23
+read-response reset-net constraint, and extends the minimal iter22 floorplan by
+one topology boundary:
+
+- assign `gemv32_cluster2_9_U0` and `xr_9_U` to SLR1;
+- steer private FIFOs `ws_18_U` and `ws_19_U` into the same underused east-side
+  SLR1 region used successfully for `ws_16_U` and `ws_17_U`;
+- leave collectors, adapters, auxiliary logic, and all other clusters movable.
+
+This is intended to lower SLR0 occupancy from 99.06% by roughly one two-port
+cluster while preserving contiguous cluster topology. The estimated additional
+~1,042 boundary nets leave aggregate SLR0↔SLR1 SLL usage near 78%; east-side
+endpoint steering limits the known per-column risk. At 100 MHz, the iter29
+kernel path would gain 2.308 ns of period and cease competing with the fixed
+250 MHz DMA group during post-route optimization. The build retains
+`AltSpreadLogic_high`, pre-route and post-route `AggressiveExplore`, and
+`route_design=Explore`.
+
+Acceptance requires a legal route, WNS ≥ 0 on `dma_ip_axi_aclk_1`, an XCLBIN
+at 100 MHz, exact eight-token on-card decode, 512-bit recurrent-state traffic,
+and a material improvement over both the 1610.693 ms iter27 integrated control
+and the 121.4 ms eight-port reference. Final results will be appended here.
+
+**Result:** iter30 exited 1 at 05:44 +03 on 2026-07-29 after approximately
+5 h 14 m. Synthesis, placement, and pre-route physical optimization completed
+without errors. The full pre-route timing engine reported setup
+**WNS/TNS +0.003 ns / 0 ns**, proving that 100 MHz removed the scalable kernel
+timing pressure. Placement nevertheless warned that the design was highly
+congested, and its estimated maxima regressed relative to iter28/iter29:
+north global congestion grew from 64x64 to 128x128, west global from 16x16 to
+64x64, and east/west long congestion from 8x8/16x16 to 16x16/16x16.
+
+The cluster-9 move improved the upper SLR1-SLR2 boundary but overloaded the
+already critical lower boundary:
+
+| SLL boundary metric | iter29 | iter30 |
+|---|---:|---:|
+| SLR1-SLR2 total demand | 9,276 / 23,040 (40.26%) | 7,532 / 23,040 (32.69%) |
+| SLR1-SLR2 peak column | 130% | 104% |
+| SLR0-SLR1 total demand | 13,168 / 23,040 (57.15%) | 14,377 / 23,040 (62.40%) |
+| SLR0-SLR1 peak column | 153% | **169%** |
+
+Five SLR0-SLR1 columns were over 100% estimated demand (119%, 169%, 102%,
+103%, and 124%). Initial routing assigned every net a provisional path, but
+those paths overlapped on **2,113,790 routing nodes**. The final congestion
+level was 7, with a 128x128 southbound hotspot spanning much of the lower
+device. Route verification reported partially conflicted control nets across
+many GEMV clusters, so this is a distributed congestion failure rather than
+one repairable fanout cone. No XCLBIN was emitted and the automatic on-card
+run correctly skipped.
+
+**Verdict:** reject the cluster-9-to-SLR1 extension. It shifts useful density
+out of SLR0 but adds more traffic to the boundary that already limits the
+Pack16 design. The next run must restore the route-complete iter22/iter28
+topology rather than move another cluster across SLR0-SLR1.
+
+### iter31 — restore the route-complete iter22 topology at 100 MHz
+
+*Started 2026-07-29 05:45 +03 after iter30 failed; requested kernel
+frequency: 100 MHz. Detached build PID: 1863675; automatic on-card runner PID:
+1863703.*
+
+Iter31 is a configuration-only recovery that reuses the exact iter28 Pack16
+XO (SHA-256
+`8421d5dea9ddfe0920f66013d6be44acab9bad6e8d4ee4a41a2a5d3fa9fe0823`).
+It removes the failed iter30 cluster-9/xr9/ws18/ws19 constraints and restores
+the minimal iter22 cluster-8/xr8/ws16/ws17 floorplan that already routed the
+same Pack16 netlist completely in iter28. It retains the iter23 localization
+of the measured HMSS read-response `state[1]` reset net, targets 100 MHz, and
+enables both pre-route and post-route `AggressiveExplore`. It deliberately
+does **not** restore iter29's 260-replica `fifoaddr_reg[5]` constraint.
+
+The rationale is evidence-based: iter28 proved this topology routable but
+missed only the fixed 250 MHz DMA clock by 0.205 ns, while explicit post-route
+physical optimization was disabled. Iter31 restores that legal topology,
+removes scalable-kernel timing competition by targeting 100 MHz, and gives the
+remaining fixed-DMA wire-delay path a post-route repair pass without
+pre-perturbing its saturated placement.
+
+Acceptance remains: zero unrouted or conflicted nets, non-negative WNS on
+`dma_ip_axi_aclk_1`, a generated XCLBIN, exact eight-token on-card parity, and
+measured latency materially below the iter27 scalar-state result of
+1610.693 ms/token. Configuration:
+`hw_iter31_pack16_iter22_postphys_f100.cfg`; launcher:
+`build_iter31_pack16_iter22_f100.sh`; diagnostics:
+`diagnostics/iter31_pack16state_iter22_postphys_f100/`.
+
+**Implementation result:** iter31 completed successfully at 12:47 +03 on
+2026-07-29 after 7 h 01 m. The route converged from 522,076 initial node
+overlaps through
+101,738/18,170/3,301/732/219/77/39/22/14/5/1 to zero. Final route status was
+zero failed, unrouted, or partially routed nets and zero node overlaps;
+verification completed successfully. Effective routed congestion peaked at
+level 4, down from the initial global/timing estimates of level 6/7. The
+restored floorplan also corrected the SLL regression seen in iter30:
+
+| Initial SLL metric | iter30 | iter31 |
+|---|---:|---:|
+| SLR0-SLR1 total demand | 14,377 / 23,040 (62.40%) | 13,438 / 23,040 (58.32%) |
+| SLR0-SLR1 peak column | 169% | 103% |
+| SLR1-SLR2 total demand | 7,532 / 23,040 (32.69%) | 7,103 / 23,040 (30.83%) |
+| SLR1-SLR2 peak column | 104% | 70% |
+
+Routing improved setup WNS from -0.353 ns through
+-0.256/-0.231/-0.138/-0.084 ns to -0.010 ns during delay cleanup. The
+authoritative post-route timing report finished at setup WNS/TNS
+**+0.003 ns / 0 ns** and hold WHS/THS **+0.004 ns / 0 ns**, so every system
+clock, including the fixed 250 MHz DMA clock, met timing. Explicit post-route
+`AggressiveExplore` ran but correctly made no netlist changes because WNS was
+already non-negative. Auto-scaling estimated 100.9 MHz for the kernel and
+selected the requested 100.0 MHz. The emitted 80,374,880-byte XCLBIN is:
+
+`build.hw.iter31.pack16state.iter22.postphys.f100.o8.v2022_2/gdn_forward.xclbin`
+
+with SHA-256
+`28ab9b9d51962bb024eefe395e3027f9f815d0596518d68285abfaa209ceb627`.
+The reused XO SHA-256 is
+`8421d5dea9ddfe0920f66013d6be44acab9bad6e8d4ee4a41a2a5d3fa9fe0823`;
+the final config SHA-256 is
+`3fd8fa3ae0c088d12557d635b0821ca81653828bedcee61783a6881ca95c0316`.
+The committed `build_iter31_pack16_iter22_f100.sh` launcher does not depend on
+this ignored build artifact: it recompiles the exact XO from `gdn_model.cpp`
+at the original 130 MHz HLS target, verifies the XO hash above, and then links
+the proven 100 MHz configuration. From a clean worktree, the source-to-XCLBIN
+reproduction command is:
+
+```bash
+bash c_impl/build_iter31_pack16_iter22_f100.sh
+```
+
+**On-card correctness and performance:** the automatic decode-from-state run
+matched the golden trajectory exactly for all 8/8 tokens with 100% top-1
+agreement. Across the seven real kernel invocations, latency was
+212.900--212.968 ms/token, mean **212.919 ms/token**. This is a
+**7.565x speedup** over iter27's 1610.693 ms scalar-state result, but is still
+1.754x slower than the 121.4 ms eight-port reference. A separate one-call XRT
+profile measured 212.948 ms, confirming the multi-token result. Its summary
+reported zero AXI and accelerator monitors in this XCLBIN; therefore it cannot
+provide a new per-port bandwidth measurement. A selective debug rebuild would
+be required for current Pack16 port counters and could perturb routability.
+
+The exact integrated csynth reports explain the remaining floor at 100 MHz:
+
+| Scheduled component | Cycles/token | Time at 100 MHz | Share of measured time |
+|---|---:|---:|---:|
+| Recurrent attention, including state restore/save | 5,855,112 | 58.551 ms | 27.50% |
+| of which external state restore/save only | 2,362,752 | 23.628 ms | 11.10% |
+| All non-GEMV scheduled work, including recurrence | 11,386,885 | 113.869 ms | 53.48% |
+| Eight GEMVs/layer plus LM head | 2,798,841 | 27.988 ms | 13.15% |
+| Reconstructed static schedule | 14,185,726 | 141.857 ms | 66.63% |
+| Measured-minus-scheduled dynamic stalls | 7,106,171 | 71.062 ms | 33.37% |
+
+Pack16 moves 50,331,648 bytes in each direction per token but reduces the
+request count from 12,582,912 scalar requests to 786,432 64-byte beats in each
+direction. This accounts for the 7.565x end-to-end improvement and proves that
+packing was necessary. It does not make state persistent on chip: every layer
+still restores and saves its 2 MiB slice, and HBM0 still carries state,
+activations, auxiliary tensors, outputs, and weight shard 0 through one master.
+The remaining 71.062 ms cannot be assigned to a specific port without a
+profiled image, but it is real external-memory/dataflow stall time above the
+scheduled 141.857 ms.
+
+**Verdict:** iter31 is the successful Pack16 implementation and the new
+routability baseline. Do not reapply the iter29 DMA-address replication or the
+iter30 cluster-9 move. Keeping all FP32 recurrent state on chip across decode
+steps is not feasible in this implementation: one 2 MiB layer state maps to 96
+URAMs, so 24 resident layers would require 2,304 URAMs versus 960 on the U55C,
+before accounting for any other storage. The next practical performance lever
+is therefore to separate packed recurrent state from the overloaded
+`workspace` AXI master, give it its own burst-tuned `m_axi` bundle, and map that
+bundle to an HBM bank whose weight traffic occurs in a disjoint phase.
+Frequency or additional floorplanning alone does not address the measured
+71 ms of external-memory/dataflow stalls.
+
 ### Superseded plan (written before iter12 ran)
 
 Pin **only the 16 clusters**, contiguous in chain order, **6/6/4** across
