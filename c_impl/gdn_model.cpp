@@ -993,8 +993,16 @@ static void gdn_recurrent_attention(
     float q_scale = 1.0f / sqrtf((float)GDN_DK);
     uint32_t h, j, i;
     uint32_t token_index;
-    /* Layer slice of the HBM-resident decode state (48 MB across 24 layers). */
+    /* Layer slice of the HBM-resident decode state (48 MB across 24 layers).
+     * Cast the external state once and address it in native 512-bit words.
+     * Merely unrolling scalar float accesses does not make HLS coalesce them:
+     * iter27 measured one four-byte AXI transaction per float. */
     size_t st_base = (size_t)layer_index * GDN_HEADS * GDN_DK * GDN_DV;
+    size_t st_base16 = st_base >> 4;
+    const Pack16 *recurrent_state_in =
+        reinterpret_cast<const Pack16 *>(recurrent_state);
+    Pack16 *recurrent_state_out =
+        reinterpret_cast<Pack16 *>(recurrent_state);
 
     {
         /* Decode (the only mode): restore this layer's state from HBM
@@ -1003,14 +1011,17 @@ static void gdn_recurrent_attention(
         #pragma HLS loop_tripcount min=8 max=8
             state_rst_j: for (j = 0; j < GDN_DK; ++j) {
             #pragma HLS loop_tripcount min=256 max=256
-                state_rst_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
-                #pragma HLS loop_tripcount min=32 max=32
+                state_rst_i: for (i = 0; i < GDN_DV; i += 16) {
+                #pragma HLS loop_tripcount min=16 max=16
                 #pragma HLS pipeline II=1
-                    uint32_t pp;
-                    for (pp = 0; pp < GDN_PK; ++pp) {
+                    Pack16 state_word = recurrent_state_in[
+                        st_base16 +
+                        ((size_t)h * GDN_DK + j) * (GDN_DV / 16) +
+                        (i >> 4)];
+                    uint32_t lane;
+                    state_rst_lane: for (lane = 0; lane < 16; ++lane) {
                     #pragma HLS unroll
-                        state[h][j][i + pp] = recurrent_state[
-                            st_base + ((size_t)h * GDN_DK + j) * GDN_DV + i + pp];
+                        state[h][j][i + lane] = state_word.data[lane];
                     }
                 }
             }
@@ -1204,16 +1215,19 @@ static void gdn_recurrent_attention(
         #pragma HLS loop_tripcount min=8 max=8
             state_sav_j: for (j = 0; j < GDN_DK; ++j) {
             #pragma HLS loop_tripcount min=256 max=256
-                state_sav_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
-                #pragma HLS loop_tripcount min=32 max=32
+                state_sav_i: for (i = 0; i < GDN_DV; i += 16) {
+                #pragma HLS loop_tripcount min=16 max=16
                 #pragma HLS pipeline II=1
-                    uint32_t pp;
-                    for (pp = 0; pp < GDN_PK; ++pp) {
+                    Pack16 state_word;
+                    uint32_t lane;
+                    state_sav_lane: for (lane = 0; lane < 16; ++lane) {
                     #pragma HLS unroll
-                        recurrent_state[
-                            st_base + ((size_t)h * GDN_DK + j) * GDN_DV + i + pp] =
-                                state[h][j][i + pp];
+                        state_word.data[lane] = state[h][j][i + lane];
                     }
+                    recurrent_state_out[
+                        st_base16 +
+                        ((size_t)h * GDN_DK + j) * (GDN_DV / 16) +
+                        (i >> 4)] = state_word;
                 }
             }
         }
