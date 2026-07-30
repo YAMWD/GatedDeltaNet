@@ -1,8 +1,16 @@
 # Disaggregated Decode-Only Accelerator (GEMV datapath)
 
-**Status:** Current integrated eight-port decode architecture and its measured
-optimization history. The routed 32-port GEMV remains a standalone
-microbenchmark; see [`../microbench/gemv_tile/README.md`](../microbench/gemv_tile/README.md).
+**Status:** Historical GEMV scaling and optimization record. The current
+production design is the integrated Iter32 32-port/16-cluster,
+activation-resident kernel documented in [architecture.md](architecture.md).
+The standalone 32-port microbenchmark remains documented separately in
+[`../microbench/gemv_tile/README.md`](../microbench/gemv_tile/README.md).
+
+The final integrated U55C image routes at 100 MHz with zero failed/unrouted
+nets and zero overlaps. It passes exact 64-token parity at 98.660 ms/token mean
+latency, 1.23x faster than the 121.4 ms eight-port baseline. Sections below
+retain the progression that led to that design; older statements describing an
+eight-port kernel as “current” are historical in their section context.
 
 This documents the pivot to a **decode-only** GatedDeltaNet accelerator: the GPU
 prefills the prompt and exports a constant-size recurrent + conv state to disk;
