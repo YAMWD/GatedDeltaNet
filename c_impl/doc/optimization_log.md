@@ -1418,6 +1418,186 @@ bundle to an HBM bank whose weight traffic occurs in a disjoint phase.
 Frequency or additional floorplanning alone does not address the measured
 71 ms of external-memory/dataflow stalls.
 
+### iter32 campaign — activation-resident 32-port decode
+
+The iter32 campaign keeps iter31's routed 32-port/16-cluster topology and
+100 MHz link target while recovering the non-GEMV efficiency sacrificed to
+make that topology fit. The first performance target is a bit-exact result
+below the 121.4 ms eight-port baseline; the working acceptance target is
+118 ms/token. At 100 MHz this permits at most 12.14 M total cycles, of which
+iter31's GEMV consumes 2.799 M.
+
+**Frozen reference before source changes (2026-07-29):**
+
+- repository HEAD: `4cbb464bd2df94fec661cd25a1f932f935d2d1a1`;
+- `gdn_model.cpp` SHA-256:
+  `e570ccf623abb0801d1aca5652f132fb39a2e97f5eec2c083fd16671b20c257a`;
+- integrated static schedule: 14,185,726 cycles at 100 MHz;
+- on-card mean: 212.919 ms/token, exact 8/8;
+- `make -C c_impl -j8`: pass;
+- `decode_correctness_check.sh --fast`: exact 6/6;
+- full `decode_correctness_check.sh`: exact 32/32.
+
+The source experiments are gated in three stages before any link: remove the
+three Q/K/V copies and two residual-buffer passes; move all transient
+activations into reusable BRAM-backed `Pack16` buffers without changing the
+kernel ABI; then remove the logits round trip and selectively restore auxiliary
+lanes. Rejected variants and their csynth deltas are recorded below as they are
+measured.
+
+**iter32A result — in-place convolution retained; HBM residual fusion
+deferred.** Native fast and full decode remained exact (6/6 and 32/32).
+Production Vitis HLS 2022.2 rejected the otherwise-correct direct residual
+store before scheduling: `gemv32_load_x_and_w0` and `gemv32_store` would both
+read `mem_weights_mm0` inside the same dataflow region. This is precisely the
+shared-master conflict that local activation storage is intended to remove.
+The three in-place Q/K/V convolutions are retained. Residual fusion is moved
+into iter32B, where both the residual read and result write target local BRAM.
+The first 2022.1 `test.tcl` attempt was also rejected because that older pragma
+parser does not expand symbolic unroll factors; all QoR gates use the production
+2022.2 toolchain used by iter31.
+
+**iter32B/C source checkpoint — local activations and direct argmax
+(2026-07-29).** The external `gdn_forward` ABI and workspace layout remain
+unchanged. The kernel now loads the embedding once, keeps six reusable
+activation arrays in explicitly BRAM-bound local storage, and writes only the
+selected token back. Residual projection results accumulate into local `x`;
+the LM-head store scans the existing reorder buffer in natural output order
+using strict `>` tie-breaking. Native validation after the final buffer-alias
+change passed `make -C c_impl -j8`, fast exact 6/6, and full exact 32/32.
+Production 2022.2 integrated csynth is the next gate; no hardware build is
+authorized unless the cycle, interface, and resource limits above pass.
+
+Two HLS-only forms were rejected before scheduling:
+
+- cyclically partitioned `float[]` storage with `Pack16 *` casts is illegal in
+  Vitis HLS (`HLS 214-341`, pointer cast cannot be combined with an array
+  transformation);
+- direct calls from differently sized local BRAMs caused HLS to specialize
+  three complete `gdn_gemv` dataflow graphs, tripling the cluster fabric even
+  with an allocation limit.
+
+The retained form uses explicit `Pack16` activation memories plus one
+352-word input/output BRAM aperture shared by every large projection. Local
+512-bit copy/add loops around the aperture add only about 47.5 K scheduled
+cycles per token, while forcing one physical 32-reader/16-cluster GEMV. Q, K,
+and V use the same maximum physical BRAM shape so convolution also remains one
+shared function instance. V is logically 128 words; padding it to 352 words
+does not consume another RAMB18 because each of its 16 banks still fits one
+primitive. A forced `allocation` limit on the differently sized convolution
+variant was rejected: it demoted the packed tail restore/save to scalar II=16
+traffic. The equal-shape form restores 512-bit bursts and one convolution
+instance.
+
+**iter32B/C final csynth gate — pass (2026-07-29).** The first direct-argmax
+form was rejected after csynth exposed a 288,010-cycle, II=9 scan: it reread
+each URAM `Pack16` once per scalar lane. The retained implementation reads each
+of the 2,000 LM-head packs once, compares its 16 lanes in parallel, and merges
+the 16 lane winners with index-aware tie handling. Its pack scan and merge are
+II=1 and take 2,020 and 18 cycles respectively. Strict `>` updates and the
+lowest original index preserve the old first-index result. Native validation
+after this correction passed build, fast exact 6/6, and full exact 32/32.
+
+As in iter31, the integrated top-level HLS latency is not the token schedule:
+the shared GEMV has run-time dimensions, so HLS substitutes its maximum
+720,896-pack trip count for all 193 calls and reports 146.352 M cycles. The
+archived iter31 synthesis reports the same behavior (150.626 M versus the
+14.186 M dimension-correct reconstruction and 21.292 M measured cycles).
+Applying the identical dimension-correct reconstruction to the final module
+reports gives:
+
+| Scheduled component | Iter31 cycles | Iter32 cycles | Delta |
+|---|---:|---:|---:|
+| 193 large GEMVs including LM head | 2,798,841 | 2,785,524 | -13,317 |
+| RMSNorm (49 calls) | 1,015,476 | 139,405 | -876,071 |
+| Tiny GEMV (48 calls) | 116,544 | 103,584 | -12,960 |
+| Q/K/V convolution (72 calls) | 588,600 | 624,744 | +36,144 |
+| Recurrent attention (24 calls) | 5,855,112 | 5,760,144 | -94,968 |
+| Output norm/gate (24 calls) | 161,544 | 128,712 | -32,832 |
+| SwiGLU (24 calls) | 1,469,976 | 321,048 | -1,148,928 |
+| Activation copy/add/argmax and handoff | 2,179,633 | 54,069 | -2,125,564 |
+| **Reconstructed static total** | **14,185,726** | **9,917,230** | **-4,268,496** |
+
+At 100 MHz the retained static schedule is **99.172 ms/token**, 30.1% below
+iter31 and 22.23 ms below the 121.4 ms reference before dynamic stalls. It is
+also below the 10.8--11.0 M campaign stop threshold, so no auxiliary-lane
+increase is retained or synthesized. This avoids spending new routing margin
+after the architecture already passed the cycle gate.
+
+Final HLS resources versus the archived iter31/Pack16 synthesis are:
+
+| Resource | Iter31 | Iter32 | Delta | Gate |
+|---|---:|---:|---:|---:|
+| RAMB18 | 1,383 | 1,511 | +128 | pass (<=128) |
+| DSP | 3,167 | 3,171 | +4 (+0.13%) | pass (<=1%) |
+| FF | 797,137 | 784,731 | -12,406 (-1.56%) | pass |
+| LUT | 866,781 | 819,688 | -47,093 (-5.43%) | pass |
+| URAM | 112 | 112 | 0 | pass |
+
+All 128 new RAMB18s are the explicitly BRAM-bound activation/aperture banks;
+none is LUTRAM or URAM. The transform and RTL reports contain one `gdn_gemv`
+dataflow graph, 16 `gemv32_cluster2` instances, one convolution instance, and
+the original `mem_weights_mm0` through `mem_weights_mm31` masters. No AXI
+master was added. Workspace activation accesses are only the initial
+128-Pack16 embedding read and final one-Pack16 token write; recurrent-state
+and convolution-tail transfers remain at their existing offsets. GEMV MAC II
+is unchanged at 4 and HLS estimates 205.47 MHz. Final kernel-source SHA-256:
+`5a4f079a508c71d476a101776cd6285970230cdb4c5be6a1e0f9a486ac5f21e9`.
+
+**First hardware candidate launched 2026-07-29 20:27 +03.** The source gate
+above authorizes the build without auxiliary-lane restoration. Launcher:
+`build_iter32_activation_resident_iter22_f100.sh`; configuration:
+`hw_iter32_activation_resident_iter22_postphys_f100.cfg` (SHA-256
+`0531b6a1856de85425d8131589eb829988eaab37026cdb3c8a80189a40e3ed02`).
+The launcher compiles HLS at 130 MHz and links only at 100 MHz with the exact
+Iter31 connectivity, Iter22 cluster-8 floorplan, Iter23 DMA hook, BRAM MM2S
+FIFOs, and pre/post-route `AggressiveExplore`. Detached build PID: 636486.
+`run_iter32_oncard_after_build.sh` (PID 637029) is armed to run exact 8-token
+smoke and 64-token decode-from-state measurement only after a successful
+XCLBIN.
+
+**Iter32 hardware and on-card result — target achieved (2026-07-30).** The
+detached build completed successfully in 8 h 25 m. Vivado routed and verified
+the design with **0 failed nets, 0 unrouted nets, and 0 node overlaps**. The
+post-route timing report states that all constraints are met:
+
+- overall WNS **+0.003 ns**, TNS 0, WHS **+0.009 ns**, THS 0;
+- 100 MHz kernel clock WNS **+0.008 ns**, WHS **+0.009 ns**;
+- fixed 250 MHz `dma_ip_axi_aclk_1` WNS **+0.003 ns**, WHS **+0.009 ns**;
+- route and bitstream generation completed with zero errors and no automatic
+  clock scaling.
+
+The routed design retains high but legal local congestion (effective south
+level 6 and west level 5 in SLR0). Global routing nevertheless converged from
+888,916 node overlaps to zero in five rip-up/reroute iterations. Post-route
+physical optimization ran with `AggressiveExplore`; because route had already
+closed both setup and hold, it made no further netlist change.
+
+The generated XCLBIN SHA-256 is
+`fdf3993b15bb1b8c5d62c96a0e830f176233a6aff4833013c4011525902cd623`;
+the XO SHA-256 is
+`03bd931020acd61576b8c309760a92406cd82df9e3a56e81887b7a88fa1914ba`.
+The automatic eight-token smoke run and 64-token decode-from-state run both
+passed exact token parity. Excluding the initial seed entry, the 63 measured
+kernel calls were:
+
+| Metric | Iter32 |
+|---|---:|
+| Minimum | 98.635 ms/token |
+| Maximum | 99.085 ms/token |
+| Median | **98.650 ms/token** |
+| Mean | **98.660 ms/token** |
+| Speedup versus iter31 212.919 ms | **2.158x** |
+| Speedup versus 121.4 ms baseline | **1.230x** |
+
+The measured mean is within 0.52 ms of the reconstructed 99.172 ms static
+schedule (within normal report-reconstruction variation), so the large iter31
+dynamic-stall gap has been removed. Iter32 therefore exceeds both
+campaign acceptance thresholds: it is below 118 ms and below the 121.4 ms
+baseline with exact 64-token parity. The activation-resident architecture,
+without auxiliary-lane restoration, is the new performance and routability
+baseline.
+
 ### Superseded plan (written before iter12 ran)
 
 Pin **only the 16 clusters**, contiguous in chain order, **6/6/4** across
