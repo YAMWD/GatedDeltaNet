@@ -1598,6 +1598,269 @@ baseline with exact 64-token parity. The activation-resident architecture,
 without auxiliary-lane restoration, is the new performance and routability
 baseline.
 
+### iter33 — selective auxiliary-parallelism recovery
+
+*Started 2026-07-30 12:40 +03; requested kernel frequency: 100 MHz.
+Detached build PID: 1606798; automatic on-card runner PID: 1608337.*
+
+Iter33 preserves the successful Iter32 activation-resident ABI, 32 weight
+masters, 16 two-port GEMV clusters, MM2S/BRAM-FIFO decoupling, Iter22
+cluster-8 floorplan, Iter23 DMA hook, and 100 MHz physical recipe. It separates
+the previously shared auxiliary lane constants so recurrence, normalization,
+convolution, output gating, and SwiGLU can be evaluated independently. Native
+validation passed `make -C c_impl -B -j8`, fast exact 6/6, and full exact
+32/32.
+
+The first production Vitis HLS 2022.2 experiment restored only recurrent-state
+column parallelism from 8 to 16 lanes. The recurrent module improved from
+239,598 to **141,350 cycles/call**:
+
+| Recurrent phase | Iter32 | Recurrent x16 |
+|---|---:|---:|
+| State restore | 65,539 cycles, II=2 | **32,771 cycles, II=1** |
+| Fused state read | 8,200 cycles | **4,105 cycles** |
+| Fused state write | 8,201 cycles | **4,106 cycles** |
+| State save | 32,771 cycles, II=1 | 32,771 cycles, II=1 |
+
+Across 24 layers, the direct recurrent saving is 2,357,952 cycles/token
+(23.580 ms at 100 MHz). Including small scheduling shifts in unchanged
+auxiliary modules, the conservative dimension-correct reconstruction is
+approximately **7.60 M cycles/token (76.0 ms)** versus Iter32's 9.917 M cycles.
+GEMV remains one physical dataflow graph with 16 clusters and MAC II=4; all 32
+weight masters remain present. Estimated Fmax remains 205.47 MHz.
+
+The recurrent-only HLS resource delta is deliberately bounded:
+
+| Resource | Iter32 production HLS | Iter33 recurrent x16 | Delta |
+|---|---:|---:|---:|
+| RAMB18 | 1,511 | 1,511 | 0 |
+| DSP | 3,171 | 3,323 | +152 (+4.79%) |
+| FF | 780,602 | 799,842 | +19,240 (+2.46%) |
+| LUT | 822,219 | 833,040 | +10,821 (+1.32%) |
+| URAM | 112 | 144 | +32 |
+
+The extra URAM is the physical cost of doubling the recurrent state's column
+banks. It is accepted for this explicitly requested experiment; the other
+resource deltas stay small enough to justify one implementation attempt.
+
+**Rejected small-op variants.** A combined sweep restored RMS/output-norm
+lanes to 16 and fully pipelined 16-lane SwiGLU. It synthesized successfully,
+but the individual payoff and resource cost were:
+
+| Variant | Cycle saving/token | Principal module cost | Decision |
+|---|---:|---:|---|
+| RMSNorm 8→16 | 6,027 (0.060 ms) | +48 DSP | reject |
+| Output norm/gate 4→16 | 74,304 (0.743 ms) | about +144 DSP | reject |
+| SwiGLU 4→16 | 278,136 (2.781 ms) | +192 DSP, +17.7 K LUT | evaluate separately |
+
+The full combined top reached 3,686 DSP, 828,708 FF, and 870,461 LUT, so it was
+rejected without implementation. A final selective recurrent-x16 +
+SwiGLU-x16 synthesis also preserved GEMV II=4 and estimated 205.47 MHz, but
+used 3,515 DSP, 814,474 FF, and 850,263 LUT. Its DSP growth is 10.85% versus
+Iter32 (10.99% versus Iter31), above the 8% implementation gate, for only
+2.78 ms beyond the recurrent-only result. SwiGLU-x16 is therefore also
+rejected. The hardware candidate retains Iter32's 8-lane norm and four-lane
+convolution/output-gate/SwiGLU datapaths and changes only recurrence to 16.
+
+The reproducible launcher is `build_iter33_recur16_iter22_f100.sh`; it pins
+the kernel source SHA-256 to
+`5f2cd5fd3482c00cb33a3ab2187918134e60b709af28a85d775b22b205174eec`
+and reuses the bit-identical successful Iter32 physical configuration
+`hw_iter32_activation_resident_iter22_postphys_f100.cfg`. HLS compiles at
+130 MHz and link targets **100 MHz only**. The detached build is active in
+`build.hw.iter33.recur16.iter22.postphys.f100.o8.v2022_2`; after a successful
+XCLBIN, `run_iter33_oncard_after_build.sh` automatically runs exact 8-token
+smoke and 64-token performance/parity tests.
+
+**Hardware result — routed, but rejected on the fixed DMA clock.** The build
+exited 1 at 2026-07-30 23:59:31 +03 after 10 h 55 m of link time. Routing
+itself completed legally with zero failed or unrouted nets and zero node
+overlaps. Before the explicit post-route pass, timing was WNS -0.509 ns,
+TNS -98.252 ns, WHS +0.009 ns. Post-route `AggressiveExplore` spent
+1 h 42 m optimizing 84 cells/nets and recovered 0.347 ns of WNS plus
+93.977 ns of TNS:
+
+| Final post-route metric | Iter33 |
+|---|---:|
+| Overall WNS / TNS | **-0.162 ns / -4.275 ns** |
+| Setup-failing endpoints | **43 / 1,993,813** |
+| Overall WHS / THS | **+0.007 ns / 0 ns** |
+| 100 MHz kernel WNS / TNS | **0.000 ns / 0 ns** |
+| 250 MHz `dma_ip_axi_aclk_1` WNS / TNS | **-0.162 ns / -4.275 ns** |
+| Route legality | **0 failed, 0 unrouted, 0 overlaps** |
+
+The first routed kernel failure was a one-LUT control path from
+`ws_6_U/dout_vld_reg` to cluster-3 product-register clock enables. Its
+1,028-fanout net contributed 9.050 ns of routing and the full path was
+98.3% route delay. Post-route physical optimization relocated the FIFO-valid
+register and many newly exposed kernel/state-write endpoints, ultimately
+closing every 100 MHz kernel setup endpoint without reducing recurrent
+parallelism. The remaining failure is entirely in the unscalable platform DMA
+clock: all 43 failing setup endpoints belong to `dma_ip_axi_aclk_1`.
+
+Vitis therefore stopped before bitstream generation with
+`VPL_TCL 101-2`; no XCLBIN was emitted and the automatic on-card test was
+correctly skipped. The final checkpoint is
+`level0_wrapper_postroute_physopt.dcp`.
+
+**Detailed routed-checkpoint diagnosis.** Vivado 2022.2 has no command named
+`report_timing_analysis`; its detailed equivalent,
+`report_design_analysis -timing -setup -show_all -full_logical_pin
+-routed_vs_estimated`, was run together with top-200 setup paths, route-delay
+distribution, congestion, high-fanout, bus-skew, SLR-utilization, and
+hierarchical-utilization reports. All actionable reports completed. The
+optional QoR-suggestion tail was stopped after nearly an hour so it would not
+compete with the next implementation run.
+
+Every residual failure is in one fixed-platform forward-path SRL FIFO:
+`hmss_0/.../path_12/slice0_12/.../w15.../common.srl_fifo_0`. The only source
+registers exposed by the failing-path analysis are:
+
+| Source | Fanout | Worst slack | Worst net delay |
+|---|---:|---:|---:|
+| `fifoaddr_reg[4]` | 1,157 | **-0.162 ns** | 3.718 ns |
+| `fifoaddr_reg[2]` | 1,159 | **-0.161 ns** | 3.816 ns |
+
+The worst complete path is only three logic levels
+(`SRLC32E -> MUXF7 -> LUT4`) and spends 3.988 ns of its 4.260 ns data delay
+(93.6%) in routing. It crosses one clock-region boundary but no SLR boundary;
+the routed delay is therefore a local high-fanout placement problem rather
+than a kernel arithmetic or SLL-capacity problem. The same checkpoint reports
+the 100 MHz kernel clock at WNS 0.000 ns with zero setup failures.
+
+### iter34 — focused `w15` DMA address-fanout repair
+
+*Launched 2026-07-31 00:54 +03; detached build PID: 3056058; automatic
+on-card monitor PID: 3056059.*
+
+Iter34 preserves the Iter33 source, recurrent-state x16 parallelism, 32 weight
+ports, 16 GEMV clusters, MM2S/BRAM-FIFO decoupling, Iter22 cluster-8 floorplan,
+Iter23 DMA-state hook, both `AggressiveExplore` physical-optimization passes,
+and the 100 MHz link target. It reuses the exact Iter33 XO
+`65eb09fd8e24807e774426b8648685420f6e581509e946605c4eb15089f63287`;
+there is no HLS recompile and hence no functional or schedule change.
+
+The new pre-place hook applies `MAX_FANOUT_MODE=CLOCK_REGION` and
+`FORCE_MAX_FANOUT=64` only to the two diagnosed `w15` FIFO address nets. This
+requests roughly 18 localized copies per source, approximately 36 total. The
+limit is intentionally less aggressive than the rejected broad Iter29
+replication experiment, which created 260 replicas and displaced the timing
+bottleneck. The hook validates exact hierarchy, source-bit identity, and an
+expected 1,000--1,300 pre-place fanout before applying either property.
+
+The reproducible command is:
+
+```bash
+bash c_impl/build_iter34_recur16_dma_w15_fanout64_f100.sh
+```
+
+The launcher pins source, XO, configuration, Iter22, Iter23, and Iter34 hook
+hashes and refuses to overwrite an existing build directory. On successful
+timing closure, `run_iter34_oncard_after_build.sh` automatically executes
+exact 8-token smoke and 64-token performance/parity runs, followed by a
+separate low-overhead XRT profile capture so profiling cannot bias the primary
+latency measurement.
+
+**Result — rejected pre-place guard, no implementation verdict.** Iter34
+exited 1 at 2026-07-31 03:10 +03 after 2 h 15 m. All 227 block-level synthesis
+jobs and top-level synthesis completed, and `opt_design` completed with zero
+errors. The Iter23 hook matched its expected 524-load net. The Iter34 hook then
+matched the exact intended
+`path_12/slice0_12/.../w15.../fifoaddr_reg[2]` source, but its safety check
+observed 582 direct input loads rather than the 1,000--1,300 range copied from
+the post-route timing report. It stopped before `place_design`; consequently
+there is no placement, congestion, routing, or timing result and the on-card
+monitor correctly skipped.
+
+The discrepancy is a reporting-stage distinction: the final routed
+high-fanout/timing analysis counted 1,159 timing loads, while the pre-place net
+queried by the hook exposes 582 direct sink pins. The exact hierarchy and
+source bit were correct. Iter34 therefore rejects only its overly strict
+validation range, not the fanout-localization strategy.
+
+### iter35 — corrected pre-place fanout guard
+
+*Launched 2026-07-31 03:55 +03; detached build PID: 3128824; automatic
+on-card monitor PID: 3128825.*
+
+Iter35 is identical to Iter34 except that the exact-target direct-fanout guard
+accepts 400--700 loads, covering the measured 582-load pre-place form for the
+two diagnosed address bits. `MAX_FANOUT_MODE=CLOCK_REGION` and
+`FORCE_MAX_FANOUT=64` remain unchanged; recurrent-state x16 and all kernel,
+connectivity, floorplan, clock, placement, routing, and physical-optimization
+inputs remain unchanged. The successful run reused the exact Iter33 XO. The
+committed launcher instead recompiles the pinned kernel source at 130 MHz,
+verifies that the generated XO has the same SHA-256 as the successful run, and
+then performs the 100 MHz link. It can optionally seed the link with Iter34's
+completed 1.8 GiB IP cache; cache absence only increases build time and is not
+a functional dependency. No generated XO, RQS binary, or prior build directory
+is required for a clean reproduction.
+
+The reproducible command is:
+
+```bash
+bash c_impl/build_iter35_recur16_dma_w15_fanout64_f100.sh
+```
+
+**Hardware result — successful.** Iter35 completed at 2026-07-31 10:55 +03
+after 7 h 0 m and produced XCLBIN SHA-256
+`e7dace2c1343502e9e9d976b298d3512ebf9502d396e930e6211da4f6bfa2a66`.
+Both diagnosed targets matched before placement:
+
+| Pre-place target | Direct loads | Applied properties |
+|---|---:|---|
+| `w15...fifoaddr_reg[2]` | 582 | `CLOCK_REGION`, `FORCE_MAX_FANOUT=64` |
+| `w15...fifoaddr_reg[4]` | 580 | `CLOCK_REGION`, `FORCE_MAX_FANOUT=64` |
+
+Routing completed legally with zero failed, unrouted, or partially routed nets
+and zero final node overlaps. Final timing met every constraint:
+
+| Final metric | Iter35 |
+|---|---:|
+| Overall setup WNS / TNS | **+0.003 ns / 0 ns** |
+| Overall hold WHS / THS | **+0.006 ns / 0 ns** |
+| 100 MHz kernel WNS / TNS | **+0.023 ns / 0 ns** |
+| 250 MHz `dma_ip_axi_aclk_1` WNS / TNS | **+0.003 ns / 0 ns** |
+| Achieved `DATA_CLK` | **100 MHz** |
+
+The post-route physical-optimization pass found no setup violation and
+therefore made no netlist modification. The pre-place fanout localization
+itself closed the fixed-DMA deficit while retaining recurrent x16. Placed
+kernel resources were 413,001 LUTs (13,459 LUTRAM), 530,448 registers,
+1,209 BRAMs, 144 URAMs, and 3,324 DSPs. Routed CLB occupancy by SLR was
+54,002 / 39,354 / 27,714, or **98.26% / 72.88% / 51.32%**. Initial routing
+still reported localized lower-boundary SLL demand peaks of 128%, but the
+router resolved them completely.
+
+**On-card result — exact and 75.062 ms/token.** The first automatic run
+exposed a host-only XRT issue: a 16 MiB BO sync at the packed recurrent
+state's nonzero workspace offset returned `EINVAL` before any kernel launch.
+Reducing the host's transfer chunk to 8 MiB left the FPGA ABI and measured
+kernel unchanged and made the upload reliable. The repeated eight-token smoke
+test was exact. The full 64-token decode matched all 64 tokens with no
+divergence:
+
+| 63 timed kernel calls | Iter35 |
+|---|---:|
+| Mean | **75.061694 ms/token** |
+| Median | **75.025197 ms/token** |
+| Min / max | 75.016230 / 75.583847 ms |
+| Speedup over Iter32 98.659598 ms | **1.314x** |
+| Speedup over 121.4 ms reference | **1.617x** |
+
+The measured latency agrees with the reconstructed recurrent-x16 static
+schedule of approximately 76.0 ms, showing that the recovered recurrence
+parallelism translates essentially one-for-one on card and that little
+dynamic-stall gap remains at this stage.
+
+A separate two-token XRT profile run was also exact and measured the real
+kernel invocation at 75.064 ms. The production XCLBIN contains zero AXI,
+accelerator, or stream monitor IP, so XRT correctly reports zero device
+counters; per-port bandwidth or stall attribution cannot be recovered from
+this image. That deeper measurement requires a separate selectively
+instrumented link and must be compared against the uninstrumented
+75.061694 ms control to detect probe perturbation.
+
 ### Superseded plan (written before iter12 ran)
 
 Pin **only the 16 clusters**, contiguous in chain order, **6/6/4** across
