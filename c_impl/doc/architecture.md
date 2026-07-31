@@ -1,7 +1,7 @@
 # GatedDeltaNet Decode Accelerator Architecture
 
-**Status:** Current routed production architecture (Iter32), measured
-2026-07-30 on an Alveo U55C.
+**Status:** Current routed production architecture (Iter36), measured
+2026-07-31 on an Alveo U55C.
 
 The accelerator in `c_impl/` is decode-only. Prompt prefill runs on the GPU and
 exports fixed-size recurrent and convolution state. The FPGA then advances one
@@ -13,13 +13,15 @@ token per `gdn_forward` invocation. The successful design combines:
 - a 4/6/6 cluster distribution across SLR0/SLR1/SLR2;
 - transient activations resident in local BRAM for the complete 24-layer
   forward;
+- a 16-bank, head-local recurrent-state buffer with HBM restore/retrieval and
+  update/save fused into the two required attention passes;
 - packed external recurrent-state and convolution-tail transfers; and
 - on-chip LM-head argmax, with no external logits materialization.
 
 The production image routes with zero failed nets, zero unrouted nets, and zero
 node overlaps at 100 MHz. It produces an exact 64-token trajectory at
-98.660 ms/token mean latency, 1.23x faster than the 121.4 ms eight-port
-baseline.
+59.578 ms/token mean latency, 2.04x faster than the 121.4 ms eight-port
+baseline and 1.26x faster than Iter35.
 
 ## Fixed Model Shape
 
@@ -120,7 +122,7 @@ The host-visible `GDN_WS_OFF_*` layout is unchanged from Iter31. This preserves
 the external ABI and XRT allocation behavior, but most activation offsets are
 now reserved compatibility space rather than active HBM traffic.
 
-| Workspace region | Iter32 synthesized use |
+| Workspace region | Iter36 synthesized use |
 |---|---|
 | `GDN_WS_OFF_X` | Host writes one 2,048-float embedding; kernel reads it once |
 | `GDN_WS_OFF_X_NORM` | Kernel writes one 512-bit result line; lane zero is the selected token |
@@ -130,8 +132,12 @@ now reserved compatibility space rather than active HBM traffic.
 
 The recurrent state cannot remain on chip across the complete decode. One layer
 is 2 MiB; all 24 layers would require roughly 2,304 URAMs before any other
-storage, versus 960 URAMs on the U55C. Iter32 therefore removes avoidable
-activation traffic while retaining the unavoidable packed state round trip.
+storage, versus 960 URAMs on the U55C. Iter36 instead buffers one 256 x 256 FP32
+head at a time in 16 cyclic URAM banks. The retrieval loop loads each 512-bit
+state word from HBM while consuming it, and the update loop writes each updated
+word back immediately. The unavoidable packed state round trip remains, but
+the two redundant full-layer restore/save traversals and the 128-URAM
+all-head buffer are gone.
 
 ## Activation-Resident Datapath
 
@@ -182,7 +188,8 @@ local x
   -> Q/K/V depthwise convolution + SiLU, in place
   -> recurrent gated-delta attention
        reads local Q/K/V
-       restores and saves this layer's packed external state
+       fuses head-local HBM restore with retrieval
+       fuses head-local state update with HBM save
        overwrites norm_attn with attention output
   -> output norm and gate, in place
   -> output-projection GEMV
@@ -306,11 +313,12 @@ Non-GEMV blocks remain shared, relatively narrow implementations:
 | RMSNorm/reductions | 8 lanes |
 | Tiny A/B GEMV | 2 output lanes |
 | Depthwise convolution, output gate, SwiGLU | 4 elementwise lanes |
-| Recurrent state arithmetic | 8 lanes |
+| Recurrent state arithmetic | 16 lanes |
 
-Iter32 did not restore wider auxiliary lanes. The activation-resident design
-already reached the 10.8-11.0 million-cycle campaign stop threshold, and
-additional lanes would spend routing margin for unnecessary throughput.
+Iter35 selectively restored recurrent-state arithmetic from 8 to 16 lanes.
+Wider normalization, output-gate, and SwiGLU variants were rejected because
+their measured cycle savings did not justify their DSP/LUT cost. Iter36 keeps
+those choices and changes recurrent-state materialization only.
 
 ## Static Schedule and HLS Resources
 
@@ -318,30 +326,31 @@ Because `gdn_gemv` accepts runtime dimensions, the raw top-level HLS latency
 uses the maximum LM-head trip count for all 193 calls and is not a token
 latency. Reconstructing the schedule with each real projection shape gives:
 
-| Component | Iter31 cycles | Iter32 cycles |
+| Component | Iter32 cycles | Iter36 cycles |
 |---|---:|---:|
-| 193 large GEMVs | 2,798,841 | 2,785,524 |
-| RMSNorm | 1,015,476 | 139,405 |
-| Tiny GEMV | 116,544 | 103,584 |
-| Q/K/V convolution | 588,600 | 624,744 |
-| Recurrent attention | 5,855,112 | 5,760,144 |
-| Output norm/gate | 161,544 | 128,712 |
-| SwiGLU | 1,469,976 | 321,048 |
-| Activation handoff/copy/add/argmax | 2,179,633 | 54,069 |
-| **Reconstructed total** | **14,185,726** | **9,917,230** |
+| 193 large GEMVs | 2,785,524 | 2,785,524 |
+| RMSNorm | 139,405 | 139,405 |
+| Tiny GEMV | 103,584 | 103,584 |
+| Q/K/V convolution | 624,744 | 624,744 |
+| Recurrent attention | 5,760,144 | **1,841,112** |
+| Output norm/gate | 128,712 | 128,712 |
+| SwiGLU | 321,048 | 321,048 |
+| Activation handoff/copy/add/argmax | 54,069 | 54,069 |
+| **Reconstructed total** | **9,917,230** | **5,998,198** |
 
-Final integrated csynth resources:
+Final Iter36 integrated csynth resources:
 
-| Resource | Iter31 | Iter32 | Change |
-|---|---:|---:|---:|
-| RAMB18 | 1,383 | 1,511 | +128 |
-| DSP | 3,167 | 3,171 | +4 |
-| FF | 797,137 | 784,731 | -12,406 |
-| LUT | 866,781 | 819,688 | -47,093 |
-| URAM | 112 | 112 | 0 |
+| Resource | Iter36 |
+|---|---:|
+| RAMB18 | 1,511 |
+| DSP | 3,323 |
+| FF | 798,733 |
+| LUT | 829,526 |
+| URAM | **32** |
 
-The 128 added RAMB18s are the local activation/aperture banks. GEMV MAC II
-remains four, no AXI master was added, and HLS estimates 205.47 MHz.
+The head-local fusion reduces the recurrent buffer from Iter35's 128 URAMs to
+16 and whole-kernel use from 144 to 32 URAMs. GEMV MAC II remains four, no AXI
+master was added, and all 32 MM2S readers remain II=1.
 
 ## Physical Implementation
 
@@ -349,7 +358,7 @@ The reproducible build compiles HLS at 130 MHz and links the U55C image at
 100 MHz:
 
 ```bash
-bash c_impl/build_iter32_activation_resident_iter22_f100.sh
+bash c_impl/build_iter36_headlocal.sh 100
 ```
 
 The launcher is hash-guarded and refuses to overwrite its existing build
@@ -358,6 +367,7 @@ directory. Its physical recipe uses:
 - exact 32-bank connectivity from the routed Iter31 topology;
 - `apply_iter22_cluster8_slr1_east.tcl`;
 - `apply_iter23_dma_fanout.tcl`;
+- `apply_iter35_dma_w15_fifoaddr_fanout.tcl` for the fixed 250 MHz DMA path;
 - BRAM implementation for all wide MM2S, activation-ripple, result, and
   collector FIFOs;
 - `AltSpreadLogic_high` placement;
@@ -368,14 +378,14 @@ Final implementation result:
 
 | Metric | Result |
 |---|---:|
-| Build duration | 8 h 25 m |
+| Build duration | 7 h 47 m (7 h 26 m link) |
 | Kernel clock | 100 MHz |
 | Failed nets | 0 |
 | Unrouted nets | 0 |
 | Node overlaps | 0 |
 | Overall WNS / TNS | +0.003 ns / 0 |
 | Overall WHS / THS | +0.009 ns / 0 |
-| 100 MHz kernel WNS / WHS | +0.008 ns / +0.009 ns |
+| 100 MHz kernel WNS / WHS | +0.104 ns / +0.009 ns |
 | 250 MHz `dma_ip_axi_aclk_1` WNS / WHS | +0.003 ns / +0.009 ns |
 | Automatic clock scaling | None |
 
@@ -398,25 +408,26 @@ Excluding the initial seed entry, 63 measured kernel calls produced:
 
 | Metric | Result |
 |---|---:|
-| Minimum | 98.635 ms/token |
-| Maximum | 99.085 ms/token |
-| Median | **98.650 ms/token** |
-| Mean | **98.660 ms/token** |
-| Speedup over Iter31, 212.919 ms | **2.158x** |
-| Speedup over eight-port baseline, 121.4 ms | **1.230x** |
+| Minimum | 59.517 ms/token |
+| Maximum | 59.851 ms/token |
+| Median | **59.563 ms/token** |
+| Mean | **59.578 ms/token** |
+| Speedup over Iter35, 75.062 ms | **1.260x** |
+| Speedup over Iter32, 98.660 ms | **1.656x** |
+| Speedup over eight-port baseline, 121.4 ms | **2.038x** |
 
-The measured mean is within 0.52 ms of the reconstructed 99.172 ms static
-schedule. This shows that eliminating transient activation round trips removed
-the large dynamic-stall gap present in Iter31.
+The measured mean is within 0.40 ms of the reconstructed 59.982 ms static
+schedule. Head-local fusion therefore removes the recurrent restore/save cost
+almost one-for-one without introducing a material dynamic-stall gap.
 
 Reproducibility hashes:
 
 | Artifact | SHA-256 |
 |---|---|
-| `gdn_model.cpp` | `5a4f079a508c71d476a101776cd6285970230cdb4c5be6a1e0f9a486ac5f21e9` |
-| Iter32 link configuration | `0531b6a1856de85425d8131589eb829988eaab37026cdb3c8a80189a40e3ed02` |
-| Compiled XO | `03bd931020acd61576b8c309760a92406cd82df9e3a56e81887b7a88fa1914ba` |
-| Successful XCLBIN | `fdf3993b15bb1b8c5d62c96a0e830f176233a6aff4833013c4011525902cd623` |
+| `gdn_model.cpp` | `b0a380365d00a7535dd1256f62f6a21f97a3eee6158e3e4b53bb92ce2df5dafb` |
+| Iter35 link configuration reused by Iter36 | `240855bd65ba1cf4525c88b34f9d07012bf73c90e75f524b2c9547eaa9e5922b` |
+| Compiled XO | `c699dcc8c678cba970906d1a9ab0d62ab2315ad7d67c77fdcdf921dbd752171e` |
+| Successful XCLBIN | `b251ca1c89a2d56111c1c336e003db3c3c0bbaf02556207a50a184578c6f3c34` |
 
 ## Design Invariants
 
@@ -431,11 +442,13 @@ integrated csynth, full implementation, and on-card measurement:
    materialization.
 6. Keep recurrent state and convolution tails packed and externally
    persistent.
-7. Keep LM-head argmax on chip and preserve strict first-index tie behavior.
-8. Keep the external workspace offsets and host ABI stable.
-9. Treat the Iter22 floorplan and Iter23 DMA hook as part of the successful
+7. Keep the recurrent buffer head-local and fuse HBM state transfer into the
+   required retrieval/update traversals.
+8. Keep LM-head argmax on chip and preserve strict first-index tie behavior.
+9. Keep the external workspace offsets and host ABI stable.
+10. Treat the Iter22 floorplan and Iter23/Iter35 DMA hooks as part of the successful
    physical architecture, not optional tuning.
-10. Judge changes against both 100 MHz timing and zero-conflict routing; HLS
+11. Judge changes against both 100 MHz timing and zero-conflict routing; HLS
     resource savings alone do not predict routability.
 
 Use [decode_disaggregated_gemv.md](decode_disaggregated_gemv.md) for the

@@ -1861,6 +1861,80 @@ this image. That deeper measurement requires a separate selectively
 instrumented link and must be compared against the uninstrumented
 75.061694 ms control to detect probe perturbation.
 
+### iter36 — head-local recurrent-state fusion
+
+*Started 2026-07-31; first hardware target: 100 MHz.*
+
+Iter36 preserves Iter35's 32 HBM weight readers, 16 two-port GEMV clusters,
+activation-resident workspace ABI, recurrent-state FP32 representation,
+Iter22 cluster-8 floorplan, Iter23 DMA repair, Iter35 focused `w15` repair,
+and physical-optimization directives. It changes only recurrent-state
+materialization.
+
+Iter35 restored all eight heads (2 MiB) into a 128-URAM layer buffer, computed
+one head at a time, then saved all eight heads. The restore and save were each
+separate 32,771-cycle layer traversals. Iter36 retains only one 256 x 256 FP32
+head in a 16-bank URAM buffer. The existing retrieval pass now reads each
+old-state Pack16 directly from HBM and retains it locally; the existing update
+pass writes each updated Pack16 directly back to the same external layout.
+The FP32 expressions and per-head element order are unchanged.
+
+Native validation passed a clean build, fast exact parity 6/6, and full exact
+parity 32/32. Integrated Vitis HLS 2022.2 synthesis completed successfully:
+
+| Metric | Iter35 recurrent x16 | Iter36 head-local | Delta |
+|---|---:|---:|---:|
+| Recurrent latency/call | 141,350 cycles | **76,713 cycles** | -64,637 |
+| Fused read | 4,105 cycles, II=1 | **4,105 cycles, II=1** | unchanged |
+| Fused update | 4,106 cycles, II=1 | **4,106 cycles, II=1** | unchanged |
+| Standalone restore/save | 32,771 + 32,771 | **removed** | -65,542 |
+| Recurrent BRAM / URAM | 20 / 128 | **20 / 16** | 0 / -112 |
+| Recurrent DSP | 263 | **263** | 0 |
+| Recurrent FF / LUT | 38,632 / 42,591 | **37,523 / 39,077** | -1,109 / -3,514 |
+
+HLS infers 4,096-beat, 512-bit bursts in both fused state loops. The complete
+kernel remains one GEMV dataflow graph with all 32 movers at II=1 and all 16
+cluster MAC loops at II=4. Whole-kernel resources are 1,511 RAMB18, 3,323 DSP,
+798,733 FF, 829,526 LUT, and **32 URAM**, versus Iter35's 144 URAM. No new AXI
+master is present.
+
+Replacing 24 recurrent calls in the dimension-correct Iter35 reconstruction
+gives approximately 5,998,198 cycles/token, or **59.982 ms at 100 MHz**. The
+successful 100 MHz build uses source SHA-256
+`b0a380365d00a7535dd1256f62f6a21f97a3eee6158e3e4b53bb92ce2df5dafb`
+and the exact Iter35 implementation config/Tcl hashes. It completed in 7 h 47 m
+(7 h 25 m 51 s link), routed with zero failed/unrouted nets and zero final node
+overlaps, and emitted a 77,139,984-byte XCLBIN. Post-route timing met every
+constraint: overall WNS/WHS are **+0.003/+0.009 ns**, the 100 MHz kernel clock
+has +0.104 ns setup slack, and `dma_ip_axi_aclk_1` has +0.003 ns setup slack.
+
+The automatic eight-token smoke test and full 64-token decode both matched the
+golden trajectory exactly. Excluding the initial seed, 63 timed kernel calls
+measured:
+
+| Metric | Iter36 100 MHz |
+|---|---:|
+| Mean | **59.577939 ms/token** |
+| Median | **59.562983 ms/token** |
+| Min / max | 59.517141 / 59.850744 ms |
+| Speedup over Iter35 75.061694 ms | **1.260x** |
+| Speedup over Iter32 98.659598 ms | **1.656x** |
+| Speedup over 121.4 ms reference | **2.038x** |
+
+The 59.578 ms hardware mean is within 0.404 ms of the reconstructed static
+schedule, confirming that the fused head-local transfer removes the two
+standalone state traversals without creating a new stall term. Reproduction is
+one command: `bash c_impl/build_iter36_headlocal.sh 100`. Artifact hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| XO | `c699dcc8c678cba970906d1a9ab0d62ab2315ad7d67c77fdcdf921dbd752171e` |
+| XCLBIN | `b251ca1c89a2d56111c1c336e003db3c3c0bbaf02556207a50a184578c6f3c34` |
+
+The gated 130 MHz follow-up launched only after this correctness/performance
+gate passed; it is a separate experiment and does not change the committed
+100 MHz milestone.
+
 ### Superseded plan (written before iter12 ran)
 
 Pin **only the 16 clusters**, contiguous in chain order, **6/6/4** across

@@ -914,9 +914,9 @@ static void gdn_depthwise_conv_silu(
 
 /* -----------------------------------------------------------------------
  * Optimized recurrent attention with:
- *   1. Persistent on-chip state in BRAM (eliminates external memory traffic)
- *   2. Fused two-pass pipeline (1 read + 1 read-modify-write vs 4 passes)
- *   3. Column parallelism P_K=8 (8 MACs per cycle on state accesses)
+ *   1. One head-local URAM state buffer
+ *   2. Fused HBM restore/retrieval and update/HBM-save passes
+ *   3. Column parallelism P_K=16 (16 MACs per cycle on state accesses)
  *
  * Algebraic fusion (Gupta et al.):
  *   S_new = g*S_old + k_norm * Δv^T
@@ -945,18 +945,18 @@ static void gdn_recurrent_attention(
     uint32_t num_tokens,
     uint32_t layer_index
 ) {
-    /* On-chip persistent recurrent state: 8 heads × 256 × 256 FP32 = 2 MB.
-     * impl=URAM (was BRAM): this array is 468.5 BRAM tiles = 31% of the kernel's
-     * BRAM, and BRAM hit 84%>80% in the 32-port build (route congestion level 7,
-     * Vivado RQS_UTIL-211 "convert BRAM to URAM"). URAM was ~1.7% used, so moving
-     * the state here frees ~466 BRAM and rebalances into idle URAM. Bit-exact:
-     * storage implementation only, same 16-bank cyclic partition / access order. */
-    static float state[GDN_HEADS][GDN_DK][GDN_DV];
+    /* Buffer one 256 x 256 FP32 head rather than restoring all eight heads
+     * before computation. Each old-state word is captured while the retrieval
+     * pass consumes it; each updated word is written to HBM directly from the
+     * update pass. This removes the two standalone 32,768-word layer copies and
+     * reduces the state memory from 128 to an expected 16 URAMs without changing
+     * the FP32 arithmetic or external state layout. */
+    float state[GDN_DK][GDN_DV];
 #pragma HLS bind_storage variable=state type=RAM_2P impl=URAM
-#pragma HLS array_partition variable=state dim=3 cyclic factor=GDN_PK
+#pragma HLS array_partition variable=state dim=2 cyclic factor=GDN_PK
 
     float q_scale = 1.0f / sqrtf((float)GDN_DK);
-    uint32_t h, j, i;
+    uint32_t j, i;
     uint32_t token_index;
     /* Layer slice of the HBM-resident decode state (48 MB across 24 layers).
      * Cast the external state once and address it in native 512-bit words.
@@ -968,30 +968,6 @@ static void gdn_recurrent_attention(
         reinterpret_cast<const Pack16 *>(recurrent_state);
     Pack16 *recurrent_state_out =
         reinterpret_cast<Pack16 *>(recurrent_state);
-
-    {
-        /* Decode (the only mode): restore this layer's state from HBM
-         * (sequential 512-bit bursts). State was loaded from the GPU export. */
-        state_rst_h: for (h = 0; h < GDN_HEADS; ++h) {
-        #pragma HLS loop_tripcount min=8 max=8
-            state_rst_j: for (j = 0; j < GDN_DK; ++j) {
-            #pragma HLS loop_tripcount min=256 max=256
-                state_rst_i: for (i = 0; i < GDN_DV; i += 16) {
-                #pragma HLS loop_tripcount min=16 max=16
-                #pragma HLS pipeline II=1
-                    Pack16 state_word = recurrent_state_in[
-                        st_base16 +
-                        ((size_t)h * GDN_DK + j) * (GDN_DV / 16) +
-                        (i >> 4)];
-                    uint32_t lane;
-                    state_rst_lane: for (lane = 0; lane < 16; ++lane) {
-                    #pragma HLS unroll
-                        state[h][j][i + lane] = state_word.data[lane];
-                    }
-                }
-            }
-        }
-    }
 
     recur_token: for (token_index = 0; token_index < num_tokens; ++token_index) {
     #pragma HLS loop_tripcount min=1 max=2048
@@ -1011,6 +987,8 @@ static void gdn_recurrent_attention(
             Pack16 *out_head = attn_out +
                 (size_t)token_index * (hidden / 16)
                 + (size_t)head_index * (GDN_DV / 16);
+            size_t head_state_base16 = st_base16 +
+                (size_t)head_index * GDN_DK * (GDN_DV / 16);
 
             /* ---- Local per-token buffers ---- */
             float q_loc[GDN_DK];
@@ -1098,11 +1076,12 @@ static void gdn_recurrent_attention(
 
             float alpha = gdn_tree_reduce_256(alpha_prod);
 
-            /* ---- Phase 2: FUSED READ PASS ----
+            /* ---- Phase 2: FUSED HBM RESTORE + READ PASS ----
              * For each column i, accumulate across rows j:
              *   r_buf[i] = Σ_j S[j][i] * k_norm[j]   (retrieval)
              *   o_buf[i] = Σ_j S[j][i] * q_norm[j]   (partial output)
-             * With P_K=8 column parallelism at II=1.
+             * The same 512-bit word is retained in the head-local state buffer
+             * for the later update, eliminating a separate restore traversal.
              */
             init_ro: for (i = 0; i < GDN_DV; ++i) {
             #pragma HLS loop_tripcount min=256 max=256
@@ -1117,12 +1096,17 @@ static void gdn_recurrent_attention(
                 float kj = k_loc[j];
                 float qj = q_loc[j];
                 fused_rd_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
-                #pragma HLS loop_tripcount min=32 max=32
+                #pragma HLS loop_tripcount min=16 max=16
                 #pragma HLS pipeline II=1
+                    Pack16 state_word = recurrent_state_in[
+                        head_state_base16 +
+                        (size_t)j * (GDN_DV / 16) +
+                        (i >> 4)];
                     uint32_t pp;
                     for (pp = 0; pp < GDN_PK; ++pp) {
                     #pragma HLS unroll
-                        float s = state[head_index][j][i + pp];
+                        float s = state_word.data[pp];
+                        state[j][i + pp] = s;
                         r_buf[i + pp] += s * kj;
                         o_buf[i + pp] += s * qj;
                     }
@@ -1161,51 +1145,34 @@ static void gdn_recurrent_attention(
                 out_head[i] = out_word;
             }
 
-            /* ---- Phase 4: FUSED WRITE PASS (state update + decay) ----
+            /* ---- Phase 4: FUSED UPDATE + HBM SAVE PASS ----
              * S[j][i] = g * S[j][i] + k_norm[j] * Δv[i]
+             * Pack and persist each updated word immediately, eliminating a
+             * separate save traversal of the complete layer state.
              */
             fused_wr_j: for (j = 0; j < GDN_DK; ++j) {
             #pragma HLS loop_tripcount min=256 max=256
                 float kj = k_loc[j];
                 fused_wr_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
-                #pragma HLS loop_tripcount min=32 max=32
+                #pragma HLS loop_tripcount min=16 max=16
                 #pragma HLS pipeline II=1
+                    Pack16 state_word;
                     uint32_t pp;
                     for (pp = 0; pp < GDN_PK; ++pp) {
                     #pragma HLS unroll
-                        state[head_index][j][i + pp] =
-                            g * state[head_index][j][i + pp]
-                            + kj * dv[i + pp];
+                        float updated = g * state[j][i + pp]
+                                      + kj * dv[i + pp];
+                        state[j][i + pp] = updated;
+                        state_word.data[pp] = updated;
                     }
+                    recurrent_state_out[
+                        head_state_base16 +
+                        (size_t)j * (GDN_DV / 16) +
+                        (i >> 4)] = state_word;
                 }
             }
         } /* recur_head */
     } /* recur_token */
-
-    {
-        /* Decode (the only mode): persist this layer's updated state to HBM
-         * (sequential 512-bit bursts) for the next token's restore. */
-        state_sav_h: for (h = 0; h < GDN_HEADS; ++h) {
-        #pragma HLS loop_tripcount min=8 max=8
-            state_sav_j: for (j = 0; j < GDN_DK; ++j) {
-            #pragma HLS loop_tripcount min=256 max=256
-                state_sav_i: for (i = 0; i < GDN_DV; i += 16) {
-                #pragma HLS loop_tripcount min=16 max=16
-                #pragma HLS pipeline II=1
-                    Pack16 state_word;
-                    uint32_t lane;
-                    state_sav_lane: for (lane = 0; lane < 16; ++lane) {
-                    #pragma HLS unroll
-                        state_word.data[lane] = state[h][j][i + lane];
-                    }
-                    recurrent_state_out[
-                        st_base16 +
-                        ((size_t)h * GDN_DK + j) * (GDN_DV / 16) +
-                        (i >> 4)] = state_word;
-                }
-            }
-        }
-    }
 }
 
 static void gdn_output_norm_and_gate(
