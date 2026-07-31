@@ -1,6 +1,9 @@
 # Optimised Recurrent Attention (`gdn_recurrent_attention`)
 
-**Location:** `gdn_model.cpp:1129`
+**Status:** Active decode compute block. The prefill synthesis tables in this
+document are historical.
+
+**Location:** `gdn_model.cpp` (`gdn_recurrent_attention`, static helper)
 
 ## Overview
 
@@ -12,7 +15,7 @@ every token step.
 The implementation applies the following optimisations, in roughly the order
 they were introduced:
 
-1. **Persistent on-chip state** in BRAM (eliminates DRAM traffic for state)
+1. **Partitioned BRAM working state** with one HBM restore/save per layer call
 2. **Fused two-pass pipeline** (algebraic fusion → 4 state passes → 2)
 3. **Column parallelism** P_K = 16 (16 MACs per cycle on state ops)
 4. **`delta_out` + `delta_drain` split** (lifts II=16 → II=1)
@@ -58,7 +61,7 @@ State:  S[h] (d_k × d_v matrix, persistent across tokens)
 These are used in C code. HLS pragmas use literal `16` because Vitis HLS
 pragma processing does not expand C preprocessor macros.
 
-## Optimisation 1: Persistent On-Chip State
+## Optimisation 1: Partitioned BRAM Working State
 
 ### Problem
 The naive implementation stores the 8 × 256 × 256 state matrix in external
@@ -74,21 +77,22 @@ static float state[GDN_HEADS][GDN_DK][GDN_DV];
 #pragma HLS array_partition variable=state dim=3 cyclic factor=16
 ```
 
-The state is declared `static` and bound to dual-port BRAM. It is cleared at
-the start of each recurrent-attention invocation, then remains on chip for the
-entire token sequence. The external `recurrent_state` pointer is kept only for
-API compatibility and is not used for state traffic. Total storage is
-8 × 256 × 256 × 4 bytes = 2 MB. In the current U55C reports this maps to
-258 BRAM_18K blocks, which is the dominant on-chip memory cost of the
-recurrent module.
+The state is declared `static`, bound to dual-port BRAM, and partitioned into
+16 column banks. In the current decode-only kernel, each layer first restores
+its 2 MiB slice from the 48 MiB HBM-resident `recurrent_state`, performs the
+single-token update on BRAM, then saves the slice for the next kernel call.
+The GPU-generated `.gdnstate` supplies the initial value after prompt prefill.
 
-The `recurrent_state` and `head_buffer` m_axi ports are kept in the interface
-for API compatibility but are unused.
+The BRAM copy removes external traffic from the inner gated-delta loops, but
+state restore/save remains a material serial cost per token. `head_buffer` is
+not used by recurrent attention; the top-level kernel uses it for persistent
+Q/K/V convolution tails.
 
-### State Clear
-The state is cleared at the start of each forward pass (new sequence). The
-clear loop is parallelised by P_K, writing 16 elements per cycle and clearing
-all 524 288 elements in ~32 770 cycles (0.33 ms @ 100 MHz).
+### State Restore and Save
+
+Restore and save traverse `[head][k][v]` in contiguous 16-float groups. The
+`v` dimension partition and Pack16 AXI access allow one 512-bit state transfer
+per pipelined iteration. No state-clear path remains in the decode kernel.
 
 ## Optimisation 2: Fused Two-Pass Pipeline
 
@@ -246,7 +250,11 @@ Two reasons for the explicit tree (rather than `for j unroll: sum += arr[j]`):
 The helper is `inline` so it lives in the caller's pipeline scope and is
 shared across `q_sq`, `k_sq`, `α`, and `sum` (in onorm).
 
-## Optimisation 6: q/k AXI Bundle Split
+## Historical Optimisation 6: q/k AXI Bundle Split
+
+This split applied to the retired `gdn_attn_forward` top. Current `gdn_forward`
+places Q and K on the shared `gmem_qkv` bundle; the text below is retained to
+explain the v7 synthesis result.
 
 `load_qk` reads `q_head[j]` and `k_head[j]` from m_axi in the same iteration:
 
@@ -277,7 +285,7 @@ pipelines at II=1. Side effect: HLS instantiates separate matmul/conv
 instances for callers using `mem_q` vs `mem_k`, doubling some resource
 counts. Total resource utilisation stays under 25 %.
 
-## Per-Head Pipeline Summary (v7)
+## Historical Per-Head Pipeline Summary (v7)
 
 ```
 Phase                    Cycles    Notes
@@ -299,7 +307,7 @@ Total per (token,head)   ~9 598 (was 19,105,698 in naive baseline)
 For 2048 tokens × 8 heads = **157.3 M cycles total** vs the naive baseline of
 **313 G cycles** — a **~2,000× speedup** on the recurrent module alone.
 
-## Synthesis Results (single-layer, U55C @ 100 MHz)
+## Historical Synthesis Results (single-layer, U55C @ 100 MHz)
 
 From `GDN_single_attn/solution2/syn/report/csynth.rpt`, target
 `xcu55c-fsvh2892-2L-e`:
@@ -311,7 +319,7 @@ From `GDN_single_attn/solution2/syn/report/csynth.rpt`, target
 | Per-(token, head) iteration   | 19.1 M  | 9 598    | **~2,000×** |
 | Top-level `gdn_attn_forward`  | 469.6 G | 141.03 G | **3.33×** |
 
-## Resource Cost (`gdn_recurrent_attention` v7)
+## Historical Resource Cost (`gdn_recurrent_attention` v7)
 
 | Resource | Naive | v7    | Δ       |
 |----------|------:|------:|--------:|
@@ -335,9 +343,9 @@ plus a few control-path BRAMs ⇒ 258 total). The state matrix (8 × 256 × 256 
    preprocessor macros, so `factor=16` is hardcoded as a literal in all
    `array_partition` and `unroll` pragmas. The `GDN_PK` define is still used
    in C code for loop bounds and stride.
-3. **`load_qk` requires separate `mem_q` / `mem_k` AXI bundles** in the
-   top-level interface for II=1. If they are coalesced back to one bundle,
-   `load_qk` falls to II=2.
+3. **State traffic is serialized with the rest of the layer.** Every token
+   restores and saves 2 MiB per layer through the state master. Spreading or
+   overlapping this traffic is the main non-GEMV architectural opportunity.
 
 ## Parity Verification
 

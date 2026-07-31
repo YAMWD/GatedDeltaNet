@@ -1,15 +1,26 @@
 # Disaggregated Decode-Only Accelerator (GEMV datapath)
 
+**Status:** Historical GEMV scaling and optimization record. The current
+production design is the integrated Iter36 32-port/16-cluster,
+activation-resident, head-local-state kernel documented in
+[architecture.md](architecture.md).
+The standalone 32-port microbenchmark remains documented separately in
+[`../microbench/gemv_tile/README.md`](../microbench/gemv_tile/README.md).
+
+The final integrated U55C image routes at 100 MHz with zero failed/unrouted
+nets and zero overlaps. It passes exact 64-token parity at 59.578 ms/token mean
+latency, 2.04x faster than the 121.4 ms eight-port baseline. Sections below
+retain the progression that led to that design; older statements describing an
+eight-port kernel as “current” are historical in their section context.
+
 This documents the pivot to a **decode-only** GatedDeltaNet accelerator: the GPU
 prefills the prompt and exports a constant-size recurrent + conv state to disk;
 the FPGA loads that state and decodes token-by-token through a new **GEMV**
 datapath. The prefill GEMM, the prefill/decode mode flags, and all prefill code
 were removed — the FPGA's only job is decode.
 
-Supersedes the dual-mode Step-1 design in
-[decode_step1_single_token.md](decode_step1_single_token.md) (which kept the
-prefill GEMM and a `decode_flags` mux). Follows the decode roadmap in
-[decode_roadmap.md](decode_roadmap.md).
+This supersedes the intermediate dual-mode design, which kept the prefill GEMM
+and selected decode through a `decode_flags` mux.
 
 ## 1. Why disaggregate
 
@@ -94,11 +105,11 @@ array idle, weights not streamed back-to-back). The next lever (roadmap Step 2)
 replicates the reader across N HBM channels toward HBM's ~460 GB/s aggregate.
 
 All eight large projections (q/k/v/gate/o, mlp gate/up/down) use `gdn_gemv`; the
-two tiny gate projections (a/b, out_dim=8) keep `gdn_matmul_tiled`.
+two tiny gate projections (a/b, out_dim=8) use `gdn_gemv_tiny`.
 
 ## 4. What was removed
 
-- **`gdn_matmul_2d`** (the weight-stationary 16×16 GEMM) and `gdn_matmul2d_top`.
+- **`gdn_matmul_2d`**, `gdn_matmul_tiled`, and their prefill test tops.
 - **`decode_flags` / `GDN_DECODE_RESTORE` / `GDN_DECODE_SAVE`** — there is one
   mode. The conv and recurrent attention always restore state at the start and
   save at the end; `gdn_forward` always forwards exactly one token.
@@ -113,13 +124,13 @@ two tiny gate projections (a/b, out_dim=8) keep `gdn_matmul_tiled`.
 kernel top. `hw.cfg` is unchanged (the flag was an s_axilite scalar, not a memory
 port; all `sp=` port names are identical).
 
-## 5. Files
+## 5. Files at the Initial Decode-Only Pivot
 
 | File | Change |
 |---|---|
 | `scripts/export_gdn_state.py` | **new** — GPU prefill → `.gdnstate` export + self-check |
 | `gdn_model.cpp` | `gdn_gemv` engine; decode-only `gdn_forward` (no GEMM/flags); conv + attention always restore/save; single `gdn_decode_step_host` |
-| `gdn_model.h` | decode-only `gdn_forward` (20 args); flag macros + prefill/matmul decls removed |
+| `gdn_model.h` | decode-only `gdn_forward` (20 args at this stage); flag macros + prefill/matmul decls removed |
 | `gdn_eval.cpp` | `--decode-from-state` loader + decode loop; MC/LL/re-prefill modes removed |
 | `host.cpp` | `upload_decode_state` into the resident BOs; `run_decode_hw` decodes from `.gdnstate`; `--decode-from-state`; 20-arg kernel call |
 | `scripts/decode_correctness_check.sh` | gates on the decode-only-from-state path |
@@ -176,7 +187,7 @@ resident activation. The burst no longer breaks between output rows.
 **1.54 s is the single-port floor**, and the decouple reached it. XRT shows the
 port reads 5.6 GB/token at 5.30 GB/s ⇒ **~1.06 s of weight streaming**; the
 kernel is 1.54 s ⇒ **~0.48 s is non-gemv serial work** (recurrent-attention state
-R/W, the a/b `gdn_matmul_tiled`, conv) during which the weight port idles. So
+R/W, the a/b `gdn_gemv_tiny`, conv) during which the weight port idles. So
 `1.06 (gemv @ 83% of one port) + 0.48 (non-gemv) = 1.54 s`. The ~1.0 s target had
 assumed a full 6.4 GB/s port *and* zero non-gemv — neither reachable on one
 master. The decouple's *purpose* (burst efficiency) was met and exceeded:
@@ -229,7 +240,7 @@ resident `a_loc`, same beat order, same partial-bank adder-tree reduction).
 
 **Why 1.76× and not 2×.** Amdahl on the kernel: `1543 = W + S`, `875 = W/2 + S`
 ⇒ **W ≈ 1336 ms** (parallel weight streaming) and **S ≈ 207 ms** serial floor —
-recurrent-attention state R/W (~50 MB/token), the a/b `gdn_matmul_tiled`, conv,
+recurrent-attention state R/W (~50 MB/token), the a/b `gdn_gemv_tiny`, conv,
 and the per-layer scalar `weight_data` reads (norms / conv / a-b proj). Logits are
 computed **host-side** (`host.cpp:compute_logits` reads `lm_head` from host RAM),
 so `lm_head` is *not* a kernel cost. The readers halved W exactly; S is untouched.
@@ -331,20 +342,127 @@ compute), which the GPU pays ~nothing for. fp32↔fp32 normalisation does **not*
 the gap (the GPU is idle, not byte-limited). The FPGA's defensible angle is perf/Watt
 (~50–75 W vs ~250–300 W), which needs the latency gap down to <~4–5×, not <1×.
 
-## 7. Next
+## 6g. Clock re-synth — 100 → 150 MHz (on-card, bit-exact)
 
-Decode-only is bit-exact and flat at **470 ms/token** *complete* decode steps
-(forward + lm_head + argmax all on-chip), **~3.3× over the single-port Stage 1**.
-The weight-bandwidth lever is exhausted (§6e); the dominant cost is now the **serial
-floor S ≈ 325 ms** (recurrent-attention state I/O on one HBM[0] master + the gated-
-delta-rule update), and the FPGA is ~14× the A100's launch-bound 33.5 ms. Levers:
+The kernel re-pipelines cleanly to ~200 MHz-class paths (csynth est. 3.837 ns at a 5 ns
+target), but two things had to line up, each caught at a cheap gate before an expensive one.
 
-- **Raise the kernel clock** (the shared BW + compute lever). Each 512-bit master is
-  6.4 GB/s at 100 MHz (~11% of HBM); 100→200 MHz ~doubles weight BW *and* recurrent
-  throughput with no extra masters. Needs the fp-reduction pipelined, DSP adders, and
-  an SLR pblock — the routability hacks (fabric adders, no pblock) fight Fmax. The
-  N=8+lm_head kernel closes at 100 MHz with WNS +0.169 ns ⇒ Fmax ≈ 102 MHz, so a
-  higher clock requires re-pipelining (recompile at the higher target — see Build B).
+**(1) Over-synthesize for routing margin.** The congested route adds ~2.7 ns of overhead,
+so building *and* linking at the same higher freq misses (the uncertainty reserve shrinks
+faster than the overhead). Synthesize the xo at a tighter target than you run:
+```
+make xo FREQ=200 && make xclbin FREQ=150
+```
+The 3.837 ns logic linked at 150 MHz (6.67 ns budget) leaves ~2.83 ns for routing — just over
+the ~2.7 ns overhead — so it closes (WNS +0.003 ns, all constraints met). A naive same-freq
+build (150-target xo @ 150) would miss; v++ accepts the synth/link freq split.
+
+**(2) A faster clock breaks the gemv MAC's II=1 — the fix is a loop restructure, not a pragma.**
+fp-add latency is ~constant in ns, so its latency *in cycles* = latency_ns ÷ clock_period: a
+~1-cycle fadd at 100 MHz becomes ~3 cycles at 150 MHz, and any *carried* accumulator dependency
+inflates II directly. `gemv_pe_k`'s rotating accumulator `part[kp & 7] += lane` reuses each of 8
+banks every 8 iters (so the fadd really has 8 cycles), but the **runtime** index makes HLS treat
+it as distance-1 → II inflates → the dominant gemv slows more than the clock gains (a naive
+150 MHz build measured **309 ms**, *worse* than 212.5). A `#pragma HLS dependence` hint did not
+convince HLS. Fix (commit `8b70225`): **unroll the k-loop by `GEMV_PARTIAL`** so each `part[p]`
+has a compile-time-fixed index → 8 independent fadd chains; the 8 stream reads/iter floor the
+outer loop at II=8 = 1 pack/cycle (same cycle count as the old II=1 over `k_packs`) but robust
+to the multi-cycle fadd. **Bit-exact**: `part[p]` still sums exactly the `kp ≡ p (mod 8)` lanes
+in order. The same break hits the smaller fp-reductions (`rmsnorm_sq`, `onorm_sq`, `gvt_k`,
+II=2–3) — left as-is (≈2.3 ms total, see below).
+
+| metric | Build A @ 100 MHz | **restructured @ 150 MHz** |
+|---|---:|---:|
+| TPOT ms/tok (on-card, 1×64) | 212.5 | **165.6** |
+| speedup | — | **1.28× (2.84× over the 470 original)** |
+| decode bit-exact | ✓ | **✓ 64/64** |
+| routed WNS / timing | +0.003 | **+0.003, all met (clean)** |
+
+**Per-op breakdown @ 150 MHz (per-op profiler) — the gemv is sliding toward HBM-bound.**
+
+| op | ms | % | scaled |
+|---|---:|---:|---|
+| gemv | 119.0 | 71.5% | **~1.19×** (not 1.5) |
+| recurrent | 26.9 | 16.2% | ~1.45× |
+| conv | 10.9 | 6.5% | ~1.5× |
+| gemv_tiny | 6.8 | 4.1% | ~ok |
+| rmsnorm / onorm / swiglu | 2.3 | 1.3% | the II loops — negligible |
+
+The compute/latency-bound ops (recurrent, conv) scaled with the clock; the **gemv (72%) only
+sped up 1.19×**. 5.6 GB ÷ 119 ms = ~47 GB/s across 8 ports = ~61% of the 76.8 GB/s the kernel
+now requests (8×512-bit×150 MHz), down from ~76% at 100 MHz: the faster clock asks HBM for packs
+faster than the read pipeline (burst gaps + 8-channel crossbar contention + HBM latency) delivers.
+So more clock now buys diminishing gemv returns — the dominant op's ceiling is HBM **efficiency/
+bandwidth**, addressed only by more channels (§6e, exhausted) or less traffic (INT8), not Fmax.
+**[Superseded by §6h: this HBM-bound read was *wrong*. The 61% was the gemv MAC's per-output-row
+pipeline fill, not HBM. Flattening the loop recovered it for a further 1.36×.]**
+
+## 6h. gemv loop-flatten — the "HBM ceiling" was the per-row pipeline fill (on-card, bit-exact)
+
+§6g blamed the gemv's ~61% port utilisation on HBM read efficiency. **That diagnosis was wrong.**
+A per-projection breakdown (one CU launch per projection) showed utilisation tracking `k_packs`,
+not bandwidth:
+
+| projection | k_packs | measured BW/port | port util |
+|---|---:|---:|---:|
+| q/k/v/o, mlp_gate, mlp_up, lm_head | 128 | ~5.6 GB/s | ~59% |
+| **mlp_down** | **352** | **~7.5 GB/s** | **~78%** |
+
+If HBM were the wall, the high-`k_packs` projection could not pull *more* per port. The real
+cause: `gemv_pe_o` (the output-row loop) was **sequential** (csynth `Pipelined: no`), running the
+inner `gemv_pe_k` read/MAC pipeline start→drain **per row**. Each row paid a fixed ~92-cycle tax —
+the ~81-stage fadd-reduction-tree fill (Depth) + ~19-cycle reduce/emit — on top of `k_packs`
+cycles of useful weight reads. So util = `k_packs / (k_packs + 92)`: 128 → 58%, 352 → 79%,
+matching the measured BW to <1%. The weight port idled during the fill; HBM was never the wall.
+
+**Fix (commit `abe46f4`): flatten the loop nest** into one continuous II=8 `gemv_pe_flat` pipeline
+over the whole `stripe × k_packs` shard, so the read/MAC pipeline never goes cold between rows —
+fill paid **once per call**, not per row. (You cannot just `#pragma HLS pipeline` the outer loop:
+that fully unrolls the inner k-loop → resource blowup. The restructure is real.)
+- **Ping-pong partials** `part[2][8]` + a **one-row-deferred emit**: a finished row is reduced/
+  written only after the next row has fully elapsed, so its accumulators are retired *and* live in
+  the other buffer than the row currently accumulating → no row-boundary RAW stall, II stays 8.
+  Runtime `cur` selects between two register banks only; the per-`p` index stays compile-time (the
+  8 independent fadd chains from §6g are unchanged).
+- **Bit-exact**: each `part[p]` still sums the `kp ≡ p (mod 8)` lanes in order, same
+  `((p0+p1)+(p2+p3))+((p4+p5)+(p6+p7))` tree. Per-row tax 92 → ~0 cyc; port util ~59% → ~99%.
+
+| metric | restructured @150 (§6g) | **flatten @150** |
+|---|---:|---:|
+| TPOT ms/tok (on-card, 1×64) | 165.6 | **121.4** |
+| speedup over §6g | — | **1.36× (−27%)** |
+| gemv total | ~109 ms | **~68 ms** |
+| decode bit-exact | ✓ 64/64 | **✓ 64/64** |
+
+csynth: II=8 holds (depth 98→109, **paid once**); +6.6K LUT total. The denser netlist needed
+**FREQ=250** over-synth (vs 200) to close at 150 MHz — routed **WNS +0.025 ns, 0 failing
+endpoints**. The failing path at xo@200 was a high-fanout loop-control reg → fadd clock-enables
+(route-dominated, −0.298 ns); the tighter 4 ns synthesis re-placed/replicated it closed. (The
+xo@200 build ran bit-exact at **129 ms** despite −0.298 — the violation was benign — but a
+negative-WNS bitstream is not committed.)
+
+## 7. Current Integrated Result and Next Step
+
+Decode-only is bit-exact and flat at **121.4 ms/token** *complete* decode steps
+(forward + lm_head + argmax all on-chip), **~3.9× over the 470 ms baseline** (§6f).
+After the loop-flatten (§6h) the gemv is ~68 ms (~56%); the remainder is the **serial
+floor** — recurrent-attention state I/O on one HBM[0] master + the gated-delta-rule
+update (~27 ms) + conv/tiny — and the FPGA is now ~3.6× the A100's launch-bound 33.5 ms. Levers:
+
+The standalone 32-port mono-kernel has since routed and sustained 263.063 GB/s
+at an achieved 130.6 MHz. That result proves the weight path, not full-model
+integration: `gdn_forward` still uses the eight-reader engine described above.
+Integration must preserve the clustered physical hierarchy without crowding
+the recurrent, convolution, activation, and state datapaths.
+
+- **Raise the kernel clock** — DONE to 150 MHz (§6g): 1.28× / 165.6 ms, bit-exact, via
+  over-synth (xo@200, link@150) + the gemv-MAC unroll restructure.
+- **Flatten the gemv loop** — DONE (§6h, `abe46f4`): a further **1.36× / 121.4 ms**, bit-exact.
+  §6g's "gemv is HBM-bound" was a misread — the 61% was the per-output-row pipeline fill, killed
+  by folding the row loop into one continuous II=8 pipeline. Needed **FREQ=250** over-synth to
+  close the denser netlist (WNS +0.025). Fixing the small fp-reduction II loops (rmsnorm/onorm/
+  gvt_k, ≈2.3 ms) is the same unroll trick but near-negligible; rmsnorm/onorm reorder the sum
+  (token-exactness risk).
 - **Attack S** (bit-exact): spread the 50 MB/tok state across channels, parallelise
   the gated-delta-rule update, overlap state R/W with the weight stream.
 - **INT8 weights** (deferred all-fp32 plan): 4× less W + relieves the crossbar; the

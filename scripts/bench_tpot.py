@@ -2,7 +2,7 @@
 """TPOT (time-per-output-token) benchmark: GatedDeltaNet vs standard transformers.
 
 Tests the decode-stage premise behind the FPGA work (see
-c_impl/doc/decode_roadmap.md): linear-attention GDN decode is O(1)/token with a
+c_impl/doc/decode_disaggregated_gemv.md): linear-attention GDN decode is O(1)/token with a
 constant-size recurrent state, whereas a standard transformer is O(n)/token with
 a KV cache that grows with context. So GDN's per-token decode latency (TPOT) and
 memory should stay *flat* as context grows, while the transformer's climb.

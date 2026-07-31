@@ -1,323 +1,457 @@
-# GatedDeltaNet HLS Accelerator -- Architecture Reference
+# GatedDeltaNet Decode Accelerator Architecture
 
-This document describes the Vitis HLS implementation of GatedDeltaNet-1.3B
-inference in `c_impl/`. It is intended as a reference for future development
-sessions.
+**Status:** Current routed production architecture (Iter36), measured
+2026-07-31 on an Alveo U55C.
 
-## 1. Model Configuration (GatedDeltaNet-1.3B)
+The accelerator in `c_impl/` is decode-only. Prompt prefill runs on the GPU and
+exports fixed-size recurrent and convolution state. The FPGA then advances one
+token per `gdn_forward` invocation. The successful design combines:
 
-| Parameter        | Value |
-|------------------|-------|
-| Hidden dim       | 2048  |
-| Num heads        | 8     |
-| Head dim (Q/K)   | 256   |
-| Value dim (V)    | 256   |
-| Intermediate     | 5632  |
-| Num layers       | 24    |
-| Conv kernel size | 4     |
-| Max seq len      | 2048  |
-| Vocab size       | 32000 |
+- 32 independent 512-bit HBM weight readers;
+- 16 two-port FP32 GEMV clusters;
+- BRAM-backed MM2S/FIFO decoupling;
+- a 4/6/6 cluster distribution across SLR0/SLR1/SLR2;
+- transient activations resident in local BRAM for the complete 24-layer
+  forward;
+- a 16-bank, head-local recurrent-state buffer with HBM restore/retrieval and
+  update/save fused into the two required attention passes;
+- packed external recurrent-state and convolution-tail transfers; and
+- on-chip LM-head argmax, with no external logits materialization.
 
-State matrix per layer: 8 heads x 256 x 256 FP32 = 2 MB.
+The production image routes with zero failed nets, zero unrouted nets, and zero
+node overlaps at 100 MHz. It produces an exact 64-token trajectory at
+59.578 ms/token mean latency, 2.04x faster than the 121.4 ms eight-port
+baseline and 1.26x faster than Iter35.
 
-## 2. File Layout
+## Fixed Model Shape
 
-| File                    | Role |
-|-------------------------|------|
-| `gdn_model.h`          | Public API: structs (`GDNWeightHeader`, `GDNLayerWeights`, `GDNModel`, `GDNRunState`), function prototypes for full-model, single-layer, and matmul-only tops |
-| `gdn_model.cpp`        | Main synthesizable implementation + HLS top functions (`gdn_forward`, `gdn_attn_forward`, `gdn_matmul_top`). Contains the systolic matmul kernel as in-file static helpers reused by all three tops. |
-| `gdn_eval.cpp`        | Host testbench: loads `.gdnw` weights, reads `.gdnreq` fixtures, runs `gdn_forward`, writes JSON output |
-| `gdn_attn_test.cpp`   | Host testbench for single-layer attention: loads `.gdnw` + `.gdnblk`, runs `gdn_attn_forward`, checks parity |
-| `gdn_matmul_test.cpp` | Host testbench for the systolic matmul (`gdn_matmul_top`) against a native-C golden matmul |
-| `host.cpp`            | XRT host program for on-card execution against `gdn_forward.xclbin` |
-| `test.tcl`             | Vitis HLS TCL script for full-model (csim/csynth/cosim), targets Alveo U55C |
-| `test_single_GDN_attn_synth.tcl` | Current TCL script for single-layer attention systolic synthesis, targets Alveo U55C |
-| `test_single_GDN_attn.tcl` | Older v7 single-layer attention script, retained for the pre-systolic tiled-matmul baseline |
-| `test_matmul.tcl`      | Matmul-only csim/csynth script (top = `gdn_matmul_top`); default test is 2048 x 2048 x 2048 |
-| `test_parity.sh`       | Automated end-to-end parity test against Python golden results |
-| `hw.cfg`, `pblock_pe_split.tcl` | v++ link configuration and pre-place floorplan TCL (SLR split for the U55C bitstream) |
-| `Makefile`             | Builds host testbenches, v++ kernel (`xo`/`xclbin`), and the XRT host; `make run_hw` is the end-to-end on-card path |
+`gdn_forward` is specialized to the committed GDN-1.3B FP32 decode shape:
 
-### Weight and Fixture Formats
+| Parameter | Value |
+|---|---:|
+| Hidden dimension | 2,048 |
+| Attention heads | 8 |
+| Q/K/V head dimension | 256 |
+| MLP intermediate dimension | 5,632 |
+| Layers | 24 |
+| Convolution kernel | 4 |
+| Vocabulary | 32,000 |
+| Tokens per invocation | 1 |
 
-- **`.gdnw`** -- Flat binary: 60-byte `GDNWeightHeader` followed by all FP32 weights
-  in layer order. Total ~5.6 GB for GDN-1.3B.
-- **`.gdnreq`** -- Pretokenized evaluation fixture: header + int32 token IDs +
-  golden log-probabilities/scores for parity checking.
-- **`.gdnblk`** -- Single-layer attention fixture: header + input tensor + golden
-  output tensor for one transformer block.
+The recurrent state is `24 x 8 x 256 x 256` FP32 values, or 48 MiB. The
+convolution state is three prior rows for Q, K, and V in every layer, or about
+1.69 MiB. These two state classes persist in HBM across kernel calls; transient
+activations do not.
 
-## 3. HLS Top Functions
+## System Overview
 
-### 3.1 `gdn_forward` (full model)
-
-**Location:** `gdn_model.cpp:1432`
-
-Full 24-layer GatedDeltaNet forward pass. All arguments are flat pointers with
-`m_axi` interfaces. The function:
-
-1. Embeds tokens (`gdn_embed_tokens`)
-2. Loops over 24 layers, each performing:
-   - RMSNorm on input
-   - 6x matmul projections (Q, K, V, A, B, Gate)
-   - Depthwise conv1d + SiLU on Q, K, V
-   - Recurrent attention (gated delta rule)
-   - Output norm + gate
-   - Output projection matmul
-   - Residual add
-   - RMSNorm on residual
-   - MLP: gate projection, up projection, SwiGLU, down projection
-   - Residual add
-3. Final RMSNorm
-
-### 3.2 `gdn_attn_forward` (single-layer attention)
-
-**Location:** `gdn_model.cpp:1665`
-
-Single-layer attention forward for isolated synthesis/co-simulation. Uses the
-same internal functions as `gdn_forward` but only runs one layer. This is the
-primary synthesis target for optimisation work.
-
-The struct-based wrapper `gdn_attn_forward_layer` is provided for testbench
-convenience but cannot be the HLS top function (HLS does not support struct
-pointers in top-function arguments).
-
-## 4. Compute Submodules
-
-### 4.1 `gdn_embed_tokens`
-
-**Location:** `gdn_model.cpp:381`
-
-Copies embedding rows from the weight table into the hidden state buffer.
-Simple lookup, no compute.
-
-### 4.2 `gdn_rmsnorm_rows`
-
-**Location:** `gdn_model.cpp:408`
-
-RMSNorm over each row (token) of the input. Uses `double` accumulation for
-numerical stability. Called before every projection block and at the final
-output.
-
-### 4.3 `gdn_matmul_systolic` (Current Large-GEMM Engine)
-
-**Location:** `gdn_model.cpp` (in-file static helper)
-
-Current GEMM engine for large projections. One-chain 1-D systolic array:
-
-```
-16 PEs x 16 output columns/PE = 256 FP32 MAC/cycle peak
+```text
+GPU prefill
+    |
+    | .gdnstate: recurrent state + Q/K/V convolution tails + seed token
+    v
+XRT host
+    |-- keeps the original embedding table in host memory
+    |-- builds 32 compact, output-row-striped GEMV weight shards
+    |-- builds one compact non-GEMV auxiliary-weight image
+    |-- writes the selected 8 KiB embedding row to workspace[X]
+    v
++---------------------------------------------------------------------+
+| gdn_forward, one token                                               |
+|                                                                     |
+|  workspace[X] --> local activation BRAMs --> 24 GDN layers          |
+|                         |                     |                      |
+|                         |                     +--> recurrent state --+--> HBM0
+|                         |                     +--> convolution tails +--> HBM0
+|                         v                                            |
+|             32 HBM readers --> 16 GEMV clusters --> local results   |
+|                         |                                            |
+|                  final norm + LM head                                |
+|                         |                                            |
+|                  on-chip strict argmax                               |
+|                         v                                            |
+|                workspace[X_NORM][0] = token                          |
++---------------------------------------------------------------------+
 ```
 
-The kernel uses `hls::stream` and a `#pragma HLS dataflow` region around
-`ReadA`, `ReadB`, a 16-PE chain, `SinkAB`, and `WriteC_chain`. It supports
-runtime `num_rows`, pads rows on chip to a multiple of 16, and supports
-`in_dim <= 5632` so the MLP down projection fits without host-side K tiling.
-Called directly from `gdn_forward` / `gdn_attn_forward` and also exposed as
-the standalone HLS top `gdn_matmul_top` (for `test_matmul.tcl` and
-`gdn_matmul_test`). See [systolic_matmul.md](systolic_matmul.md).
+The host writes an embedding rather than a token ID because the embedding table
+remains in host memory. After the kernel completes, the host reads one 512-bit
+line at the existing `GDN_WS_OFF_X_NORM` offset and interprets lane zero as the
+next token ID.
 
-### 4.4 `gdn_matmul_tiled` (Fallback)
+## Kernel Interface and HBM Mapping
 
-**Location:** `gdn_model.cpp:866`
+The HLS top has 34 pointer arguments:
 
-Legacy 16 x 16 x 16 tiled matrix multiplication. It remains in the current
-design as the fallback for A/B projections where `out_dim=8`, which is too
-small for the 16-column systolic output tile. Manual-flattened R x C compute
-with an explicit balanced fadd tree gives II=1 in the inner pipeline. See
-[tiled_matmul.md](tiled_matmul.md).
+- `aux_weights`;
+- `workspace`; and
+- `weight_data_mm0` through `weight_data_mm31`.
 
-### 4.5 `gdn_depthwise_conv_silu`
+They synthesize to exactly 32 AXI masters. `aux_weights`, `workspace`, and shard
+0 intentionally share `mem_weights_mm0`; shards 1-31 each have their own
+master. The successful connectivity is:
 
-**Location:** `gdn_model.cpp:1037`
+| AXI bundle | HBM bank | Contents |
+|---|---:|---|
+| `mem_weights_mm0` | HBM[0] | GEMV shard 0, compact auxiliary weights, workspace, recurrent state, convolution tails, embedding ingress, token egress |
+| `mem_weights_mm1` ... `mem_weights_mm31` | HBM[1] ... HBM[31] | One compact GEMV shard per bank, read-only during decode |
 
-Depthwise 1D convolution with SiLU activation. Kernel size is always 4
-(causal, looking back 3 positions). Applied independently to Q, K, V after
-their linear projections. Uses pre-buffered weights and a 4-row sliding window;
-two-phase per-row execution (load + shift, then compute + write) keeps both
-phases at II=1. See [depthwise_conv.md](depthwise_conv.md).
+Every large matrix, including `lm_head`, is split across the 32 compact shards.
+There is one total copy of the projection weights: channel `c` holds output rows
+`[c * out_dim/32, (c + 1) * out_dim/32)`. Within every shard the matrices are
+stored in this order:
 
-### 4.6 `gdn_recurrent_attention` (Optimised)
-
-**Location:** `gdn_model.cpp:1129`
-
-Core gated delta rule recurrence. Persistent BRAM state, fused two-pass
-read/write, P_K=16 column parallelism, on-chip out_loc + drain split for
-the AXI write phase, and tree-reduced L2 norm / α reductions. See
-[recurrent_attention.md](recurrent_attention.md).
-
-### 4.7 `gdn_output_norm_and_gate`
-
-**Location:** `gdn_model.cpp:1349`
-
-Per-head RMSNorm on attention output, followed by gated SiLU:
-```
-out[i] = RMSNorm(attn[i]) * gate[i] * sigmoid(gate[i])
-```
-Pre-loaded shared weight, on-chip per-(token, head) attn/gate buffers, and a
-tree-reduced sum-of-squares give II=1 across all sub-passes. See
-[output_norm.md](output_norm.md).
-
-### 4.8 `gdn_swiglu_inplace`
-
-**Location:** `gdn_model.cpp:1424`
-
-Element-wise SwiGLU activation for MLP: `gate[i] = SiLU(gate[i]) * up[i]`.
-
-### 4.9 `gdn_tree_reduce_256` (helper)
-
-**Location:** `gdn_model.cpp:343`
-
-Inline 8-level paired-sum FP32 fadd tree (256 → 128 → … → 1). Used by
-`gdn_recurrent_attention` (`q_sq`, `k_sq`, `α`) and `gdn_output_norm_and_gate`
-(`sum`) to reduce per-element scratch arrays. Replaces `for j unroll: sum +=
-arr[j]` patterns, which HLS emits as a 256-deep linear adder rather than a
-balanced tree.
-
-## 5. Data Flow (Single Layer)
-
-```
-input (num_tokens x 2048)
-  |
-  +-- RMSNorm --> x_norm
-  |
-  +-- Systolic MatMul x4 --> Q, K, V, Gate
-  +-- Tiled MatMul x2 ----> A, B             (small out_dim=8 fallback)
-  |
-  +-- DepthwiseConv1D+SiLU --> Q', K', V'   (causal conv, kernel=4)
-  |
-  +-- RecurrentAttention(Q', K', V', A, B)   (gated delta rule)
-  |       |
-  |       +-- L2 normalise Q, K per head
-  |       +-- Compute decay g, gate beta per head
-  |       +-- For each token x head:
-  |       |     Phase 1: alpha = q_norm^T * k_norm
-  |       |     Phase 2: fused read (retrieval r + partial output o)
-  |       |     Phase 3: delta correction + output
-  |       |     Phase 4: fused write (decay + state update)
-  |       |
-  |       +-- Output: attn (num_tokens x 2048)
-  |
-  +-- OutputNormGate(attn, Gate)
-  |
-  +-- Systolic MatMul(o_proj) --> tmp_hidden
-  |
-  +-- Residual: x += tmp_hidden
-  |
-  +-- RMSNorm --> x_norm
-  |
-  +-- MLP: Systolic MatMul(gate_proj), Systolic MatMul(up_proj),
-  |        SwiGLU, Systolic MatMul(down_proj)
-  |
-  +-- Residual: x += tmp_hidden
-  |
-  v
-output (num_tokens x 2048)
+```text
+per layer: q, k, v, gate, output, mlp_gate, mlp_up, mlp_down
+global:    lm_head
 ```
 
-## 6. HLS Interface Strategy
+One shard contains 43,728,896 FP32 values (166.8125 MiB). The small norms,
+A/B projections, convolution kernels, and final norm are packed into
+`aux_weights`; the full 5.6 GB source weight blob is not duplicated on the
+device.
 
-All external data is accessed through AXI4 master (`m_axi`) ports with
-`offset=slave` (base address set via AXI-Lite control registers). Scalar
-arguments use `s_axilite`.
+Port 0 is special. Its loader first copies the local GEMV activation into the
+cluster ripple and then streams shard-0 weights. This gives the dataflow region
+one reader for the shared port-0 bundle and avoids the local congestion caused
+by giving compute blocks direct AXI access.
 
-The `GDNWeightHeader` struct is read from DRAM via `m_axi` to extract config
-parameters at runtime (hidden size, num heads, etc.). Weight pointers for
-each layer are computed as offsets into the flat `weight_data` array.
+## External Workspace Contract
 
-### AXI bundle topology (`gdn_attn_forward`, current systolic path)
+The host-visible `GDN_WS_OFF_*` layout is unchanged from Iter31. This preserves
+the external ABI and XRT allocation behavior, but most activation offsets are
+now reserved compatibility space rather than active HBM traffic.
 
-| Bundle    | Ports                                                                 |
-|-----------|------------------------------------------------------------------------|
-| `gmem`    | config, input, output, v, a, b, gate, attn, tmp_hidden, recurrent_state, head_buffer |
-| `mem_weights` | weight_data |
-| `mem_q`   | q                                                                      |
-| `mem_k`   | k                                                                      |
+| Workspace region | Iter36 synthesized use |
+|---|---|
+| `GDN_WS_OFF_X` | Host writes one 2,048-float embedding; kernel reads it once |
+| `GDN_WS_OFF_X_NORM` | Kernel writes one 512-bit result line; lane zero is the selected token |
+| Q/K/V, gate, attention, temporary, MLP and logits offsets | Reserved but not accessed by the activation datapath |
+| `GDN_WS_OFF_REC_STATE` | Persistent packed recurrent-state read/update/write |
+| `GDN_WS_OFF_HEAD_BUF` | Persistent packed Q/K/V convolution-tail read/update/write |
 
-Splitting `q` and `k` onto dedicated bundles lets `gdn_recurrent_attention`'s
-`load_qk` issue both reads in the same cycle (II=1). The AXI port-contention
-warning ("HLS 200-885: limited memory ports") was the only structural
-violation that could not be resolved without this bundle split.
+The recurrent state cannot remain on chip across the complete decode. One layer
+is 2 MiB; all 24 layers would require roughly 2,304 URAMs before any other
+storage, versus 960 URAMs on the U55C. Iter36 instead buffers one 256 x 256 FP32
+head at a time in 16 cyclic URAM banks. The retrieval loop loads each 512-bit
+state word from HBM while consuming it, and the update loop writes each updated
+word back immediately. The unavoidable packed state round trip remains, but
+the two redundant full-layer restore/save traversals and the 128-URAM
+all-head buffer are gone.
 
-`weight_data` is also placed on `mem_weights` so the systolic `ReadB` task
-does not contend with `ReadA`, which reads activations from the default bundle.
-The full-model `gdn_forward` top uses `mem_weights` for weights and the default
-bundle for all activation/state buffers; only `gdn_attn_forward` splits q/k
-because those are explicit top-level buffers in the single-layer top.
+## Activation-Resident Datapath
 
-## 7. Numerical Precision
+The embedding is loaded once from HBM into local `Pack16` storage. A `Pack16`
+is one 512-bit word containing 16 FP32 lanes. The activation lifetime then
+remains on chip until the final token is written.
 
-- All compute is FP32.
-- L2 norm and RMSNorm accumulators use `double` (FP64) for numerical stability.
-- Parity target: < 1e-3 absolute tolerance vs Python golden reference.
-- Observed parity: ~1e-5 to 1e-6 max absolute difference.
+Six logical activation buffers hold the layer state, and two equally shaped
+buffers provide a single shared GEMV aperture:
 
-## 8. Target Device
+| Local storage | Physical size | Lifetime/reuse |
+|---|---:|---|
+| `x_storage` | 128 Pack16 / 8 KiB | Residual stream across all 24 layers |
+| `norm_attn_storage` | 128 Pack16 / 8 KiB | RMSNorm output, then reused for attention output |
+| `q_mlp_gate_storage` | 352 Pack16 / 22 KiB | Q for attention, then MLP gate |
+| `k_mlp_up_storage` | 352 Pack16 / 22 KiB | K for attention, then MLP up |
+| `v_storage` | 352 Pack16 / 22 KiB | V; only the first 128 words are logically used |
+| `gate_storage` | 128 Pack16 / 8 KiB | Attention output gate |
+| `gemv_in_storage` | 352 Pack16 / 22 KiB | Common input aperture for every large projection |
+| `gemv_out_storage` | 352 Pack16 / 22 KiB | Common output aperture and LM-head token result |
+| `a_storage`, `b_storage` | 16 FP32 each | Fully partitioned eight-element head vectors |
 
-The canonical target for both `gdn_forward` and `gdn_attn_forward` is the
-Xilinx Alveo U55C card:
+All large buffers are explicitly bound to dual-port BRAM. The equal 352-word
+shape for Q, K, V, and both GEMV apertures is deliberate: it makes HLS share one
+physical convolution implementation and one physical `gdn_gemv` graph across
+all projection shapes. The top also enforces
+`allocation function instances=gdn_gemv limit=1`. Without this, HLS specializes
+complete 32-reader fabrics for different pointer shapes and multiplies the
+hardware.
 
-| Device | FPGA | TCL |
-|--------|------|-----|
-| `xcu55c-fsvh2892-2L-e` | Virtex UltraScale+ VU13P (U55C card) | `test.tcl`, `test_single_GDN_attn.tcl` |
+The aperture copies are local 512-bit II=1 loops. They cost tens of thousands
+of cycles per token, rather than the millions of cycles and dynamic stalls
+caused by materializing every activation through HBM.
 
-Clock period: 10 ns (100 MHz).
+## Per-Layer Schedule
 
-## 9. Current Synthesis Snapshot
+Each of the 24 layers executes serially:
 
-### Single-layer attention
+```text
+local x
+  -> RMSNorm -> norm_attn
+  -> shared GEMV aperture
+       -> Q -> q_mlp_gate
+       -> K -> k_mlp_up
+       -> V -> v
+  -> tiny GEMV A and B -> partitioned scalar arrays
+  -> shared GEMV aperture -> attention gate
+  -> Q/K/V depthwise convolution + SiLU, in place
+  -> recurrent gated-delta attention
+       reads local Q/K/V
+       fuses head-local HBM restore with retrieval
+       fuses head-local state update with HBM save
+       overwrites norm_attn with attention output
+  -> output norm and gate, in place
+  -> output-projection GEMV
+  -> local residual accumulation into x
+  -> RMSNorm
+  -> MLP gate GEMV -> reuse q_mlp_gate
+  -> MLP up GEMV   -> reuse k_mlp_up
+  -> SwiGLU, in place
+  -> MLP down GEMV
+  -> local residual accumulation into x
+```
 
-| Metric | v7 tiled matmul | Current systolic matmul |
-|--------|----------------:|------------------------:|
-| Top-level latency | 141.03 G cycles | 3.976 G cycles |
-| Timing slack @ 100 MHz target | 0.00 ns | -0.04 ns |
-| BRAM_18K | 322 (7 %) | 1602 (39 %) |
-| DSP | 1042 (11 %) | 4690 (51 %) |
-| FF | 209.8 k (8 %) | 848.9 k (32 %) |
-| LUT | 237.0 k (18 %) | 932.0 k (71 %) |
+Q, K, and V convolution is safe in place because the convolution function
+captures the complete current input row before it emits the output row. Output
+projection and MLP-down results are added directly to local `x`, eliminating
+two external residual-materialization passes.
 
-The latency reduction comes from replacing the dominant large projection
-matmuls with the systolic dataflow kernel. The resource increase is expected:
-the current single-attention top contains multiple systolic dataflow instances
-plus the persistent recurrent state. The report has a small timing miss
-(-0.04 ns).
+There are eight large GEMVs per layer and one global LM-head GEMV:
 
-### Full model
+```text
+24 * (Q + K + V + gate + output + MLP gate + MLP up + MLP down)
+  + LM head
+= 193 large GEMV calls per token
+```
 
-| Metric | Current `gdn_forward` |
-|--------|----------------------:|
-| Top-level latency | 129.686 G cycles |
-| Timing slack @ 100 MHz target | -0.04 ns |
-| BRAM_18K | 1058 (26 %) |
-| DSP | 2847 (31 %) |
-| FF | 508.4 k (19 %) |
-| LUT | 580.3 k (44 %) |
+The architecture does not wrap the whole layer in one HLS `dataflow` region.
+The shared GEMV fabric is time-multiplexed between projections; only the
+internals of each GEMV use dataflow.
 
-The full model does not instantiate 24 physical layers. The layer loop is a
-time loop, so resources are for one reused datapath and the 24 layers increase
-latency rather than multiplying resource use.
+## 32-Port GEMV Microarchitecture
 
-## 10. Optimisation History
+### Reader/compute decoupling
 
-The v1-v7 optimisation passes applied to `gdn_attn_forward` before the
-systolic matmul rewrite are documented in [optimization_log.md](optimization_log.md).
-The v7 tiled-matmul baseline for single-layer attention was:
+Each projection starts 32 monotonic MM2S readers. A reader issues one 512-bit
+weight beat per cycle into a depth-64 BRAM FIFO:
 
-| Metric                         | Baseline (v0) | Final (v7) | Δ |
-|--------------------------------|---------------|-----------:|---|
-| Top-level latency              | 190.96 G cyc  | **141.03 G** | −26 % |
-| Outstanding II violations      | 7             | **0**        | −7 |
-| Timing slack @ 100 MHz target  | −0.46 ns      | **0.00 ns**  | +0.46 ns (closes timing) |
-| BRAM_18K                       | 938 (23 %)    | 322 (7 %)    | −616 |
-| DSP                            | 317 (3 %)     | 1042 (11 %)  | +725 |
-| LUT                            | 172 k (13 %)  | 237 k (18 %) | +65 k |
-| FF                             | 96 k (3 %)    | 210 k (8 %)  | +114 k |
+```text
+HBM[c] -- MM2S II=1 --> ws[c] BRAM FIFO --> compute cluster
+```
 
-(Numbers from `GDN_single_attn/solution2/syn/report/csynth.rpt`, U55C target.
-The BRAM count drops on U55C because HLS maps the persistent state with a
-denser per-partition allocation than it did on the prior VU11P run.)
+This decouples AXI burst issue from FP32 compute. The reader can keep HBM
+transactions long and contiguous while the FIFO absorbs pipeline startup,
+row-boundary handling, and short compute stalls. Earlier direct-AXI compute
+coupled address generation and MAC placement around the HBM interfaces,
+creating severe local congestion. BRAM FIFOs also move about 60K LUTs and 112K
+FFs of wide queue storage out of the already dense SLR0 CLB fabric.
 
-The current architecture implements that structural follow-up through the
-systolic matmul described in [systolic_matmul.md](systolic_matmul.md). The
-older tiled matmul documentation remains relevant for the A/B projection
-fallback path and for explaining the pre-systolic baseline.
+### Sixteen two-port clusters
+
+Two adjacent weight channels feed one `gemv32_cluster2`; 16 clusters consume all
+32 ports. The activation travels through a one-way ripple:
+
+```text
+xr[0] -> cluster 0 -> xr[1] -> cluster 1 -> ... -> cluster 15 -> drain
+              |                         |
+           ws[0:1]                  ws[30:31]
+              |                         |
+            ys[0]                    ys[15]
+```
+
+Every cluster captures a private, 16-bank activation copy in BRAM before
+computing. This avoids one 32-way high-fanout activation broadcast. A cluster
+computes two output stripes in parallel:
+
+- 16 FP32 multiplies per channel per weight beat;
+- a balanced 16-input FP32 adder tree;
+- `GEMV_PARTIAL=4` rotating partial sums;
+- a flattened row/reduction loop at II=4, unrolled by four; and
+- ping-pong accumulation banks so the prior row drains while the next row
+  starts.
+
+II=4 with four unrolled packs still consumes one weight beat from each port per
+cycle. Reducing the sharing factor from eight to four preserved the arithmetic
+rate and DSP count while cutting the cluster operand-mux LUT cost.
+
+### SLR-local result collection
+
+The compute topology is physically grouped 4/6/6:
+
+| Region | Clusters | Weight channels | Collector output per result-pack step |
+|---|---|---|---:|
+| SLR0 | 0-3 | 0-7 | 8 channel packs |
+| SLR1 | 4-9 | 8-19 | 12 channel packs |
+| SLR2 | 10-15 | 20-31 | 12 channel packs |
+
+Each SLR has a local collector. A final collector concatenates the three
+streams, avoiding a single 16-input global collector and keeping most result
+wiring local.
+
+The physical Iter22 hook moves cluster 8 and its two FIFO endpoints into the
+SLR1 east side. This narrow topology-boundary adjustment relieved the SLR0/SLL
+hotspot without imposing a global hard floorplan. The Iter23 hook replicates
+the measured high-fanout DMA FIFO-address cone. The final configuration keeps
+the successful connectivity and hooks unchanged.
+
+### Output reorder and store modes
+
+Collectors emit pack-major/channel-minor order. `gemv32_store` first buffers
+that stream in a shared URAM reorder memory, then exposes natural output-row
+order to the rest of the kernel.
+
+Normal projections copy natural-order `Pack16` results into the local output
+aperture. The LM head uses a different store mode:
+
+1. Read every reorder word once at II=1.
+2. Compare its 16 lanes in parallel.
+3. Keep 16 lane-local winners.
+4. Merge the winners using strict `>` comparison and lowest-index tie
+   resolution.
+5. Return only the selected token.
+
+No 32,000-float logits tensor is written to or reread from HBM. The comparison
+order preserves the original first-index argmax behavior.
+
+## Auxiliary Compute
+
+Non-GEMV blocks remain shared, relatively narrow implementations:
+
+| Block | Parallelism |
+|---|---:|
+| RMSNorm/reductions | 8 lanes |
+| Tiny A/B GEMV | 2 output lanes |
+| Depthwise convolution, output gate, SwiGLU | 4 elementwise lanes |
+| Recurrent state arithmetic | 16 lanes |
+
+Iter35 selectively restored recurrent-state arithmetic from 8 to 16 lanes.
+Wider normalization, output-gate, and SwiGLU variants were rejected because
+their measured cycle savings did not justify their DSP/LUT cost. Iter36 keeps
+those choices and changes recurrent-state materialization only.
+
+## Static Schedule and HLS Resources
+
+Because `gdn_gemv` accepts runtime dimensions, the raw top-level HLS latency
+uses the maximum LM-head trip count for all 193 calls and is not a token
+latency. Reconstructing the schedule with each real projection shape gives:
+
+| Component | Iter32 cycles | Iter36 cycles |
+|---|---:|---:|
+| 193 large GEMVs | 2,785,524 | 2,785,524 |
+| RMSNorm | 139,405 | 139,405 |
+| Tiny GEMV | 103,584 | 103,584 |
+| Q/K/V convolution | 624,744 | 624,744 |
+| Recurrent attention | 5,760,144 | **1,841,112** |
+| Output norm/gate | 128,712 | 128,712 |
+| SwiGLU | 321,048 | 321,048 |
+| Activation handoff/copy/add/argmax | 54,069 | 54,069 |
+| **Reconstructed total** | **9,917,230** | **5,998,198** |
+
+Final Iter36 integrated csynth resources:
+
+| Resource | Iter36 |
+|---|---:|
+| RAMB18 | 1,511 |
+| DSP | 3,323 |
+| FF | 798,733 |
+| LUT | 829,526 |
+| URAM | **32** |
+
+The head-local fusion reduces the recurrent buffer from Iter35's 128 URAMs to
+16 and whole-kernel use from 144 to 32 URAMs. GEMV MAC II remains four, no AXI
+master was added, and all 32 MM2S readers remain II=1.
+
+## Physical Implementation
+
+The reproducible build compiles HLS at 130 MHz and links the U55C image at
+100 MHz:
+
+```bash
+bash c_impl/build_iter36_headlocal.sh 100
+```
+
+The launcher is hash-guarded and refuses to overwrite its existing build
+directory. Its physical recipe uses:
+
+- exact 32-bank connectivity from the routed Iter31 topology;
+- `apply_iter22_cluster8_slr1_east.tcl`;
+- `apply_iter23_dma_fanout.tcl`;
+- `apply_iter35_dma_w15_fifoaddr_fanout.tcl` for the fixed 250 MHz DMA path;
+- BRAM implementation for all wide MM2S, activation-ripple, result, and
+  collector FIFOs;
+- `AltSpreadLogic_high` placement;
+- `Explore` routing; and
+- pre-route and post-route `AggressiveExplore` physical optimization.
+
+Final implementation result:
+
+| Metric | Result |
+|---|---:|
+| Build duration | 7 h 47 m (7 h 26 m link) |
+| Kernel clock | 100 MHz |
+| Failed nets | 0 |
+| Unrouted nets | 0 |
+| Node overlaps | 0 |
+| Overall WNS / TNS | +0.003 ns / 0 |
+| Overall WHS / THS | +0.009 ns / 0 |
+| 100 MHz kernel WNS / WHS | +0.104 ns / +0.009 ns |
+| 250 MHz `dma_ip_axi_aclk_1` WNS / WHS | +0.003 ns / +0.009 ns |
+| Automatic clock scaling | None |
+
+Local routing remains dense: SLR0 reports effective south congestion level 6
+and west level 5. The design is therefore routed, but it does not have enough
+physical margin to justify casually widening compute blocks or changing FIFO
+implementation. Any such change requires a new full route.
+
+## Correctness and On-Card Performance
+
+The final image passed:
+
+- native C++ build;
+- fast exact decode, 6/6;
+- full native exact decode, 32/32;
+- eight-token on-card smoke parity; and
+- 64-token on-card decode-from-state parity, first divergence `-1`.
+
+Excluding the initial seed entry, 63 measured kernel calls produced:
+
+| Metric | Result |
+|---|---:|
+| Minimum | 59.517 ms/token |
+| Maximum | 59.851 ms/token |
+| Median | **59.563 ms/token** |
+| Mean | **59.578 ms/token** |
+| Speedup over Iter35, 75.062 ms | **1.260x** |
+| Speedup over Iter32, 98.660 ms | **1.656x** |
+| Speedup over eight-port baseline, 121.4 ms | **2.038x** |
+
+The measured mean is within 0.40 ms of the reconstructed 59.982 ms static
+schedule. Head-local fusion therefore removes the recurrent restore/save cost
+almost one-for-one without introducing a material dynamic-stall gap.
+
+Reproducibility hashes:
+
+| Artifact | SHA-256 |
+|---|---|
+| `gdn_model.cpp` | `b0a380365d00a7535dd1256f62f6a21f97a3eee6158e3e4b53bb92ce2df5dafb` |
+| Iter35 link configuration reused by Iter36 | `240855bd65ba1cf4525c88b34f9d07012bf73c90e75f524b2c9547eaa9e5922b` |
+| Compiled XO | `c699dcc8c678cba970906d1a9ab0d62ab2315ad7d67c77fdcdf921dbd752171e` |
+| Successful XCLBIN | `b251ca1c89a2d56111c1c336e003db3c3c0bbaf02556207a50a184578c6f3c34` |
+
+## Design Invariants
+
+Preserve these unless a replacement is validated through native parity,
+integrated csynth, full implementation, and on-card measurement:
+
+1. Keep 32 independent weight masters and 16 two-port clusters.
+2. Keep MM2S readers separate from compute and keep the wide FIFOs in BRAM.
+3. Keep the activation ripple and 4/6/6 SLR-local collectors.
+4. Keep only one shared physical `gdn_gemv` instance.
+5. Keep transient activations local; do not reintroduce workspace
+   materialization.
+6. Keep recurrent state and convolution tails packed and externally
+   persistent.
+7. Keep the recurrent buffer head-local and fuse HBM state transfer into the
+   required retrieval/update traversals.
+8. Keep LM-head argmax on chip and preserve strict first-index tie behavior.
+9. Keep the external workspace offsets and host ABI stable.
+10. Treat the Iter22 floorplan and Iter23/Iter35 DMA hooks as part of the successful
+   physical architecture, not optional tuning.
+11. Judge changes against both 100 MHz timing and zero-conflict routing; HLS
+    resource savings alone do not predict routability.
+
+Use [decode_disaggregated_gemv.md](decode_disaggregated_gemv.md) for the
+historical GEMV scaling progression and
+[optimization_log.md](optimization_log.md) for the exhaustive build,
+congestion, timing, and performance record.

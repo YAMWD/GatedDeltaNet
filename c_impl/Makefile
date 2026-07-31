@@ -15,6 +15,9 @@
 # flattened into one file because c_impl/ keeps everything in one directory.
 # ============================================================================
 
+SHELL          := /bin/bash
+.SHELLFLAGS    := -o pipefail -c
+
 # ----------------------------------------------------------------------------
 # Common host-toolchain config
 # ----------------------------------------------------------------------------
@@ -35,6 +38,7 @@ XILINX_HLS_INC ?= /tools/Xilinx/Vitis_HLS/2022.1/include
 # ----------------------------------------------------------------------------
 XILINX_VITIS   ?= /tools/Xilinx/Vitis/2022.1
 XILINX_XRT     ?= /opt/xilinx/xrt
+VPP            ?= $(XILINX_VITIS)/bin/v++
 
 
 # ----------------------------------------------------------------------------
@@ -47,37 +51,39 @@ XILINX_XRT     ?= /opt/xilinx/xrt
 #         router and making the design effectively unroutable.
 PLATFORM       ?= xilinx_u55c_gen3x16_xdma_3_202210_1
 TARGET         ?= hw
-FREQ           ?= 100
+FREQ           ?= 130
 JOBS           ?= 8
+VPP_DEBUG      ?= 0
 
 KERNEL         := gdn_forward
 KERNEL_SRC     := gdn_model.cpp gdn_model.h
 HW_CFG         := $(abspath ./hw.cfg)
+HLS_PRE_TCL    := $(abspath ./hls_gdn_forward.tcl)
 
-BUILD_DIR      := build.$(TARGET)
+BUILD_DIR      := build.$(TARGET).gdn32.f$(FREQ).o8
 XO             := $(BUILD_DIR)/$(KERNEL).xo
 XCLBIN         := $(BUILD_DIR)/$(KERNEL).xclbin
 
 XSA            := $(strip $(patsubst %.xpfm,%,$(shell basename $(PLATFORM))))
 
 VPP_FLAGS      := -t $(TARGET) --platform $(PLATFORM) --save-temps
-VPP_FLAGS      += -g --optimize 2
+VPP_FLAGS      += --optimize 2
+ifeq ($(VPP_DEBUG),1)
+VPP_FLAGS      += -g
+endif
 VPP_FLAGS      += --hls.jobs $(JOBS)
 # --kernel_frequency overrides the platform's default kernel clock (300 MHz on
-# U55C gen3x16) and matches the 100 MHz target the HLS source was synthesized
-# for. Set unconditionally; v++ accepts it on both -c and -l. On non-gen3x16
-# platforms it has the same effect as --clock.defaultFreqHz on the kernel
-# clock domain.
+# U55C gen3x16). The retained 32-port implementation requests and closes at
+# 130 MHz. Set it unconditionally; v++ accepts it on both -c and -l.
 VPP_FLAGS      += --kernel_frequency $(FREQ)
 
 VPP_LDFLAGS    := --config $(HW_CFG)
 VPP_LDFLAGS    += --vivado.synth.jobs $(JOBS) --vivado.impl.jobs $(JOBS)
-# --profile.data inserts the DPA hardware trace IP (trace buffer on HBM[0]).
-# At N=4 (8+ HBM masters spanning SLR0/1/2) that trace infrastructure crashes
-# design-init: "HADAFileSet::getSrcOptions() : NULL pointer". We measure TPOT
-# from host-side timing and correctness from the decode output, so the on-card
-# profiling trace is not needed — leave it off. Re-enable (with
-# --profile.trace_memory <bank>:<SLR>) only if port-bandwidth telemetry is wanted.
+# `-g` and --profile.data invoke Vitis debug/profiling automation. With this
+# 32-master DFX design, the empty-monitor path crashes design initialization with
+# "HADAFileSet::getSrcOptions() : NULL pointer". Keep both disabled for normal
+# hardware builds. Host timing measures TPOT and throughput; set VPP_DEBUG=1
+# only for a dedicated diagnostic build with explicit monitor points.
 # VPP_LDFLAGS  += --profile.data all:all:all
 
 
@@ -112,7 +118,7 @@ HW_MAX_EX      ?=
 # ----------------------------------------------------------------------------
 # Default target
 # ----------------------------------------------------------------------------
-.PHONY: all host_tb xo xclbin host run_hw clean clean_hw distclean help
+.PHONY: all host_tb xo xclbin host run_hw reproduce_iter24_success clean clean_hw distclean help
 
 all: host_tb
 
@@ -123,6 +129,7 @@ help:
 	@echo "  xclbin      v++ link     → $(XCLBIN)"
 	@echo "  host        XRT host    → $(HOST_BIN)"
 	@echo "  run_hw      xo + xclbin + host + ./host.exe ... (full hardware run)"
+	@echo "  reproduce_iter24_success  rebuild the correct, routable iter24b XCLBIN"
 	@echo "  clean       remove host-tb binaries"
 	@echo "  clean_hw    remove build.\$$(TARGET), _x/, v++ logs"
 	@echo "  distclean   clean + clean_hw + remove host.exe"
@@ -132,6 +139,7 @@ help:
 	@echo "  TARGET=$(TARGET)        (sw_emu | hw_emu | hw)"
 	@echo "  FREQ=$(FREQ) MHz"
 	@echo "  JOBS=$(JOBS)"
+	@echo "  VPP_DEBUG=$(VPP_DEBUG)       (0 normally; 1 enables v++ -g)"
 	@echo ""
 	@echo "run_hw knobs (override on cmdline, e.g. make run_hw FIXTURE=fixtures_smoke/piqa.gdnreq):"
 	@echo "  WEIGHTS=$(WEIGHTS)"
@@ -169,9 +177,13 @@ gdn_matmul_test: gdn_matmul_test.cpp gdn_model.cpp gdn_model.h
 # ----------------------------------------------------------------------------
 xo: $(XO)
 
-$(XO): $(KERNEL_SRC)
+$(XO): $(KERNEL_SRC) $(HLS_PRE_TCL)
 	@mkdir -p $(BUILD_DIR)
-	v++ $(VPP_FLAGS) -k $(KERNEL) -c -o $@ $(filter %.cpp,$(KERNEL_SRC)) \
+	$(VPP) $(VPP_FLAGS) \
+	    --temp_dir $(BUILD_DIR)/_x_compile \
+	    --report_dir $(BUILD_DIR)/reports_compile \
+	    --hls.pre_tcl $(HLS_PRE_TCL) \
+	    -k $(KERNEL) -c -o $@ $(filter %.cpp,$(KERNEL_SRC)) \
 	    2>&1 | tee $(BUILD_DIR)/$(KERNEL)_compile.log
 
 
@@ -182,7 +194,7 @@ xclbin: $(XCLBIN)
 
 $(XCLBIN): $(XO) $(HW_CFG)
 	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && v++ -l $(VPP_FLAGS) $(VPP_LDFLAGS) \
+	cd $(BUILD_DIR) && $(VPP) -l $(VPP_FLAGS) $(VPP_LDFLAGS) \
 	    --temp_dir _x_temp/ \
 	    --report_dir reports/ \
 	    -o $(KERNEL).xclbin \
@@ -220,6 +232,16 @@ run_hw: $(XCLBIN) $(HOST_BIN)
 	@echo "  device : $(HW_DEVICE)"
 	@echo "  max_ex : $(if $(HW_MAX_EX),$(HW_MAX_EX),(all))"
 	./$(HOST_BIN) $(XCLBIN) $(WEIGHTS) $(FIXTURE) $(HW_OUT) $(HW_DEVICE) $(HW_MAX_EX)
+
+
+# ----------------------------------------------------------------------------
+# Preserved successful implementation
+# ----------------------------------------------------------------------------
+# This target deliberately uses a dedicated, checksum-guarded recipe rather
+# than the mutable default hardware knobs above. It rebuilds both the XO and
+# XCLBIN for the correct, routable iter24b physical result.
+reproduce_iter24_success:
+	bash $(CURDIR)/reproduce_iter24_success.sh
 
 
 # ----------------------------------------------------------------------------

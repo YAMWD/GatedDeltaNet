@@ -17,6 +17,10 @@ c_impl/GDN_synth/
 c_impl/.ipcache/
 c_impl/.Xil/
 c_impl/.run/
+c_impl/microbench/**/build.*/
+c_impl/microbench/**/_x*/
+c_impl/microbench/**/.Xil/
+c_impl/microbench/**/.ipcache/
 
 # v++/Vivado/HLS logs and metadata
 c_impl/v++_*.log
@@ -26,6 +30,9 @@ c_impl/vivado*.jou
 c_impl/vitis_hls.log
 c_impl/xcd.log
 c_impl/xrc.log
+c_impl/microbench/**/*.log
+c_impl/microbench/**/*.jou
+c_impl/microbench/**/*.pb
 c_impl/run_hw.log
 c_impl/hls_qor.tcl
 c_impl/congestion_diag.tcl
@@ -42,6 +49,7 @@ c_impl/gdn_model.o
 c_impl/gdn_model_main.o
 c_impl/gdn_matmul_systolic.o
 c_impl/host.exe
+c_impl/microbench/**/*.exe
 
 # Hardware run outputs and parity artefacts produced by gdn_eval / host.exe
 c_impl/hw_*.json

@@ -1,7 +1,7 @@
 # Decode Premise: GDN vs a Standard Transformer (GPU measurement)
 
-This document validates the premise behind the decode pivot in
-[decode_roadmap.md](decode_roadmap.md): that GatedDeltaNet decode (linear
+This document validates the premise behind the decode-only architecture in
+[decode_disaggregated_gemv.md](decode_disaggregated_gemv.md): GatedDeltaNet decode (linear
 attention → O(1) compute/token, constant-size recurrent state) is
 fundamentally better-scaling than a standard transformer (full attention →
 O(n)/token, KV cache that grows with context).
@@ -102,7 +102,7 @@ launches, the recurrence runs flat-out, and there is no growing KV-cache
 bandwidth. So the regime where GDN is architecturally best — single-stream,
 low-latency, memory-bound decode — is precisely where the GPU is worst and a
 custom accelerator is best. The GPU result therefore **understates** GDN's
-decode advantage and confirms the [decode_roadmap.md](decode_roadmap.md) thesis:
+decode advantage and confirms the decode-only accelerator thesis:
 *decode is the FPGA-favorable regime.* The flat O(1) latency and constant memory
 are real and measured.
 
@@ -141,12 +141,12 @@ datapoint if the wheel is installed later.
 # --quick for a smoke run; --models <subset> to pick models
 ```
 
-## Implications for the decode roadmap
+## Implications for the Decode Accelerator
 
 The premise is validated: GDN decode is flat O(1) in both latency and memory
 while a standard transformer is O(n) in both. The work in
-[decode_roadmap.md](decode_roadmap.md) — GEMV decode datapath, multi-channel
-weight readers, INT8 weights, resident kernel — is aimed at the one cost GDN
+[decode_disaggregated_gemv.md](decode_disaggregated_gemv.md) uses a GEMV
+datapath and multi-channel weight readers to address the one cost GDN
 *does* pay per token: reading every weight once. That is bandwidth-bound and
 constant per token (no KV cache), so the FPGA's job is to drive weight bandwidth
 toward HBM's ceiling and turn GDN's architectural O(1) into a low absolute
