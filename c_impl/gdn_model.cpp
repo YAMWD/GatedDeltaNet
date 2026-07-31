@@ -13,9 +13,12 @@
 #define GDN_HEADS   8
 #define GDN_DK    256   /* head_dim = query/key dimension */
 #define GDN_DV    256   /* value_dim = hidden/num_heads   */
-#define GDN_AUX_LANES      8 /* recurrent/reduction arithmetic lanes */
-#define GDN_AUX_ELEM_LANES 4 /* shared independent elementwise lanes  */
-#define GDN_PK     GDN_AUX_LANES
+#define GDN_RECURRENT_LANES 16 /* recurrent-state column parallelism */
+#define GDN_NORM_LANES       8 /* RMS/output-norm arithmetic lanes   */
+#define GDN_CONV_LANES       4 /* depthwise-convolution lanes        */
+#define GDN_OUTPUT_GATE_LANES 4 /* output norm/gate arithmetic lanes */
+#define GDN_SWIGLU_LANES      4 /* independent SwiGLU lanes          */
+#define GDN_PK     GDN_RECURRENT_LANES
 
 /* iter19 (step 4): the decode kernel is specialized for the fixed GDN-1.3B shape.
  * These match the .gdnw header (verified by read: vocab 32000, hidden 2048,
@@ -587,9 +590,9 @@ static void gdn_rmsnorm_rows(
     uint32_t col_packs = num_cols / 16;
 
     /* Buffer the per-channel norm weight once (it is otherwise re-read every
-     * row); cyclic/16 so the scale pass reads 16 lanes in parallel. */
+     * row); partitioning follows the independently tuned norm lane count. */
     float w_loc[2048];
-    #pragma HLS array_partition variable=w_loc cyclic factor=GDN_AUX_LANES
+    #pragma HLS array_partition variable=w_loc cyclic factor=GDN_NORM_LANES
     rms_load_w: for (uint32_t c = 0; c < num_cols; ++c) {
     #pragma HLS loop_tripcount min=2048 max=2048
     #pragma HLS pipeline II=1
@@ -607,7 +610,7 @@ static void gdn_rmsnorm_rows(
             Pack16 v = in[(size_t)row * col_packs + cp];
             float s = 0.0f;
             sq_lane: for (int kk = 0; kk < 16; ++kk) {
-            #pragma HLS unroll factor=GDN_AUX_LANES
+            #pragma HLS unroll factor=GDN_NORM_LANES
                 s += v.data[kk] * v.data[kk];
             }
             sum += (double)s;
@@ -619,7 +622,7 @@ static void gdn_rmsnorm_rows(
             Pack16 v = in[(size_t)row * col_packs + cp];
             Pack16 o;
             scl_lane: for (int kk = 0; kk < 16; ++kk) {
-            #pragma HLS unroll factor=GDN_AUX_LANES
+            #pragma HLS unroll factor=GDN_NORM_LANES
                 o.data[kk] = v.data[kk] * scale * w_loc[cp * 16 + kk];
             }
             out[(size_t)row * col_packs + cp] = o;
@@ -760,11 +763,11 @@ static void gdn_depthwise_conv_silu(
      * unrolled with raw m_axi loads. */
     float w_loc[GDN_CONV_COLS_MAX][GDN_CONV_K_MAX];
     #pragma HLS array_partition variable=w_loc dim=2 complete
-    #pragma HLS array_partition variable=w_loc dim=1 cyclic factor=GDN_AUX_ELEM_LANES
+    #pragma HLS array_partition variable=w_loc dim=1 cyclic factor=GDN_CONV_LANES
 
     float in_window[GDN_CONV_K_MAX][GDN_CONV_COLS_MAX];
     #pragma HLS array_partition variable=in_window dim=1 complete
-    #pragma HLS array_partition variable=in_window dim=2 cyclic factor=GDN_AUX_ELEM_LANES
+    #pragma HLS array_partition variable=in_window dim=2 cyclic factor=GDN_CONV_LANES
 
     /* Pack16-widened activation I/O: 16 channels (512-bit) per beat. conv is
      * depthwise, so channels are independent and contiguous — index the Pack16
@@ -862,11 +865,11 @@ static void gdn_depthwise_conv_silu(
             /* Pipeline four-lane groups. Pipelining conv_compute itself forces
              * conv_comp_lane to unroll all 16 channels. */
             conv_comp_group: for (int kb = 0; kb < 16;
-                                  kb += GDN_AUX_ELEM_LANES) {
+                                  kb += GDN_CONV_LANES) {
             #pragma HLS loop_tripcount min=4 max=4
             #pragma HLS pipeline II=1
                 conv_comp_lane: for (int kl = 0;
-                                     kl < GDN_AUX_ELEM_LANES; ++kl) {
+                                     kl < GDN_CONV_LANES; ++kl) {
                 #pragma HLS unroll
                     int kk = kb + kl;
                     uint32_t c = cp * 16 + (uint32_t)kk;
@@ -1222,7 +1225,7 @@ static void gdn_output_norm_and_gate(
 
     /* Pre-load the per-head norm weight once and reuse for every (token, head). */
     float weight_loc[GDN_DV];
-    #pragma HLS array_partition variable=weight_loc cyclic factor=GDN_AUX_LANES
+    #pragma HLS array_partition variable=weight_loc cyclic factor=GDN_NORM_LANES
     uint32_t windex;
     onorm_load_w: for (windex = 0; windex < head_dim; ++windex) {
     #pragma HLS loop_tripcount min=256 max=256
@@ -1242,8 +1245,8 @@ static void gdn_output_norm_and_gate(
              * avoid a second AXI read of gate per element. */
             float attn_loc[GDN_DV];
             float gate_loc[GDN_DV];
-            #pragma HLS array_partition variable=attn_loc cyclic factor=GDN_AUX_LANES
-            #pragma HLS array_partition variable=gate_loc cyclic factor=GDN_AUX_LANES
+            #pragma HLS array_partition variable=attn_loc cyclic factor=GDN_NORM_LANES
+            #pragma HLS array_partition variable=gate_loc cyclic factor=GDN_NORM_LANES
 
             /* Phase 1: load attn (Pack16) into local + accumulate sum of squares */
             double sum = 0.0;
@@ -1253,7 +1256,7 @@ static void gdn_output_norm_and_gate(
                 Pack16 v = attn[base + ip];
                 float s = 0.0f;
                 onorm_sq_lane: for (int kk = 0; kk < 16; ++kk) {
-                #pragma HLS unroll factor=GDN_AUX_LANES
+                #pragma HLS unroll factor=GDN_NORM_LANES
                     float a = v.data[kk];
                     attn_loc[ip * 16 + kk] = a;
                     s += a * a;
@@ -1267,7 +1270,7 @@ static void gdn_output_norm_and_gate(
             #pragma HLS pipeline II=2
                 Pack16 g = gate[base + ip];
                 onorm_g_lane: for (int kk = 0; kk < 16; ++kk) {
-                #pragma HLS unroll factor=GDN_AUX_LANES
+                #pragma HLS unroll factor=GDN_NORM_LANES
                     gate_loc[ip * 16 + kk] = g.data[kk];
                 }
             }
@@ -1279,14 +1282,14 @@ static void gdn_output_norm_and_gate(
             #pragma HLS loop_tripcount min=16 max=16
                 float o_lane[16];
                 #pragma HLS array_partition variable=o_lane complete
-                /* Four shared lanes; pipelining onorm_gate itself would force
-                 * the lane loop to unroll completely. */
+                /* Retain four physical lanes here: fully parallel output-gate
+                 * arithmetic saves too few token cycles for its DSP cost. */
                 onorm_gate_group: for (int kb = 0; kb < 16;
-                                       kb += GDN_AUX_ELEM_LANES) {
+                                       kb += GDN_OUTPUT_GATE_LANES) {
                 #pragma HLS loop_tripcount min=4 max=4
                 #pragma HLS pipeline II=1
                     onorm_gate_lane: for (int kl = 0;
-                                          kl < GDN_AUX_ELEM_LANES; ++kl) {
+                                          kl < GDN_OUTPUT_GATE_LANES; ++kl) {
                     #pragma HLS unroll
                         int kk = kb + kl;
                         uint32_t index = ip * 16 + (uint32_t)kk;
@@ -1322,11 +1325,11 @@ static void gdn_swiglu_inplace(Pack16 *gate, const Pack16 *up, size_t count) {
         float g_lane[16];
         #pragma HLS array_partition variable=g_lane complete
         swiglu_group: for (int jb = 0; jb < 16;
-                           jb += GDN_AUX_ELEM_LANES) {
+                           jb += GDN_SWIGLU_LANES) {
         #pragma HLS loop_tripcount min=4 max=4
         #pragma HLS pipeline II=1
             swiglu_lane: for (int jl = 0;
-                              jl < GDN_AUX_ELEM_LANES; ++jl) {
+                              jl < GDN_SWIGLU_LANES; ++jl) {
             #pragma HLS unroll
                 int j = jb + jl;
                 g_lane[j] = gdn_silu(g.data[j]) * u.data[j];
