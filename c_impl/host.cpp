@@ -477,10 +477,11 @@ public:
         }
     }
 
-    // On this xocl/xdma driver (XRT 2022.1, U55C) the per-call sync transfer
-    // size caps out at 16 MiB; anything larger returns EINVAL/EIO. Wrap every
-    // sync that might exceed that with this helper.
-    static constexpr size_t kSyncChunk = 16ULL * 1024 * 1024;  // 16 MiB
+    // On this xocl/xdma driver (XRT 2022.1, U55C), a nominally maximal 16 MiB
+    // sync can still return EINVAL for a large BO at a nonzero subrange offset.
+    // Keep transfers below that boundary; 8 MiB is accepted for both weight
+    // BOs and the packed recurrent-state region.
+    static constexpr size_t kSyncChunk = 8ULL * 1024 * 1024;  // 8 MiB
     static void sync_bo_chunked(xrt::bo &bo, xclBOSyncDirection dir,
                                 size_t size, size_t offset) {
         for (size_t done = 0; done < size; done += kSyncChunk) {
