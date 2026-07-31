@@ -7,8 +7,8 @@ BRAM, packed external recurrent state, and an on-chip LM-head argmax. Prefill
 runs on the GPU and supplies persistent recurrent and convolution state.
 
 The integrated U55C image routes at 100 MHz with zero failed/unrouted nets and
-zero overlaps. Its exact 64-token on-card result is 98.660 ms/token mean,
-1.23x faster than the 121.4 ms eight-port baseline.
+zero overlaps. Its exact 64-token on-card result is 59.578 ms/token mean,
+2.04x faster than the 121.4 ms eight-port baseline.
 
 ## Current References
 
