@@ -1931,9 +1931,49 @@ one command: `bash c_impl/build_iter36_headlocal.sh 100`. Artifact hashes are:
 | XO | `c699dcc8c678cba970906d1a9ab0d62ab2315ad7d67c77fdcdf921dbd752171e` |
 | XCLBIN | `b251ca1c89a2d56111c1c336e003db3c3c0bbaf02556207a50a184578c6f3c34` |
 
-The gated 130 MHz follow-up launched only after this correctness/performance
-gate passed; it is a separate experiment and does not change the committed
-100 MHz milestone.
+#### Iter36 frequency follow-up — requested 130 MHz, validated at 115.7 MHz
+
+The gated follow-up reused the exact Iter36 source and physical recipe and
+changed only the link request from 100 to 130 MHz. Source SHA-256 remained
+`b0a380365d00a7535dd1256f62f6a21f97a3eee6158e3e4b53bb92ce2df5dafb`;
+the config SHA-256 remained
+`240855bd65ba1cf4525c88b34f9d07012bf73c90e75f524b2c9547eaa9e5922b`.
+The one-line reproduction command is
+`bash c_impl/build_iter36_headlocal.sh 130`.
+
+The build completed all routing, post-route `AggressiveExplore`, DRC, and
+bitstream phases in **31 h 31 m 16 s**. At the requested 130 MHz, the final
+post-physopt report has overall WNS/TNS **-0.948/-10111.593 ns**, 19,904
+failing setup endpoints, and WHS **+0.001 ns**. The kernel setup paths therefore
+did not close at 130 MHz. Vivado auto-frequency scaling selected an achieved
+**115.7 MHz** `DATA_CLK`; the fixed 250 MHz DMA same-clock setup path remained
+positive. The emitted 79,292,496-byte XCLBIN is a valid 115.7 MHz artifact, not
+a 130 MHz closure result.
+
+The automatic eight-token smoke test and full 64-token decode both matched the
+golden trajectory exactly with first divergence `-1`. Excluding the initial
+seed, 63 kernel calls measured:
+
+| Metric | Iter36 auto-scaled 115.7 MHz |
+|---|---:|
+| Mean | **51.844010 ms/token** |
+| Median | **51.813378 ms/token** |
+| Min / max | 51.776322 / 52.103974 ms |
+| Improvement over Iter36 100 MHz | **1.149x / 12.98%** |
+| Speedup over Iter35 75.061694 ms | **1.448x** |
+| Speedup over Iter32 98.659598 ms | **1.903x** |
+| Speedup over 121.4 ms reference | **2.342x** |
+
+The ideal 100/115.7 clock-ratio prediction from the 59.577939 ms control is
+51.493465 ms. The measured mean is only 0.68% above it, confirming that the
+higher clock did not introduce a material dynamic stall. This is a retained
+performance improvement even though the original 130 MHz timing objective was
+not met.
+
+| Artifact | SHA-256 |
+|---|---|
+| XO | `01b8bf9f19fd62c4762fe16d77235212731cad0b31e48601fbc0f37608ef7f6f` |
+| XCLBIN | `7f631a7941f5614c91a1eb80246c0dd7fe3e8e83f1eceb1e171487c04498505f` |
 
 ### Superseded plan (written before iter12 ran)
 

@@ -1,7 +1,8 @@
 # GatedDeltaNet Decode Accelerator Architecture
 
-**Status:** Current routed production architecture (Iter36), measured
-2026-07-31 on an Alveo U55C.
+**Status:** Current routed production architecture (Iter36). The timing-closed
+100 MHz image was measured 2026-07-31 and the faster auto-scaled 115.7 MHz
+image was measured 2026-08-02 on an Alveo U55C.
 
 The accelerator in `c_impl/` is decode-only. Prompt prefill runs on the GPU and
 exports fixed-size recurrent and convolution state. The FPGA then advances one
@@ -18,10 +19,12 @@ token per `gdn_forward` invocation. The successful design combines:
 - packed external recurrent-state and convolution-tail transfers; and
 - on-chip LM-head argmax, with no external logits materialization.
 
-The production image routes with zero failed nets, zero unrouted nets, and zero
-node overlaps at 100 MHz. It produces an exact 64-token trajectory at
-59.578 ms/token mean latency, 2.04x faster than the 121.4 ms eight-port
-baseline and 1.26x faster than Iter35.
+The architecture routes with zero failed nets, zero unrouted nets, and zero
+node overlaps. The explicit 100 MHz image produces an exact 64-token trajectory
+at 59.578 ms/token. The fastest validated image was requested at 130 MHz but
+auto-scaled to 115.7 MHz; it preserves exact parity at **51.844 ms/token**,
+2.342x faster than the 121.4 ms eight-port baseline and 1.448x faster than
+Iter35. It is not evidence of 130 MHz timing closure.
 
 ## Fixed Model Shape
 
@@ -394,6 +397,22 @@ and west level 5. The design is therefore routed, but it does not have enough
 physical margin to justify casually widening compute blocks or changing FIFO
 implementation. Any such change requires a new full route.
 
+### Faster auto-scaled frequency follow-up
+
+The unchanged Iter36 source was also built with a 130 MHz link request:
+
+```bash
+bash c_impl/build_iter36_headlocal.sh 130
+```
+
+Post-route `AggressiveExplore` improved the kernel paths but did not close the
+7.692 ns requirement. At the requested 130 MHz, the post-physopt report has
+WNS/TNS **-0.948/-10111.593 ns**, 19,904 failing setup endpoints, and WHS
+**+0.001 ns**. Vivado auto-frequency scaling encoded `DATA_CLK` at an achieved
+**115.7 MHz**. The fixed 250 MHz DMA same-clock setup path remained positive.
+The build completed in 31 h 31 m and emitted a valid XCLBIN; this is a routed,
+on-card-validated 115.7 MHz result, not a 130 MHz closure result.
+
 ## Correctness and On-Card Performance
 
 The final image passed:
@@ -420,14 +439,34 @@ The measured mean is within 0.40 ms of the reconstructed 59.982 ms static
 schedule. Head-local fusion therefore removes the recurrent restore/save cost
 almost one-for-one without introducing a material dynamic-stall gap.
 
+The automatic follow-up then ran the same smoke and full fixtures with the
+115.7 MHz image. Both remained exact. Excluding the seed, its 63 kernel calls
+measured:
+
+| Metric | Auto-scaled 115.7 MHz |
+|---|---:|
+| Minimum | 51.776 ms/token |
+| Maximum | 52.104 ms/token |
+| Median | **51.813 ms/token** |
+| Mean | **51.844 ms/token** |
+| Improvement over Iter36 100 MHz | **1.149x / 12.98%** |
+| Speedup over Iter35, 75.062 ms | **1.448x** |
+| Speedup over Iter32, 98.660 ms | **1.903x** |
+| Speedup over eight-port baseline, 121.4 ms | **2.342x** |
+
+The ideal clock-ratio prediction was 51.493 ms/token; the measured result is
+within 0.68%, so the frequency increase did not expose a material new stall.
+
 Reproducibility hashes:
 
 | Artifact | SHA-256 |
 |---|---|
 | `gdn_model.cpp` | `b0a380365d00a7535dd1256f62f6a21f97a3eee6158e3e4b53bb92ce2df5dafb` |
 | Iter35 link configuration reused by Iter36 | `240855bd65ba1cf4525c88b34f9d07012bf73c90e75f524b2c9547eaa9e5922b` |
-| Compiled XO | `c699dcc8c678cba970906d1a9ab0d62ab2315ad7d67c77fdcdf921dbd752171e` |
-| Successful XCLBIN | `b251ca1c89a2d56111c1c336e003db3c3c0bbaf02556207a50a184578c6f3c34` |
+| 100 MHz compiled XO | `c699dcc8c678cba970906d1a9ab0d62ab2315ad7d67c77fdcdf921dbd752171e` |
+| 100 MHz XCLBIN | `b251ca1c89a2d56111c1c336e003db3c3c0bbaf02556207a50a184578c6f3c34` |
+| 115.7 MHz compiled XO | `01b8bf9f19fd62c4762fe16d77235212731cad0b31e48601fbc0f37608ef7f6f` |
+| 115.7 MHz XCLBIN | `7f631a7941f5614c91a1eb80246c0dd7fe3e8e83f1eceb1e171487c04498505f` |
 
 ## Design Invariants
 
