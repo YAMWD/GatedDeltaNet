@@ -113,12 +113,13 @@ FIXTURE        ?= fixtures_smoke/wikitext.gdnreq
 HW_OUT         ?= hw_$(basename $(notdir $(FIXTURE))).json
 HW_DEVICE      ?= 0
 HW_MAX_EX      ?=
+ITER37_FREQ    ?= 115
 
 
 # ----------------------------------------------------------------------------
 # Default target
 # ----------------------------------------------------------------------------
-.PHONY: all host_tb xo xclbin host run_hw reproduce_iter24_success clean clean_hw distclean help
+.PHONY: all host_tb xo xclbin host run_hw iter37 reproduce_iter24_success clean clean_hw distclean help
 
 all: host_tb
 
@@ -129,6 +130,7 @@ help:
 	@echo "  xclbin      v++ link     → $(XCLBIN)"
 	@echo "  host        XRT host    → $(HOST_BIN)"
 	@echo "  run_hw      xo + xclbin + host + ./host.exe ... (full hardware run)"
+	@echo "  iter37      reproduce the routed four-port/32-lane recurrent design"
 	@echo "  reproduce_iter24_success  rebuild the correct, routable iter24b XCLBIN"
 	@echo "  clean       remove host-tb binaries"
 	@echo "  clean_hw    remove build.\$$(TARGET), _x/, v++ logs"
@@ -147,6 +149,7 @@ help:
 	@echo "  HW_OUT=$(HW_OUT)"
 	@echo "  HW_DEVICE=$(HW_DEVICE)"
 	@echo "  HW_MAX_EX=$(if $(HW_MAX_EX),$(HW_MAX_EX),(all))"
+	@echo "  ITER37_FREQ=$(ITER37_FREQ) MHz (100 or 115; default 115)"
 
 
 # ----------------------------------------------------------------------------
@@ -232,6 +235,15 @@ run_hw: $(XCLBIN) $(HOST_BIN)
 	@echo "  device : $(HW_DEVICE)"
 	@echo "  max_ex : $(if $(HW_MAX_EX),$(HW_MAX_EX),(all))"
 	./$(HOST_BIN) $(XCLBIN) $(WEIGHTS) $(FIXTURE) $(HW_OUT) $(HW_DEVICE) $(HW_MAX_EX)
+
+
+# ----------------------------------------------------------------------------
+# Iter37 production build
+# ----------------------------------------------------------------------------
+# The checksum-guarded launcher reuses the verified XO when available and
+# regenerates only relocatable path resolution in diagnostics.
+iter37:
+	bash $(CURDIR)/build_iter37_state4_recur32.sh $(ITER37_FREQ)
 
 
 # ----------------------------------------------------------------------------
