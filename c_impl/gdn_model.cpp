@@ -13,7 +13,7 @@
 #define GDN_HEADS   8
 #define GDN_DK    256   /* head_dim = query/key dimension */
 #define GDN_DV    256   /* value_dim = hidden/num_heads   */
-#define GDN_RECURRENT_LANES 16 /* recurrent-state column parallelism */
+#define GDN_RECURRENT_LANES 32 /* recurrent-state column parallelism */
 #define GDN_NORM_LANES       8 /* RMS/output-norm arithmetic lanes   */
 #define GDN_CONV_LANES       4 /* depthwise-convolution lanes        */
 #define GDN_OUTPUT_GATE_LANES 4 /* output norm/gate arithmetic lanes */
@@ -54,6 +54,8 @@ static_assert(GDN_WSF_HEADBUF ==
     (size_t)GDN_LAYERS*3*(GDN_CONV-1)*GDN_HIDDEN, "workspace head_buffer drift");
 static_assert(GDN_WSF_LOGITS == GDN_VOCAB, "workspace logits size drift");
 static_assert(GDN_WSF_HEAD >= GDN_HEADS, "workspace head padding too small");
+static_assert((GDN_WSF_STATE % (GDN_RECURRENT_STATE_PORTS * 16u)) == 0,
+    "recurrent state must stripe into whole Pack16 words");
 
 /* Pack16 = 16 FP32 values = 64 bytes = 512 bits. */
 struct Pack16 {
@@ -219,6 +221,34 @@ void gdn_build_weight_shards(const float *wd, const GDNWeightHeader *config,
         for (c = 0; c < GEMV_CHANNELS; ++c)
             memcpy(shards[c] + soff, wd + lmh + (size_t)c * s, s * sizeof(float));
         soff += s;
+    }
+}
+
+void gdn_scatter_recurrent_state(float *const state_stripes[],
+                                 const float *recurrent_state,
+                                 size_t recurrent_state_floats) {
+    const size_t pack_floats = 16;
+    const size_t pack_count = recurrent_state_floats / pack_floats;
+    size_t pack;
+
+    if ((recurrent_state_floats % pack_floats) != 0) {
+        gdn_print_error("recurrent state is not Pack16 aligned");
+        return;
+    }
+    for (pack = 0; pack < pack_count; ++pack) {
+        /* Within each 256-float row, ports 0/1 alternate across the low
+         * 128 floats and ports 2/3 alternate across the high 128 floats.
+         * Each port then owns four contiguous words per row. This keeps the
+         * kernel's two 1,024-word half-head sweeps monotonic and burstable. */
+        size_t row = pack / (GDN_DV / pack_floats);
+        size_t row_word = pack % (GDN_DV / pack_floats);
+        size_t port = row_word < (GDN_DV / pack_floats / 2)
+                        ? (row_word & 1)
+                        : 2 + (row_word & 1);
+        size_t local_pack = row * 4 + ((row_word & 7) >> 1);
+        memcpy(state_stripes[port] + local_pack * pack_floats,
+               recurrent_state + pack * pack_floats,
+               pack_floats * sizeof(float));
     }
 }
 
@@ -462,8 +492,14 @@ int gdn_run_state_init(GDNRunState *state, const GDNModel *model, uint32_t max_t
     {
         size_t shard_floats = gdn_weight_shard_floats(&model->config);
         int c;
-        for (c = 0; c < GEMV_CHANNELS; ++c)
-            if (gdn_alloc_run_buffer(&state->weight_shards[c], shard_floats) != 0) return -1;
+        for (c = 0; c < GEMV_CHANNELS; ++c) {
+            size_t state_extra =
+                (c >= GDN_RECURRENT_STATE_FIRST_PORT &&
+                 c < GDN_RECURRENT_STATE_FIRST_PORT + GDN_RECURRENT_STATE_PORTS)
+                    ? GDN_RECURRENT_STATE_STRIPE_FLOATS : 0;
+            if (gdn_alloc_run_buffer(&state->weight_shards[c],
+                                     shard_floats + state_extra) != 0) return -1;
+        }
         gdn_build_weight_shards(model->weight_data, &model->config, state->weight_shards);
     }
     if (gdn_alloc_run_buffer(&state->aux_weights,
@@ -930,8 +966,10 @@ static void gdn_depthwise_conv_silu(
  * ----------------------------------------------------------------------- */
 static void gdn_recurrent_attention(
     Pack16 *attn_out,
-    float *recurrent_state,  /* decode: per-layer state at layer_index*8*256*256; prefill: unused */
-    float *head_buffer,      /* unused: local buffers used instead */
+    float *recurrent_state0,
+    float *recurrent_state1,
+    float *recurrent_state2,
+    float *recurrent_state3,
     const Pack16 *q,
     const Pack16 *k,
     const Pack16 *v,
@@ -962,12 +1000,14 @@ static void gdn_recurrent_attention(
      * Cast the external state once and address it in native 512-bit words.
      * Merely unrolling scalar float accesses does not make HLS coalesce them:
      * iter27 measured one four-byte AXI transaction per float. */
-    size_t st_base = (size_t)layer_index * GDN_HEADS * GDN_DK * GDN_DV;
-    size_t st_base16 = st_base >> 4;
-    const Pack16 *recurrent_state_in =
-        reinterpret_cast<const Pack16 *>(recurrent_state);
-    Pack16 *recurrent_state_out =
-        reinterpret_cast<Pack16 *>(recurrent_state);
+    const Pack16 *state_in0 = reinterpret_cast<const Pack16 *>(recurrent_state0);
+    const Pack16 *state_in1 = reinterpret_cast<const Pack16 *>(recurrent_state1);
+    const Pack16 *state_in2 = reinterpret_cast<const Pack16 *>(recurrent_state2);
+    const Pack16 *state_in3 = reinterpret_cast<const Pack16 *>(recurrent_state3);
+    Pack16 *state_out0 = reinterpret_cast<Pack16 *>(recurrent_state0);
+    Pack16 *state_out1 = reinterpret_cast<Pack16 *>(recurrent_state1);
+    Pack16 *state_out2 = reinterpret_cast<Pack16 *>(recurrent_state2);
+    Pack16 *state_out3 = reinterpret_cast<Pack16 *>(recurrent_state3);
 
     recur_token: for (token_index = 0; token_index < num_tokens; ++token_index) {
     #pragma HLS loop_tripcount min=1 max=2048
@@ -987,18 +1027,25 @@ static void gdn_recurrent_attention(
             Pack16 *out_head = attn_out +
                 (size_t)token_index * (hidden / 16)
                 + (size_t)head_index * (GDN_DV / 16);
-            size_t head_state_base16 = st_base16 +
-                (size_t)head_index * GDN_DK * (GDN_DV / 16);
+            /* Each port owns four Pack16 words per state row. A compact head
+             * therefore occupies 256 rows * 4 words = 1024 words per port. */
+            size_t head_state_base16 =
+                ((size_t)layer_index * GDN_HEADS + head_index) *
+                GDN_DK * (GDN_DV / 16) / GDN_RECURRENT_STATE_PORTS;
 
             /* ---- Local per-token buffers ---- */
             float q_loc[GDN_DK];
             float k_loc[GDN_DK];
             float v_loc[GDN_DV];
-            float r_buf[GDN_DV];   /* retrieval result           */
-            float o_buf[GDN_DV];   /* partial output              */
+            float r_lo[GDN_DV / 2]; /* retrieval, columns 0..127   */
+            float r_hi[GDN_DV / 2]; /* retrieval, columns 128..255 */
+            float o_lo[GDN_DV / 2]; /* partial output, low half     */
+            float o_hi[GDN_DV / 2]; /* partial output, high half    */
             float dv[GDN_DV];      /* delta correction            */
-#pragma HLS array_partition variable=r_buf cyclic factor=GDN_PK
-#pragma HLS array_partition variable=o_buf cyclic factor=GDN_PK
+#pragma HLS array_partition variable=r_lo cyclic factor=GDN_PK
+#pragma HLS array_partition variable=r_hi cyclic factor=GDN_PK
+#pragma HLS array_partition variable=o_lo cyclic factor=GDN_PK
+#pragma HLS array_partition variable=o_hi cyclic factor=GDN_PK
 #pragma HLS array_partition variable=dv    cyclic factor=GDN_PK
 #pragma HLS array_partition variable=v_loc cyclic factor=GDN_PK
 
@@ -1083,33 +1130,53 @@ static void gdn_recurrent_attention(
              * The same 512-bit word is retained in the head-local state buffer
              * for the later update, eliminating a separate restore traversal.
              */
-            init_ro: for (i = 0; i < GDN_DV; ++i) {
-            #pragma HLS loop_tripcount min=256 max=256
+            init_ro: for (i = 0; i < GDN_DV / 2; ++i) {
+            #pragma HLS loop_tripcount min=128 max=128
             #pragma HLS pipeline II=1
             #pragma HLS unroll factor=GDN_PK
-                r_buf[i] = 0.0f;
-                o_buf[i] = 0.0f;
+                r_lo[i] = 0.0f;
+                r_hi[i] = 0.0f;
+                o_lo[i] = 0.0f;
+                o_hi[i] = 0.0f;
             }
 
-            fused_rd_j: for (j = 0; j < GDN_DK; ++j) {
-            #pragma HLS loop_tripcount min=256 max=256
-                float kj = k_loc[j];
-                float qj = q_loc[j];
-                fused_rd_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
-                #pragma HLS loop_tripcount min=16 max=16
-                #pragma HLS pipeline II=1
-                    Pack16 state_word = recurrent_state_in[
-                        head_state_base16 +
-                        (size_t)j * (GDN_DV / 16) +
-                        (i >> 4)];
-                    uint32_t pp;
-                    for (pp = 0; pp < GDN_PK; ++pp) {
-                    #pragma HLS unroll
-                        float s = state_word.data[pp];
-                        state[j][i + pp] = s;
-                        r_buf[i + pp] += s * kj;
-                        o_buf[i + pp] += s * qj;
-                    }
+            fused_rd01: for (uint32_t block = 0; block < GDN_DK * 4; ++block) {
+            #pragma HLS loop_tripcount min=1024 max=1024
+            #pragma HLS pipeline II=1
+                uint32_t row = block >> 2;
+                uint32_t column_base = (block & 3) * GDN_PK;
+                Pack16 state_word0 = state_in0[head_state_base16 + block];
+                Pack16 state_word1 = state_in1[head_state_base16 + block];
+                float kj = k_loc[row];
+                float qj = q_loc[row];
+                uint32_t pp;
+                for (pp = 0; pp < GDN_PK; ++pp) {
+                #pragma HLS unroll
+                    float s = pp < 16 ? state_word0.data[pp]
+                                      : state_word1.data[pp - 16];
+                    state[row][column_base + pp] = s;
+                    r_lo[column_base + pp] += s * kj;
+                    o_lo[column_base + pp] += s * qj;
+                }
+            }
+            fused_rd23: for (uint32_t block = 0; block < GDN_DK * 4; ++block) {
+            #pragma HLS loop_tripcount min=1024 max=1024
+            #pragma HLS pipeline II=1
+                uint32_t row = block >> 2;
+                uint32_t half_column = (block & 3) * GDN_PK;
+                uint32_t state_column = GDN_DV / 2 + half_column;
+                Pack16 state_word0 = state_in2[head_state_base16 + block];
+                Pack16 state_word1 = state_in3[head_state_base16 + block];
+                float kj = k_loc[row];
+                float qj = q_loc[row];
+                uint32_t pp;
+                for (pp = 0; pp < GDN_PK; ++pp) {
+                #pragma HLS unroll
+                    float s = pp < 16 ? state_word0.data[pp]
+                                      : state_word1.data[pp - 16];
+                    state[row][state_column + pp] = s;
+                    r_hi[half_column + pp] += s * kj;
+                    o_hi[half_column + pp] += s * qj;
                 }
             }
 
@@ -1129,9 +1196,13 @@ static void gdn_recurrent_attention(
             #pragma HLS loop_tripcount min=256 max=256
             #pragma HLS pipeline II=1
             #pragma HLS unroll factor=GDN_PK
-                float d = beta * (v_loc[i] - g * r_buf[i]);
+                float retrieval = i < GDN_DV / 2 ? r_lo[i]
+                                                  : r_hi[i - GDN_DV / 2];
+                float partial = i < GDN_DV / 2 ? o_lo[i]
+                                                : o_hi[i - GDN_DV / 2];
+                float d = beta * (v_loc[i] - g * retrieval);
                 dv[i] = d;
-                out_loc[i] = q_scale * (g * o_buf[i] + alpha * d);
+                out_loc[i] = q_scale * (g * partial + alpha * d);
             }
 
             delta_drain: for (i = 0; i < GDN_DV / 16; ++i) {
@@ -1150,26 +1221,51 @@ static void gdn_recurrent_attention(
              * Pack and persist each updated word immediately, eliminating a
              * separate save traversal of the complete layer state.
              */
-            fused_wr_j: for (j = 0; j < GDN_DK; ++j) {
-            #pragma HLS loop_tripcount min=256 max=256
-                float kj = k_loc[j];
-                fused_wr_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
-                #pragma HLS loop_tripcount min=16 max=16
-                #pragma HLS pipeline II=1
-                    Pack16 state_word;
-                    uint32_t pp;
-                    for (pp = 0; pp < GDN_PK; ++pp) {
-                    #pragma HLS unroll
-                        float updated = g * state[j][i + pp]
-                                      + kj * dv[i + pp];
-                        state[j][i + pp] = updated;
-                        state_word.data[pp] = updated;
-                    }
-                    recurrent_state_out[
-                        head_state_base16 +
-                        (size_t)j * (GDN_DV / 16) +
-                        (i >> 4)] = state_word;
+            fused_wr01: for (uint32_t block = 0; block < GDN_DK * 4; ++block) {
+            #pragma HLS loop_tripcount min=1024 max=1024
+            #pragma HLS pipeline II=1
+            #pragma HLS dependence variable=state inter false
+                uint32_t row = block >> 2;
+                uint32_t column_base = (block & 3) * GDN_PK;
+                float kj = k_loc[row];
+                Pack16 state_word0;
+                Pack16 state_word1;
+                uint32_t pp;
+                for (pp = 0; pp < GDN_PK; ++pp) {
+                #pragma HLS unroll
+                    float updated = g * state[row][column_base + pp]
+                                  + kj * dv[column_base + pp];
+                    state[row][column_base + pp] = updated;
+                    if (pp < 16)
+                        state_word0.data[pp] = updated;
+                    else
+                        state_word1.data[pp - 16] = updated;
                 }
+                state_out0[head_state_base16 + block] = state_word0;
+                state_out1[head_state_base16 + block] = state_word1;
+            }
+            fused_wr23: for (uint32_t block = 0; block < GDN_DK * 4; ++block) {
+            #pragma HLS loop_tripcount min=1024 max=1024
+            #pragma HLS pipeline II=1
+            #pragma HLS dependence variable=state inter false
+                uint32_t row = block >> 2;
+                uint32_t column_base = GDN_DV / 2 + (block & 3) * GDN_PK;
+                float kj = k_loc[row];
+                Pack16 state_word0;
+                Pack16 state_word1;
+                uint32_t pp;
+                for (pp = 0; pp < GDN_PK; ++pp) {
+                #pragma HLS unroll
+                    float updated = g * state[row][column_base + pp]
+                                  + kj * dv[column_base + pp];
+                    state[row][column_base + pp] = updated;
+                    if (pp < 16)
+                        state_word0.data[pp] = updated;
+                    else
+                        state_word1.data[pp - 16] = updated;
+                }
+                state_out2[head_state_base16 + block] = state_word0;
+                state_out3[head_state_base16 + block] = state_word1;
             }
         } /* recur_head */
     } /* recur_token */
@@ -1400,10 +1496,10 @@ int gdn_forward(
     const float *weight_data_mm25,
     const float *weight_data_mm26,
     const float *weight_data_mm27,
-    const float *weight_data_mm28,
-    const float *weight_data_mm29,
-    const float *weight_data_mm30,
-    const float *weight_data_mm31
+    float *weight_data_mm28,
+    float *weight_data_mm29,
+    float *weight_data_mm30,
+    float *weight_data_mm31
 ) {
     /* Depths match gdn-1.3b-f32.gdnw: hidden=2048 heads=8 head_dim=256
     intermediate=5632 layers=24 conv=4 max_seq_len=2048 vocab=32000 */
@@ -1456,10 +1552,10 @@ int gdn_forward(
     #pragma HLS interface m_axi port=weight_data_mm25 depth=43728896 offset=slave bundle=mem_weights_mm25 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
     #pragma HLS interface m_axi port=weight_data_mm26 depth=43728896 offset=slave bundle=mem_weights_mm26 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
     #pragma HLS interface m_axi port=weight_data_mm27 depth=43728896 offset=slave bundle=mem_weights_mm27 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm28 depth=43728896 offset=slave bundle=mem_weights_mm28 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm29 depth=43728896 offset=slave bundle=mem_weights_mm29 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm30 depth=43728896 offset=slave bundle=mem_weights_mm30 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm31 depth=43728896 offset=slave bundle=mem_weights_mm31 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
+    #pragma HLS interface m_axi port=weight_data_mm28 depth=46874624 offset=slave bundle=mem_weights_mm28 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8 max_write_burst_length=64 num_write_outstanding=8
+    #pragma HLS interface m_axi port=weight_data_mm29 depth=46874624 offset=slave bundle=mem_weights_mm29 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8 max_write_burst_length=64 num_write_outstanding=8
+    #pragma HLS interface m_axi port=weight_data_mm30 depth=46874624 offset=slave bundle=mem_weights_mm30 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8 max_write_burst_length=64 num_write_outstanding=8
+    #pragma HLS interface m_axi port=weight_data_mm31 depth=46874624 offset=slave bundle=mem_weights_mm31 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8 max_write_burst_length=64 num_write_outstanding=8
     /* step 4 Stage B: the 15 activation/state buffers are packed into this one
      * workspace pointer (GDN_WS_OFF_* layout in gdn_model.h), replacing 15 m_axi
      * ports and their control_s_axi base-address registers. Read+write, HBM0. */
@@ -1490,8 +1586,15 @@ int gdn_forward(
      * are reused for the MLP gate/up vectors after recurrence consumes q/k. */
     float *workspace_x     = workspace + GDN_WS_OFF_X;
     float *workspace_out   = workspace + GDN_WS_OFF_X_NORM;
-    float *recurrent_state = workspace + GDN_WS_OFF_REC_STATE;
     float *head_buffer     = workspace + GDN_WS_OFF_HEAD_BUF;
+    float *recurrent_state0 =
+        weight_data_mm28 + GDN_COMPILED_WEIGHT_SHARD_FLOATS;
+    float *recurrent_state1 =
+        weight_data_mm29 + GDN_COMPILED_WEIGHT_SHARD_FLOATS;
+    float *recurrent_state2 =
+        weight_data_mm30 + GDN_COMPILED_WEIGHT_SHARD_FLOATS;
+    float *recurrent_state3 =
+        weight_data_mm31 + GDN_COMPILED_WEIGHT_SHARD_FLOATS;
 
     Pack16 x_storage[GDN_HIDDEN / 16];
     Pack16 norm_attn_storage[GDN_HIDDEN / 16];
@@ -1627,8 +1730,10 @@ int gdn_forward(
 
         gdn_recurrent_attention(
             norm_attn_storage,
-            recurrent_state,
-            head_buffer,
+            recurrent_state0,
+            recurrent_state1,
+            recurrent_state2,
+            recurrent_state3,
             q_mlp_gate_storage,
             k_mlp_up_storage,
             v_storage,

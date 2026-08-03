@@ -344,6 +344,17 @@ static void load_gdnstate(const char *path, const GDNModel *model,
                        hdr->head_dim * hdr->value_dim;
     if (fread(run_state->recurrent_state, sizeof(float), rec_count, f) != rec_count)
         die(".gdnstate: truncated recurrent section");
+    {
+        float *state_stripes[GDN_RECURRENT_STATE_PORTS];
+        const size_t shard_floats = gdn_weight_shard_floats(c);
+        for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
+            state_stripes[p] =
+                run_state->weight_shards[GDN_RECURRENT_STATE_FIRST_PORT + p] +
+                shard_floats;
+        }
+        gdn_scatter_recurrent_state(state_stripes,
+                                    run_state->recurrent_state, rec_count);
+    }
     /* Section B: conv tails -> run_state->head_buffer (layers x 3 x (W-1) x hidden). */
     size_t conv_count = (size_t)hdr->num_layers * 3u *
                         (hdr->conv_size - 1u) * hdr->hidden;

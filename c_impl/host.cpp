@@ -422,12 +422,21 @@ public:
           x_norm_host_(hidden_, 0.0f) {
         const size_t shard_floats = gdn_weight_shard_floats(&model.config);
         const size_t shard_bytes = shard_floats * sizeof(float);
+        if (shard_floats != GDN_COMPILED_WEIGHT_SHARD_FLOATS) {
+            throw std::runtime_error("loaded model weight-shard size != compiled kernel layout");
+        }
+        const size_t state_stripe_bytes =
+            static_cast<size_t>(GDN_RECURRENT_STATE_STRIPE_FLOATS) * sizeof(float);
         const size_t aux_floats = gdn_aux_weight_floats(&model.config);
         const size_t aux_bytes = aux_floats * sizeof(float);
         // step 4 Stage B arg order: 0=aux_weights, 1=workspace, 2..33=weight_mm0..31.
         weight_bos_.reserve(GEMV_CHANNELS);
         for (int c = 0; c < GEMV_CHANNELS; ++c) {
             size_t extra_bytes = c == 0 ? aux_bytes : 0;
+            if (c >= GDN_RECURRENT_STATE_FIRST_PORT &&
+                c < GDN_RECURRENT_STATE_FIRST_PORT + GDN_RECURRENT_STATE_PORTS) {
+                extra_bytes = state_stripe_bytes;
+            }
             weight_bos_.emplace_back(device, shard_bytes + extra_bytes,
                                      kernel_.group_id(2 + c));
         }
@@ -542,10 +551,27 @@ public:
                              const std::vector<float> &conv) {
         size_t rbytes = recurrent.size() * sizeof(float);
         size_t cbytes = conv.size() * sizeof(float);
-        const size_t rec_off = GDN_WS_OFF_REC_STATE * sizeof(float);
         const size_t hb_off  = GDN_WS_OFF_HEAD_BUF * sizeof(float);
-        workspace_bo_.write(recurrent.data(), rbytes, rec_off);
-        sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_TO_DEVICE, rbytes, rec_off);
+        const size_t shard_bytes =
+            static_cast<size_t>(GDN_COMPILED_WEIGHT_SHARD_FLOATS) * sizeof(float);
+        if (rbytes != static_cast<size_t>(GDN_WSF_STATE) * sizeof(float)) {
+            throw std::runtime_error("recurrent-state size != compiled striped layout");
+        }
+        std::vector<float> stripes[GDN_RECURRENT_STATE_PORTS];
+        float *stripe_ptrs[GDN_RECURRENT_STATE_PORTS];
+        for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
+            stripes[p].resize(GDN_RECURRENT_STATE_STRIPE_FLOATS);
+            stripe_ptrs[p] = stripes[p].data();
+        }
+        gdn_scatter_recurrent_state(stripe_ptrs,
+                                    recurrent.data(), recurrent.size());
+        for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
+            const int port = GDN_RECURRENT_STATE_FIRST_PORT + p;
+            const size_t stripe_bytes = stripes[p].size() * sizeof(float);
+            weight_bos_[port].write(stripes[p].data(), stripe_bytes, shard_bytes);
+            sync_bo_chunked(weight_bos_[port], XCL_BO_SYNC_BO_TO_DEVICE,
+                            stripe_bytes, shard_bytes);
+        }
         workspace_bo_.write(conv.data(), cbytes, hb_off);
         sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_TO_DEVICE, cbytes, hb_off);
     }

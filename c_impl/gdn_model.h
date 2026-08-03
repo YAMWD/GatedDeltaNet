@@ -65,6 +65,18 @@ typedef struct {
 #define GDN_WS_OFF_LOGITS     (GDN_WS_OFF_HEAD_BUF  + GDN_WSF_HEADBUF)
 #define GDN_WS_FLOATS         (GDN_WS_OFF_LOGITS    + GDN_WSF_LOGITS)
 
+/* Iter37 recurrent-state layout. The external .gdnstate file remains one
+ * contiguous [layer][head][K][V] FP32 tensor. At upload time its aligned
+ * Pack16 words are striped round-robin over the tails of weight shards 28..31.
+ * The four corresponding AXI masters are idle while recurrent attention runs,
+ * so the kernel gains independent state bandwidth without adding an m_axi
+ * interface or changing the public state-file format. */
+#define GDN_RECURRENT_STATE_PORTS       4
+#define GDN_RECURRENT_STATE_FIRST_PORT 28
+#define GDN_RECURRENT_STATE_STRIPE_FLOATS \
+    (GDN_WSF_STATE / GDN_RECURRENT_STATE_PORTS)
+#define GDN_COMPILED_WEIGHT_SHARD_FLOATS 43728896u
+
 typedef struct {
     const float *attn_norm;
     const float *a_log;
@@ -127,6 +139,9 @@ void gdn_build_weight_shards(const float *weight_data, const GDNWeightHeader *co
 size_t gdn_aux_weight_floats(const GDNWeightHeader *config);
 void gdn_build_aux_weights(const float *weight_data, const GDNWeightHeader *config,
                            float *aux_weights);
+void gdn_scatter_recurrent_state(float *const state_stripes[],
+                                 const float *recurrent_state,
+                                 size_t recurrent_state_floats);
 
 int gdn_model_load(GDNModel *model, const char *path);
 void gdn_model_free(GDNModel *model);
@@ -170,10 +185,10 @@ int gdn_forward(
     const float *weight_data_mm25,
     const float *weight_data_mm26,
     const float *weight_data_mm27,
-    const float *weight_data_mm28,
-    const float *weight_data_mm29,
-    const float *weight_data_mm30,
-    const float *weight_data_mm31
+    float *weight_data_mm28,
+    float *weight_data_mm29,
+    float *weight_data_mm30,
+    float *weight_data_mm31
 );
 
 /* Single-token decode step (the only host entry): gdn_forward with num_tokens=1
