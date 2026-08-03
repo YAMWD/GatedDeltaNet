@@ -1,15 +1,15 @@
 # Disaggregated Decode-Only Accelerator (GEMV datapath)
 
 **Status:** Historical GEMV scaling and optimization record. The current
-production design is the integrated Iter36 32-port/16-cluster,
-activation-resident, head-local-state kernel documented in
+production design is the integrated Iter37 32-port/16-cluster,
+activation-resident, four-port/32-lane recurrent-state kernel documented in
 [architecture.md](architecture.md).
 The standalone 32-port microbenchmark remains documented separately in
 [`../microbench/gemv_tile/README.md`](../microbench/gemv_tile/README.md).
 
 The final integrated U55C image routes at 100 MHz with zero failed/unrouted
-nets and zero overlaps. It passes exact 64-token parity at 59.578 ms/token mean
-latency, 2.04x faster than the 121.4 ms eight-port baseline. Sections below
+nets and zero overlaps. It passes exact 64-token parity at 51.451 ms/token mean
+latency, 2.36x faster than the 121.4 ms eight-port baseline. Sections below
 retain the progression that led to that design; older statements describing an
 eight-port kernel as “current” are historical in their section context.
 

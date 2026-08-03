@@ -1,8 +1,8 @@
 # GatedDeltaNet Decode Accelerator Architecture
 
-**Status:** Current routed production architecture (Iter36). The timing-closed
-100 MHz image was measured 2026-07-31 and the faster auto-scaled 115.7 MHz
-image was measured 2026-08-02 on an Alveo U55C.
+**Status:** Current routed production architecture (Iter37D). The image was
+requested at 115 MHz, auto-scaled to 100 MHz after timing analysis, and measured
+2026-08-04 on an Alveo U55C.
 
 The accelerator in `c_impl/` is decode-only. Prompt prefill runs on the GPU and
 exports fixed-size recurrent and convolution state. The FPGA then advances one
@@ -14,17 +14,17 @@ token per `gdn_forward` invocation. The successful design combines:
 - a 4/6/6 cluster distribution across SLR0/SLR1/SLR2;
 - transient activations resident in local BRAM for the complete 24-layer
   forward;
-- a 16-bank, head-local recurrent-state buffer with HBM restore/retrieval and
-  update/save fused into the two required attention passes;
+- four packed recurrent-state stripes appended to HBM weight ports 28--31;
+- 32-lane, head-local recurrent arithmetic with HBM retrieval and update fused
+  into the two required attention passes;
 - packed external recurrent-state and convolution-tail transfers; and
 - on-chip LM-head argmax, with no external logits materialization.
 
 The architecture routes with zero failed nets, zero unrouted nets, and zero
-node overlaps. The explicit 100 MHz image produces an exact 64-token trajectory
-at 59.578 ms/token. The fastest validated image was requested at 130 MHz but
-auto-scaled to 115.7 MHz; it preserves exact parity at **51.844 ms/token**,
-2.342x faster than the 121.4 ms eight-port baseline and 1.448x faster than
-Iter35. It is not evidence of 130 MHz timing closure.
+node overlaps. It preserves exact 64-token parity at **51.451 ms/token** at
+100 MHz: 1.158x faster than Iter36 at the same clock, 1.0076x faster than the
+previous 115.7 MHz best, and 2.360x faster than the 121.4 ms eight-port
+baseline. It is not evidence of 115 MHz timing closure.
 
 ## Fixed Model Shape
 
@@ -64,7 +64,7 @@ XRT host
 |                                                                     |
 |  workspace[X] --> local activation BRAMs --> 24 GDN layers          |
 |                         |                     |                      |
-|                         |                     +--> recurrent state --+--> HBM0
+|                         |                     +--> recurrent state --+--> HBM28..31
 |                         |                     +--> convolution tails +--> HBM0
 |                         v                                            |
 |             32 HBM readers --> 16 GEMV clusters --> local results   |
@@ -96,8 +96,9 @@ master. The successful connectivity is:
 
 | AXI bundle | HBM bank | Contents |
 |---|---:|---|
-| `mem_weights_mm0` | HBM[0] | GEMV shard 0, compact auxiliary weights, workspace, recurrent state, convolution tails, embedding ingress, token egress |
-| `mem_weights_mm1` ... `mem_weights_mm31` | HBM[1] ... HBM[31] | One compact GEMV shard per bank, read-only during decode |
+| `mem_weights_mm0` | HBM[0] | GEMV shard 0, compact auxiliary weights, workspace, convolution tails, embedding ingress, token egress |
+| `mem_weights_mm1` ... `mem_weights_mm27` | HBM[1] ... HBM[27] | One compact GEMV shard per bank, read-only during decode |
+| `mem_weights_mm28` ... `mem_weights_mm31` | HBM[28] ... HBM[31] | One GEMV shard plus one 12 MiB recurrent-state stripe per bank |
 
 Every large matrix, including `lm_head`, is split across the 32 compact shards.
 There is one total copy of the projection weights: channel `c` holds output rows
@@ -109,7 +110,8 @@ per layer: q, k, v, gate, output, mlp_gate, mlp_up, mlp_down
 global:    lm_head
 ```
 
-One shard contains 43,728,896 FP32 values (166.8125 MiB). The small norms,
+One weight shard contains 43,728,896 FP32 values (166.8125 MiB). Ports 28--31
+append 3,145,728 FP32 state values (12 MiB) after that fixed boundary. The small norms,
 A/B projections, convolution kernels, and final norm are packed into
 `aux_weights`; the full 5.6 GB source weight blob is not duplicated on the
 device.
@@ -125,22 +127,24 @@ The host-visible `GDN_WS_OFF_*` layout is unchanged from Iter31. This preserves
 the external ABI and XRT allocation behavior, but most activation offsets are
 now reserved compatibility space rather than active HBM traffic.
 
-| Workspace region | Iter36 synthesized use |
+| Workspace region | Iter37 synthesized use |
 |---|---|
 | `GDN_WS_OFF_X` | Host writes one 2,048-float embedding; kernel reads it once |
 | `GDN_WS_OFF_X_NORM` | Kernel writes one 512-bit result line; lane zero is the selected token |
 | Q/K/V, gate, attention, temporary, MLP and logits offsets | Reserved but not accessed by the activation datapath |
-| `GDN_WS_OFF_REC_STATE` | Persistent packed recurrent-state read/update/write |
+| `GDN_WS_OFF_REC_STATE` | Reserved compatibility space; recurrent state moved to weight-shard tails 28--31 |
 | `GDN_WS_OFF_HEAD_BUF` | Persistent packed Q/K/V convolution-tail read/update/write |
 
 The recurrent state cannot remain on chip across the complete decode. One layer
 is 2 MiB; all 24 layers would require roughly 2,304 URAMs before any other
-storage, versus 960 URAMs on the U55C. Iter36 instead buffers one 256 x 256 FP32
-head at a time in 16 cyclic URAM banks. The retrieval loop loads each 512-bit
-state word from HBM while consuming it, and the update loop writes each updated
-word back immediately. The unavoidable packed state round trip remains, but
-the two redundant full-layer restore/save traversals and the 128-URAM
-all-head buffer are gone.
+storage, versus 960 URAMs on the U55C. Iter37 instead buffers one 256 x 256 FP32
+head at a time. Within each state row, the eight low-half Pack16 words alternate
+between ports 28/29 and the eight high-half words alternate between ports 30/31.
+The two low ports are consumed together, followed by the two high ports, so 32
+state columns are processed per cycle while every individual port retains a
+monotonic 1,024-beat burst per head. The update loops write the same striped
+layout back immediately. The unavoidable packed state round trip remains, but
+no new AXI master or public `.gdnstate` format is required.
 
 ## Activation-Resident Datapath
 
@@ -316,12 +320,13 @@ Non-GEMV blocks remain shared, relatively narrow implementations:
 | RMSNorm/reductions | 8 lanes |
 | Tiny A/B GEMV | 2 output lanes |
 | Depthwise convolution, output gate, SwiGLU | 4 elementwise lanes |
-| Recurrent state arithmetic | 16 lanes |
+| Recurrent state arithmetic | **32 lanes** |
 
 Iter35 selectively restored recurrent-state arithmetic from 8 to 16 lanes.
 Wider normalization, output-gate, and SwiGLU variants were rejected because
-their measured cycle savings did not justify their DSP/LUT cost. Iter36 keeps
-those choices and changes recurrent-state materialization only.
+their measured cycle savings did not justify their DSP/LUT cost. Iter37 keeps
+those narrow blocks, doubles only recurrent arithmetic to 32 lanes, and supplies
+those lanes from the four state stripes.
 
 ## Static Schedule and HLS Resources
 
@@ -329,39 +334,41 @@ Because `gdn_gemv` accepts runtime dimensions, the raw top-level HLS latency
 uses the maximum LM-head trip count for all 193 calls and is not a token
 latency. Reconstructing the schedule with each real projection shape gives:
 
-| Component | Iter32 cycles | Iter36 cycles |
+| Component | Iter32 cycles | Iter36 cycles | Iter37 cycles |
+|---|---:|---:|---:|
+| 193 large GEMVs | 2,785,524 | 2,785,524 | 2,785,524 |
+| RMSNorm | 139,405 | 139,405 | 139,405 |
+| Tiny GEMV | 103,584 | 103,584 | 103,584 |
+| Q/K/V convolution | 624,744 | 624,744 | 624,744 |
+| Recurrent attention | 5,760,144 | **1,841,112** | **1,057,944** |
+| Output norm/gate | 128,712 | 128,712 | 128,712 |
+| SwiGLU | 321,048 | 321,048 | 321,048 |
+| Activation handoff/copy/add/argmax | 54,069 | 54,069 | 54,069 |
+| **Reconstructed total** | **9,917,230** | **5,998,198** | **5,215,030** |
+
+Final Iter37 integrated csynth resources:
+
+| Resource | Iter36 | Iter37 |
 |---|---:|---:|
-| 193 large GEMVs | 2,785,524 | 2,785,524 |
-| RMSNorm | 139,405 | 139,405 |
-| Tiny GEMV | 103,584 | 103,584 |
-| Q/K/V convolution | 624,744 | 624,744 |
-| Recurrent attention | 5,760,144 | **1,841,112** |
-| Output norm/gate | 128,712 | 128,712 |
-| SwiGLU | 321,048 | 321,048 |
-| Activation handoff/copy/add/argmax | 54,069 | 54,069 |
-| **Reconstructed total** | **9,917,230** | **5,998,198** |
+| RAMB18 | 1,511 | 1,511 |
+| DSP | 3,323 | **3,627** |
+| FF | 798,733 | **851,903** |
+| LUT | 829,526 | **912,694** |
+| URAM | 32 | **48** |
 
-Final Iter36 integrated csynth resources:
-
-| Resource | Iter36 |
-|---|---:|
-| RAMB18 | 1,511 |
-| DSP | 3,323 |
-| FF | 798,733 |
-| LUT | 829,526 |
-| URAM | **32** |
-
-The head-local fusion reduces the recurrent buffer from Iter35's 128 URAMs to
-16 and whole-kernel use from 144 to 32 URAMs. GEMV MAC II remains four, no AXI
-master was added, and all 32 MM2S readers remain II=1.
+The 32-lane recurrent call is estimated at 43,873--44,081 cycles versus 76,713
+for Iter36. The integrated top minimum falls from 4,741,679 to **3,957,551
+cycles**. All four state read/write loops achieve II=1; GEMV MAC II remains
+four, no AXI master was added, and all 32 MM2S readers remain II=1.
 
 ## Physical Implementation
 
-The reproducible build compiles HLS at 130 MHz and links the U55C image at
-100 MHz:
+The reproducible build compiles HLS at 130 MHz and requests a 115 MHz U55C
+link. The Make target owns the hash-guarded launcher and uses only relocatable
+configuration/Tcl source:
 
 ```bash
-bash c_impl/build_iter36_headlocal.sh 100
+make -C c_impl iter37 ITER37_FREQ=115
 ```
 
 The launcher is hash-guarded and refuses to overwrite its existing build
@@ -369,37 +376,35 @@ directory. Its physical recipe uses:
 
 - exact 32-bank connectivity from the routed Iter31 topology;
 - `apply_iter22_cluster8_slr1_east.tcl`;
-- `apply_iter23_dma_fanout.tcl`;
 - `apply_iter35_dma_w15_fifoaddr_fanout.tcl` for the fixed 250 MHz DMA path;
+- an exact recurrent hierarchy constraint to the full SLR2;
 - BRAM implementation for all wide MM2S, activation-ripple, result, and
   collector FIFOs;
-- `AltSpreadLogic_high` placement;
-- `Explore` routing; and
+- `SSI_SpreadSLLs` placement;
+- `AlternateCLBRouting`; and
 - pre-route and post-route `AggressiveExplore` physical optimization.
 
 Final implementation result:
 
 | Metric | Result |
 |---|---:|
-| Build duration | 7 h 47 m (7 h 26 m link) |
-| Kernel clock | 100 MHz |
+| Build duration | 14 h 32 m |
+| Requested / encoded kernel clock | 115 / **100 MHz** |
 | Failed nets | 0 |
 | Unrouted nets | 0 |
 | Node overlaps | 0 |
-| Overall WNS / TNS | +0.003 ns / 0 |
-| Overall WHS / THS | +0.009 ns / 0 |
-| 100 MHz kernel WNS / WHS | +0.104 ns / +0.009 ns |
-| 250 MHz `dma_ip_axi_aclk_1` WNS / WHS | +0.003 ns / +0.009 ns |
-| Automatic clock scaling | None |
+| 115 MHz post-physopt WNS / TNS | **-1.296 ns / -5314.403 ns** |
+| Post-physopt WHS / THS | +0.001 ns / 0 |
+| Automatic clock scaling | **115 to 100 MHz** |
 
 Local routing remains dense: SLR0 reports effective south congestion level 6
 and west level 5. The design is therefore routed, but it does not have enough
 physical margin to justify casually widening compute blocks or changing FIFO
 implementation. Any such change requires a new full route.
 
-### Faster auto-scaled frequency follow-up
+### Previous Iter36 frequency result
 
-The unchanged Iter36 source was also built with a 130 MHz link request:
+For comparison, the Iter36 source was built with a 130 MHz link request:
 
 ```bash
 bash c_impl/build_iter36_headlocal.sh 130
@@ -415,7 +420,7 @@ on-card-validated 115.7 MHz result, not a 130 MHz closure result.
 
 ## Correctness and On-Card Performance
 
-The final image passed:
+The Iter37 image passed:
 
 - native C++ build;
 - fast exact decode, 6/6;
@@ -425,23 +430,26 @@ The final image passed:
 
 Excluding the initial seed entry, 63 measured kernel calls produced:
 
-| Metric | Result |
+| Metric | Iter37 at 100 MHz |
 |---|---:|
-| Minimum | 59.517 ms/token |
-| Maximum | 59.851 ms/token |
-| Median | **59.563 ms/token** |
-| Mean | **59.578 ms/token** |
-| Speedup over Iter35, 75.062 ms | **1.260x** |
-| Speedup over Iter32, 98.660 ms | **1.656x** |
-| Speedup over eight-port baseline, 121.4 ms | **2.038x** |
+| Minimum | 51.423 ms/token |
+| Maximum | 51.785 ms/token |
+| Median | **51.438 ms/token** |
+| Mean | **51.451 ms/token** |
+| Speedup over Iter36 100 MHz, 59.578 ms | **1.158x** |
+| Speedup over Iter36 115.7 MHz, 51.844 ms | **1.0076x** |
+| Speedup over Iter35, 75.062 ms | **1.459x** |
+| Speedup over Iter32, 98.660 ms | **1.918x** |
+| Speedup over eight-port baseline, 121.4 ms | **2.360x** |
 
-The measured mean is within 0.40 ms of the reconstructed 59.982 ms static
-schedule. Head-local fusion therefore removes the recurrent restore/save cost
-almost one-for-one without introducing a material dynamic-stall gap.
+At 100 MHz, the measured 5.145-million-cycle mean is 0.813 million cycles below
+Iter36. The difference between the 3.958-million-cycle integrated HLS minimum
+and hardware is about 1.19 million cycles, showing that external recurrent-state
+traffic/backpressure is still the dominant residual beyond the static minimum.
 
-The automatic follow-up then ran the same smoke and full fixtures with the
-115.7 MHz image. Both remained exact. Excluding the seed, its 63 kernel calls
-measured:
+For comparison, the previous Iter36 auto-scaled follow-up ran the same smoke
+and full fixtures with its 115.7 MHz image. Both remained exact. Excluding the
+seed, its 63 kernel calls measured:
 
 | Metric | Auto-scaled 115.7 MHz |
 |---|---:|
@@ -457,16 +465,15 @@ measured:
 The ideal clock-ratio prediction was 51.493 ms/token; the measured result is
 within 0.68%, so the frequency increase did not expose a material new stall.
 
-Reproducibility hashes:
+Reproducibility hashes for the retained Iter37 result:
 
 | Artifact | SHA-256 |
 |---|---|
-| `gdn_model.cpp` | `b0a380365d00a7535dd1256f62f6a21f97a3eee6158e3e4b53bb92ce2df5dafb` |
-| Iter35 link configuration reused by Iter36 | `240855bd65ba1cf4525c88b34f9d07012bf73c90e75f524b2c9547eaa9e5922b` |
-| 100 MHz compiled XO | `c699dcc8c678cba970906d1a9ab0d62ab2315ad7d67c77fdcdf921dbd752171e` |
-| 100 MHz XCLBIN | `b251ca1c89a2d56111c1c336e003db3c3c0bbaf02556207a50a184578c6f3c34` |
-| 115.7 MHz compiled XO | `01b8bf9f19fd62c4762fe16d77235212731cad0b31e48601fbc0f37608ef7f6f` |
-| 115.7 MHz XCLBIN | `7f631a7941f5614c91a1eb80246c0dd7fe3e8e83f1eceb1e171487c04498505f` |
+| `gdn_model.cpp` | `88e68abdcba29f4355216571440d70d8611f0855717466e8f73891a3db58b216` |
+| Compiled XO | `5846289626acf27d200a098038ed934432fe16730071c8e185d9e9c5fc766626` |
+| Recurrent-SLR2 hook | `15587403b5e904345abdee72cd84cfc0fa24f8be559f94f1e5554cdcedbd059e` |
+| Relocatable link configuration | `998b71e3a8cb3b7f818f12cbe6581f0ffd2e04010dba5db3f20ca2ae844aa08f` |
+| Auto-scaled 100 MHz XCLBIN | `5dd2c7c460f635f3bc3cbe931c365549f47d33653d679871953c161b62da3524` |
 
 ## Design Invariants
 
@@ -481,12 +488,12 @@ integrated csynth, full implementation, and on-card measurement:
    materialization.
 6. Keep recurrent state and convolution tails packed and externally
    persistent.
-7. Keep the recurrent buffer head-local and fuse HBM state transfer into the
-   required retrieval/update traversals.
+7. Keep the recurrent buffer head-local, the state striped across ports 28--31,
+   and HBM transfer fused into the required retrieval/update traversals.
 8. Keep LM-head argmax on chip and preserve strict first-index tie behavior.
 9. Keep the external workspace offsets and host ABI stable.
-10. Treat the Iter22 floorplan and Iter23/Iter35 DMA hooks as part of the successful
-   physical architecture, not optional tuning.
+10. Treat the Iter22 cluster placement, Iter35 DMA hook, and recurrent-SLR2
+    assignment as part of the successful physical architecture.
 11. Judge changes against both 100 MHz timing and zero-conflict routing; HLS
     resource savings alone do not predict routability.
 

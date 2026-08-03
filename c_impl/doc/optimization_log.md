@@ -1975,6 +1975,174 @@ not met.
 | XO | `01b8bf9f19fd62c4762fe16d77235212731cad0b31e48601fbc0f37608ef7f6f` |
 | XCLBIN | `7f631a7941f5614c91a1eb80246c0dd7fe3e8e83f1eceb1e171487c04498505f` |
 
+### iter37A — four-port recurrent-state striping, first scheduling attempt (rejected)
+
+*Tested 2026-08-02; stopped during integrated csynth before hardware link.*
+
+This sub-variant moved the unchanged FP32 recurrent-state tensor from the
+single HBM0 workspace region to four Pack16-striped tails on existing weight
+ports 28--31 and widened recurrent column arithmetic from 16 to 32 lanes. The
+native fast 6-token and full 32-token decode gates were both exact. HLS also
+inferred the intended 1,024-beat, 512-bit bursts for all four read streams and
+all four write streams; the 32 GEMV MM2S loops remained at II=1.
+
+The first flattened low/high implementation did not meet its recurrent-loop
+schedule gate:
+
+| Loop | Target II | Achieved II |
+|---|---:|---:|
+| Low-half state read (`fused_rd01`) | 1 | **1** |
+| High-half state read (`fused_rd23`) | 1 | **2** |
+| Low-half update/write (`fused_wr01`) | 1 | **2** |
+| High-half update/write (`fused_wr23`) | 1 | **3** |
+
+The high-half read alias is caused by sharing one dynamically indexed
+low/high accumulator array. The write-loop warnings are false state-array
+carried dependencies: `(row,column)` is unique for every flattened loop
+iteration, so no state element is revisited in that pass. Because these IIs
+would miss the planned <=50K recurrent cycles/layer, synthesis was terminated
+during RTL generation and no link was launched. Iter37B splits low/high
+accumulator arrays and applies an explicit false inter-iteration dependency
+only to the one-write state update loops. This rejected source/config is not a
+commit candidate.
+
+### iter37B — four-port recurrent-state striping, 115 MHz routing failure
+
+*Tested 2026-08-02; implementation failed during route verification.*
+
+Iter37B retained Iter37A's four-way Pack16-striped recurrent-state placement on
+the existing weight ports 28--31 and its 32 recurrent arithmetic lanes. It
+split the low/high accumulator storage and applied a false inter-iteration
+dependency only to the flattened one-write update loops. Native fast 6-token
+and full 32-token decode checks remained exact. Integrated Vitis HLS 2022.2
+synthesis achieved II=1 on all four state read/write loops, with a top-level
+minimum latency estimate of **3,957,551 cycles** versus Iter36's 4,741,679.
+Each recurrent layer was estimated at 43,873--44,081 cycles. Whole-kernel HLS
+resources were 1,511 RAMB18, 3,627 DSP, 851,903 FF, 912,694 LUT, and 48 URAM;
+the 32 weight movers remained II=1 and the 16 GEMV clusters remained II=4.
+
+The full implementation used the accepted source SHA-256
+`88e68abdcba29f4355216571440d70d8611f0855717466e8f73891a3db58b216` and XO SHA-256
+`5846289626acf27d200a098038ed934432fe16730071c8e185d9e9c5fc766626`.
+It requested 115 MHz while preserving the Iter36/Iter35 physical recipe. The
+placer completed, but routing reported global/short congestion level 6 and
+timing congestion level 7. Rip-up/reroute reduced the first iteration from
+1,140,068 to 3,784 overlapping nodes, but the next iteration did not converge.
+Final verification reported **6,708 failed-to-route signals** and **5,845 node
+overlaps**, then `route_design` failed with partially conflicted nets. No
+XCLBIN was emitted, so there is no timing or on-card performance result.
+
+Post-failure checkpoint analysis localized the new pressure. The recurrent
+hierarchy was placed almost entirely in SLR1: 17,681 CLBs, 71,153 LUTs,
+67,399 registers, 568 DSPs, 32 URAMs, and 13.5 BRAM tiles were in SLR1; only
+781 CLBs and 1,921 registers spilled into SLR0, and none entered SLR2. It
+accounted for 47% of a level-7 long-routing congestion window. Relative to the
+successful Iter36 130 MHz-request placement, total SLL use rose from 26,417 to
+31,643, SLR0--SLR1 crossings rose from 16,938 to 19,455, and SLR1--SLR2
+crossings rose from 9,479 to 12,188. SLR0 was 99.54% occupied by CLBs and SLR1
+was 87.11%, while SLR2 remained only 50.36% occupied. These measurements make
+the next repair a recurrent-specific redistribution/reduction problem, not a
+clock-frequency problem or a shortage of total device resources.
+
+This is a **negative implementation result** and must not be committed as an
+improvement. It shows that the additional recurrent-state striping/32-lane
+logic exceeds the routability margin of the current 115 MHz physical recipe;
+the preliminary -0.013 ns timing seen before detailed rerouting is not a final
+timing verdict. A 100 MHz fallback was not launched from this status check.
+
+### iter37C — recurrent-only SLR2 redistribution (rejected hook guard)
+
+*Tested 2026-08-02--03 at 115 MHz; stopped before `opt_design`.*
+
+Iter37C keeps the exact bit-exact Iter37B source and verified XO. Its only
+changes are physical: retain the Iter22 cluster-8 and Iter35 DMA repairs,
+assign the complete `grp_gdn_recurrent_attention_fu_*` hierarchy to the full
+SLR2 without a rectangular pblock, use `SSI_SpreadSLLs` placement, and use
+`AlternateCLBRouting`. Post-route `AggressiveExplore` remains enabled. The
+goal is to move the 17,681 recurrent CLBs and their 568 DSP/32 URAM anchors out
+of SLR1 while leaving Vivado free to spread them within the underused SLR2.
+
+The checksum-guarded command was `make -C c_impl iter37c`. It reused
+the accepted XO SHA-256
+`5846289626acf27d200a098038ed934432fe16730071c8e185d9e9c5fc766626`;
+the relocatable config-template SHA-256 is
+`e31edd150c44f7745de470b5e95405c7e539a6f8c0ad3e07783ac2393abb0952`
+and the recurrent-placement hook SHA-256 is
+`3826b82f3266b59a36f8552fdfab46a67825f77ba01a9fa0cf5e3e0e5c014a5c`.
+The build completed synthesis, then the pre-optimization hook rejected its own
+selector: `NAME =~ */grp_gdn_recurrent_attention_fu_*` matched the hierarchy
+root and all descendants because Vivado's glob `*` spans `/`, producing
+204,004 matches instead of one. Placement and routing never ran, so this is a
+**negative recipe result with no physical-design verdict**. No source, XO, or
+frequency result is implicated, and no 100 MHz fallback was launched. Iter37D
+replaces the glob with the checkpoint-validated anchored regexp
+`^.*/grp_gdn_recurrent_attention_fu_[0-9]+$` and reruns the same experiment.
+
+### iter37D — corrected recurrent-only SLR2 redistribution, routed at 100 MHz
+
+*Tested 2026-08-03--04; 115 MHz timing failed and Vitis emitted an
+automatically scaled 100 MHz XCLBIN.*
+
+Iter37D is the corrected retry of Iter37C. It preserves the exact Iter37B
+source and XO and changes only the physical recipe. The pre-optimization hook
+now uses `get_cells -hierarchical -regexp` with the checkpoint-validated exact
+root pattern `^.*/grp_gdn_recurrent_attention_fu_[0-9]+$`; the one selected
+recurrent hierarchy is assigned to the full SLR2. Iter22's cluster-8 placement,
+Iter35's DMA fanout repair, `SSI_SpreadSLLs`, `AlternateCLBRouting`, and
+post-route `AggressiveExplore` remain enabled.
+
+The reproducible command is `make -C c_impl iter37 ITER37_FREQ=115`. The source
+SHA-256 remains
+`88e68abdcba29f4355216571440d70d8611f0855717466e8f73891a3db58b216`,
+the reused XO SHA-256 remains
+`5846289626acf27d200a098038ed934432fe16730071c8e185d9e9c5fc766626`,
+the corrected hook SHA-256 is
+`15587403b5e904345abdee72cd84cfc0fa24f8be559f94f1e5554cdcedbd059e`,
+and the relocatable config-template SHA-256 is
+`998b71e3a8cb3b7f818f12cbe6581f0ffd2e04010dba5db3f20ca2ae844aa08f`.
+No independent 100 MHz implementation was launched; this same run was allowed
+to fall back only after its 115 MHz timing failure was established.
+
+The corrected hook selected exactly one recurrent root and implementation
+completed routing with **zero failed/unrouted nets and zero node overlaps**.
+This confirms that moving the enlarged recurrent block into SLR2 resolves the
+Iter37B routing failure. At the requested 115 MHz, however, routed timing was
+WNS -1.775 ns/TNS -8697.074 ns before post-route physical optimization.
+`AggressiveExplore` recovered 0.479 ns, finishing at **WNS -1.296 ns**, TNS
+-5314.403 ns, WHS +0.001 ns, and THS 0.000 ns. The failing path group was the
+kernel data clock and included recurrent state RAM/control paths as well as
+GEMV-cluster datapaths; this is a broad physical-timing failure rather than the
+single DMA path seen in earlier iterations.
+
+Vitis therefore scaled `DATA_CLK` from 115 to **100 MHz**, generated the
+bitstream, and exited successfully after 14 h 32 min. The resulting XCLBIN is
+77,620,790 bytes with SHA-256
+`5dd2c7c460f635f3bc3cbe931c365549f47d33653d679871953c161b62da3524`.
+The eight-token smoke run and full 64-token decode-from-state run on U55C device
+0 both matched the golden trajectory exactly, with first divergence `-1` and
+100% top-1 agreement. Excluding the initial seed, the 63 full-run kernel calls
+measured:
+
+| Metric | Iter37D, auto-scaled 100 MHz |
+|---|---:|
+| Minimum | 51.422932 ms/token |
+| Maximum | 51.784876 ms/token |
+| Median | **51.437899 ms/token** |
+| Mean | **51.450918 ms/token** |
+| Speedup over Iter36 100 MHz, 59.577939 ms | **1.158x / 13.64%** |
+| Speedup over Iter36 115.7 MHz, 51.844010 ms | **1.0076x / 0.76%** |
+| Speedup over 121.4 ms reference | **2.360x** |
+
+This is a **retained positive result**. Four-port state striping plus 32
+recurrent lanes saves about 0.813 million measured cycles/token relative to
+Iter36 at the same 100 MHz, and is narrowly faster than the previous best even
+though that image ran at 115.7 MHz. The achieved 51.451 ms is higher than the
+3.958-million-cycle integrated HLS minimum because the external state streams
+still incur about 1.19 million cycles of dynamic transfer/backpressure, nearly
+the same residual term as Iter36. The architecture, reproducible physical
+recipe, and measured result are therefore commit candidates; the unachieved
+115 MHz target remains explicitly recorded as a timing failure.
+
 ### Superseded plan (written before iter12 ran)
 
 Pin **only the 16 clusters**, contiguous in chain order, **6/6/4** across
