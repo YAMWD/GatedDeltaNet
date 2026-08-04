@@ -1,13 +1,14 @@
-# Cycle-First Optimization Roadmap After Iter38
+# Cycle-First Optimization Roadmap After Iter39C
 
-**Status:** Iter38E unified layouts and concurrent four-port recurrent state are
-implemented, routed, timing-closed at 100 MHz, and on-card validated. The
-bounded overlap stages below remain proposed.
+**Status:** Iter39C implements the first bounded head-streaming edge: each
+head's Q/K/V convolution overlaps production of later QKVG heads. It is routed,
+timing-closed at 100 MHz, and exact on card. Recurrent and output-projection
+head overlap remain proposed.
 
-**Current reference:** Iter38E preserves the 32-port/16-cluster FP32 GEMV
-topology and measures **4.708M cycles/token** (47.079335 ms at 100 MHz) with
-exact 64-token parity. It closes timing with design WNS/WHS +0.003/+0.006 ns.
-Iter37D remains the immediate rollback at 5.145M cycles.
+**Current reference:** Iter39C preserves the 32-port/16-cluster FP32 GEMV
+topology and measures **4.309M cycles/token** (43.093000 ms at 100 MHz) with
+exact 64-token parity. It closes timing with design WNS/WHS +0.003/+0.009 ns.
+Iter38E is the immediate rollback at 4.708M cycles.
 
 **Primary objective:** minimize exact single-token decode cycles first. Perform
 only the 100 MHz implementation checkpoints required to verify real cycles and
@@ -20,12 +21,12 @@ Iter38 stripes the 48 MiB recurrent state over tails appended to weight ports
 28--31 and advances all four ports concurrently. Compact 64-bit low/high state
 pairs let the same 32 URAM banks serve both halves without a second address.
 
-| Metric | Iter36 | Iter37 | Iter38 |
-|---|---:|---:|---:|
-| Clock used on card | 100 MHz | 100 MHz | 100 MHz |
-| Mean cycles/token | 5.958M | 5.145M | **4.708M** |
-| Mean latency | 59.578 ms | 51.451 ms | **47.079 ms** |
-| Recurrent HLS cycles/layer | 76.7K | 43.9--44.1K | **27.3--27.5K** |
+| Metric | Iter36 | Iter37 | Iter38 | Iter39C |
+|---|---:|---:|---:|---:|
+| Clock used on card | 100 MHz | 100 MHz | 100 MHz | 100 MHz |
+| Mean cycles/token | 5.958M | 5.145M | 4.708M | **4.309M** |
+| Mean latency | 59.578 ms | 51.451 ms | 47.079 ms | **43.093 ms** |
+| Recurrent HLS cycles/layer | 76.7K | 43.9--44.1K | 27.3--27.5K | **27.3--27.5K** |
 
 The dimension-correct Iter37 schedule is:
 
@@ -46,6 +47,11 @@ reduction is QKVG/GU dynamic-call accounting rather than eliminated GEMV work.
 The defensible fixed-trip recurrent reduction is 0.397M cycles and the measured
 reduction is 0.437M. Continue using on-card kernel cycles for roadmap decisions,
 not the raw HLS top minimum alone.
+
+Iter39C reduces the integrated HLS minimum from 2,744,183 to 2,270,495 cycles
+by removing the serial whole-hidden Q/K/V convolution passes. Hardware removes
+0.399M cycles, or 84.2% of the 0.474M static prediction. The remaining gap is
+dynamic traffic/control stall and must be measured rather than inferred.
 
 ## 2. Hard Floors and Target Outcome
 
@@ -72,7 +78,7 @@ measurements.
 
 | Outcome | Cycles/token | 100 MHz | 115 MHz | 130 MHz |
 |---|---:|---:|---:|---:|
-| Current Iter38 | 4.708M | 47.08 ms | 40.94 ms | 36.22 ms |
+| Current Iter39C | 4.309M | 43.09 ms | 37.47 ms | 33.15 ms |
 | Conservative streamed FP32 | 3.5M | 35.0 ms | 30.4 ms | 26.9 ms |
 | Primary target | 3.3M | 33.0 ms | 28.7 ms | 25.4 ms |
 | Stretch target | 3.0M | 30.0 ms | 26.1 ms | 23.1 ms |
@@ -120,7 +126,7 @@ work for head-level overlap.
 
 Completed and retained evidence:
 
-- one head-major QKVG command replaces four projection commands;
+- one merged QKVG command replaces four projection commands;
 - one pair-interleaved GU command replaces two MLP commands;
 - a native full-byte validator checks every sharded projection float;
 - all four recurrent state ports read and write concurrently at II=1;
@@ -139,6 +145,25 @@ the four QKVG tensors and two GU tensors still perform the same FP32 MACs and
 stream the same bytes. Its value is exposing head/chunk order for bounded
 downstream overlap.
 
+### Iter39C completed overlap prerequisite
+
+Completed and retained evidence:
+
+- QKVG heads are sequential and each is striped across all 32 ports;
+- two collector rounds expose one complete Q/K/V/gate head every about 4,096
+  weight beats;
+- one shared 256-column convolution actor processes Q, K, and V for that head
+  while later heads stream;
+- fixed-bank context movers infer 512-bit II=1 reads/writes;
+- integrated minimum falls by 473,688 cycles with no GEMV II or DSP increase;
+- route completes with zero failed/unrouted nets and timing closes at
+  WNS/WHS +0.003/+0.009 ns; and
+- exact hardware latency falls from 4.708M to **4.309M cycles/token**.
+
+This completes only the `QKVG -> convolution` edge of head-streamed attention.
+Recurrent attention still waits for all eight convolved heads, and output norm
+and projection still wait for the complete recurrent output.
+
 ## 4. Stage 3B — Persistent Services
 
 The layouts and concurrent four-port state traversal are complete. The next
@@ -146,7 +171,7 @@ foundation is turning them into independently scheduled bounded services.
 
 ### Matrix layout
 
-1. Head-major QKVG: **complete**.
+1. Head-serial/all-port QKVG: **complete**.
 2. Original inner-dimension and FP32 accumulation order: **preserved**.
 3. Pair-interleaved GU: **complete**.
 4. Native full-byte shard reconstruction gate: **complete**.
@@ -185,7 +210,7 @@ Acceptance gates:
 
 Expected direct saving is only 0.04--0.10M cycles. The stage is retained only
 when it enables tagged head/chunk consumption without regressing the current
-4.708M-cycle behavior.
+4.309M-cycle behavior.
 
 ## 5. Stage 4 — Head-Streamed Attention
 
@@ -193,13 +218,13 @@ Build a bounded per-head pipeline:
 
 ```text
 QKVG head
-    -> Q/K/V convolution for that head
+    -> Q/K/V convolution for that head       [complete in Iter39C]
     -> recurrent attention
     -> output norm and gate
     -> output-projection partial accumulation
 ```
 
-Approximate steady work after Iter38 is:
+Approximate steady work after Iter39C is:
 
 | Actor | Approximate cycles/head |
 |---|---:|
@@ -209,16 +234,19 @@ Approximate steady work after Iter38 is:
 | Output norm and gate | 629 |
 | O-projection input-head chunk | 1,024 |
 
-QKVG streaming is now the largest individual per-head actor, with convolution
-and recurrence close behind. Prefetch head `h+1` while head `h` computes and
-defer its writeback while later heads proceed. For output
+QKVG streaming is now the largest individual per-head actor. Iter39C hides the
+standalone convolution pass, but recurrence remains a serial full-layer
+consumer. The next step is a rotating state prefetch/compute/writeback service:
+prefetch old state for head `h+1` while head `h` computes, and defer head `h`
+writeback while later heads proceed. For output
 projection, retain partial accumulators across input-head chunks, visit chunks
 in increasing input-index order, and preserve the existing FP32 partial and
 final-combination order.
 
-Target: **3.6--4.0M cycles/token**. This is the first remaining change large
-enough for an explicit 100 MHz implementation and exact on-card measurement.
-Do not attempt 115 or 130 MHz during this stage.
+Target after recurrent-head overlap: **3.7--4.0M cycles/token**. A subsequent
+head-chunked output projection can approach **3.5--3.8M**. Each is large enough
+for an explicit 100 MHz implementation and exact on-card measurement. Do not
+attempt 115 or 130 MHz during this stage.
 
 ## 6. Stage 5 — Chunk-Streamed MLP
 
@@ -278,7 +306,7 @@ Every sub-variant must pass the evidence level appropriate to its size:
 3. isolated actor synthesis when interfaces or buffering change;
 4. integrated csynth and a dimension-correct token schedule;
 5. no GEMV MM2S/cluster II regression;
-6. resource comparison against Iter38; and
+6. resource comparison against Iter39C; and
 7. optimization-log entry whether retained or rejected.
 
 For the major attention and MLP milestones, additionally require:
@@ -316,7 +344,7 @@ The final source must first route and close at 100 MHz. Then:
    timing predicts it is plausible.
 
 Re-extract critical paths from the final architecture. Do not blindly reuse a
-fix from Iter35--37: Iter38 closes 100 MHz with only +0.003 ns design WNS, so
+fix from Iter35--38: Iter39C closes 100 MHz with only +0.003 ns design WNS, so
 the final cycle-reduced netlist must be analyzed from its own routed checkpoint.
 
 Frequency changes do not count as cycle improvements. If a timing repair adds

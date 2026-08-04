@@ -2393,6 +2393,181 @@ positive result**. The QKVG/GU layouts, packed state pairs, concurrent state
 loops, exact shard validator, and Makefile-only reproducible build/on-card
 recipe become the new production baseline.
 
+### iter39A — head-serial/all-port QKVG prerequisite (native + csynth)
+
+*Logged: 2026-08-04.*
+
+**Hypothesis.** Iter38 called its QKVG layout head-major, but tracing the actual
+collector order showed that channel `c = head*4 + kind` assigns only four HBM
+ports to a head. All eight heads therefore advance concurrently and become
+visible together; the layout cannot feed a bounded head pipeline. Re-stripe
+each head's 1,024 concatenated Q/K/V/gate rows across all 32 ports, storing
+heads sequentially within each shard. This preserves all dot-product FP32
+orders and bytes while making one complete head visible every approximately
+4,096 weight beats.
+
+**Change.** `gdn_build_weight_shards` and its full-byte validator now map
+channels 0--7 to Q segments, 8--15 to K, 16--23 to V, and 24--31 to the gate;
+each channel stores two `Pack16` results per head. The local unpack reverses
+the collector's channel-major order back to the existing natural Q/K/V/gate
+buffers. No kernel ABI, AXI master, GEMV arithmetic, weight volume, or model
+operation changed.
+
+**Identity and validation.** Working source SHA-256 was
+`1811e9ca931ea0519839f3fc2553fc2e5161434bcdb9bdcda21982fd6dee2271`
+on Iter38 base `ccb16f32f`. `make -C c_impl -j8`, the fast exact decode gate,
+and the full 32-token gate passed; the full gate reported exact trajectory,
+100% top-1 agreement, and first divergence `-1`. Integrated synthesis used
+Vitis HLS 2022.2 and
+`c_impl/diagnostics/iter39a_headserial_qkvg/csynth.tcl`; report SHA-256 was
+`2e953e303a31e154ec2fe0323c57ffda23ae083f5596aaa1aab3e63c20e6ce1e`.
+An initial invocation through the 2022.1 executable stopped during front-end
+analysis because that older path did not expand macro-valued HLS pragma
+factors; it generated no design result and the production 2022.2 run replaced
+it.
+
+**Synthesis result versus Iter38.** The schedule is deliberately unchanged:
+2,744,183 minimum cycles, 8,435-cycle minimum shared-GEMV call, 514-cycle QKVG
+unpack, all 32 MM2S loops at II=1, and all 16 cluster MAC loops at II=4.
+Estimated Fmax remains 167.98 MHz. Resources are 1,527 RAMB18, 3,629 DSP,
+857,342 FF, 929,926 LUT, and 48 URAM (only -1 FF/-15 LUT versus Iter38).
+
+**Verdict: neutral enabling prerequisite, not independently committed.** It
+does not lower the current serial schedule and therefore is not a positive
+iteration under the commit discipline. Keep it only in the working tree for
+Iter39B, whose bounded QKVG-result consumer must overlap each completed head's
+three depthwise convolutions with production of later heads. If that overlap
+does not yield a material integrated cycle reduction, revert both Iter39A and
+Iter39B to the committed Iter38 baseline.
+
+### iter39B — first head-local QKVG/convolution overlap (rejected csynth)
+
+*Logged: 2026-08-04.*
+
+**Hypothesis.** Consume each complete 256-element Q/K/V/gate head directly
+from the head-serial QKVG collector, persist the gate, and run one time-shared
+head-local depthwise-convolution actor for Q, K, and V while the GEMV engine
+produces subsequent heads. The actor should replace three serial whole-hidden
+convolutions without triplicating their arithmetic.
+
+**Direct-AXI subvariant.** The first implementation passed convolution weights
+and tails on `mem_weights_mm0` directly into the GEMV result sink. Vitis HLS
+rejected it before scheduling because the dataflow region then had two reader
+processes on one bundled master: `gemv32_load_x_and_w0` and the result sink.
+This confirms that the shared AXI interface must remain outside the GEMV
+dataflow region.
+
+**Preloaded-context subvariant.** The second implementation staged the three
+convolution weight arrays and tails into partitioned BRAM before QKVG, invoked
+one head-local convolution call site three times per completed head, and wrote
+the staged tails back afterward. Native compilation, the fast exact gate, and
+the full 32-token exact gate passed with first divergence `-1`. Integrated
+synthesis used Vitis HLS 2022.2 and
+`c_impl/diagnostics/iter39b_qkvg_conv_overlap/csynth.tcl`. Working source
+SHA-256 was
+`3abaca74ba96350f3972ab2e206c90fe3a285ea7bdb4bd53023ee016f4e0c767`;
+report SHA-256 was
+`ff0d1ab6a78a38a867e9ebc6b3d46306da6ff66458863147ee5e4920812b06dc`.
+
+**Synthesis result versus Iter38.** Arithmetic sharing succeeded: the report
+contains one `gdn_depthwise_conv_silu_head_kind`, and the GEMV engine retained
+its 8,435-cycle minimum, 32 MM2S loops at II=1, and 16 cluster loops at II=4.
+However, the runtime `kind` pointer selection caused HLS to scalarize every
+`Pack16` context transfer into 16 narrow AXI/BRAM operations. The context load
+took 43,459 cycles per layer and the store 18,655, with the critical loops at
+II=16. Top minimum latency regressed from 2,744,183 to **3,653,039 cycles**
+(+908,856), and layer minimum latency rose from 113,854 to 151,723. Resources
+rose from 1,527 to **1,591 RAMB18**, 857,343 to **886,566 FF**, and 929,941 to
+**1,041,897 LUT**; DSP stayed at 3,629 and URAM at 48. Estimated Fmax remained
+167.98 MHz.
+
+**Verdict: rejected negative implementation; no hardware build and no
+commit.** The overlap structure remains plausible, but this generic context
+mover destroys both schedule and area. The next bounded subvariant must use
+explicit fixed-bank 512-bit load/store loops, keep the staged tail read-only
+during head convolution, and capture only each head's new raw Q/K/V row for a
+packed final writeback. Iter39A remains an uncommitted prerequisite only while
+that corrected subvariant is evaluated.
+
+### iter39C — packed context and head-local QKVG/convolution overlap (retained)
+
+*Logged: 2026-08-04.*
+
+**Change.** The corrected overlap keeps the one time-shared 256-column
+convolution actor from Iter39B but removes every runtime-selected external
+pointer from the context movers. Six explicit Q/K/V loops load convolution
+weights and old tails as 512-bit `Pack16` bursts. The head actor treats the old
+tail as read-only; after all three Q/K/V calls consume a head, the result sink
+reuses obsolete tail row 0 to capture that head's new raw Q/K/V row. Three
+explicit packed stores finally emit old rows 1/2 followed by the captured new
+row. This needs no extra tail buffer and preserves the exact recurrent-tail
+ABI and FP32 operation order.
+
+**Identity and validation.** Working source SHA-256 is
+`d2674931f90897d932fc73915981866e38a233cb6efa4138caaef2029f3d5bbb`
+on Iter38 base `ccb16f32f`. `make -C c_impl -j8`, the fast exact gate, and the
+full 32-token exact gate passed; both parity reports had first divergence
+`-1`. Integrated synthesis used Vitis HLS 2022.2 and
+`c_impl/diagnostics/iter39c_packed_qkvg_context/csynth.tcl`; report SHA-256 is
+`5c35c51f3e32c3ffafb1ebc4059f69a5149c8786b9618cf31959092fd183b7f8`.
+
+**Synthesis result versus Iter38.** HLS inferred 512-bit bursts for all six
+context-read loops and all three tail-write loops. The load takes 3,137 cycles
+per layer and the store 1,371, with every external mover loop at II=1. QKVG
+retains one physical `gdn_depthwise_conv_silu_head_kind`; its compute loop is
+II=1, and its 16-cycle new-tail capture is II=1. The 32 GEMV MM2S readers
+remain II=1, all 16 cluster MAC loops remain II=4, and the shared GEMV minimum
+remains 8,435 cycles.
+
+| Integrated metric | Iter38 | Iter39C | Delta |
+|---|---:|---:|---:|
+| Top minimum cycles | 2,744,183 | **2,270,495** | **-473,688 / -17.27%** |
+| Layer minimum cycles | 113,854 | **94,117** | **-19,737** |
+| RAMB18 | 1,527 | **1,543** | +16 / +1.05% |
+| DSP | 3,629 | **3,629** | 0 |
+| FF | 857,343 | **863,589** | +6,246 / +0.73% |
+| LUT | 929,941 | **937,707** | +7,766 / +0.84% |
+| URAM | 48 | **48** | 0 |
+
+Estimated Fmax remains 167.98 MHz. Unlike the unified-call accounting in
+Iter38, this 473,688-cycle reduction is exactly 24 times the fixed per-layer
+reduction and represents removed serial convolution work.
+
+**Hardware implementation.** `make -C c_impl iter39` compiled at 130 MHz and
+linked only at 100 MHz using the exact Iter38 connectivity, cluster-8 and
+recurrent-SLR2 floorplans, DMA fanout repair, BRAM FIFOs, and pre/post-route
+`AggressiveExplore`. The build ran from 12:50:04 to 21:09:07 +03. The link
+reported 7 h 56 m 30 s and exited zero. Artifact hashes are:
+
+- XO: `53a47efc2098f6967fd256edce29aedfbe4dfe4da0383f609bc8b006e73131c0`;
+- XCLBIN: `5c81e79ceb51d3faa00a4ae80a5055f716bbedac884700840011257494f11021`.
+
+Routing completed with zero failed nets, zero unrouted nets, zero partially
+routed nets, and zero node overlaps. Timing closed without automatic clock
+scaling: design WNS/TNS **+0.003/0 ns**, design WHS/THS **+0.009/0 ns**,
+kernel-clock WNS **+0.289 ns**, and fixed 250 MHz DMA WNS **+0.003 ns**.
+
+**On-card result.** `make -C c_impl iter39-oncard` passed both the 8-token
+smoke and exact 64-token decode with first divergence `-1` and 100% top-1
+agreement. Excluding the seed, 63 calls measured:
+
+| On-card metric | Iter38 | Iter39C | Change |
+|---|---:|---:|---:|
+| Minimum | 47.066309 ms | **43.080265 ms** | -- |
+| Maximum | 47.109197 ms | **43.313968 ms** | -- |
+| Median | 47.076699 ms | **43.085956 ms** | -- |
+| Mean | 47.079335 ms | **43.093000 ms** | **1.0925x / -8.47%** |
+| Mean cycles at 100 MHz | 4.707934M | **4.309300M** | **-0.398634M** |
+| Speedup over 121.4 ms | 2.579x | **2.817x** | -- |
+
+The measured 0.399M-cycle gain captures 84.2% of the 0.474M static prediction;
+the difference is dynamic HBM/control stall outside the HLS minimum.
+
+**Verdict: retained positive result and new production baseline.** Iter39C is
+exact, routable, timing-closed, and materially faster than Iter38. Retain the
+head-serial/all-port QKVG layout, packed fixed-bank context movers, shared
+head-local Q/K/V convolution actor, and one-line Iter39 build/on-card targets.
+
 ### Superseded plan (written before iter12 ran)
 
 Pin **only the 16 clusters**, contiguous in chain order, **6/6/4** across
