@@ -134,12 +134,26 @@ ITER38_DECODE_WEIGHTS ?= artifacts/gdn-1.3b-f32.gdnw
 ITER38_DECODE_FIXTURE ?= fixtures_decode/decode.gdnreq
 ITER38_DECODE_STATE ?= fixtures_decode/decode_ex0.gdnstate
 ITER38_DECODE_GOLDEN ?= results_decode_golden/decode.decode.json
+ITER39_HLS_FREQ  ?= 130
+ITER39_LINK_FREQ ?= 100
+ITER39_BUILD_DIR ?= build.hw.iter39c.qkvg.headconv.f$(ITER39_LINK_FREQ).o8.v2022_2
+ITER39_DIAGNOSTICS_DIR ?= diagnostics/iter39c_qkvg_headconv_f$(ITER39_LINK_FREQ)
+ITER39_CFG_TEMPLATE := hw_iter37c_state4_recur32_slr2_f115.cfg
+ITER39_RESOLVED_CFG := $(ITER39_DIAGNOSTICS_DIR)/resolved_hw.cfg
+ITER39_VITIS_SETTINGS ?= /tools/Xilinx/Vitis/2022.2/settings64.sh
+ITER39_IP_CACHE ?= build.hw.iter38e.qkvg.gu.state4packed.f100.o8.v2022_2/.ipcache
+ITER39_XCLBIN := $(ITER39_BUILD_DIR)/gdn_forward.xclbin
+ITER39_ONCARD_DIR := $(ITER39_DIAGNOSTICS_DIR)/on_card
+ITER39_DECODE_WEIGHTS ?= artifacts/gdn-1.3b-f32.gdnw
+ITER39_DECODE_FIXTURE ?= fixtures_decode/decode.gdnreq
+ITER39_DECODE_STATE ?= fixtures_decode/decode_ex0.gdnstate
+ITER39_DECODE_GOLDEN ?= results_decode_golden/decode.decode.json
 
 
 # ----------------------------------------------------------------------------
 # Default target
 # ----------------------------------------------------------------------------
-.PHONY: all host_tb xo xclbin host run_hw iter37 iter38 iter38-verify iter38-oncard reproduce_iter24_success clean clean_hw distclean help
+.PHONY: all host_tb xo xclbin host run_hw iter37 iter38 iter38-verify iter38-oncard iter39 iter39-verify iter39-oncard reproduce_iter24_success clean clean_hw distclean help
 
 all: host_tb
 
@@ -153,6 +167,8 @@ help:
 	@echo "  iter37      reproduce the routed four-port/32-lane recurrent design"
 	@echo "  iter38      build packed concurrent-state + unified QKVG/GU at 100 MHz"
 	@echo "  iter38-oncard  exact 8-token smoke + 64-token measurement of Iter38"
+	@echo "  iter39      reproduce retained head-streamed QKVG/convolution at 100 MHz"
+	@echo "  iter39-oncard  exact 8-token smoke + 64-token measurement of Iter39"
 	@echo "  reproduce_iter24_success  rebuild the correct, routable iter24b XCLBIN"
 	@echo "  clean       remove host-tb binaries"
 	@echo "  clean_hw    remove build.\$$(TARGET), _x/, v++ logs"
@@ -358,6 +374,93 @@ iter38-oncard: host
 	    '$(ITER38_ONCARD_DIR)/performance_summary.json' >/dev/null; \
 	sha256sum $(HOST_BIN) '$(ITER38_XCLBIN)' \
 	    > '$(ITER38_ONCARD_DIR)/artifact_hashes.txt'
+
+
+# ----------------------------------------------------------------------------
+# Iter39 retained head-streamed QKVG/convolution build
+# ----------------------------------------------------------------------------
+$(ITER39_RESOLVED_CFG): $(ITER39_CFG_TEMPLATE) \
+                        apply_iter37c_recurrent_slr2.tcl \
+                        apply_iter35_dma_w15_fifoaddr_fanout.tcl \
+                        apply_iter22_cluster8_slr1_east.tcl \
+                        apply_iter23_dma_fanout.tcl
+	@mkdir -p $(@D)
+	@sed 's|@C_IMPL_DIR@|$(CURDIR)|g' $< > $@
+	@if grep -q '@C_IMPL_DIR@' $@; then \
+	    echo "iter39: unresolved path placeholder in $@" >&2; \
+	    rm -f $@; \
+	    exit 1; \
+	fi
+
+iter39-verify:
+	@echo 'd2674931f90897d932fc73915981866e38a233cb6efa4138caaef2029f3d5bbb  gdn_model.cpp' | sha256sum -c -
+	@echo '7bf6bf9d567241028d916a5def4924c6efb7031e416e573921c11d4b10fa2e74  gdn_model.h' | sha256sum -c -
+	@echo 'a76930f3332baac50bf7540b58f9242a2efcd235154215b26e95e8da5a057633  hls_gdn_forward.tcl' | sha256sum -c -
+	@echo '998b71e3a8cb3b7f818f12cbe6581f0ffd2e04010dba5db3f20ca2ae844aa08f  $(ITER39_CFG_TEMPLATE)' | sha256sum -c -
+	@echo '15587403b5e904345abdee72cd84cfc0fa24f8be559f94f1e5554cdcedbd059e  apply_iter37c_recurrent_slr2.tcl' | sha256sum -c -
+	@echo 'd6cd2074b8bd987cf00db922c390c3c92ecd48947108d4d1b54a46e1445263bb  apply_iter35_dma_w15_fifoaddr_fanout.tcl' | sha256sum -c -
+	@echo 'b0f07d2128589789641c649d8c127949dd06ca72f6f3140154eda5e24c331b1f  apply_iter22_cluster8_slr1_east.tcl' | sha256sum -c -
+	@echo '268f9e9fb8e0e6178317edd88be46811372351251758dc781ba950e84f4ba4d8  apply_iter23_dma_fanout.tcl' | sha256sum -c -
+
+iter39: iter39-verify $(ITER39_RESOLVED_CFG)
+	+@set -euo pipefail; \
+	test -r '$(ITER39_VITIS_SETTINGS)'; \
+	source '$(ITER39_VITIS_SETTINGS)'; \
+	mkdir -p '$(ITER39_BUILD_DIR)'; \
+	if [[ -d '$(ITER39_IP_CACHE)' && ! -d '$(ITER39_BUILD_DIR)/.ipcache' ]]; then \
+	    mkdir -p '$(ITER39_BUILD_DIR)/.ipcache'; \
+	    cp -a --reflink=auto '$(ITER39_IP_CACHE)/.' '$(ITER39_BUILD_DIR)/.ipcache/'; \
+	fi; \
+	manifest='$(ITER39_DIAGNOSTICS_DIR)/build.manifest'; \
+	{ \
+	    printf 'iteration=iter39c_qkvg_headconv_f%s\n' '$(ITER39_LINK_FREQ)'; \
+	    printf 'hls_frequency_mhz=%s\n' '$(ITER39_HLS_FREQ)'; \
+	    printf 'link_frequency_mhz=%s\n' '$(ITER39_LINK_FREQ)'; \
+	    printf 'started_at=%s\n' "$$(date --iso-8601=seconds)"; \
+	    sha256sum gdn_model.cpp gdn_model.h hls_gdn_forward.tcl '$(ITER39_RESOLVED_CFG)'; \
+	} > "$$manifest"; \
+	$(MAKE) xclbin \
+	    TARGET=hw \
+	    FREQ='$(ITER39_LINK_FREQ)' \
+	    HLS_FREQ='$(ITER39_HLS_FREQ)' \
+	    LINK_FREQ='$(ITER39_LINK_FREQ)' \
+	    XILINX_VITIS=/tools/Xilinx/Vitis/2022.2 \
+	    VPP=/tools/Xilinx/Vitis/2022.2/bin/v++ \
+	    BUILD_DIR='$(ITER39_BUILD_DIR)' \
+	    HW_CFG='$(abspath $(ITER39_RESOLVED_CFG))' \
+	    JOBS='$(JOBS)'; \
+	sha256sum '$(ITER39_BUILD_DIR)/gdn_forward.xo' \
+	          '$(ITER39_BUILD_DIR)/gdn_forward.xclbin' >> "$$manifest"; \
+	printf 'completed_at=%s\n' "$$(date --iso-8601=seconds)" >> "$$manifest"
+
+iter39-oncard: host
+	@set -euo pipefail; \
+	test -s '$(ITER39_XCLBIN)'; \
+	mkdir -p '$(ITER39_ONCARD_DIR)'; \
+	for spec in '8 smoke8' '64 decode64'; do \
+	    read -r decode_len stem <<< "$$spec"; \
+	    output='$(ITER39_ONCARD_DIR)/oncard_iter39_'; \
+	    output="$${output}$${stem}.json"; \
+	    log="$${output%.json}.log"; \
+	    parity="$${output%.json}_parity.log"; \
+	    stdbuf -oL -eL ./$(HOST_BIN) \
+	        '$(ITER39_XCLBIN)' \
+	        '$(ITER39_DECODE_WEIGHTS)' \
+	        '$(ITER39_DECODE_FIXTURE)' \
+	        "$$output" 0 1 \
+	        --decode --decode-from-state '$(ITER39_DECODE_STATE)' \
+	        --decode-len "$$decode_len" 2>&1 | tee "$$log"; \
+	    python3 ../scripts/check_gdn_c_parity.py \
+	        --decode --golden '$(ITER39_DECODE_GOLDEN)' --c "$$output" \
+	        2>&1 | tee "$$parity"; \
+	done; \
+	output='$(ITER39_ONCARD_DIR)/oncard_iter39_decode64.json'; \
+	jq 'def median: sort as $$s | ($$s | length) as $$n | if $$n % 2 == 1 then $$s[($$n / 2 | floor)] else (($$s[$$n / 2 - 1] + $$s[$$n / 2]) / 2) end; [.examples[0].kernel_ms[] | select(. > 0)] as $$runs | {decode_len, measured_runs: ($$runs | length), min_kernel_ms: ($$runs | min), max_kernel_ms: ($$runs | max), median_kernel_ms: ($$runs | median), mean_kernel_ms: ($$runs | add / length), speedup_vs_iter38_47_079335ms: (47.079335 / ($$runs | add / length)), speedup_vs_8port_121_4ms: (121.4 / ($$runs | add / length))}' \
+	    "$$output" | tee '$(ITER39_ONCARD_DIR)/performance_summary.json'; \
+	jq -e '.measured_runs == 63 and .mean_kernel_ms > 0' \
+	    '$(ITER39_ONCARD_DIR)/performance_summary.json' >/dev/null; \
+	sha256sum $(HOST_BIN) '$(ITER39_XCLBIN)' \
+	    > '$(ITER39_ONCARD_DIR)/artifact_hashes.txt'
 
 
 # ----------------------------------------------------------------------------
