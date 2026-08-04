@@ -1,15 +1,17 @@
 # Disaggregated Decode-Only Accelerator (GEMV datapath)
 
 **Status:** Historical GEMV scaling and optimization record. The current
-production design is the integrated Iter37 32-port/16-cluster,
-activation-resident, four-port/32-lane recurrent-state kernel documented in
+production design is the integrated Iter38 32-port/16-cluster,
+activation-resident, concurrent four-port/32-lane recurrent-state kernel documented in
 [architecture.md](architecture.md).
 The standalone 32-port microbenchmark remains documented separately in
 [`../microbench/gemv_tile/README.md`](../microbench/gemv_tile/README.md).
 
-The final integrated U55C image routes at 100 MHz with zero failed/unrouted
-nets and zero overlaps. It passes exact 64-token parity at 51.451 ms/token mean
-latency, 2.36x faster than the 121.4 ms eight-port baseline. Sections below
+The final integrated U55C image routes and closes timing at 100 MHz with zero
+failed/unrouted nets and zero overlaps. It passes exact 64-token parity at
+47.079 ms/token mean latency, 2.579x faster than the 121.4 ms eight-port
+baseline. It uses one head-major QKVG GEMV command and one pair-interleaved GU
+command per layer while preserving the same dense FP32 weight bytes. Sections below
 retain the progression that led to that design; older statements describing an
 eight-port kernel as “current” are historical in their section context.
 
@@ -441,7 +443,7 @@ endpoints**. The failing path at xo@200 was a high-fanout loop-control reg → f
 xo@200 build ran bit-exact at **129 ms** despite −0.298 — the violation was benign — but a
 negative-WNS bitstream is not committed.)
 
-## 7. Current Integrated Result and Next Step
+## 7. Historical Eight-Port Integrated Result
 
 Decode-only is bit-exact and flat at **121.4 ms/token** *complete* decode steps
 (forward + lm_head + argmax all on-chip), **~3.9× over the 470 ms baseline** (§6f).

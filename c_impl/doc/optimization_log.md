@@ -2143,6 +2143,256 @@ the same residual term as Iter36. The architecture, reproducible physical
 recipe, and measured result are therefore commit candidates; the unachieved
 115 MHz target remains explicitly recorded as a timing failure.
 
+### iter38A — head-major unified Q/K/V/gate layout (csynth-positive foundation)
+
+*Tested 2026-08-04; no hardware build launched.*
+
+Iter38A changes the first per-layer shard section from four independent
+output-striped Q, K, V, and attention-gate matrices into one head-major QKVG
+section. Channel `4*head+kind` owns all 256 rows of one Q/K/V/gate head. A
+single 8,192-output call to the existing one physical `gdn_gemv` graph replaces
+four 2,048-output calls. Weight bytes, row order within each matrix, inner
+dimension order, FP32 dot-product order, 32 MM2S readers, 16 two-port clusters,
+and the external ABI are unchanged. A native-only validator compares every
+copied shard float against its source tensor, including all unaffected matrix
+sections and the LM head.
+
+Validation and identities:
+
+- source SHA-256: `a0774f91ab2ca305c605d3daa59618ffac562e21be89369ce9a94b0ed8cd68b4`;
+- header SHA-256: `7bf6bf9d567241028d916a5def4924c6efb7031e416e573921c11d4b10fa2e74`;
+- evaluator SHA-256: `2712848cab0e054a3e43b6d10e4ef4d2e50e5abc149dc2d6dea5ea12c17db953`;
+- `make -C c_impl -j2`: PASS with only pre-existing warnings;
+- `bash scripts/decode_correctness_check.sh --fast`: exact 6/6 positions,
+  first divergence `-1`;
+- `bash scripts/decode_correctness_check.sh`: exact 32/32 positions, first
+  divergence `-1`; and
+- Vitis HLS 2022.2 integrated csynth at 7.692 ns using Tcl SHA-256
+  `b93fb3d3e84bdd0c4f3f8eeff42c04ea9508b65b6f63819eab6971c130f54258`:
+  PASS, MM2S II=1 and cluster MAC II=4 unchanged.
+
+| Integrated HLS metric | Iter37D | Iter38A | Delta |
+|---|---:|---:|---:|
+| Static minimum cycles | 3,957,551 | **3,343,751** | -613,800 |
+| RAMB18 | 1,511 | 1,511 | 0 |
+| DSP | 3,627 | 3,627 | 0 |
+| FF | 851,903 | **851,782** | -121 |
+| LUT | 912,694 | **911,889** | -805 |
+| URAM | 48 | 48 | 0 |
+
+The 0.614M static-cycle reduction is **not** accepted as a predicted on-card
+gain. Because the shared GEMV retains runtime dimensions, top-level csynth
+charges each call the module's 8,435-cycle minimum; removing three calls per
+layer mechanically removes about 0.607M reported cycles even though the MAC
+and weight-stream work is unchanged. The demonstrated result is narrower but
+useful: the streaming-friendly head-major layout is exact, has no II or
+resource regression, and eliminates three engine startups/activation reloads.
+The variant is retained in the working tree as foundation for Iter38B and head
+streaming, but is not independently committed or promoted to a hardware
+performance result.
+
+### iter38B — pair-interleaved unified MLP gate/up layout (retained foundation)
+
+*Tested 2026-08-04; no hardware build launched.*
+
+Iter38B keeps Iter38A QKVG and changes the two 5,632-row MLP gate/up shard
+sections into one pair-interleaved GU section. Channel `2*chunk+kind` owns one
+352-row gate or up block, so one 11,264-output GEMV replaces two 5,632-output
+calls and exposes bounded gate/up pairs for later chunk streaming. MLP-down,
+weight bytes, FP32 dot-product order, the 32-reader/16-cluster engine, and all
+external interfaces remain unchanged. The exact shard validator was extended
+to cover every GU chunk.
+
+Validation and identities:
+
+- source SHA-256: `92e65cb24e4dbed510a8c9164d4fac118e43206e4da0f3e9d91666b48846b79a`;
+- header SHA-256: `7bf6bf9d567241028d916a5def4924c6efb7031e416e573921c11d4b10fa2e74`;
+- evaluator SHA-256: `2712848cab0e054a3e43b6d10e4ef4d2e50e5abc149dc2d6dea5ea12c17db953`;
+- `make -C c_impl -j2`: PASS with only pre-existing warnings;
+- `bash scripts/decode_correctness_check.sh --fast`: exact 6/6 positions,
+  first divergence `-1`, including the full-byte shard-layout gate; and
+- Vitis HLS 2022.2 integrated csynth at 7.692 ns using Tcl SHA-256
+  `f2df1b8633bcf718032e0c482d3abdc8e3f37df94c925211415dd9c539764f67`:
+  PASS, GU unpack II=1, MM2S II=1, cluster MAC II=4, estimated Fmax
+  167.98 MHz.
+
+| Integrated HLS metric | Iter38A | Iter38B | Delta |
+|---|---:|---:|---:|
+| Static minimum cycles | 3,343,751 | **3,141,239** | -202,512 |
+| RAMB18 | 1,511 | 1,527 | +16 |
+| DSP | 3,627 | 3,629 | +2 |
+| FF | 851,782 | 851,881 | +99 |
+| LUT | 911,889 | **911,752** | -137 |
+| URAM | 48 | 48 | 0 |
+
+As with Iter38A, almost all of the reported cycle reduction is the shared
+dynamic GEMV module's 8,435-cycle minimum being charged one fewer time per
+layer; it is not an on-card prediction. The 16 RAMB18 increase is the enlarged
+704-Pack16 common result aperture and the two DSPs are address arithmetic for
+the 22-pack chunk mapping. This remains inside the Stage-3 acceptance bound,
+does not change any throughput II, and enables tagged/chunk consumption. It is
+retained as foundation in the working tree, but is not independently committed
+or claimed as a demonstrated hardware-speed improvement.
+
+### iter38C — merged four-port recurrent-state loops (rejected)
+
+*Tested and stopped during integrated csynth on 2026-08-04.*
+
+Iter38C merged the serial low-port-pair and high-port-pair state traversals
+into one four-port read loop and one four-port write loop. The arithmetic order
+within every state column was unchanged, and both native gates passed: exact
+6/6 fast positions and exact 32/32 full positions with first divergence `-1`.
+The candidate source SHA-256 was
+`4e44e0e2faf29e8e116dbd86ee9f16eb571bb507a6635ff0e9a7fc334c565ba6`;
+the 7.692 ns csynth Tcl SHA-256 was
+`20ec24a5a719005755ec85d9f835de72bb1155c42f6ee746971f500076a610d8`.
+
+Integrated HLS rejected the schedule before report completion:
+
+- `fused_rd0123`: target II=1, **final II=2**;
+- `fused_wr0123`: target II=1, **final II=3**; and
+- both violations were explicitly attributed to limited ports on the single
+  cyclically partitioned `state` array. Low and high columns select the same
+  modulo-32 URAM bank, so the merged loop requests two read-modify-write accesses
+  per bank per cycle.
+
+At II=2 the merged read merely equals the two former 1,024-cycle II=1 loops;
+at II=3 the merged write is about 1,024 cycles/head worse than the two former
+write loops. The synthesis was stopped after this decisive negative result to
+avoid spending time on RTL/report generation. This variant is rejected and
+must not be committed. Iter38D retains concurrent HBM access but splits the
+head-local state into independent low/high URAM arrays so each half has its own
+bank ports.
+
+### iter38D — concurrent state with struct-paired local storage (superseded)
+
+*Tested 2026-08-04; no hardware build launched.*
+
+Iter38D fixed Iter38C's port conflict by storing each low/high column pair in a
+`GDNStatePair` element at the same cyclic bank address. Native compilation and
+the six-token exact gate passed, and integrated HLS achieved II=1 for both the
+1,024-word four-port read and four-port write loops. Recurrent latency fell
+from 43,873--44,081 to **27,329--27,537 cycles/layer**, or 3,416--3,442
+cycles/head instead of 5,484--5,510. Unlike the QKVG/GU call-count effect, this
+16,544-cycle/layer reduction is a real fixed-trip-count schedule change.
+
+The candidate source SHA-256 was
+`eb5cbf5e566e62eac6e25084c94f2c337a4360fe75b567e4a8147904bd20f05f`;
+the Vitis HLS 2022.2 7.692 ns Tcl SHA-256 was
+`3dd3e05a817b40230b3f0c9ef97b65d46f773f9bf76cbfbcd477f072d2dcbd79`.
+
+| Integrated HLS metric | Iter38B | Iter38D | Delta |
+|---|---:|---:|---:|
+| Static minimum cycles | 3,141,239 | **2,744,183** | -397,056 |
+| Recurrent cycles/layer, minimum | 43,873 | **27,329** | -16,544 |
+| RAMB18 | 1,527 | 1,527 | 0 |
+| DSP | 3,629 | 3,629 | 0 |
+| FF | 851,881 | 859,711 | +7,830 |
+| LUT | 911,752 | 933,045 | +21,293 |
+| URAM | 48 | **80** | +32 |
+
+The C struct was automatically decomposed into 32 separate low-field and 32
+separate high-field 1,024x32 memories, doubling recurrent URAM from 32 to 64
+instead of producing the intended 32 memories at 1,024x64. The cycle result is
+positive, but this avoidable 32-URAM and 21K-LUT routing risk is not accepted as
+the final implementation. Iter38D is superseded and not committed; Iter38E
+adds an explicit aggregate/packing directive and requires the same II/cycles
+with the original URAM count before any hardware build.
+
+### iter38E — packed four-port concurrent state, QKVG, and GU (hardware candidate)
+
+*Native, integrated csynth, 100 MHz implementation, and on-card validation
+completed 2026-08-04.*
+
+Iter38E adds `aggregate compact=bit` to the Iter38D state-pair array. HLS now
+implements exactly 32 banks of 1,024 x 64-bit URAM words instead of decomposing
+the struct fields into 64 banks. The four external state readers and writers
+remain concurrent at II=1, recurrent latency remains 27,329--27,537
+cycles/layer, and total URAM returns from 80 to the Iter37/Iter38B value of 48.
+The candidate also includes the exact head-major QKVG and pair-interleaved GU
+layouts from Iter38A/B.
+
+Pre-hardware evidence and identities:
+
+- source SHA-256: `0791d1d158dc476e7f2cc1e44b6bf7790038ea8bf0458138ea2e015ca7184708`;
+- header SHA-256: `7bf6bf9d567241028d916a5def4924c6efb7031e416e573921c11d4b10fa2e74`;
+- evaluator SHA-256: `2712848cab0e054a3e43b6d10e4ef4d2e50e5abc149dc2d6dea5ea12c17db953`;
+- Vitis HLS 2022.2 7.692 ns Tcl SHA-256:
+  `380d76359b4c477d4d353173d09eb8ab602ccde21bc5a267c907b1d0e09d9118`;
+- native full-byte weight-shard validation: PASS;
+- six-token fast trajectory: exact, first divergence `-1`;
+- 32-token full trajectory: exact, first divergence `-1`; and
+- integrated csynth: PASS, MM2S II=1, GEMV MAC II=4, recurrent read/write
+  II=1, estimated Fmax 167.98 MHz.
+
+| Integrated HLS metric | Iter37D | Iter38E | Delta |
+|---|---:|---:|---:|
+| Static minimum cycles | 3,957,551 | **2,744,183** | -1,213,368* |
+| Recurrent cycles/layer, minimum | 43,873 | **27,329** | -16,544 |
+| RAMB18 | 1,511 | 1,527 | +16 / +1.06% |
+| DSP | 3,627 | 3,629 | +2 / +0.06% |
+| FF | 851,903 | 857,343 | +5,440 / +0.64% |
+| LUT | 912,694 | 929,941 | +17,247 / +1.89% |
+| URAM | 48 | 48 | 0 |
+
+\*About 0.816M of the top-level static delta is the known dynamic-GEMV
+call-count accounting artifact from QKVG/GU. The fixed-trip recurrent delta is
+0.397M cycles/token and is the defensible pre-hardware gain. Concurrent use of
+all four state ports may also reduce dynamic HBM backpressure, but only the
+on-card run can measure that. At 100 MHz the conservative expectation is about
+4.75M cycles / 47.5 ms per token versus Iter37D's measured 5.145M / 51.451 ms.
+
+The one-line build command was:
+
+```bash
+make -C c_impl iter38
+```
+
+It compiled HLS at 130 MHz and linked only at 100 MHz with the exact Iter37D
+connectivity, cluster-8 placement, recurrent-SLR2 placement, DMA fanout hook,
+BRAM FIFOs, `SSI_SpreadSLLs`, `AlternateCLBRouting`, and pre/post-route
+`AggressiveExplore`. The wrapper ran from 01:57:53 to 10:34:16 +03 (8 h 36 m)
+and exited zero. Artifact hashes were:
+
+- XO: `8533474f648ded537f7b0b7f92d1f3dc17f8d3670c940a7846858e561a144034`;
+- XCLBIN: `c209a41b28ee97d6d897c4eaea66974ebb88773c46079c0aeb059d839b9d79dc`.
+
+Implementation completed with zero failed nets, zero unrouted nets, zero
+partially routed nets, and zero node overlaps. One hundred percent of nets were
+fully routed. Timing closed without automatic clock scaling:
+
+| Routed timing metric | Result |
+|---|---:|
+| Encoded kernel frequency | **100 MHz** |
+| Design WNS / TNS | **+0.003 ns / 0** |
+| Design WHS / THS | **+0.006 ns / 0** |
+| Kernel clock WNS | **+0.032 ns** |
+| Fixed 250 MHz DMA WNS | **+0.003 ns** |
+
+The automatic on-card target completed both runs; its final summary-only `jq`
+command initially failed because a quoted Make continuation passed literal
+backslashes to `jq`. The already-written JSON and parity results were valid,
+and the Makefile quoting was corrected without rebuilding or rerunning. Both
+the 8-token smoke and 64-token decode matched exactly with first divergence
+`-1`. Excluding the seed, 63 kernel invocations measured:
+
+| On-card metric | Iter37D | Iter38E | Change |
+|---|---:|---:|---:|
+| Minimum | 51.422932 ms | **47.066309 ms** | -- |
+| Maximum | 51.784876 ms | **47.109197 ms** | -- |
+| Median | 51.437899 ms | **47.076699 ms** | -- |
+| Mean | 51.450918 ms | **47.079335 ms** | **1.0929x / -8.50% latency** |
+| Mean cycles at 100 MHz | 5.145M | **4.708M** | **-0.437M / -8.50%** |
+| Speedup over 121.4 ms | 2.360x | **2.579x** | -- |
+
+The measured 0.437M-cycle reduction is close to the 0.397M fixed-trip
+recurrent prediction. It confirms that the 2.744M HLS minimum is not an
+end-to-end hardware cycle count, while demonstrating a real benefit from the
+concurrent four-port packed state traversal. Iter38E is therefore a **retained
+positive result**. The QKVG/GU layouts, packed state pairs, concurrent state
+loops, exact shard validator, and Makefile-only reproducible build/on-card
+recipe become the new production baseline.
+
 ### Superseded plan (written before iter12 ran)
 
 Pin **only the 16 clusters**, contiguous in chain order, **6/6/4** across

@@ -50,11 +50,16 @@ after synthesis. Before starting the next iteration:
    so they describe the new architecture, measured result, and reproduction
    command. Clearly distinguish native-only, csynth, routed, timing-closed, and
    on-card evidence; do not promote an intermediate result to production
-   status.
+   status. Every positive iteration must also update
+   `c_impl/doc/cycle_optimization_roadmap.md`: mark the completed stage, replace
+   estimates with measured evidence, rebase the current cycle reference when
+   applicable, and revise the remaining targets or dependencies.
 4. After that improvement is demonstrated and documented, commit the retained
    source architecture changes, necessary build/config/Tcl or launcher files,
    the positive result, and all accumulated optimization-log entries in focused
-   commits. Do not commit generated build products or logs.
+   commits. Include the roadmap update in the same positive commit series so
+   the roadmap is never stale after a positive commit. Do not commit generated
+   build products or logs.
 
 Do not move on to the next optimization iteration with an unrecorded result.
 Never commit an architectural or build change whose measured result is negative
