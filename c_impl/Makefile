@@ -52,6 +52,8 @@ VPP            ?= $(XILINX_VITIS)/bin/v++
 PLATFORM       ?= xilinx_u55c_gen3x16_xdma_3_202210_1
 TARGET         ?= hw
 FREQ           ?= 130
+HLS_FREQ       ?= $(FREQ)
+LINK_FREQ      ?= $(FREQ)
 JOBS           ?= 8
 VPP_DEBUG      ?= 0
 
@@ -60,7 +62,9 @@ KERNEL_SRC     := gdn_model.cpp gdn_model.h
 HW_CFG         := $(abspath ./hw.cfg)
 HLS_PRE_TCL    := $(abspath ./hls_gdn_forward.tcl)
 
-BUILD_DIR      := build.$(TARGET).gdn32.f$(FREQ).o8
+# Include both clocks so changing only the HLS target cannot silently reuse an
+# XO synthesized for a different period.
+BUILD_DIR      := build.$(TARGET).gdn32.h$(HLS_FREQ).f$(LINK_FREQ).o8
 XO             := $(BUILD_DIR)/$(KERNEL).xo
 XCLBIN         := $(BUILD_DIR)/$(KERNEL).xclbin
 
@@ -72,10 +76,12 @@ ifeq ($(VPP_DEBUG),1)
 VPP_FLAGS      += -g
 endif
 VPP_FLAGS      += --hls.jobs $(JOBS)
-# --kernel_frequency overrides the platform's default kernel clock (300 MHz on
-# U55C gen3x16). The retained 32-port implementation requests and closes at
-# 130 MHz. Set it unconditionally; v++ accepts it on both -c and -l.
-VPP_FLAGS      += --kernel_frequency $(FREQ)
+# Compile and link clocks are deliberately separate. The routed decode designs
+# synthesize HLS at 130 MHz, then request the independently chosen physical
+# DATA_CLK during link (100 MHz for Iter38). Both default to legacy FREQ so old
+# one-line commands retain their behavior.
+VPP_COMPILE_FLAGS := $(VPP_FLAGS) --kernel_frequency $(HLS_FREQ)
+VPP_LINK_FLAGS    := $(VPP_FLAGS) --kernel_frequency $(LINK_FREQ)
 
 VPP_LDFLAGS    := --config $(HW_CFG)
 VPP_LDFLAGS    += --vivado.synth.jobs $(JOBS) --vivado.impl.jobs $(JOBS)
@@ -114,12 +120,26 @@ HW_OUT         ?= hw_$(basename $(notdir $(FIXTURE))).json
 HW_DEVICE      ?= 0
 HW_MAX_EX      ?=
 ITER37_FREQ    ?= 115
+ITER38_HLS_FREQ  ?= 130
+ITER38_LINK_FREQ ?= 100
+ITER38_BUILD_DIR ?= build.hw.iter38e.qkvg.gu.state4packed.f$(ITER38_LINK_FREQ).o8.v2022_2
+ITER38_DIAGNOSTICS_DIR ?= diagnostics/iter38e_qkvg_gu_state4packed_f$(ITER38_LINK_FREQ)
+ITER38_CFG_TEMPLATE := hw_iter37c_state4_recur32_slr2_f115.cfg
+ITER38_RESOLVED_CFG := $(ITER38_DIAGNOSTICS_DIR)/resolved_hw.cfg
+ITER38_VITIS_SETTINGS ?= /tools/Xilinx/Vitis/2022.2/settings64.sh
+ITER38_IP_CACHE ?= build.hw.iter35.recur16.dmaw15f64.postphys.f100.o8.v2022_2/.ipcache
+ITER38_XCLBIN := $(ITER38_BUILD_DIR)/gdn_forward.xclbin
+ITER38_ONCARD_DIR := $(ITER38_DIAGNOSTICS_DIR)/on_card
+ITER38_DECODE_WEIGHTS ?= artifacts/gdn-1.3b-f32.gdnw
+ITER38_DECODE_FIXTURE ?= fixtures_decode/decode.gdnreq
+ITER38_DECODE_STATE ?= fixtures_decode/decode_ex0.gdnstate
+ITER38_DECODE_GOLDEN ?= results_decode_golden/decode.decode.json
 
 
 # ----------------------------------------------------------------------------
 # Default target
 # ----------------------------------------------------------------------------
-.PHONY: all host_tb xo xclbin host run_hw iter37 reproduce_iter24_success clean clean_hw distclean help
+.PHONY: all host_tb xo xclbin host run_hw iter37 iter38 iter38-verify iter38-oncard reproduce_iter24_success clean clean_hw distclean help
 
 all: host_tb
 
@@ -131,6 +151,8 @@ help:
 	@echo "  host        XRT host    → $(HOST_BIN)"
 	@echo "  run_hw      xo + xclbin + host + ./host.exe ... (full hardware run)"
 	@echo "  iter37      reproduce the routed four-port/32-lane recurrent design"
+	@echo "  iter38      build packed concurrent-state + unified QKVG/GU at 100 MHz"
+	@echo "  iter38-oncard  exact 8-token smoke + 64-token measurement of Iter38"
 	@echo "  reproduce_iter24_success  rebuild the correct, routable iter24b XCLBIN"
 	@echo "  clean       remove host-tb binaries"
 	@echo "  clean_hw    remove build.\$$(TARGET), _x/, v++ logs"
@@ -140,6 +162,8 @@ help:
 	@echo "  PLATFORM=$(PLATFORM)"
 	@echo "  TARGET=$(TARGET)        (sw_emu | hw_emu | hw)"
 	@echo "  FREQ=$(FREQ) MHz"
+	@echo "  HLS_FREQ=$(HLS_FREQ) MHz"
+	@echo "  LINK_FREQ=$(LINK_FREQ) MHz"
 	@echo "  JOBS=$(JOBS)"
 	@echo "  VPP_DEBUG=$(VPP_DEBUG)       (0 normally; 1 enables v++ -g)"
 	@echo ""
@@ -182,7 +206,7 @@ xo: $(XO)
 
 $(XO): $(KERNEL_SRC) $(HLS_PRE_TCL)
 	@mkdir -p $(BUILD_DIR)
-	$(VPP) $(VPP_FLAGS) \
+	$(VPP) $(VPP_COMPILE_FLAGS) \
 	    --temp_dir $(BUILD_DIR)/_x_compile \
 	    --report_dir $(BUILD_DIR)/reports_compile \
 	    --hls.pre_tcl $(HLS_PRE_TCL) \
@@ -197,7 +221,7 @@ xclbin: $(XCLBIN)
 
 $(XCLBIN): $(XO) $(HW_CFG)
 	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && $(VPP) -l $(VPP_FLAGS) $(VPP_LDFLAGS) \
+	cd $(BUILD_DIR) && $(VPP) -l $(VPP_LINK_FLAGS) $(VPP_LDFLAGS) \
 	    --temp_dir _x_temp/ \
 	    --report_dir reports/ \
 	    -o $(KERNEL).xclbin \
@@ -244,6 +268,96 @@ run_hw: $(XCLBIN) $(HOST_BIN)
 # regenerates only relocatable path resolution in diagnostics.
 iter37:
 	bash $(CURDIR)/build_iter37_state4_recur32.sh $(ITER37_FREQ)
+
+
+# ----------------------------------------------------------------------------
+# Iter38 current optimization build
+# ----------------------------------------------------------------------------
+# Keep the long build behind one Make target instead of cloning another
+# iteration-specific launcher. The committed config remains relocatable; this
+# generated copy resolves only the checkout path used by Vivado's Tcl hooks.
+$(ITER38_RESOLVED_CFG): $(ITER38_CFG_TEMPLATE) \
+                        apply_iter37c_recurrent_slr2.tcl \
+                        apply_iter35_dma_w15_fifoaddr_fanout.tcl \
+                        apply_iter22_cluster8_slr1_east.tcl \
+                        apply_iter23_dma_fanout.tcl
+	@mkdir -p $(@D)
+	@sed 's|@C_IMPL_DIR@|$(CURDIR)|g' $< > $@
+	@if grep -q '@C_IMPL_DIR@' $@; then \
+	    echo "iter38: unresolved path placeholder in $@" >&2; \
+	    rm -f $@; \
+	    exit 1; \
+	fi
+
+iter38-verify:
+	@echo '0791d1d158dc476e7f2cc1e44b6bf7790038ea8bf0458138ea2e015ca7184708  gdn_model.cpp' | sha256sum -c -
+	@echo '7bf6bf9d567241028d916a5def4924c6efb7031e416e573921c11d4b10fa2e74  gdn_model.h' | sha256sum -c -
+	@echo 'a76930f3332baac50bf7540b58f9242a2efcd235154215b26e95e8da5a057633  hls_gdn_forward.tcl' | sha256sum -c -
+	@echo '998b71e3a8cb3b7f818f12cbe6581f0ffd2e04010dba5db3f20ca2ae844aa08f  $(ITER38_CFG_TEMPLATE)' | sha256sum -c -
+	@echo '15587403b5e904345abdee72cd84cfc0fa24f8be559f94f1e5554cdcedbd059e  apply_iter37c_recurrent_slr2.tcl' | sha256sum -c -
+	@echo 'd6cd2074b8bd987cf00db922c390c3c92ecd48947108d4d1b54a46e1445263bb  apply_iter35_dma_w15_fifoaddr_fanout.tcl' | sha256sum -c -
+	@echo 'b0f07d2128589789641c649d8c127949dd06ca72f6f3140154eda5e24c331b1f  apply_iter22_cluster8_slr1_east.tcl' | sha256sum -c -
+	@echo '268f9e9fb8e0e6178317edd88be46811372351251758dc781ba950e84f4ba4d8  apply_iter23_dma_fanout.tcl' | sha256sum -c -
+
+iter38: iter38-verify $(ITER38_RESOLVED_CFG)
+	+@set -euo pipefail; \
+	test -r '$(ITER38_VITIS_SETTINGS)'; \
+	source '$(ITER38_VITIS_SETTINGS)'; \
+	mkdir -p '$(ITER38_BUILD_DIR)'; \
+	if [[ -d '$(ITER38_IP_CACHE)' && ! -d '$(ITER38_BUILD_DIR)/.ipcache' ]]; then \
+	    mkdir -p '$(ITER38_BUILD_DIR)/.ipcache'; \
+	    cp -a --reflink=auto '$(ITER38_IP_CACHE)/.' '$(ITER38_BUILD_DIR)/.ipcache/'; \
+	fi; \
+	manifest='$(ITER38_DIAGNOSTICS_DIR)/build.manifest'; \
+	{ \
+	    printf 'iteration=iter38e_qkvg_gu_state4packed_f%s\n' '$(ITER38_LINK_FREQ)'; \
+	    printf 'hls_frequency_mhz=%s\n' '$(ITER38_HLS_FREQ)'; \
+	    printf 'link_frequency_mhz=%s\n' '$(ITER38_LINK_FREQ)'; \
+	    printf 'started_at=%s\n' "$$(date --iso-8601=seconds)"; \
+	    sha256sum gdn_model.cpp gdn_model.h hls_gdn_forward.tcl '$(ITER38_RESOLVED_CFG)'; \
+	} > "$$manifest"; \
+	$(MAKE) xclbin \
+	    TARGET=hw \
+	    FREQ='$(ITER38_LINK_FREQ)' \
+	    HLS_FREQ='$(ITER38_HLS_FREQ)' \
+	    LINK_FREQ='$(ITER38_LINK_FREQ)' \
+	    XILINX_VITIS=/tools/Xilinx/Vitis/2022.2 \
+	    VPP=/tools/Xilinx/Vitis/2022.2/bin/v++ \
+	    BUILD_DIR='$(ITER38_BUILD_DIR)' \
+	    HW_CFG='$(abspath $(ITER38_RESOLVED_CFG))' \
+	    JOBS='$(JOBS)'; \
+	sha256sum '$(ITER38_BUILD_DIR)/gdn_forward.xo' \
+	          '$(ITER38_BUILD_DIR)/gdn_forward.xclbin' >> "$$manifest"; \
+	printf 'completed_at=%s\n' "$$(date --iso-8601=seconds)" >> "$$manifest"
+
+iter38-oncard: host
+	@set -euo pipefail; \
+	test -s '$(ITER38_XCLBIN)'; \
+	mkdir -p '$(ITER38_ONCARD_DIR)'; \
+	for spec in '8 smoke8' '64 decode64'; do \
+	    read -r decode_len stem <<< "$$spec"; \
+	    output='$(ITER38_ONCARD_DIR)/oncard_iter38_'; \
+	    output="$${output}$${stem}.json"; \
+	    log="$${output%.json}.log"; \
+	    parity="$${output%.json}_parity.log"; \
+	    stdbuf -oL -eL ./$(HOST_BIN) \
+	        '$(ITER38_XCLBIN)' \
+	        '$(ITER38_DECODE_WEIGHTS)' \
+	        '$(ITER38_DECODE_FIXTURE)' \
+	        "$$output" 0 1 \
+	        --decode --decode-from-state '$(ITER38_DECODE_STATE)' \
+	        --decode-len "$$decode_len" 2>&1 | tee "$$log"; \
+	    python3 ../scripts/check_gdn_c_parity.py \
+	        --decode --golden '$(ITER38_DECODE_GOLDEN)' --c "$$output" \
+	        2>&1 | tee "$$parity"; \
+	done; \
+	output='$(ITER38_ONCARD_DIR)/oncard_iter38_decode64.json'; \
+	jq 'def median: sort as $$s | ($$s | length) as $$n | if $$n % 2 == 1 then $$s[($$n / 2 | floor)] else (($$s[$$n / 2 - 1] + $$s[$$n / 2]) / 2) end; [.examples[0].kernel_ms[] | select(. > 0)] as $$runs | {decode_len, measured_runs: ($$runs | length), min_kernel_ms: ($$runs | min), max_kernel_ms: ($$runs | max), median_kernel_ms: ($$runs | median), mean_kernel_ms: ($$runs | add / length), speedup_vs_iter37d_51_450918ms: (51.450918 / ($$runs | add / length)), speedup_vs_8port_121_4ms: (121.4 / ($$runs | add / length))}' \
+	    "$$output" | tee '$(ITER38_ONCARD_DIR)/performance_summary.json'; \
+	jq -e '.measured_runs == 63 and .mean_kernel_ms > 0' \
+	    '$(ITER38_ONCARD_DIR)/performance_summary.json' >/dev/null; \
+	sha256sum $(HOST_BIN) '$(ITER38_XCLBIN)' \
+	    > '$(ITER38_ONCARD_DIR)/artifact_hashes.txt'
 
 
 # ----------------------------------------------------------------------------
