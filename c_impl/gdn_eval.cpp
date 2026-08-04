@@ -485,6 +485,13 @@ int main(int argc, char **argv) {
         gdn_model_free(&model);
         return 1;
     }
+    log_progress_message("[progress] validating exact weight-shard layout");
+    if (gdn_validate_weight_shards(model.weight_data, &model.config,
+                                   run_state.weight_shards) != 0) {
+        gdn_run_state_free(&run_state);
+        gdn_model_free(&model);
+        return 1;
+    }
     logits = (float *)xmalloc((size_t)model.config.vocab_size * sizeof(float));
     log_progress_message("[progress] loading fixture");
     load_fixture(argv[2], &fixture);

@@ -136,6 +136,9 @@ typedef struct {
 size_t gdn_weight_shard_floats(const GDNWeightHeader *config);
 void gdn_build_weight_shards(const float *weight_data, const GDNWeightHeader *config,
                              float *const shards[]);
+int gdn_validate_weight_shards(const float *weight_data,
+                               const GDNWeightHeader *config,
+                               float *const shards[]);
 size_t gdn_aux_weight_floats(const GDNWeightHeader *config);
 void gdn_build_aux_weights(const float *weight_data, const GDNWeightHeader *config,
                            float *aux_weights);
