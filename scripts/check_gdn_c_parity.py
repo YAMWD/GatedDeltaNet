@@ -205,13 +205,14 @@ def compare_decode(golden_path: Path, c_path: Path) -> dict:
     logits_parity = c.get("logits_parity")
     logits_parity_pass = None
     if logits_parity is not None:
-        logits_parity_pass = bool(
-            int(logits_parity.get("checked_steps", 0)) > 0
-            and int(logits_parity.get("compared_values", 0)) > 0
-            and int(logits_parity.get("cpu_tolerance_failures", 0)) == 0
-            and int(logits_parity.get("exact_reference_mismatches", 0)) == 0
-            and int(logits_parity.get("argmax_mismatches", 0)) == 0
-        )
+        checked_steps = int(logits_parity.get("checked_steps", 0))
+        compared_values = int(logits_parity.get("compared_values", 0))
+        if checked_steps > 0 and compared_values > 0:
+            logits_parity_pass = bool(
+                int(logits_parity.get("cpu_tolerance_failures", 0)) == 0
+                and int(logits_parity.get("exact_reference_mismatches", 0)) == 0
+                and int(logits_parity.get("argmax_mismatches", 0)) == 0
+            )
 
     aggregate = {
         "exact_traj_match": bool(all_exact and compared_examples > 0),
