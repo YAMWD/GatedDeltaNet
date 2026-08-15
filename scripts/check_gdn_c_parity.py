@@ -112,6 +112,8 @@ def compare_decode(golden_path: Path, c_path: Path) -> dict:
                       per_step_logprob[N]   (golden_traj == per_step_argmax)
       C/HW example:   index, gen_traj[N], tf_argmax[N], per_step_tpot_ms[N],
                       and (HW only) kernel_ms[N]
+      C native root:  optional logits_parity summary covering every pre-argmax
+                      logit produced during the decode
 
     The golden may cover more examples / more positions than the C/HW file
     (e.g. golden N=64, E=12 vs a fast C run N=6, E=1). We compare only the
@@ -127,6 +129,9 @@ def compare_decode(golden_path: Path, c_path: Path) -> dict:
                              golden_traj[i]; aggregate = mean over positions
       * tpot_summary         median/mean ms from per_step_tpot_ms (and
                              kernel_ms when present, HW)
+      * logits_parity        full-vocabulary comparison against the independent
+                             scalar CPU LM head, plus optional exact-reference
+                             and captured-argmax checks
     """
     golden = json.loads(golden_path.read_text())
     c = json.loads(c_path.read_text())
@@ -197,6 +202,18 @@ def compare_decode(golden_path: Path, c_path: Path) -> dict:
             }
         )
 
+    logits_parity = c.get("logits_parity")
+    logits_parity_pass = None
+    if logits_parity is not None:
+        checked_steps = int(logits_parity.get("checked_steps", 0))
+        compared_values = int(logits_parity.get("compared_values", 0))
+        if checked_steps > 0 and compared_values > 0:
+            logits_parity_pass = bool(
+                int(logits_parity.get("cpu_tolerance_failures", 0)) == 0
+                and int(logits_parity.get("exact_reference_mismatches", 0)) == 0
+                and int(logits_parity.get("argmax_mismatches", 0)) == 0
+            )
+
     aggregate = {
         "exact_traj_match": bool(all_exact and compared_examples > 0),
         "first_divergence_index": overall_first_div,
@@ -205,6 +222,7 @@ def compare_decode(golden_path: Path, c_path: Path) -> dict:
         "kernel_summary": _summarize_ms(kernel_all) if has_kernel else None,
         "compared_examples": compared_examples,
         "compared_positions_total": top1_total,
+        "logits_parity_pass": logits_parity_pass,
     }
 
     return {
@@ -217,6 +235,7 @@ def compare_decode(golden_path: Path, c_path: Path) -> dict:
         "c_num_examples": int(c.get("num_examples", len(c_examples))),
         "has_kernel_ms": has_kernel,
         "skipped_c_examples_not_in_golden": skipped,
+        "logits_parity": logits_parity,
         "aggregate": aggregate,
         "examples": per_example,
     }
@@ -272,13 +291,35 @@ def print_decode_report(report: dict) -> None:
     print(f"    tpot_summary (ms/tok) : {_fmt_ms(agg['tpot_summary'])}")
     if report["has_kernel_ms"]:
         print(f"    kernel_summary (ms/tok): {_fmt_ms(agg['kernel_summary'])}")
+    logits = report["logits_parity"]
+    if logits is not None:
+        print("    full_logits_parity:")
+        print(
+            f"      checked_steps={int(logits.get('checked_steps', 0))} "
+            f"values={int(logits.get('compared_values', 0))} "
+            f"max_abs={float(logits.get('max_abs_error', 0.0)):.9g} "
+            f"max_rel={float(logits.get('max_rel_error', 0.0)):.9g}"
+        )
+        print(
+            f"      cpu_tol_fail={int(logits.get('cpu_tolerance_failures', 0))} "
+            f"exact_ref_mismatch={int(logits.get('exact_reference_mismatches', 0))} "
+            f"argmax_mismatch={int(logits.get('argmax_mismatches', 0))} "
+            f"pass={agg['logits_parity_pass']}"
+        )
     print(
-        "    NOTE: on the current kernel TPOT/kernel timings reflect the O(n^2) "
-        "re-prefill baseline (full prefix re-forward each step), not a flat O(1) decode."
+        "    NOTE: decode-from-state timings are one O(1) recurrent decode call "
+        "per generated token; the seed entry has no kernel invocation."
     )
     print("-" * 70)
-    banner = "PASS" if agg["exact_traj_match"] else "FAIL"
-    print(f"  RESULT: {banner}  (gates on exact_traj_match)")
+    passed = bool(
+        agg["exact_traj_match"]
+        and (agg["logits_parity_pass"] is not False)
+    )
+    banner = "PASS" if passed else "FAIL"
+    gate = "exact trajectory"
+    if logits is not None:
+        gate += " + full pre-argmax logits"
+    print(f"  RESULT: {banner}  (gates on {gate})")
     print("=" * 70)
 
 
@@ -298,7 +339,12 @@ def run_decode(args: argparse.Namespace) -> int:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(report, indent=2))
             print(f"wrote {args.output}")
-    return 0 if report["aggregate"]["exact_traj_match"] else 1
+    aggregate = report["aggregate"]
+    passed = bool(
+        aggregate["exact_traj_match"]
+        and aggregate["logits_parity_pass"] is not False
+    )
+    return 0 if passed else 1
 
 
 def run_parity(args: argparse.Namespace) -> int:

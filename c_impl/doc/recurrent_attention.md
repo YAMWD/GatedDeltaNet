@@ -1,31 +1,26 @@
 # Optimised Recurrent Attention (`gdn_recurrent_attention`)
 
-**Status:** Active decode compute block. The prefill synthesis tables in this
-document are historical.
+**Status:** Active Iter37 decode compute block. The prefill and v1--v7
+synthesis discussions later in this document are historical.
 
 **Location:** `gdn_model.cpp` (`gdn_recurrent_attention`, static helper)
 
 ## Overview
 
-This module implements the gated delta rule recurrence, the core mechanism
-that distinguishes GatedDeltaNet from standard linear attention. Each head
-maintains a persistent state matrix S (256 × 256 FP32) that is updated at
-every token step.
+This module implements the gated delta rule recurrence. Each of the eight
+heads maintains a persistent 256 x 256 FP32 state matrix. Iter37 combines four
+features:
 
-The implementation applies the following optimisations, in roughly the order
-they were introduced:
+1. one head-local 256 x 256 URAM buffer rather than an all-head layer buffer;
+2. algebraic fusion that reduces four state traversals to a retrieval pass and
+   an update pass;
+3. four external state stripes appended to weight ports 28--31; and
+4. 32-column recurrent arithmetic supplied by two state ports at a time.
 
-1. **Partitioned BRAM working state** with one HBM restore/save per layer call
-2. **Fused two-pass pipeline** (algebraic fusion → 4 state passes → 2)
-3. **Column parallelism** P_K = 16 (16 MACs per cycle on state ops)
-4. **`delta_out` + `delta_drain` split** (lifts II=16 → II=1)
-5. **Tree-reduce reductions for `q_sq`, `k_sq`, `α`** (lifts II=2/3 → II=1)
-6. **q/k AXI bundle split** (lifts `load_qk` II=2 → II=1)
-
-(1)–(3) are inherited from Gupta et al., "A Persistent-State Dataflow
-Accelerator for Memory-Bound Linear Attention Decode on FPGA". (4)–(6) were
-added during the v1–v7 optimisation passes documented in
-[optimization_log.md](optimization_log.md).
+The external `.gdnstate` format remains contiguous
+`[layer][head][K][V]`. The host scatters Pack16 words into four 12 MiB tails
+when it uploads the state; the kernel updates that striped representation in
+place across decode calls.
 
 ## Gated Delta Rule Algorithm
 
@@ -49,52 +44,45 @@ State:  S[h] (d_k × d_v matrix, persistent across tokens)
      S[j][i] = g * S[j][i] + k_norm[j] * Δv[i]
 ```
 
-## Compile-Time Constants
+## Iter37 Compile-Time Constants
 
 ```c
 #define GDN_HEADS   8     // number of attention heads
 #define GDN_DK    256     // query/key head dimension
 #define GDN_DV    256     // value head dimension
-#define GDN_PK     16     // column parallelism factor
+#define GDN_RECURRENT_LANES 32
+#define GDN_RECURRENT_STATE_PORTS 4
+#define GDN_RECURRENT_STATE_FIRST_PORT 28
 ```
 
-These are used in C code. HLS pragmas use literal `16` because Vitis HLS
-pragma processing does not expand C preprocessor macros.
+`Pack16` remains the external 512-bit transfer unit. `GDN_RECURRENT_LANES=32`
+means each fused loop consumes two Pack16 words from two independent ports and
+performs 32 state-column updates per cycle.
 
-## Optimisation 1: Partitioned BRAM Working State
+## Head-Local State and Four-Port Layout
 
-### Problem
-The naive implementation stores the 8 × 256 × 256 state matrix in external
-DRAM (via `m_axi`). Each token step requires 4 full state matrix traversals
-(decay, retrieval, update, output query), each reading/writing 256 × 256 =
-65,536 FP32 values through the AXI bus. At ~100 cycles per AXI transaction,
-this creates massive memory-bound latency.
+All 24 layers require 48 MiB, so the recurrent state cannot remain wholly on
+chip. The kernel uses one head-local buffer:
 
-### Solution
 ```c
-static float state[GDN_HEADS][GDN_DK][GDN_DV];
-#pragma HLS bind_storage variable=state type=RAM_2P impl=BRAM
-#pragma HLS array_partition variable=state dim=3 cyclic factor=16
+float state[256][256];
+#pragma HLS bind_storage variable=state type=RAM_2P impl=URAM
+#pragma HLS array_partition variable=state dim=2 cyclic factor=32
 ```
 
-The state is declared `static`, bound to dual-port BRAM, and partitioned into
-16 column banks. In the current decode-only kernel, each layer first restores
-its 2 MiB slice from the 48 MiB HBM-resident `recurrent_state`, performs the
-single-token update on BRAM, then saves the slice for the next kernel call.
-The GPU-generated `.gdnstate` supplies the initial value after prompt prefill.
+Every row contains 16 Pack16 words. Words 0--7 cover columns 0--127 and
+alternate between ports 28 and 29; words 8--15 cover columns 128--255 and
+alternate between ports 30 and 31. Consequently each port owns four contiguous
+logical words per row and 1,024 words per head. The host appends each compact
+stripe after the fixed 43,728,896-float GEMV shard boundary.
 
-The BRAM copy removes external traffic from the inner gated-delta loops, but
-state restore/save remains a material serial cost per token. `head_buffer` is
-not used by recurrent attention; the top-level kernel uses it for persistent
-Q/K/V convolution tails.
+`fused_rd01` reads ports 28/29 together for the low half, then `fused_rd23`
+reads ports 30/31 together for the high half. `fused_wr01` and `fused_wr23`
+write the same layout. Each loop has a 1,024-iteration II=1 schedule and each
+individual state port sees a monotonic burst. GEMV and recurrence are serial,
+so reusing the four weight masters adds no competing memory operation.
 
-### State Restore and Save
-
-Restore and save traverse `[head][k][v]` in contiguous 16-float groups. The
-`v` dimension partition and Pack16 AXI access allow one 512-bit state transfer
-per pipelined iteration. No state-clear path remains in the decode kernel.
-
-## Optimisation 2: Fused Two-Pass Pipeline
+## Fused Two-Pass Pipeline
 
 ### Problem
 The naive algorithm requires 4 separate passes over the state matrix per
@@ -119,62 +107,16 @@ o = q_scale * S_new^T * q_norm
 This fuses passes 1+2+4 into a single read pass and pass 3+1 into one
 read-modify-write pass:
 
-**Fused Read Pass (Phase 2):**
-```c
-fused_rd_j: for (j = 0; j < GDN_DK; ++j) {
-    float kj = k_loc[j], qj = q_loc[j];
-    fused_rd_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
-    #pragma HLS pipeline II=1
-        for (pp = 0; pp < GDN_PK; ++pp) {
-        #pragma HLS unroll
-            float s = state[head_index][j][i + pp];
-            r_buf[i + pp] += s * kj;    // retrieval
-            o_buf[i + pp] += s * qj;    // partial output
-        }
-    }
-}
-```
+The read loops capture every old-state word in the head-local URAM while also
+accumulating `r` and partial `o`. The write loops consume that captured word,
+apply decay plus the rank-one update, and immediately persist the updated
+Pack16 pair. This removes the standalone full-layer restore/save passes that
+preceded Iter36 without changing FP32 expression order.
 
-**Fused Write Pass (Phase 4):**
-```c
-fused_wr_j: for (j = 0; j < GDN_DK; ++j) {
-    float kj = k_loc[j];
-    fused_wr_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
-    #pragma HLS pipeline II=1
-        for (pp = 0; pp < GDN_PK; ++pp) {
-        #pragma HLS unroll
-            state[head_index][j][i + pp] =
-                g * state[head_index][j][i + pp] + kj * dv[i + pp];
-        }
-    }
-}
-```
-
-This combines decay and rank-1 update into one read-modify-write pass.
-
-### Result
-Total state traversals reduced from 4 to 2 per token per head.
-
-## Optimisation 3: Column Parallelism P_K = 16
-
-The innermost dimension of the state array (`d_v = 256`) is cyclically
-partitioned by factor 16:
-
-```c
-#pragma HLS array_partition variable=state dim=3 cyclic factor=16
-```
-
-This creates 16 independent BRAM banks. The inner loop strides by `GDN_PK`
-with a fully unrolled inner loop of 16 iterations, allowing 16 parallel read
-or read-modify-write operations per cycle.
-
-The per-head working buffers are partitioned to match:
-```c
-#pragma HLS array_partition variable=r_buf cyclic factor=16
-#pragma HLS array_partition variable=o_buf cyclic factor=16
-#pragma HLS array_partition variable=dv    cyclic factor=16
-#pragma HLS array_partition variable=v_loc cyclic factor=16
-```
+Integrated Vitis HLS 2022.2 estimates 43,873--44,081 cycles per layer call,
+down from Iter36's 76,713. All four state loops achieve II=1. The complete
+kernel uses 3,627 DSPs and 48 URAMs, and the routed 100 MHz image measures
+51.451 ms/token with exact 64-token parity.
 
 ## Optimisation 4: `delta_out` + `delta_drain` Split
 

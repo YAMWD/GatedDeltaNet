@@ -5,9 +5,10 @@
 #
 # Compares the native testbench's decode trajectory (gen_traj / tf_argmax)
 # against the CACHED decode golden produced by the GPU reference run
-# (c_impl/results_decode_golden/decode.decode.json). Reports decode-correctness
-# metrics via scripts/check_gdn_c_parity.py --decode and gates on
-# exact_traj_match (non-zero exit on mismatch) so it can drive a git/editor hook.
+# (c_impl/results_decode_golden/decode.decode.json). The native run also checks
+# every pre-argmax logit against an independent scalar CPU LM head; the report
+# gates on both exact trajectory and full-logits parity (non-zero exit on any
+# mismatch) so it can drive a git/editor hook.
 #
 # Modes:
 #   --fast        Quick, NO GPU. Rebuilds gdn_eval, runs a TINY decode subset
@@ -131,7 +132,7 @@ echo "    cd ${C_IMPL} && ./gdn_eval <weights> <fixture> ${OUT_JSON} --decode --
 
 # --- check -------------------------------------------------------------------
 echo "----------------------------------------------------------------------"
-echo "==> Comparing candidate decode trajectory against cached golden"
+echo "==> Comparing exact trajectory and full pre-argmax logits"
 echo "    ${PYTHON_BIN} ${CHECKER} --decode --golden ${GOLDEN} --c ${OUT_JSON}"
 echo
 
@@ -147,7 +148,7 @@ if [[ "${CHECK_RC}" -eq 0 ]]; then
     echo "======================================================================"
     exit 0
 else
-    echo "  DECODE CORRECTNESS: FAIL  [mode=${MODE}]  (exact_traj_match mismatch)"
+    echo "  DECODE CORRECTNESS: FAIL  [mode=${MODE}]  (trajectory or logits mismatch)"
     echo "======================================================================"
     exit 1
 fi

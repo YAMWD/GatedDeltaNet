@@ -13,7 +13,7 @@
 #define GDN_HEADS   8
 #define GDN_DK    256   /* head_dim = query/key dimension */
 #define GDN_DV    256   /* value_dim = hidden/num_heads   */
-#define GDN_RECURRENT_LANES 16 /* recurrent-state column parallelism */
+#define GDN_RECURRENT_LANES 32 /* recurrent-state column parallelism */
 #define GDN_NORM_LANES       8 /* RMS/output-norm arithmetic lanes   */
 #define GDN_CONV_LANES       4 /* depthwise-convolution lanes        */
 #define GDN_OUTPUT_GATE_LANES 4 /* output norm/gate arithmetic lanes */
@@ -54,11 +54,31 @@ static_assert(GDN_WSF_HEADBUF ==
     (size_t)GDN_LAYERS*3*(GDN_CONV-1)*GDN_HIDDEN, "workspace head_buffer drift");
 static_assert(GDN_WSF_LOGITS == GDN_VOCAB, "workspace logits size drift");
 static_assert(GDN_WSF_HEAD >= GDN_HEADS, "workspace head padding too small");
+static_assert((GDN_WSF_STATE % (GDN_RECURRENT_STATE_PORTS * 16u)) == 0,
+    "recurrent state must stripe into whole Pack16 words");
 
 /* Pack16 = 16 FP32 values = 64 bytes = 512 bits. */
 struct Pack16 {
     float data[16];
 };
+
+/* One low/high recurrent-state column pair. Packing both halves into a single
+ * 64-bit local-memory word lets four HBM ports advance concurrently without
+ * requesting two accesses to the same cyclic URAM bank. */
+struct GDNStatePair {
+    float lo;
+    float hi;
+};
+
+#ifndef __SYNTHESIS__
+static float *gdn_native_final_hidden_debug = NULL;
+static float *gdn_native_logits_debug = NULL;
+
+void gdn_set_native_debug_buffers(float *final_hidden, float *logits) {
+    gdn_native_final_hidden_debug = final_hidden;
+    gdn_native_logits_debug = logits;
+}
+#endif
 
 static void gdn_print_error(const char *message) {
 #ifdef __SYNTHESIS__
@@ -162,12 +182,15 @@ static size_t gdn_final_norm_offset(const GDNWeightHeader *config) {
 }
 
 /* ---- Compact weight shards for the multi-channel decode GEMV (Stage 2) ----
- * Each gemv projection's output rows are split into GEMV_CHANNELS stripes; shard
- * c holds stripe c of every projection, packed per layer in the order
- * q,k,v,gate,o,mlp_gate,mlp_up,mlp_down — exactly the order gdn_forward threads
- * its compact shard offset (soff). Total across all shards = one copy of the
- * projection weights (no replication), so the parallel 512-bit readers fit the
- * same HBM budget as the old single weight_data_mm copy. Host-only (memcpy). */
+ * The first per-layer segment is one head-serial Q/K/V/gate command. For each
+ * head, its concatenated [Q,K,V,gate] rows are striped across all 32 channels;
+ * every channel owns 32 rows/head. The clustered GEMV therefore finishes one
+ * complete head every 4096 weight beats while preserving each dot product's
+ * FP32 accumulation order and the section's total byte count.
+ * MLP gate/up use the analogous pair-interleaved layout: channel
+ * c=(chunk*2+kind) owns 352 rows of gate or up. The remaining O and MLP-down
+ * projections retain output-row stripes. Total across all shards is one copy
+ * of the projection weights (no replication). Host-only (memcpy). */
 size_t gdn_weight_shard_floats(const GDNWeightHeader *config) {
     size_t H = config->hidden_size, I = config->intermediate_size, V = config->vocab_size;
     size_t per_layer = 5 * (H / GEMV_CHANNELS) * H     /* q,k,v,gate,o */
@@ -194,19 +217,57 @@ void gdn_build_weight_shards(const float *wd, const GDNWeightHeader *config,
         size_t mg = o + H * H + H;                           /* past o_proj + mlp_norm */
         size_t mu = mg + I * H;
         size_t md = mu + I * H;
-        size_t poff[8] = { q, k, v, g, o, mg, mu, md };
-        size_t pout[8] = { H, H, H, H, H, I, I, H };
-        size_t pin [8] = { H, H, H, H, H, H, H, I };
-        int p;
-        for (p = 0; p < 8; ++p) {
-            /* output rows split into GEMV_CHANNELS stripes; stripe c = rows
-             * [c*out/N,(c+1)*out/N) → floats [poff + c*s, ...) → shards[c]. */
-            size_t s = (pout[p] / GEMV_CHANNELS) * pin[p];   /* one stripe (floats) */
-            int c;
-            for (c = 0; c < GEMV_CHANNELS; ++c)
-                memcpy(shards[c] + soff, wd + poff[p] + (size_t)c * s, s * sizeof(float));
-            soff += s;
+        size_t qkvg_off[4] = { q, k, v, g };
+        int c;
+
+        /* Head-serial Q/K/V/gate. A 4*head_dim=1024-row head block is split
+         * evenly across all 32 readers, so channel c owns one 32-row segment
+         * for every head. Channels 0..7 carry Q segments, 8..15 K, 16..23 V,
+         * and 24..31 gate. Within a shard, heads are stored in increasing
+         * order, which makes the existing row-progressive clusters finish
+         * complete heads sequentially without changing total weight traffic. */
+        size_t qkvg_rows_per_channel_head = (4 * hd) / GEMV_CHANNELS;
+        for (c = 0; c < GEMV_CHANNELS; ++c) {
+            size_t kind = (size_t)c / (GEMV_CHANNELS / 4);
+            size_t segment = (size_t)c % (GEMV_CHANNELS / 4);
+            for (size_t head = 0; head < nh; ++head) {
+                size_t source_row = head * hd
+                                  + segment * qkvg_rows_per_channel_head;
+                size_t destination = soff
+                                   + head * qkvg_rows_per_channel_head * H;
+                memcpy(shards[c] + destination,
+                       wd + qkvg_off[kind] + source_row * H,
+                       qkvg_rows_per_channel_head * H * sizeof(float));
+            }
         }
+        soff += hd * H;
+
+        /* O projection: conventional output-row stripes. */
+        size_t o_stripe = (H / GEMV_CHANNELS) * H;
+        for (c = 0; c < GEMV_CHANNELS; ++c)
+            memcpy(shards[c] + soff, wd + o + (size_t)c * o_stripe,
+                   o_stripe * sizeof(float));
+        soff += o_stripe;
+
+        /* Pair-interleaved MLP gate/up. Sixteen chunks times two kinds map
+         * exactly onto the 32 readers; each channel holds one 352-row block. */
+        size_t gu_off[2] = { mg, mu };
+        size_t gu_chunk = (I / (GEMV_CHANNELS / 2)) * H;
+        for (c = 0; c < GEMV_CHANNELS; ++c) {
+            size_t chunk = (size_t)c >> 1;
+            size_t kind = (size_t)c & 1;
+            memcpy(shards[c] + soff,
+                   wd + gu_off[kind] + chunk * gu_chunk,
+                   gu_chunk * sizeof(float));
+        }
+        soff += gu_chunk;
+
+        /* MLP down projection: conventional output-row stripes. */
+        size_t md_stripe = (H / GEMV_CHANNELS) * I;
+        for (c = 0; c < GEMV_CHANNELS; ++c)
+            memcpy(shards[c] + soff, wd + md + (size_t)c * md_stripe,
+                   md_stripe * sizeof(float));
+        soff += md_stripe;
     }
     /* lm_head [V,H] (global): split its rows into GEMV_CHANNELS stripes appended
      * after every layer's projections — the order gdn_forward threads for the
@@ -219,6 +280,134 @@ void gdn_build_weight_shards(const float *wd, const GDNWeightHeader *config,
         for (c = 0; c < GEMV_CHANNELS; ++c)
             memcpy(shards[c] + soff, wd + lmh + (size_t)c * s, s * sizeof(float));
         soff += s;
+    }
+}
+
+/* Native-only exact layout gate. Check every copied projection float so a shard
+ * mapping change cannot pass merely because the short decode keeps the same
+ * argmax trajectory. This function is not reachable from the HLS top. */
+int gdn_validate_weight_shards(const float *wd, const GDNWeightHeader *config,
+                               float *const shards[]) {
+    size_t H = config->hidden_size, I = config->intermediate_size;
+    size_t nh = config->num_heads, hd = config->head_dim, cs = config->conv_size;
+    size_t soff = 0;
+
+    if (H != nh * hd || (4 * hd) % GEMV_CHANNELS != 0
+                       || GEMV_CHANNELS % 4 != 0) {
+        gdn_print_error("head-serial QKVG shard geometry is incompatible with the model");
+        return -1;
+    }
+
+    for (uint32_t L = 0; L < config->num_layers; ++L) {
+        size_t base = gdn_layer_weight_offset(config, L);
+        size_t q  = base + H + 2 * nh;
+        size_t k  = q + H * H;
+        size_t v  = k + H * H;
+        size_t g  = v + H * H + 2 * nh * H + 3 * H * cs;
+        size_t o  = g + H * H + hd;
+        size_t mg = o + H * H + H;
+        size_t mu = mg + I * H;
+        size_t md = mu + I * H;
+        size_t qkvg_off[4] = { q, k, v, g };
+
+        size_t qkvg_rows_per_channel_head = (4 * hd) / GEMV_CHANNELS;
+        for (int c = 0; c < GEMV_CHANNELS; ++c) {
+            size_t kind = (size_t)c / (GEMV_CHANNELS / 4);
+            size_t segment = (size_t)c % (GEMV_CHANNELS / 4);
+            for (size_t head = 0; head < nh; ++head) {
+                size_t source_row = head * hd
+                                  + segment * qkvg_rows_per_channel_head;
+                size_t source = qkvg_off[kind] + source_row * H;
+                size_t destination = soff
+                                   + head * qkvg_rows_per_channel_head * H;
+                if (memcmp(shards[c] + destination,
+                           wd + source,
+                           qkvg_rows_per_channel_head * H * sizeof(float)) != 0) {
+                    fprintf(stderr,
+                            "gdn: QKVG shard mismatch layer=%u channel=%d head=%zu\n",
+                            L, c, head);
+                    return -1;
+                }
+            }
+        }
+        soff += hd * H;
+
+        size_t o_stripe = (H / GEMV_CHANNELS) * H;
+        for (int c = 0; c < GEMV_CHANNELS; ++c) {
+            if (memcmp(shards[c] + soff, wd + o + (size_t)c * o_stripe,
+                       o_stripe * sizeof(float)) != 0) {
+                fprintf(stderr, "gdn: O shard mismatch layer=%u channel=%d\n", L, c);
+                return -1;
+            }
+        }
+        soff += o_stripe;
+
+        size_t gu_off[2] = { mg, mu };
+        size_t gu_chunk = (I / (GEMV_CHANNELS / 2)) * H;
+        for (int c = 0; c < GEMV_CHANNELS; ++c) {
+            size_t chunk = (size_t)c >> 1;
+            size_t kind = (size_t)c & 1;
+            if (memcmp(shards[c] + soff,
+                       wd + gu_off[kind] + chunk * gu_chunk,
+                       gu_chunk * sizeof(float)) != 0) {
+                fprintf(stderr, "gdn: GU shard mismatch layer=%u channel=%d\n", L, c);
+                return -1;
+            }
+        }
+        soff += gu_chunk;
+
+        size_t md_stripe = (H / GEMV_CHANNELS) * I;
+        for (int c = 0; c < GEMV_CHANNELS; ++c) {
+            if (memcmp(shards[c] + soff, wd + md + (size_t)c * md_stripe,
+                       md_stripe * sizeof(float)) != 0) {
+                fprintf(stderr, "gdn: MLP-down shard mismatch layer=%u channel=%d\n",
+                        L, c);
+                return -1;
+            }
+        }
+        soff += md_stripe;
+    }
+
+    {
+        size_t V = config->vocab_size;
+        size_t lmh = gdn_final_norm_offset(config) + H;
+        size_t s = (V / GEMV_CHANNELS) * H;
+        for (int c = 0; c < GEMV_CHANNELS; ++c) {
+            if (memcmp(shards[c] + soff, wd + lmh + (size_t)c * s,
+                       s * sizeof(float)) != 0) {
+                fprintf(stderr, "gdn: lm_head shard mismatch channel=%d\n", c);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+void gdn_scatter_recurrent_state(float *const state_stripes[],
+                                 const float *recurrent_state,
+                                 size_t recurrent_state_floats) {
+    const size_t pack_floats = 16;
+    const size_t pack_count = recurrent_state_floats / pack_floats;
+    size_t pack;
+
+    if ((recurrent_state_floats % pack_floats) != 0) {
+        gdn_print_error("recurrent state is not Pack16 aligned");
+        return;
+    }
+    for (pack = 0; pack < pack_count; ++pack) {
+        /* Within each 256-float row, ports 0/1 alternate across the low
+         * 128 floats and ports 2/3 alternate across the high 128 floats.
+         * Each port then owns four contiguous words per row. This keeps the
+         * kernel's two 1,024-word half-head sweeps monotonic and burstable. */
+        size_t row = pack / (GDN_DV / pack_floats);
+        size_t row_word = pack % (GDN_DV / pack_floats);
+        size_t port = row_word < (GDN_DV / pack_floats / 2)
+                        ? (row_word & 1)
+                        : 2 + (row_word & 1);
+        size_t local_pack = row * 4 + ((row_word & 7) >> 1);
+        memcpy(state_stripes[port] + local_pack * pack_floats,
+               recurrent_state + pack * pack_floats,
+               pack_floats * sizeof(float));
     }
 }
 
@@ -462,8 +651,14 @@ int gdn_run_state_init(GDNRunState *state, const GDNModel *model, uint32_t max_t
     {
         size_t shard_floats = gdn_weight_shard_floats(&model->config);
         int c;
-        for (c = 0; c < GEMV_CHANNELS; ++c)
-            if (gdn_alloc_run_buffer(&state->weight_shards[c], shard_floats) != 0) return -1;
+        for (c = 0; c < GEMV_CHANNELS; ++c) {
+            size_t state_extra =
+                (c >= GDN_RECURRENT_STATE_FIRST_PORT &&
+                 c < GDN_RECURRENT_STATE_FIRST_PORT + GDN_RECURRENT_STATE_PORTS)
+                    ? GDN_RECURRENT_STATE_STRIPE_FLOATS : 0;
+            if (gdn_alloc_run_buffer(&state->weight_shards[c],
+                                     shard_floats + state_extra) != 0) return -1;
+        }
         gdn_build_weight_shards(model->weight_data, &model->config, state->weight_shards);
     }
     if (gdn_alloc_run_buffer(&state->aux_weights,
@@ -637,10 +832,26 @@ static void gdn_rmsnorm_rows(
 #define GDN_GEMV_TINY_IN_MAX  2048
 #define GDN_GEMV_TINY_OUT_LANES 2
 
-static void gdn_gemv_tiny(
+static void gdn_gemv_tiny_mm2s(
+    const float *weights,
+    hls::stream<Pack16> &weight_stream,
+    uint32_t in_dim,
+    uint32_t out_dim
+) {
+#pragma HLS inline off
+    const Pack16 *weight_words = reinterpret_cast<const Pack16 *>(weights);
+    const uint32_t total_words = out_dim * (in_dim / 16);
+gvt_mm2s: for (uint32_t i = 0; i < total_words; ++i) {
+#pragma HLS loop_tripcount min=1024 max=1024
+#pragma HLS pipeline II=1
+        weight_stream.write(weight_words[i]);
+    }
+}
+
+static void gdn_gemv_tiny_compute(
     float *out,
     const Pack16 *in,
-    const float *weights,
+    hls::stream<Pack16> &weight_stream,
     uint32_t num_rows,
     uint32_t in_dim,
     uint32_t out_dim
@@ -655,7 +866,6 @@ static void gdn_gemv_tiny(
      * Bit-exact to the prior per-output reduction (each acc[c] keeps the chunk
      * order); removes the 8x per-output pipeline restart + redundant activation
      * reads that made the prior form ~0.18 ms/call. */
-    const Pack16 *w_p  = reinterpret_cast<const Pack16 *>(weights);
     uint32_t k_packs = in_dim / 16;   /* 128 for in_dim=2048 */
     uint32_t c, kc, i;
     (void)num_rows;  /* decode: always the single token (row 0) */
@@ -682,7 +892,7 @@ static void gdn_gemv_tiny(
         gvt_lw_kc: for (kc = 0; kc < k_packs; ++kc) {
         #pragma HLS loop_tripcount min=128 max=128
         #pragma HLS pipeline II=1
-            Pack16 w = w_p[(size_t)c * k_packs + kc];
+            Pack16 w = weight_stream.read();
             gvt_lw_i: for (i = 0; i < 16; ++i) {
             #pragma HLS unroll
                 w_loc[c][kc * 16 + i] = w.data[i];
@@ -736,6 +946,24 @@ static void gdn_gemv_tiny(
     #pragma HLS unroll factor=GDN_GEMV_TINY_OUT_LANES
         out[c] = acc[c];
     }
+}
+
+static void gdn_gemv_tiny(
+    float *out,
+    const Pack16 *in,
+    const float *weights,
+    uint32_t num_rows,
+    uint32_t in_dim,
+    uint32_t out_dim
+) {
+#pragma HLS inline off
+    hls::stream<Pack16> weight_stream;
+#pragma HLS stream variable=weight_stream depth=64
+#pragma HLS bind_storage variable=weight_stream type=fifo impl=bram
+#pragma HLS dataflow disable_start_propagation
+    gdn_gemv_tiny_mm2s(weights, weight_stream, in_dim, out_dim);
+    gdn_gemv_tiny_compute(out, in, weight_stream,
+                          num_rows, in_dim, out_dim);
 }
 
 /* No dispatch wrapper — gdn_forward calls gdn_gemv directly for the large
@@ -912,6 +1140,293 @@ static void gdn_depthwise_conv_silu(
     }
 }
 
+/* Iter39B: one fixed decode head of one Q/K/V depthwise convolution. The
+ * caller invokes this single call site three times (kind=Q,K,V), so HLS can
+ * time-share one small 256-column convolution datapath. Unlike the retired
+ * whole-hidden helper above, this actor is short enough to execute between
+ * successive head completions from the head-serial QKVG GEMV collector. */
+static void gdn_depthwise_conv_silu_head_kind(
+    Pack16 head_out[GDN_HEAD_DIM / 16],
+    const Pack16 head_value[4][GDN_HEAD_DIM / 16],
+    const Pack16 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    const Pack16 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 16],
+    uint32_t head,
+    uint32_t kind
+) {
+#pragma HLS inline off
+#pragma HLS aggregate variable=conv_weights compact=bit
+#pragma HLS aggregate variable=conv_tails compact=bit
+    float w_loc[GDN_HEAD_DIM][GDN_CONV];
+#pragma HLS array_partition variable=w_loc dim=2 complete
+#pragma HLS array_partition variable=w_loc dim=1 cyclic factor=GDN_CONV_LANES
+    float in_window[GDN_CONV][GDN_HEAD_DIM];
+#pragma HLS array_partition variable=in_window dim=1 complete
+#pragma HLS array_partition variable=in_window dim=2 cyclic factor=GDN_CONV_LANES
+
+    const uint32_t head_packs = GDN_HEAD_DIM / 16;
+    const uint32_t hidden_packs = GDN_HIDDEN / 16;
+    const uint32_t weight_packs_per_head =
+        (GDN_HEAD_DIM * GDN_CONV) / 16;
+
+iter39_head_conv_load_w: for (uint32_t wb = 0;
+                              wb < weight_packs_per_head; ++wb) {
+#pragma HLS loop_tripcount min=64 max=64
+#pragma HLS pipeline II=1
+        Pack16 wp = conv_weights[kind][head * weight_packs_per_head + wb];
+    iter39_head_conv_load_w_col: for (uint32_t col4 = 0; col4 < 4; ++col4) {
+#pragma HLS unroll
+        iter39_head_conv_load_w_k: for (uint32_t k = 0; k < GDN_CONV; ++k) {
+#pragma HLS unroll
+                w_loc[wb * 4 + col4][k] = wp.data[col4 * GDN_CONV + k];
+            }
+        }
+    }
+
+iter39_head_conv_restore_k: for (uint32_t k = 0; k + 1 < GDN_CONV; ++k) {
+    iter39_head_conv_restore_p: for (uint32_t p = 0; p < head_packs; ++p) {
+#pragma HLS loop_tripcount min=16 max=16
+#pragma HLS pipeline II=1
+            Pack16 value = conv_tails[kind][(size_t)k * hidden_packs
+                                           + head * head_packs + p];
+        iter39_head_conv_restore_lane: for (uint32_t lane = 0;
+                                            lane < 16; ++lane) {
+#pragma HLS unroll
+                in_window[k + 1][p * 16 + lane] = value.data[lane];
+            }
+        }
+    }
+
+iter39_head_conv_shift: for (uint32_t p = 0; p < head_packs; ++p) {
+#pragma HLS loop_tripcount min=16 max=16
+#pragma HLS pipeline II=1
+        Pack16 value = head_value[kind][p];
+    iter39_head_conv_shift_lane: for (uint32_t lane = 0; lane < 16; ++lane) {
+#pragma HLS unroll
+            uint32_t col = p * 16 + lane;
+            in_window[0][col] = in_window[1][col];
+            in_window[1][col] = in_window[2][col];
+            in_window[2][col] = in_window[3][col];
+            in_window[3][col] = value.data[lane];
+        }
+    }
+
+iter39_head_conv_compute: for (uint32_t p = 0; p < head_packs; ++p) {
+#pragma HLS loop_tripcount min=16 max=16
+        float o_lane[16];
+#pragma HLS array_partition variable=o_lane complete
+    iter39_head_conv_group: for (uint32_t base = 0; base < 16;
+                                 base += GDN_CONV_LANES) {
+#pragma HLS loop_tripcount min=4 max=4
+#pragma HLS pipeline II=1
+        iter39_head_conv_lane: for (uint32_t lane = 0;
+                                    lane < GDN_CONV_LANES; ++lane) {
+#pragma HLS unroll
+                uint32_t out_lane = base + lane;
+                uint32_t col = p * 16 + out_lane;
+                float sum = in_window[0][col] * w_loc[col][0]
+                          + in_window[1][col] * w_loc[col][1]
+                          + in_window[2][col] * w_loc[col][2]
+                          + in_window[3][col] * w_loc[col][3];
+                o_lane[out_lane] = gdn_silu(sum);
+            }
+        }
+        Pack16 result;
+    iter39_head_conv_pack: for (uint32_t lane = 0; lane < 16; ++lane) {
+#pragma HLS unroll
+            result.data[lane] = o_lane[lane];
+        }
+        head_out[p] = result;
+    }
+
+}
+
+/* Keep the shared mem_weights_mm0 AXI master outside the QKVG dataflow region:
+ * Vitis HLS permits only one reader process for a bundled m_axi interface.
+ * These fixed-trip transfers stage exactly the three convolution tensors and
+ * persistent tails needed by the bounded head consumer. */
+static void gdn_read_qkvg_conv_context(
+    hls::stream<Pack16> &context,
+    const float *q_weights,
+    const float *k_weights,
+    const float *v_weights,
+    const float *q_tail,
+    const float *k_tail,
+    const float *v_tail
+) {
+#pragma HLS inline off
+    const Pack16 *q_weight_words = reinterpret_cast<const Pack16 *>(q_weights);
+    const Pack16 *k_weight_words = reinterpret_cast<const Pack16 *>(k_weights);
+    const Pack16 *v_weight_words = reinterpret_cast<const Pack16 *>(v_weights);
+    const Pack16 *q_tail_words = reinterpret_cast<const Pack16 *>(q_tail);
+    const Pack16 *k_tail_words = reinterpret_cast<const Pack16 *>(k_tail);
+    const Pack16 *v_tail_words = reinterpret_cast<const Pack16 *>(v_tail);
+qkvg_context_read_q_weight: for (uint32_t p = 0; p < 512; ++p) {
+#pragma HLS pipeline II=1
+        context.write(q_weight_words[p]);
+    }
+qkvg_context_read_k_weight: for (uint32_t p = 0; p < 512; ++p) {
+#pragma HLS pipeline II=1
+        context.write(k_weight_words[p]);
+    }
+qkvg_context_read_v_weight: for (uint32_t p = 0; p < 512; ++p) {
+#pragma HLS pipeline II=1
+        context.write(v_weight_words[p]);
+    }
+qkvg_context_read_q_tail: for (uint32_t p = 0; p < 384; ++p) {
+#pragma HLS pipeline II=1
+        context.write(q_tail_words[p]);
+    }
+qkvg_context_read_k_tail: for (uint32_t p = 0; p < 384; ++p) {
+#pragma HLS pipeline II=1
+        context.write(k_tail_words[p]);
+    }
+qkvg_context_read_v_tail: for (uint32_t p = 0; p < 384; ++p) {
+#pragma HLS pipeline II=1
+        context.write(v_tail_words[p]);
+    }
+}
+
+static void gdn_store_qkvg_conv_context_stream(
+    Pack16 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    Pack16 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 16],
+    hls::stream<Pack16> &context
+) {
+#pragma HLS inline off
+#pragma HLS aggregate variable=conv_weights compact=bit
+#pragma HLS aggregate variable=conv_tails compact=bit
+
+iter39_context_q_weight: for (uint32_t p = 0;
+                              p < (GDN_HIDDEN * GDN_CONV) / 16; ++p) {
+#pragma HLS loop_tripcount min=512 max=512
+#pragma HLS pipeline II=1
+        conv_weights[0][p] = context.read();
+    }
+iter39_context_k_weight: for (uint32_t p = 0;
+                              p < (GDN_HIDDEN * GDN_CONV) / 16; ++p) {
+#pragma HLS loop_tripcount min=512 max=512
+#pragma HLS pipeline II=1
+        conv_weights[1][p] = context.read();
+    }
+iter39_context_v_weight: for (uint32_t p = 0;
+                              p < (GDN_HIDDEN * GDN_CONV) / 16; ++p) {
+#pragma HLS loop_tripcount min=512 max=512
+#pragma HLS pipeline II=1
+        conv_weights[2][p] = context.read();
+    }
+iter39_context_q_tail: for (uint32_t p = 0;
+                            p < ((GDN_CONV - 1) * GDN_HIDDEN) / 16; ++p) {
+#pragma HLS loop_tripcount min=384 max=384
+#pragma HLS pipeline II=1
+        conv_tails[0][p] = context.read();
+    }
+iter39_context_k_tail: for (uint32_t p = 0;
+                            p < ((GDN_CONV - 1) * GDN_HIDDEN) / 16; ++p) {
+#pragma HLS loop_tripcount min=384 max=384
+#pragma HLS pipeline II=1
+        conv_tails[1][p] = context.read();
+    }
+iter39_context_v_tail: for (uint32_t p = 0;
+                            p < ((GDN_CONV - 1) * GDN_HIDDEN) / 16; ++p) {
+#pragma HLS loop_tripcount min=384 max=384
+#pragma HLS pipeline II=1
+        conv_tails[2][p] = context.read();
+    }
+}
+
+static void gdn_load_qkvg_conv_context(
+    Pack16 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    Pack16 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 16],
+    const float *q_weights,
+    const float *k_weights,
+    const float *v_weights,
+    const float *q_tail,
+    const float *k_tail,
+    const float *v_tail
+) {
+#pragma HLS inline off
+    hls::stream<Pack16> context;
+#pragma HLS stream variable=context depth=64
+#pragma HLS bind_storage variable=context type=fifo impl=bram
+#pragma HLS dataflow disable_start_propagation
+    gdn_read_qkvg_conv_context(context, q_weights, k_weights, v_weights,
+                               q_tail, k_tail, v_tail);
+    gdn_store_qkvg_conv_context_stream(conv_weights, conv_tails, context);
+}
+
+static void gdn_store_qkvg_conv_tails(
+    float *q_tail,
+    float *k_tail,
+    float *v_tail,
+    const Pack16 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 16]
+) {
+#pragma HLS inline off
+#pragma HLS aggregate variable=conv_tails compact=bit
+    Pack16 *q_tail_dst = reinterpret_cast<Pack16 *>(q_tail);
+    Pack16 *k_tail_dst = reinterpret_cast<Pack16 *>(k_tail);
+    Pack16 *v_tail_dst = reinterpret_cast<Pack16 *>(v_tail);
+    const uint32_t hidden_packs = GDN_HIDDEN / 16;
+    const uint32_t tail_packs = ((GDN_CONV - 1) * GDN_HIDDEN) / 16;
+
+iter39_context_store_q: for (uint32_t p = 0; p < tail_packs; ++p) {
+#pragma HLS loop_tripcount min=384 max=384
+#pragma HLS pipeline II=1
+        uint32_t source = (p < 2 * hidden_packs)
+                        ? p + hidden_packs : p - 2 * hidden_packs;
+        q_tail_dst[p] = conv_tails[0][source];
+    }
+iter39_context_store_k: for (uint32_t p = 0; p < tail_packs; ++p) {
+#pragma HLS loop_tripcount min=384 max=384
+#pragma HLS pipeline II=1
+        uint32_t source = (p < 2 * hidden_packs)
+                        ? p + hidden_packs : p - 2 * hidden_packs;
+        k_tail_dst[p] = conv_tails[1][source];
+    }
+iter39_context_store_v: for (uint32_t p = 0; p < tail_packs; ++p) {
+#pragma HLS loop_tripcount min=384 max=384
+#pragma HLS pipeline II=1
+        uint32_t source = (p < 2 * hidden_packs)
+                        ? p + hidden_packs : p - 2 * hidden_packs;
+        v_tail_dst[p] = conv_tails[2][source];
+    }
+}
+
+static void gdn_read_recurrent_scalar_word(
+    const float *layer_a_log,
+    hls::stream<Pack16> &scalar_word
+) {
+#pragma HLS inline off
+    const Pack16 *source = reinterpret_cast<const Pack16 *>(layer_a_log);
+    scalar_word.write(source[0]);
+}
+
+static void gdn_store_recurrent_scalar_word(
+    hls::stream<Pack16> &scalar_word,
+    float a_log_storage[GDN_HEADS],
+    float dt_bias_storage[GDN_HEADS]
+) {
+#pragma HLS inline off
+    Pack16 values = scalar_word.read();
+recur_scalar_local_lane: for (uint32_t head = 0; head < GDN_HEADS; ++head) {
+#pragma HLS unroll
+        a_log_storage[head] = values.data[head];
+        dt_bias_storage[head] = values.data[GDN_HEADS + head];
+    }
+}
+
+static void gdn_load_recurrent_scalars(
+    float a_log_storage[GDN_HEADS],
+    float dt_bias_storage[GDN_HEADS],
+    const float *layer_a_log
+) {
+#pragma HLS inline off
+    hls::stream<Pack16> scalar_word;
+#pragma HLS stream variable=scalar_word depth=2
+#pragma HLS dataflow disable_start_propagation
+    gdn_read_recurrent_scalar_word(layer_a_log, scalar_word);
+    gdn_store_recurrent_scalar_word(scalar_word,
+                                    a_log_storage, dt_bias_storage);
+}
+
 /* -----------------------------------------------------------------------
  * Optimized recurrent attention with:
  *   1. One head-local URAM state buffer
@@ -928,91 +1443,128 @@ static void gdn_depthwise_conv_silu(
  * read pass, then apply a scalar correction, reducing state passes from
  * 4 to 2.
  * ----------------------------------------------------------------------- */
-static void gdn_recurrent_attention(
+static void gdn_recurrent_attention_stream(
+    hls::stream<Pack16> &q_stream,
+    hls::stream<Pack16> &k_stream,
+    hls::stream<Pack16> &v_stream,
+    hls::stream<Pack16> &state_stream0,
+    hls::stream<Pack16> &state_stream1,
+    hls::stream<Pack16> &state_stream2,
+    hls::stream<Pack16> &state_stream3,
     Pack16 *attn_out,
-    float *recurrent_state,  /* decode: per-layer state at layer_index*8*256*256; prefill: unused */
-    float *head_buffer,      /* unused: local buffers used instead */
-    const Pack16 *q,
-    const Pack16 *k,
-    const Pack16 *v,
+    float *recurrent_state0,
+    float *recurrent_state1,
+    float *recurrent_state2,
+    float *recurrent_state3,
     const float *a,
     const float *b,
     const float *layer_a_log,
     const float *layer_dt_bias,
-    uint32_t hidden,
-    uint32_t num_heads,
-    uint32_t head_dim,
-    uint32_t num_tokens,
-    uint32_t layer_index
+    uint32_t layer_index,
+    bool enabled
 ) {
+#pragma HLS inline off
+    if (!enabled)
+        return;
+
     /* Buffer one 256 x 256 FP32 head rather than restoring all eight heads
      * before computation. Each old-state word is captured while the retrieval
      * pass consumes it; each updated word is written to HBM directly from the
      * update pass. This removes the two standalone 32,768-word layer copies and
-     * reduces the state memory from 128 to an expected 16 URAMs without changing
-     * the FP32 arithmetic or external state layout. */
-    float state[GDN_DK][GDN_DV];
-#pragma HLS bind_storage variable=state type=RAM_2P impl=URAM
-#pragma HLS array_partition variable=state dim=2 cyclic factor=GDN_PK
+     * keeps the FP32 arithmetic and external state layout unchanged. Low/high
+     * columns share one 64-bit word so the 32 cyclic banks still occupy 32 URAMs
+     * while serving both halves through one address per lane. */
+    GDNStatePair state_pair[GDN_DK][GDN_DV / 2];
+#pragma HLS aggregate variable=state_pair compact=bit
+#pragma HLS bind_storage variable=state_pair type=RAM_2P impl=URAM
+#pragma HLS array_partition variable=state_pair dim=2 cyclic factor=GDN_PK
 
     float q_scale = 1.0f / sqrtf((float)GDN_DK);
     uint32_t j, i;
-    uint32_t token_index;
     /* Layer slice of the HBM-resident decode state (48 MB across 24 layers).
      * Cast the external state once and address it in native 512-bit words.
      * Merely unrolling scalar float accesses does not make HLS coalesce them:
      * iter27 measured one four-byte AXI transaction per float. */
-    size_t st_base = (size_t)layer_index * GDN_HEADS * GDN_DK * GDN_DV;
-    size_t st_base16 = st_base >> 4;
-    const Pack16 *recurrent_state_in =
-        reinterpret_cast<const Pack16 *>(recurrent_state);
-    Pack16 *recurrent_state_out =
-        reinterpret_cast<Pack16 *>(recurrent_state);
+    Pack16 *state_out0 = reinterpret_cast<Pack16 *>(recurrent_state0);
+    Pack16 *state_out1 = reinterpret_cast<Pack16 *>(recurrent_state1);
+    Pack16 *state_out2 = reinterpret_cast<Pack16 *>(recurrent_state2);
+    Pack16 *state_out3 = reinterpret_cast<Pack16 *>(recurrent_state3);
 
-    recur_token: for (token_index = 0; token_index < num_tokens; ++token_index) {
-    #pragma HLS loop_tripcount min=1 max=2048
-        uint32_t head_index;
-        recur_head: for (head_index = 0; head_index < GDN_HEADS; ++head_index) {
+    uint32_t head_index;
+    recur_head: for (head_index = 0; head_index < GDN_HEADS; ++head_index) {
         #pragma HLS loop_tripcount min=8 max=8
 
-            const Pack16 *q_head = q +
-                (size_t)token_index * (hidden / 16)
-                + (size_t)head_index * (GDN_DK / 16);
-            const Pack16 *k_head = k +
-                (size_t)token_index * (hidden / 16)
-                + (size_t)head_index * (GDN_DK / 16);
-            const Pack16 *v_head = v +
-                (size_t)token_index * (hidden / 16)
-                + (size_t)head_index * (GDN_DV / 16);
+            Pack16 q_head[GDN_DK / 16];
+            Pack16 k_head[GDN_DK / 16];
+            Pack16 v_head[GDN_DV / 16];
+#pragma HLS aggregate variable=q_head compact=bit
+#pragma HLS aggregate variable=k_head compact=bit
+#pragma HLS aggregate variable=v_head compact=bit
+        recur_stream_load_qkv: for (uint32_t p = 0;
+                                    p < GDN_DK / 16; ++p) {
+#pragma HLS loop_tripcount min=16 max=16
+#pragma HLS pipeline II=1
+                q_head[p] = q_stream.read();
+                k_head[p] = k_stream.read();
+                v_head[p] = v_stream.read();
+            }
+
             Pack16 *out_head = attn_out +
-                (size_t)token_index * (hidden / 16)
-                + (size_t)head_index * (GDN_DV / 16);
-            size_t head_state_base16 = st_base16 +
-                (size_t)head_index * GDN_DK * (GDN_DV / 16);
+                (size_t)head_index * (GDN_DV / 16);
+            /* Each port owns four Pack16 words per state row. A compact head
+             * therefore occupies 256 rows * 4 words = 1024 words per port. */
+            size_t head_state_base16 =
+                ((size_t)layer_index * GDN_HEADS + head_index) *
+                GDN_DK * (GDN_DV / 16) / GDN_RECURRENT_STATE_PORTS;
+
+            /* Drain the four state-owner streams into the state buffer before
+             * the arithmetic touches it. Iter40B read the streams directly in
+             * the 32-lane fused MAC loop; HLS consequently selected a
+             * free-running pipeline with a 28K-load control cone. Keeping the
+             * blocking FIFO reads in this narrow copy loop restores a local,
+             * regular compute pipeline while reusing state_pair as the only
+             * whole-head buffer. Start the drain immediately after Q/K/V arrive
+             * so shallow producer FIFOs can release the next head's weights. */
+        recur_stream_load_state: for (uint32_t block = 0;
+                                      block < GDN_DK * 4; ++block) {
+#pragma HLS loop_tripcount min=1024 max=1024
+#pragma HLS pipeline II=1
+                uint32_t row = block >> 2;
+                uint32_t half_column = (block & 3) * GDN_PK;
+                Pack16 state_word0 = state_stream0.read();
+                Pack16 state_word1 = state_stream1.read();
+                Pack16 state_word2 = state_stream2.read();
+                Pack16 state_word3 = state_stream3.read();
+            recur_stream_load_state_lane: for (uint32_t pp = 0;
+                                                pp < GDN_PK; ++pp) {
+#pragma HLS unroll
+                    GDNStatePair state_value;
+                    state_value.lo = pp < 16 ? state_word0.data[pp]
+                                             : state_word1.data[pp - 16];
+                    state_value.hi = pp < 16 ? state_word2.data[pp]
+                                             : state_word3.data[pp - 16];
+                    state_pair[row][half_column + pp] = state_value;
+                }
+            }
 
             /* ---- Local per-token buffers ---- */
             float q_loc[GDN_DK];
             float k_loc[GDN_DK];
             float v_loc[GDN_DV];
-            float r_buf[GDN_DV];   /* retrieval result           */
-            float o_buf[GDN_DV];   /* partial output              */
+            float r_lo[GDN_DV / 2]; /* retrieval, columns 0..127   */
+            float r_hi[GDN_DV / 2]; /* retrieval, columns 128..255 */
+            float o_lo[GDN_DV / 2]; /* partial output, low half     */
+            float o_hi[GDN_DV / 2]; /* partial output, high half    */
             float dv[GDN_DV];      /* delta correction            */
-#pragma HLS array_partition variable=r_buf cyclic factor=GDN_PK
-#pragma HLS array_partition variable=o_buf cyclic factor=GDN_PK
+#pragma HLS array_partition variable=r_lo cyclic factor=GDN_PK
+#pragma HLS array_partition variable=r_hi cyclic factor=GDN_PK
+#pragma HLS array_partition variable=o_lo cyclic factor=GDN_PK
+#pragma HLS array_partition variable=o_hi cyclic factor=GDN_PK
 #pragma HLS array_partition variable=dv    cyclic factor=GDN_PK
 #pragma HLS array_partition variable=v_loc cyclic factor=GDN_PK
 
-            /* ---- Load q, k from DRAM, square into per-element scratch ----
-             * Pipelined load loop has no carried dep (each iteration writes a
-             * different qsq[j]/ksq[j]). The L2 sums are produced by a fully-
-             * unrolled tree reduction in a separate phase. The earlier 8-lane
-             * partial accumulator was muxed by HLS into a single register and
-             * tracked as a carried dep, holding load_qk at II=2.
-             *
-             * load_qk itself is still bound by 2 m_axi reads per iter on the
-             * shared gmem port (HLS schedules them in 2 cycles), so II=2 is
-             * fundamental here without splitting q/k onto separate bundles.
-             */
+            /* Copy the streamed head into scalar scratch while preserving the
+             * original element and reduction order. */
             float qsq_arr[GDN_DK], ksq_arr[GDN_DK];
             #pragma HLS array_partition variable=qsq_arr cyclic factor=2
             #pragma HLS array_partition variable=ksq_arr cyclic factor=2
@@ -1053,8 +1605,8 @@ static void gdn_recurrent_attention(
 
             /* Scalar gates */
             float beta = gdn_sigmoid(
-                b[(size_t)token_index * num_heads + head_index]);
-            float decay_in = a[(size_t)token_index * num_heads + head_index]
+                b[head_index]);
+            float decay_in = a[head_index]
                            + layer_dt_bias[head_index];
             float decay_val = -expf(layer_a_log[head_index])
                             * gdn_softplus(decay_in);
@@ -1083,33 +1635,40 @@ static void gdn_recurrent_attention(
              * The same 512-bit word is retained in the head-local state buffer
              * for the later update, eliminating a separate restore traversal.
              */
-            init_ro: for (i = 0; i < GDN_DV; ++i) {
-            #pragma HLS loop_tripcount min=256 max=256
+            init_ro: for (i = 0; i < GDN_DV / 2; ++i) {
+            #pragma HLS loop_tripcount min=128 max=128
             #pragma HLS pipeline II=1
             #pragma HLS unroll factor=GDN_PK
-                r_buf[i] = 0.0f;
-                o_buf[i] = 0.0f;
+                r_lo[i] = 0.0f;
+                r_hi[i] = 0.0f;
+                o_lo[i] = 0.0f;
+                o_hi[i] = 0.0f;
             }
 
-            fused_rd_j: for (j = 0; j < GDN_DK; ++j) {
-            #pragma HLS loop_tripcount min=256 max=256
-                float kj = k_loc[j];
-                float qj = q_loc[j];
-                fused_rd_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
-                #pragma HLS loop_tripcount min=16 max=16
-                #pragma HLS pipeline II=1
-                    Pack16 state_word = recurrent_state_in[
-                        head_state_base16 +
-                        (size_t)j * (GDN_DV / 16) +
-                        (i >> 4)];
-                    uint32_t pp;
-                    for (pp = 0; pp < GDN_PK; ++pp) {
-                    #pragma HLS unroll
-                        float s = state_word.data[pp];
-                        state[j][i + pp] = s;
-                        r_buf[i + pp] += s * kj;
-                        o_buf[i + pp] += s * qj;
-                    }
+            /* All 32 cyclic state banks advance together. The external stream
+             * handshakes are deliberately absent from this dense MAC loop: the
+             * preceding copy already placed each low/high pair in its local
+             * URAM bank. This preserves the per-column accumulation order and
+             * Iter37's parallel low/high traversal. */
+            fused_rd0123: for (uint32_t block = 0;
+                               block < GDN_DK * 4; ++block) {
+            #pragma HLS loop_tripcount min=1024 max=1024
+            #pragma HLS pipeline II=1
+                uint32_t row = block >> 2;
+                uint32_t half_column = (block & 3) * GDN_PK;
+                float kj = k_loc[row];
+                float qj = q_loc[row];
+                uint32_t pp;
+                for (pp = 0; pp < GDN_PK; ++pp) {
+                #pragma HLS unroll
+                    GDNStatePair state_value =
+                        state_pair[row][half_column + pp];
+                    float s_lo = state_value.lo;
+                    float s_hi = state_value.hi;
+                    r_lo[half_column + pp] += s_lo * kj;
+                    o_lo[half_column + pp] += s_lo * qj;
+                    r_hi[half_column + pp] += s_hi * kj;
+                    o_hi[half_column + pp] += s_hi * qj;
                 }
             }
 
@@ -1129,9 +1688,13 @@ static void gdn_recurrent_attention(
             #pragma HLS loop_tripcount min=256 max=256
             #pragma HLS pipeline II=1
             #pragma HLS unroll factor=GDN_PK
-                float d = beta * (v_loc[i] - g * r_buf[i]);
+                float retrieval = i < GDN_DV / 2 ? r_lo[i]
+                                                  : r_hi[i - GDN_DV / 2];
+                float partial = i < GDN_DV / 2 ? o_lo[i]
+                                                : o_hi[i - GDN_DV / 2];
+                float d = beta * (v_loc[i] - g * retrieval);
                 dv[i] = d;
-                out_loc[i] = q_scale * (g * o_buf[i] + alpha * d);
+                out_loc[i] = q_scale * (g * partial + alpha * d);
             }
 
             delta_drain: for (i = 0; i < GDN_DV / 16; ++i) {
@@ -1150,30 +1713,464 @@ static void gdn_recurrent_attention(
              * Pack and persist each updated word immediately, eliminating a
              * separate save traversal of the complete layer state.
              */
-            fused_wr_j: for (j = 0; j < GDN_DK; ++j) {
-            #pragma HLS loop_tripcount min=256 max=256
-                float kj = k_loc[j];
-                fused_wr_i: for (i = 0; i < GDN_DV; i += GDN_PK) {
-                #pragma HLS loop_tripcount min=16 max=16
-                #pragma HLS pipeline II=1
-                    Pack16 state_word;
-                    uint32_t pp;
-                    for (pp = 0; pp < GDN_PK; ++pp) {
-                    #pragma HLS unroll
-                        float updated = g * state[j][i + pp]
-                                      + kj * dv[i + pp];
-                        state[j][i + pp] = updated;
-                        state_word.data[pp] = updated;
+            fused_wr0123: for (uint32_t block = 0;
+                               block < GDN_DK * 4; ++block) {
+            #pragma HLS loop_tripcount min=1024 max=1024
+            #pragma HLS pipeline II=1
+            #pragma HLS dependence variable=state_pair inter false
+                uint32_t row = block >> 2;
+                uint32_t half_column = (block & 3) * GDN_PK;
+                float kj = k_loc[row];
+                Pack16 state_word0;
+                Pack16 state_word1;
+                Pack16 state_word2;
+                Pack16 state_word3;
+                uint32_t pp;
+                for (pp = 0; pp < GDN_PK; ++pp) {
+                #pragma HLS unroll
+                    GDNStatePair old_state = state_pair[row][half_column + pp];
+                    float updated_lo = g * old_state.lo
+                                     + kj * dv[half_column + pp];
+                    float updated_hi = g * old_state.hi
+                                     + kj * dv[GDN_DV / 2 + half_column + pp];
+                    GDNStatePair updated_state;
+                    updated_state.lo = updated_lo;
+                    updated_state.hi = updated_hi;
+                    state_pair[row][half_column + pp] = updated_state;
+                    if (pp < 16) {
+                        state_word0.data[pp] = updated_lo;
+                        state_word2.data[pp] = updated_hi;
+                    } else {
+                        state_word1.data[pp - 16] = updated_lo;
+                        state_word3.data[pp - 16] = updated_hi;
                     }
-                    recurrent_state_out[
-                        head_state_base16 +
-                        (size_t)j * (GDN_DV / 16) +
-                        (i >> 4)] = state_word;
                 }
+                state_out0[head_state_base16 + block] = state_word0;
+                state_out1[head_state_base16 + block] = state_word1;
+                state_out2[head_state_base16 + block] = state_word2;
+                state_out3[head_state_base16 + block] = state_word3;
             }
-        } /* recur_head */
-    } /* recur_token */
+    } /* recur_head */
 }
+
+/* -----------------------------------------------------------------------
+ * Frequency-oriented recurrent islands.
+ *
+ * The packed state layout has a natural two-way physical cut: ports 0/2 own
+ * the first 16 columns of every 32-column block (low/high respectively), and
+ * ports 1/3 own the second 16.  Two independent actors therefore preserve the
+ * existing 32 total MAC lanes without a crossbar.  Each actor has its own FSM,
+ * 16 URAM banks, address decode, Q/K scratch, and enable cone.  The only wide
+ * interfaces between actors are forward-only BRAM FIFOs and the final
+ * alternating Pack16 merger.
+ * ----------------------------------------------------------------------- */
+#define GDN_RECURRENT_ISLAND_LANES 16
+#define GDN_RECURRENT_ISLAND_COLS  (GDN_DV / 4)
+
+static void gdn_recurrent_duplicate_qkv(
+    hls::stream<Pack16> &q_in,
+    hls::stream<Pack16> &k_in,
+    hls::stream<Pack16> &v_in,
+    hls::stream<Pack16> &q0,
+    hls::stream<Pack16> &k0,
+    hls::stream<Pack16> &v0,
+    hls::stream<Pack16> &q1,
+    hls::stream<Pack16> &k1,
+    hls::stream<Pack16> &v1
+) {
+#pragma HLS inline off
+recur_island_broadcast_head: for (uint32_t head = 0;
+                                  head < GDN_HEADS; ++head) {
+#pragma HLS loop_tripcount min=8 max=8
+    recur_island_broadcast_pack: for (uint32_t p = 0;
+                                      p < GDN_DK / 16; ++p) {
+#pragma HLS loop_tripcount min=16 max=16
+#pragma HLS pipeline II=1
+            Pack16 qv = q_in.read();
+            Pack16 kv = k_in.read();
+            Pack16 vv = v_in.read();
+            q0.write(qv);
+            k0.write(kv);
+            v0.write(vv);
+            q1.write(qv);
+            k1.write(kv);
+            v1.write(vv);
+        }
+    }
+}
+
+template <int ISLAND>
+static void gdn_recurrent_attention_island(
+    hls::stream<Pack16> &q_stream,
+    hls::stream<Pack16> &k_stream,
+    hls::stream<Pack16> &v_stream,
+    hls::stream<Pack16> &state_low_stream,
+    hls::stream<Pack16> &state_high_stream,
+    hls::stream<Pack16> &out_stream,
+    float *recurrent_state_low,
+    float *recurrent_state_high,
+    const float *a,
+    const float *b,
+    const float *layer_a_log,
+    const float *layer_dt_bias,
+    uint32_t layer_index
+) {
+#pragma HLS inline off
+    GDNStatePair state_pair[GDN_DK][GDN_RECURRENT_ISLAND_COLS];
+#pragma HLS aggregate variable=state_pair compact=bit
+#pragma HLS bind_storage variable=state_pair type=RAM_2P impl=URAM
+#pragma HLS array_partition variable=state_pair dim=2 cyclic factor=GDN_RECURRENT_ISLAND_LANES
+
+    Pack16 *state_out_low = reinterpret_cast<Pack16 *>(recurrent_state_low);
+    Pack16 *state_out_high = reinterpret_cast<Pack16 *>(recurrent_state_high);
+    const float q_scale = 1.0f / sqrtf((float)GDN_DK);
+
+recur_island_head: for (uint32_t head_index = 0;
+                        head_index < GDN_HEADS; ++head_index) {
+#pragma HLS loop_tripcount min=8 max=8
+        Pack16 q_head[GDN_DK / 16];
+        Pack16 k_head[GDN_DK / 16];
+        Pack16 v_head[GDN_DV / 16];
+#pragma HLS aggregate variable=q_head compact=bit
+#pragma HLS aggregate variable=k_head compact=bit
+#pragma HLS aggregate variable=v_head compact=bit
+
+    recur_island_load_qkv: for (uint32_t p = 0;
+                                p < GDN_DK / 16; ++p) {
+#pragma HLS loop_tripcount min=16 max=16
+#pragma HLS pipeline II=1
+            q_head[p] = q_stream.read();
+            k_head[p] = k_stream.read();
+            v_head[p] = v_stream.read();
+        }
+
+        const size_t head_state_base16 =
+            ((size_t)layer_index * GDN_HEADS + head_index) *
+            GDN_DK * (GDN_DV / 16) / GDN_RECURRENT_STATE_PORTS;
+
+    recur_island_load_state: for (uint32_t block = 0;
+                                  block < GDN_DK * 4; ++block) {
+#pragma HLS loop_tripcount min=1024 max=1024
+#pragma HLS pipeline II=1
+            const uint32_t row = block >> 2;
+            const uint32_t local_base =
+                (block & 3) * GDN_RECURRENT_ISLAND_LANES;
+            Pack16 state_low = state_low_stream.read();
+            Pack16 state_high = state_high_stream.read();
+        recur_island_load_state_lane: for (uint32_t lane = 0;
+                                            lane < GDN_RECURRENT_ISLAND_LANES;
+                                            ++lane) {
+#pragma HLS unroll
+                GDNStatePair value;
+                value.lo = state_low.data[lane];
+                value.hi = state_high.data[lane];
+                state_pair[row][local_base + lane] = value;
+            }
+        }
+
+        float q_loc[GDN_DK];
+        float k_loc[GDN_DK];
+        float v_loc[GDN_DV];
+        float qsq_arr[GDN_DK];
+        float ksq_arr[GDN_DK];
+        float alpha_prod[GDN_DK];
+#pragma HLS array_partition variable=qsq_arr cyclic factor=2
+#pragma HLS array_partition variable=ksq_arr cyclic factor=2
+#pragma HLS array_partition variable=alpha_prod cyclic factor=2
+#pragma HLS bind_storage variable=qsq_arr type=ram_2p impl=bram
+#pragma HLS bind_storage variable=ksq_arr type=ram_2p impl=bram
+#pragma HLS bind_storage variable=alpha_prod type=ram_2p impl=bram
+
+    recur_island_load_qk: for (uint32_t j = 0; j < GDN_DK; ++j) {
+#pragma HLS loop_tripcount min=256 max=256
+#pragma HLS pipeline II=1
+            float qj = q_head[j >> 4].data[j & 15];
+            float kj = k_head[j >> 4].data[j & 15];
+            q_loc[j] = qj;
+            k_loc[j] = kj;
+            qsq_arr[j] = qj * qj;
+            ksq_arr[j] = kj * kj;
+        }
+
+        float q_sq = gdn_tree_reduce_256(qsq_arr);
+        float k_sq = gdn_tree_reduce_256(ksq_arr);
+        float q_inv = 1.0f / sqrtf(q_sq + 1e-6f);
+        float k_inv = 1.0f / sqrtf(k_sq + 1e-6f);
+
+    recur_island_norm_qk: for (uint32_t j = 0; j < GDN_DK; ++j) {
+#pragma HLS loop_tripcount min=256 max=256
+#pragma HLS pipeline II=1
+            q_loc[j] *= q_inv;
+            k_loc[j] *= k_inv;
+        }
+    recur_island_load_v: for (uint32_t i = 0; i < GDN_DV; ++i) {
+#pragma HLS loop_tripcount min=256 max=256
+#pragma HLS pipeline II=1
+            v_loc[i] = v_head[i >> 4].data[i & 15];
+        }
+
+        const float beta = gdn_sigmoid(b[head_index]);
+        const float decay_in = a[head_index] + layer_dt_bias[head_index];
+        const float decay_val = -expf(layer_a_log[head_index]) *
+                                gdn_softplus(decay_in);
+        const float decay = expf(decay_val);
+
+    recur_island_alpha_product: for (uint32_t j = 0; j < GDN_DK; ++j) {
+#pragma HLS loop_tripcount min=256 max=256
+#pragma HLS pipeline II=1
+            alpha_prod[j] = q_loc[j] * k_loc[j];
+        }
+        const float alpha = gdn_tree_reduce_256(alpha_prod);
+
+        float retrieval_lo[GDN_RECURRENT_ISLAND_COLS];
+        float retrieval_hi[GDN_RECURRENT_ISLAND_COLS];
+        float partial_lo[GDN_RECURRENT_ISLAND_COLS];
+        float partial_hi[GDN_RECURRENT_ISLAND_COLS];
+        float delta_lo[GDN_RECURRENT_ISLAND_COLS];
+        float delta_hi[GDN_RECURRENT_ISLAND_COLS];
+        float output_lo[GDN_RECURRENT_ISLAND_COLS];
+        float output_hi[GDN_RECURRENT_ISLAND_COLS];
+#pragma HLS array_partition variable=retrieval_lo cyclic factor=GDN_RECURRENT_ISLAND_LANES
+#pragma HLS array_partition variable=retrieval_hi cyclic factor=GDN_RECURRENT_ISLAND_LANES
+#pragma HLS array_partition variable=partial_lo cyclic factor=GDN_RECURRENT_ISLAND_LANES
+#pragma HLS array_partition variable=partial_hi cyclic factor=GDN_RECURRENT_ISLAND_LANES
+#pragma HLS array_partition variable=delta_lo cyclic factor=GDN_RECURRENT_ISLAND_LANES
+#pragma HLS array_partition variable=delta_hi cyclic factor=GDN_RECURRENT_ISLAND_LANES
+#pragma HLS array_partition variable=output_lo cyclic factor=GDN_RECURRENT_ISLAND_LANES
+#pragma HLS array_partition variable=output_hi cyclic factor=GDN_RECURRENT_ISLAND_LANES
+
+    recur_island_init: for (uint32_t i = 0;
+                            i < GDN_RECURRENT_ISLAND_COLS; ++i) {
+#pragma HLS loop_tripcount min=64 max=64
+#pragma HLS pipeline II=1
+#pragma HLS unroll factor=GDN_RECURRENT_ISLAND_LANES
+            retrieval_lo[i] = 0.0f;
+            retrieval_hi[i] = 0.0f;
+            partial_lo[i] = 0.0f;
+            partial_hi[i] = 0.0f;
+        }
+
+    recur_island_read: for (uint32_t block = 0;
+                            block < GDN_DK * 4; ++block) {
+#pragma HLS loop_tripcount min=1024 max=1024
+#pragma HLS pipeline II=1
+            const uint32_t row = block >> 2;
+            const uint32_t local_base =
+                (block & 3) * GDN_RECURRENT_ISLAND_LANES;
+            const float kj = k_loc[row];
+            const float qj = q_loc[row];
+        recur_island_read_lane: for (uint32_t lane = 0;
+                                      lane < GDN_RECURRENT_ISLAND_LANES;
+                                      ++lane) {
+#pragma HLS unroll
+                GDNStatePair state_value =
+                    state_pair[row][local_base + lane];
+                retrieval_lo[local_base + lane] += state_value.lo * kj;
+                retrieval_hi[local_base + lane] += state_value.hi * kj;
+                partial_lo[local_base + lane] += state_value.lo * qj;
+                partial_hi[local_base + lane] += state_value.hi * qj;
+            }
+        }
+
+    /* Process 16 columns per island per cycle. Across both concurrently
+     * running islands this retains the original aggregate 32-column width. */
+    recur_island_delta: for (uint32_t logical = 0;
+                             logical < 2 * GDN_RECURRENT_ISLAND_COLS;
+                             ++logical) {
+#pragma HLS loop_tripcount min=128 max=128
+#pragma HLS pipeline II=1
+#pragma HLS unroll factor=GDN_RECURRENT_ISLAND_LANES
+            const bool high = logical >= GDN_RECURRENT_ISLAND_COLS;
+            const uint32_t local = high
+                ? logical - GDN_RECURRENT_ISLAND_COLS : logical;
+            const uint32_t physical =
+                (high ? GDN_DV / 2 : 0) +
+                (local / GDN_RECURRENT_ISLAND_LANES) *
+                    (2 * GDN_RECURRENT_ISLAND_LANES) +
+                ISLAND * GDN_RECURRENT_ISLAND_LANES +
+                (local % GDN_RECURRENT_ISLAND_LANES);
+            const float retrieval = high ? retrieval_hi[local]
+                                         : retrieval_lo[local];
+            const float partial = high ? partial_hi[local]
+                                       : partial_lo[local];
+            const float delta = beta * (v_loc[physical] - decay * retrieval);
+            const float output = q_scale *
+                (decay * partial + alpha * delta);
+            if (high) {
+                delta_hi[local] = delta;
+                output_hi[local] = output;
+            } else {
+                delta_lo[local] = delta;
+                output_lo[local] = output;
+            }
+        }
+
+    recur_island_output_half: for (uint32_t half = 0; half < 2; ++half) {
+        recur_island_output_block: for (uint32_t block = 0;
+                                        block < 4; ++block) {
+#pragma HLS pipeline II=1
+                Pack16 output_word;
+            recur_island_output_lane: for (uint32_t lane = 0;
+                                            lane < GDN_RECURRENT_ISLAND_LANES;
+                                            ++lane) {
+#pragma HLS unroll
+                    uint32_t local =
+                        block * GDN_RECURRENT_ISLAND_LANES + lane;
+                    output_word.data[lane] = half == 0
+                        ? output_lo[local] : output_hi[local];
+                }
+                out_stream.write(output_word);
+            }
+        }
+
+    recur_island_update: for (uint32_t block = 0;
+                              block < GDN_DK * 4; ++block) {
+#pragma HLS loop_tripcount min=1024 max=1024
+#pragma HLS pipeline II=1
+#pragma HLS dependence variable=state_pair inter false
+            const uint32_t row = block >> 2;
+            const uint32_t local_base =
+                (block & 3) * GDN_RECURRENT_ISLAND_LANES;
+            const float kj = k_loc[row];
+            Pack16 state_low;
+            Pack16 state_high;
+        recur_island_update_lane: for (uint32_t lane = 0;
+                                        lane < GDN_RECURRENT_ISLAND_LANES;
+                                        ++lane) {
+#pragma HLS unroll
+                const uint32_t local = local_base + lane;
+                GDNStatePair old_state = state_pair[row][local];
+                const float updated_lo =
+                    decay * old_state.lo + kj * delta_lo[local];
+                const float updated_hi =
+                    decay * old_state.hi + kj * delta_hi[local];
+                GDNStatePair updated_state;
+                updated_state.lo = updated_lo;
+                updated_state.hi = updated_hi;
+                state_pair[row][local] = updated_state;
+                state_low.data[lane] = updated_lo;
+                state_high.data[lane] = updated_hi;
+            }
+            state_out_low[head_state_base16 + block] = state_low;
+            state_out_high[head_state_base16 + block] = state_high;
+        }
+    }
+}
+
+static void gdn_recurrent_merge_islands(
+    hls::stream<Pack16> &out0,
+    hls::stream<Pack16> &out1,
+    Pack16 *attn_out
+) {
+#pragma HLS inline off
+recur_island_merge_head: for (uint32_t head = 0;
+                              head < GDN_HEADS; ++head) {
+#pragma HLS loop_tripcount min=8 max=8
+    recur_island_merge_half: for (uint32_t half = 0; half < 2; ++half) {
+        recur_island_merge_block: for (uint32_t block = 0;
+                                       block < 4; ++block) {
+#pragma HLS pipeline II=1
+                const size_t base = (size_t)head * (GDN_DV / 16) +
+                                    half * 8 + block * 2;
+                attn_out[base] = out0.read();
+                attn_out[base + 1] = out1.read();
+            }
+        }
+    }
+}
+
+static void gdn_recurrent_attention_islands_dataflow(
+    hls::stream<Pack16> &q_stream,
+    hls::stream<Pack16> &k_stream,
+    hls::stream<Pack16> &v_stream,
+    hls::stream<Pack16> &state_stream0,
+    hls::stream<Pack16> &state_stream1,
+    hls::stream<Pack16> &state_stream2,
+    hls::stream<Pack16> &state_stream3,
+    Pack16 *attn_out,
+    float *recurrent_state0,
+    float *recurrent_state1,
+    float *recurrent_state2,
+    float *recurrent_state3,
+    const float *a,
+    const float *b,
+    const float *layer_a_log,
+    const float *layer_dt_bias,
+    uint32_t layer_index
+) {
+#pragma HLS inline off
+    hls::stream<Pack16> q0, k0, v0, q1, k1, v1;
+    hls::stream<Pack16> out0, out1;
+#pragma HLS stream variable=q0 depth=32
+#pragma HLS stream variable=k0 depth=32
+#pragma HLS stream variable=v0 depth=32
+#pragma HLS stream variable=q1 depth=32
+#pragma HLS stream variable=k1 depth=32
+#pragma HLS stream variable=v1 depth=32
+#pragma HLS stream variable=out0 depth=16
+#pragma HLS stream variable=out1 depth=16
+    /* These eight queues exist only inside the SLR2 recurrent wrapper. At
+     * depths 16/32 their BRAM implementation consumed about 112 RAMB18s and
+     * pushed both outer SLRs above 92% BRAM while SLR1 remained at 62.5%.
+     * LUTRAM costs only about 3.6K LUTs here; keep the 69 high-traffic GEMV
+     * decouplers in BRAM, where LUTRAM would cost roughly 60K LUTs. */
+#pragma HLS bind_storage variable=q0 type=fifo impl=lutram
+#pragma HLS bind_storage variable=k0 type=fifo impl=lutram
+#pragma HLS bind_storage variable=v0 type=fifo impl=lutram
+#pragma HLS bind_storage variable=q1 type=fifo impl=lutram
+#pragma HLS bind_storage variable=k1 type=fifo impl=lutram
+#pragma HLS bind_storage variable=v1 type=fifo impl=lutram
+#pragma HLS bind_storage variable=out0 type=fifo impl=lutram
+#pragma HLS bind_storage variable=out1 type=fifo impl=lutram
+
+#pragma HLS dataflow disable_start_propagation
+    gdn_recurrent_duplicate_qkv(q_stream, k_stream, v_stream,
+                                q0, k0, v0, q1, k1, v1);
+    gdn_recurrent_attention_island<0>(
+        q0, k0, v0, state_stream0, state_stream2, out0,
+        recurrent_state0, recurrent_state2,
+        a, b, layer_a_log, layer_dt_bias, layer_index);
+    gdn_recurrent_attention_island<1>(
+        q1, k1, v1, state_stream1, state_stream3, out1,
+        recurrent_state1, recurrent_state3,
+        a, b, layer_a_log, layer_dt_bias, layer_index);
+    gdn_recurrent_merge_islands(out0, out1, attn_out);
+}
+
+static void gdn_recurrent_attention_islands(
+    hls::stream<Pack16> &q_stream,
+    hls::stream<Pack16> &k_stream,
+    hls::stream<Pack16> &v_stream,
+    hls::stream<Pack16> &state_stream0,
+    hls::stream<Pack16> &state_stream1,
+    hls::stream<Pack16> &state_stream2,
+    hls::stream<Pack16> &state_stream3,
+    Pack16 *attn_out,
+    float *recurrent_state0,
+    float *recurrent_state1,
+    float *recurrent_state2,
+    float *recurrent_state3,
+    const float *a,
+    const float *b,
+    const float *layer_a_log,
+    const float *layer_dt_bias,
+    uint32_t layer_index,
+    bool enabled
+) {
+#pragma HLS inline off
+    if (!enabled)
+        return;
+    gdn_recurrent_attention_islands_dataflow(
+        q_stream, k_stream, v_stream,
+        state_stream0, state_stream1, state_stream2, state_stream3,
+        attn_out,
+        recurrent_state0, recurrent_state1,
+        recurrent_state2, recurrent_state3,
+        a, b, layer_a_log, layer_dt_bias, layer_index);
+}
+
+#undef GDN_RECURRENT_ISLAND_COLS
+#undef GDN_RECURRENT_ISLAND_LANES
 
 static void gdn_output_norm_and_gate(
     Pack16 *attn,
@@ -1325,6 +2322,65 @@ copy_local: for (uint32_t i = 0; i < count16; ++i) {
     }
 }
 
+/* Deinterleave the head-serial/all-port result of the unified Q/K/V/gate GEMV.
+ * gemv32_store presents channel-major output: each channel contains two packs
+ * per head. Eight adjacent channels make one Q/K/V/gate kind. Reconstruct the
+ * existing natural [head][head_dim] consumer buffers one Pack16 at a time. */
+static void gdn_unpack_qkvg_local(
+    Pack16 *q, Pack16 *k, Pack16 *v, Pack16 *gate,
+    const Pack16 *qkvg
+) {
+#pragma HLS inline
+qkvg_unpack_channel: for (uint32_t channel = 0;
+                          channel < GEMV_CHANNELS; ++channel) {
+    uint32_t kind = channel / (GEMV_CHANNELS / 4);
+    uint32_t segment = channel % (GEMV_CHANNELS / 4);
+qkvg_unpack_channel_pack: for (uint32_t channel_pack = 0;
+                               channel_pack < GDN_HEADS * 2;
+                               ++channel_pack) {
+#pragma HLS loop_tripcount min=16 max=16
+#pragma HLS pipeline II=1
+        uint32_t head = channel_pack >> 1;
+        uint32_t half = channel_pack & 1;
+        Pack16 value = qkvg[channel * (GDN_HEADS * 2) + channel_pack];
+        uint32_t destination = head * (GDN_HEAD_DIM / 16)
+                             + segment * 2 + half;
+        if (kind == 0)
+            q[destination] = value;
+        else if (kind == 1)
+            k[destination] = value;
+        else if (kind == 2)
+            v[destination] = value;
+        else
+            gate[destination] = value;
+    }
+}
+}
+
+/* Deinterleave [chunk0 gate,up, chunk1 gate,up, ...] from the unified GU
+ * command into the existing natural-row gate and up buffers. */
+static void gdn_unpack_gu_local(
+    Pack16 *gate, Pack16 *up, const Pack16 *gu
+) {
+#pragma HLS inline
+gu_unpack_block: for (uint32_t block = 0; block < GEMV_CHANNELS; ++block) {
+    uint32_t chunk = block >> 1;
+    uint32_t kind = block & 1;
+gu_unpack_pack: for (uint32_t p = 0;
+                     p < (GDN_INTER / (GEMV_CHANNELS / 2)) / 16; ++p) {
+#pragma HLS loop_tripcount min=22 max=22
+#pragma HLS pipeline II=1
+        Pack16 value = gu[block * ((GDN_INTER / (GEMV_CHANNELS / 2)) / 16) + p];
+        uint32_t destination =
+            chunk * ((GDN_INTER / (GEMV_CHANNELS / 2)) / 16) + p;
+        if (kind == 0)
+            gate[destination] = value;
+        else
+            up[destination] = value;
+    }
+}
+}
+
 static void gdn_pack16_add_local(
     Pack16 *residual, const Pack16 *projection, uint32_t count16
 ) {
@@ -1352,9 +2408,18 @@ static void gdn_gemv(
     const float *w16, const float *w17, const float *w18, const float *w19,
     const float *w20, const float *w21, const float *w22, const float *w23,
     const float *w24, const float *w25, const float *w26, const float *w27,
-    const float *w28, const float *w29, const float *w30, const float *w31,
+    float *w28, float *w29, float *w30, float *w31,
     uint32_t w_pack_off,
-    uint32_t num_rows, uint32_t in_dim, uint32_t out_dim);
+    uint32_t num_rows, uint32_t in_dim, uint32_t out_dim,
+    bool qkvg_recurrent_mode,
+    Pack16 *attn_out, Pack16 *gate_out,
+    const Pack16 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    Pack16 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 16],
+    const float a[GDN_HEADS],
+    const float b[GDN_HEADS],
+    const float layer_a_log[GDN_HEADS],
+    const float layer_dt_bias[GDN_HEADS],
+    uint32_t layer_index);
 
 /* Vitis HLS 2022.1 does not synthesize arrays of pointers. This expands each
  * call to the explicit scalar pointer interface above. */
@@ -1400,10 +2465,10 @@ int gdn_forward(
     const float *weight_data_mm25,
     const float *weight_data_mm26,
     const float *weight_data_mm27,
-    const float *weight_data_mm28,
-    const float *weight_data_mm29,
-    const float *weight_data_mm30,
-    const float *weight_data_mm31
+    float *weight_data_mm28,
+    float *weight_data_mm29,
+    float *weight_data_mm30,
+    float *weight_data_mm31
 ) {
     /* Depths match gdn-1.3b-f32.gdnw: hidden=2048 heads=8 head_dim=256
     intermediate=5632 layers=24 conv=4 max_seq_len=2048 vocab=32000 */
@@ -1429,37 +2494,37 @@ int gdn_forward(
      * Do not use the full-model float count here: it exceeds one AXI address
      * range and corrupts the metadata consumed by the Vitis platform linker. */
     #pragma HLS interface m_axi port=weight_data_mm0 depth=43728896 offset=slave bundle=mem_weights_mm0 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=64 max_write_burst_length=64 num_write_outstanding=64
-    #pragma HLS interface m_axi port=weight_data_mm1 depth=43728896 offset=slave bundle=mem_weights_mm1 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm2 depth=43728896 offset=slave bundle=mem_weights_mm2 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm3 depth=43728896 offset=slave bundle=mem_weights_mm3 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm4 depth=43728896 offset=slave bundle=mem_weights_mm4 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm5 depth=43728896 offset=slave bundle=mem_weights_mm5 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm6 depth=43728896 offset=slave bundle=mem_weights_mm6 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm7 depth=43728896 offset=slave bundle=mem_weights_mm7 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm8 depth=43728896 offset=slave bundle=mem_weights_mm8 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm9 depth=43728896 offset=slave bundle=mem_weights_mm9 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm10 depth=43728896 offset=slave bundle=mem_weights_mm10 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm11 depth=43728896 offset=slave bundle=mem_weights_mm11 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm12 depth=43728896 offset=slave bundle=mem_weights_mm12 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm13 depth=43728896 offset=slave bundle=mem_weights_mm13 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm14 depth=43728896 offset=slave bundle=mem_weights_mm14 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm15 depth=43728896 offset=slave bundle=mem_weights_mm15 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm16 depth=43728896 offset=slave bundle=mem_weights_mm16 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm17 depth=43728896 offset=slave bundle=mem_weights_mm17 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm18 depth=43728896 offset=slave bundle=mem_weights_mm18 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm19 depth=43728896 offset=slave bundle=mem_weights_mm19 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm20 depth=43728896 offset=slave bundle=mem_weights_mm20 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm21 depth=43728896 offset=slave bundle=mem_weights_mm21 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm22 depth=43728896 offset=slave bundle=mem_weights_mm22 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm23 depth=43728896 offset=slave bundle=mem_weights_mm23 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm24 depth=43728896 offset=slave bundle=mem_weights_mm24 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm25 depth=43728896 offset=slave bundle=mem_weights_mm25 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm26 depth=43728896 offset=slave bundle=mem_weights_mm26 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm27 depth=43728896 offset=slave bundle=mem_weights_mm27 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm28 depth=43728896 offset=slave bundle=mem_weights_mm28 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm29 depth=43728896 offset=slave bundle=mem_weights_mm29 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm30 depth=43728896 offset=slave bundle=mem_weights_mm30 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
-    #pragma HLS interface m_axi port=weight_data_mm31 depth=43728896 offset=slave bundle=mem_weights_mm31 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=8
+    #pragma HLS interface m_axi port=weight_data_mm1 depth=43728896 offset=slave bundle=mem_weights_mm1 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm2 depth=43728896 offset=slave bundle=mem_weights_mm2 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm3 depth=43728896 offset=slave bundle=mem_weights_mm3 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm4 depth=43728896 offset=slave bundle=mem_weights_mm4 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm5 depth=43728896 offset=slave bundle=mem_weights_mm5 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm6 depth=43728896 offset=slave bundle=mem_weights_mm6 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm7 depth=43728896 offset=slave bundle=mem_weights_mm7 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm8 depth=43728896 offset=slave bundle=mem_weights_mm8 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm9 depth=43728896 offset=slave bundle=mem_weights_mm9 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm10 depth=43728896 offset=slave bundle=mem_weights_mm10 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm11 depth=43728896 offset=slave bundle=mem_weights_mm11 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm12 depth=43728896 offset=slave bundle=mem_weights_mm12 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm13 depth=43728896 offset=slave bundle=mem_weights_mm13 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm14 depth=43728896 offset=slave bundle=mem_weights_mm14 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm15 depth=43728896 offset=slave bundle=mem_weights_mm15 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm16 depth=43728896 offset=slave bundle=mem_weights_mm16 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm17 depth=43728896 offset=slave bundle=mem_weights_mm17 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm18 depth=43728896 offset=slave bundle=mem_weights_mm18 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm19 depth=43728896 offset=slave bundle=mem_weights_mm19 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm20 depth=43728896 offset=slave bundle=mem_weights_mm20 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm21 depth=43728896 offset=slave bundle=mem_weights_mm21 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm22 depth=43728896 offset=slave bundle=mem_weights_mm22 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm23 depth=43728896 offset=slave bundle=mem_weights_mm23 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm24 depth=43728896 offset=slave bundle=mem_weights_mm24 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm25 depth=43728896 offset=slave bundle=mem_weights_mm25 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm26 depth=43728896 offset=slave bundle=mem_weights_mm26 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm27 depth=43728896 offset=slave bundle=mem_weights_mm27 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+    #pragma HLS interface m_axi port=weight_data_mm28 depth=46874624 offset=slave bundle=mem_weights_mm28 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+    #pragma HLS interface m_axi port=weight_data_mm29 depth=46874624 offset=slave bundle=mem_weights_mm29 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+    #pragma HLS interface m_axi port=weight_data_mm30 depth=46874624 offset=slave bundle=mem_weights_mm30 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+    #pragma HLS interface m_axi port=weight_data_mm31 depth=46874624 offset=slave bundle=mem_weights_mm31 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
     /* step 4 Stage B: the 15 activation/state buffers are packed into this one
      * workspace pointer (GDN_WS_OFF_* layout in gdn_model.h), replacing 15 m_axi
      * ports and their control_s_axi base-address registers. Read+write, HBM0. */
@@ -1490,41 +2555,50 @@ int gdn_forward(
      * are reused for the MLP gate/up vectors after recurrence consumes q/k. */
     float *workspace_x     = workspace + GDN_WS_OFF_X;
     float *workspace_out   = workspace + GDN_WS_OFF_X_NORM;
-    float *recurrent_state = workspace + GDN_WS_OFF_REC_STATE;
     float *head_buffer     = workspace + GDN_WS_OFF_HEAD_BUF;
-
     Pack16 x_storage[GDN_HIDDEN / 16];
     Pack16 norm_attn_storage[GDN_HIDDEN / 16];
     Pack16 q_mlp_gate_storage[GDN_INTER / 16];
     Pack16 k_mlp_up_storage[GDN_INTER / 16];
-    Pack16 v_storage[GDN_INTER / 16];
     Pack16 gate_storage[GDN_HIDDEN / 16];
     Pack16 gemv_in_storage[GDN_INTER / 16];
-    Pack16 gemv_out_storage[GDN_INTER / 16];
+    Pack16 gemv_out_storage[(2 * GDN_INTER) / 16];
+    Pack16 conv_weight_storage[3][(GDN_HIDDEN * GDN_CONV) / 16];
+    Pack16 conv_tail_storage[3][((GDN_CONV - 1) * GDN_HIDDEN) / 16];
     float a_storage[16];
     float b_storage[16];
+    float a_log_storage[GDN_HEADS];
+    float dt_bias_storage[GDN_HEADS];
 #pragma HLS bind_storage variable=x_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=norm_attn_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=q_mlp_gate_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=k_mlp_up_storage type=ram_2p impl=bram
-#pragma HLS bind_storage variable=v_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=gate_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=gemv_in_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=gemv_out_storage type=ram_2p impl=bram
+#pragma HLS bind_storage variable=conv_weight_storage type=ram_2p impl=bram
+#pragma HLS bind_storage variable=conv_tail_storage type=ram_2p impl=bram
+#pragma HLS array_partition variable=conv_weight_storage complete dim=1
+#pragma HLS array_partition variable=conv_tail_storage complete dim=1
+#pragma HLS aggregate variable=conv_weight_storage compact=bit
+#pragma HLS aggregate variable=conv_tail_storage compact=bit
 #pragma HLS array_partition variable=a_storage complete dim=1
 #pragma HLS array_partition variable=b_storage complete dim=1
+#pragma HLS array_partition variable=a_log_storage complete dim=1
+#pragma HLS array_partition variable=dt_bias_storage complete dim=1
 
     float *a = a_storage;
     float *b = b_storage;
 
     mlp_count = (size_t)num_tokens * intermediate;
 
-    /* Compact-shard geometry (Pack16 units): each gemv projection's output stripe
-     * (out_dim/GEMV_CHANNELS rows) occupies stripe_packs in every shard, packed
-     * per layer in the order q,k,v,gate,o,mlp_gate,mlp_up,mlp_down — matching
-     * gdn_build_weight_shards. */
+    /* Compact-shard geometry (Pack16 units): the first per-layer segment is one
+     * head-major Q/K/V/gate command (four old HxH stripe lengths), followed by
+     * O, one pair-interleaved gate/up command, and MLP-down. */
     size_t shard_hh = (size_t)(hidden / GEMV_CHANNELS) * (hidden / 16);
+    size_t shard_qkvg = 4 * shard_hh;
     size_t shard_ih = (size_t)(intermediate / GEMV_CHANNELS) * (hidden / 16);
+    size_t shard_gu = 2 * shard_ih;
     size_t shard_di = (size_t)(hidden / GEMV_CHANNELS) * (intermediate / 16);
     size_t shard_per_layer = 5 * shard_hh + 2 * shard_ih + shard_di;
 
@@ -1574,74 +2648,48 @@ int gdn_forward(
         layer_offset += head_dim;
         layer_mlp_norm = aux_weights + layer_offset;
 
-        /* Running compact-shard offset (Pack16); order q,k,v,gate,o,mlp_gate,
-         * mlp_up,mlp_down — matches gdn_build_weight_shards. */
+        /* Running compact-shard offset (Pack16); order qkvg,o,gu,mlp_down —
+         * matches gdn_build_weight_shards. */
         size_t soff = (size_t)layer_index * shard_per_layer;
 
         gdn_rmsnorm_rows(norm_attn_storage, x_storage, layer_attn_norm,
                          num_tokens, hidden, GDN_NORM_EPS);
         gdn_pack16_copy_local(gemv_in_storage, norm_attn_storage,
                               hidden / 16);
-        gdn_gemv(gemv_out_storage, gemv_in_storage,
-                 GDN_GEMV_SHARD_ARGUMENTS,
-                 (uint32_t)soff, num_tokens, hidden, hidden);
-        gdn_pack16_copy_local(q_mlp_gate_storage, gemv_out_storage,
-                              hidden / 16);
-        soff += shard_hh;
-        gdn_gemv(gemv_out_storage, gemv_in_storage,
-                 GDN_GEMV_SHARD_ARGUMENTS,
-                 (uint32_t)soff, num_tokens, hidden, hidden);
-        gdn_pack16_copy_local(k_mlp_up_storage, gemv_out_storage,
-                              hidden / 16);
-        soff += shard_hh;
-        gdn_gemv(gemv_out_storage, gemv_in_storage,
-                 GDN_GEMV_SHARD_ARGUMENTS,
-                 (uint32_t)soff, num_tokens, hidden, hidden);
-        gdn_pack16_copy_local(v_storage, gemv_out_storage, hidden / 16);
-        soff += shard_hh;
+        /* Recurrence consumes each convolved head inside the QKVG dataflow
+         * graph. Stage every auxiliary scalar before that graph starts so the
+         * shared mem_weights_mm0 adapter retains a single active reader. */
         gdn_gemv_tiny(a, norm_attn_storage, layer_a_proj,
                       num_tokens, hidden, num_heads);
         gdn_gemv_tiny(b, norm_attn_storage, layer_b_proj,
                       num_tokens, hidden, num_heads);
-        gdn_gemv(gemv_out_storage, gemv_in_storage,
-                 GDN_GEMV_SHARD_ARGUMENTS,
-                 (uint32_t)soff, num_tokens, hidden, hidden);
-        gdn_pack16_copy_local(gate_storage, gemv_out_storage, hidden / 16);
-        soff += shard_hh;
+        (void)layer_dt_bias;
+        gdn_load_recurrent_scalars(a_log_storage, dt_bias_storage,
+                                   layer_a_log);
 
         /* Per-(layer, conv) slice of the persistent conv tail in head_buffer:
-         * 3 convs/layer × (conv_size-1) rows × hidden floats. */
+         * 3 convs/layer x (conv_size-1) rows x hidden floats. Iter39B passes
+         * these into the QKVG result sink so head h convolution overlaps GEMV
+         * production of head h+1. */
         size_t tail_stride = (size_t)(GDN_CONV - 1) * hidden;
         float *q_tail = head_buffer + ((size_t)layer_index * 3 + 0) * tail_stride;
         float *k_tail = head_buffer + ((size_t)layer_index * 3 + 1) * tail_stride;
         float *v_tail = head_buffer + ((size_t)layer_index * 3 + 2) * tail_stride;
 
-        gdn_depthwise_conv_silu(q_mlp_gate_storage, q_mlp_gate_storage,
-                                layer_q_conv, q_tail, num_tokens, hidden,
-                                GDN_CONV);
-        gdn_depthwise_conv_silu(k_mlp_up_storage, k_mlp_up_storage,
-                                layer_k_conv, k_tail, num_tokens, hidden,
-                                GDN_CONV);
-        gdn_depthwise_conv_silu(v_storage, v_storage, layer_v_conv, v_tail,
-                                num_tokens, hidden, GDN_CONV);
-
-        gdn_recurrent_attention(
-            norm_attn_storage,
-            recurrent_state,
-            head_buffer,
-            q_mlp_gate_storage,
-            k_mlp_up_storage,
-            v_storage,
-            a,
-            b,
-            layer_a_log,
-            layer_dt_bias,
-            hidden,
-            num_heads,
-            head_dim,
-            num_tokens,
-            layer_index
-        );
+        gdn_load_qkvg_conv_context(
+            conv_weight_storage, conv_tail_storage,
+            layer_q_conv, layer_k_conv, layer_v_conv,
+            q_tail, k_tail, v_tail);
+        gdn_gemv(gemv_out_storage, gemv_in_storage,
+                 GDN_GEMV_SHARD_ARGUMENTS,
+                 (uint32_t)soff, num_tokens, hidden, 4 * hidden,
+                 true,
+                 norm_attn_storage, gate_storage,
+                 conv_weight_storage, conv_tail_storage,
+                 a, b, a_log_storage, dt_bias_storage, layer_index);
+        gdn_store_qkvg_conv_tails(q_tail, k_tail, v_tail,
+                                  conv_tail_storage);
+        soff += shard_qkvg;
         gdn_output_norm_and_gate(norm_attn_storage, gate_storage,
                                  layer_o_norm, num_tokens, num_heads,
                                  head_dim, GDN_NORM_EPS);
@@ -1649,7 +2697,11 @@ int gdn_forward(
                               hidden / 16);
         gdn_gemv(gemv_out_storage, gemv_in_storage,
                  GDN_GEMV_SHARD_ARGUMENTS,
-                 (uint32_t)soff, num_tokens, hidden, hidden);
+                 (uint32_t)soff, num_tokens, hidden, hidden,
+                 false,
+                 norm_attn_storage, gate_storage,
+                 conv_weight_storage, conv_tail_storage,
+                 a, b, a_log_storage, dt_bias_storage, layer_index);
         gdn_pack16_add_local(x_storage, gemv_out_storage, hidden / 16);
         soff += shard_hh;
 
@@ -1659,27 +2711,39 @@ int gdn_forward(
                               hidden / 16);
         gdn_gemv(gemv_out_storage, gemv_in_storage,
                  GDN_GEMV_SHARD_ARGUMENTS,
-                 (uint32_t)soff, num_tokens, hidden, intermediate);
-        gdn_pack16_copy_local(q_mlp_gate_storage, gemv_out_storage,
-                              intermediate / 16);
-        soff += shard_ih;
-        gdn_gemv(gemv_out_storage, gemv_in_storage,
-                 GDN_GEMV_SHARD_ARGUMENTS,
-                 (uint32_t)soff, num_tokens, hidden, intermediate);
-        gdn_pack16_copy_local(k_mlp_up_storage, gemv_out_storage,
-                              intermediate / 16);
-        soff += shard_ih;
+                 (uint32_t)soff, num_tokens, hidden, 2 * intermediate,
+                 false,
+                 norm_attn_storage, gate_storage,
+                 conv_weight_storage, conv_tail_storage,
+                 a, b, a_log_storage, dt_bias_storage, layer_index);
+        gdn_unpack_gu_local(q_mlp_gate_storage, k_mlp_up_storage,
+                            gemv_out_storage);
+        soff += shard_gu;
         gdn_swiglu_inplace(q_mlp_gate_storage, k_mlp_up_storage, mlp_count);
         gdn_pack16_copy_local(gemv_in_storage, q_mlp_gate_storage,
                               intermediate / 16);
         gdn_gemv(gemv_out_storage, gemv_in_storage,
                  GDN_GEMV_SHARD_ARGUMENTS,
-                 (uint32_t)soff, num_tokens, intermediate, hidden);
+                 (uint32_t)soff, num_tokens, intermediate, hidden,
+                 false,
+                 norm_attn_storage, gate_storage,
+                 conv_weight_storage, conv_tail_storage,
+                 a, b, a_log_storage, dt_bias_storage, layer_index);
         gdn_pack16_add_local(x_storage, gemv_out_storage, hidden / 16);
     }
 
     gdn_rmsnorm_rows(norm_attn_storage, x_storage, final_norm,
                      num_tokens, hidden, GDN_NORM_EPS);
+#ifndef __SYNTHESIS__
+    if (gdn_native_final_hidden_debug != NULL) {
+        for (uint32_t p = 0; p < GDN_HIDDEN / 16; ++p) {
+            for (uint32_t lane = 0; lane < 16; ++lane) {
+                gdn_native_final_hidden_debug[p * 16 + lane] =
+                    norm_attn_storage[p].data[lane];
+            }
+        }
+    }
+#endif
     /* The LM-head store reduces its existing reorder buffer directly to argmax;
      * no 32,000-float logits tensor is materialized in HBM. */
     {
@@ -1688,7 +2752,11 @@ int gdn_forward(
                               hidden / 16);
         gdn_gemv(gemv_out_storage, gemv_in_storage,
                  GDN_GEMV_SHARD_ARGUMENTS,
-                 (uint32_t)lm_soff, num_tokens, hidden, GDN_VOCAB);
+                 (uint32_t)lm_soff, num_tokens, hidden, GDN_VOCAB,
+                 false,
+                 norm_attn_storage, gate_storage,
+                 conv_weight_storage, conv_tail_storage,
+                 a, b, a_log_storage, dt_bias_storage, layer_index);
     }
 
     /* Preserve the old x_norm handoff offset. Write one full 512-bit line so
@@ -2022,6 +3090,64 @@ gemv32_mm2s_loop: for (uint32_t i = 0; i < n_packs; ++i) {
     }
 }
 
+/* Ports 28--31 own both one GEMV shard and one packed recurrent-state stripe.
+ * HLS permits only one read process per bundled m_axi interface, so this actor
+ * is the sole reader for both address ranges. In QKVG mode it emits one head's
+ * weights, then emits that head's 1,024 state words while the collectors and
+ * convolution actor finish the head. Iter40C drains a shallow BRAM decoupler
+ * into the recurrent actor's existing head-local state buffer before the MAC
+ * pass, so no second whole-head FIFO or stream-controlled MAC cone is needed. */
+template <int CHANNEL>
+static void gemv32_mm2s_with_state(
+    const Pack16 *w,
+    const Pack16 *state,
+    size_t weight_base,
+    hls::stream<Pack16> &ws,
+    hls::stream<Pack16> &state_stream,
+    uint32_t n_packs,
+    uint32_t layer_index,
+    bool qkvg_recurrent_mode
+) {
+#pragma HLS inline off
+    (void)CHANNEL;
+    if (!qkvg_recurrent_mode) {
+    gemv32_state_owner_weight_only: for (uint32_t i = 0;
+                                          i < n_packs; ++i) {
+#pragma HLS loop_tripcount min=8192 max=720896
+#pragma HLS pipeline II=1
+            ws.write(w[weight_base + i]);
+        }
+        return;
+    }
+
+    const uint32_t weight_packs_per_head = n_packs / GDN_HEADS;
+    const uint32_t state_packs_per_head =
+        GDN_DK * (GDN_DV / 16) / GDN_RECURRENT_STATE_PORTS;
+gemv32_state_owner_head: for (uint32_t head = 0;
+                               head < GDN_HEADS; ++head) {
+#pragma HLS loop_tripcount min=8 max=8
+    gemv32_state_owner_weight: for (uint32_t i = 0;
+                                     i < weight_packs_per_head; ++i) {
+#pragma HLS loop_tripcount min=4096 max=4096
+#pragma HLS pipeline II=1
+            ws.write(w[weight_base + head * weight_packs_per_head + i]);
+        }
+
+        /* The per-owner state FIFO holds this complete 1,024-word burst.
+         * Consequently the owner can always advance to the next head's
+         * weights, whose first row flushes the cluster's pending final row
+         * for this head. This forward-only schedule avoids a credit cycle. */
+        size_t state_base = ((size_t)layer_index * GDN_HEADS + head)
+                          * state_packs_per_head;
+    gemv32_state_owner_prefetch: for (uint32_t i = 0;
+                                       i < state_packs_per_head; ++i) {
+#pragma HLS loop_tripcount min=1024 max=1024
+#pragma HLS pipeline II=1
+            state_stream.write(state[state_base + i]);
+        }
+    }
+}
+
 static void gemv32_drain_x(hls::stream<Pack16> &xr, uint32_t k_packs) {
 #pragma HLS inline off
 gemv32_dx: for (uint32_t kp = 0; kp < k_packs; ++kp) {
@@ -2181,6 +3307,24 @@ gemv32_c4_p: for (uint32_t p = 0; p < opacks_per_ch; ++p) {
     }
 }
 
+/* Materialize a real II=1 register stage at each local-collector boundary.
+ * The physical hook places these small actors in SLR1 and marks their
+ * sequential leaves as USER_SLL_REG, giving SSI placement an explicit
+ * destination register instead of a direct BRAM/control crossing. */
+template <int RELAY>
+static void gemv32_boundary_relay(hls::stream<Pack16> &source,
+                                  hls::stream<Pack16> &destination,
+                                  uint32_t words) {
+#pragma HLS inline off
+    (void)RELAY;
+gemv32_boundary_relay_word: for (uint32_t word = 0; word < words; ++word) {
+#pragma HLS loop_tripcount min=32 max=756
+#pragma HLS pipeline II=1
+        Pack16 value = source.read();
+        destination.write(value);
+    }
+}
+
 static void gemv32_collect_final(hls::stream<Pack16> &slr0,
                                  hls::stream<Pack16> &slr1,
                                  hls::stream<Pack16> &slr2,
@@ -2189,15 +3333,15 @@ static void gemv32_collect_final(hls::stream<Pack16> &slr0,
 #pragma HLS inline off
 gemv32_cf_p: for (uint32_t p = 0; p < opacks_per_ch; ++p) {
 #pragma HLS loop_tripcount min=4 max=63
-    gemv32_cf_0: for (int i = 0; i < 8; ++i) {
+gemv32_cf_0: for (int i = 0; i < 8; ++i) {
 #pragma HLS pipeline II=1
             result.write(slr0.read());
         }
-    gemv32_cf_1: for (int i = 0; i < 12; ++i) {
+gemv32_cf_1: for (int i = 0; i < 12; ++i) {
 #pragma HLS pipeline II=1
             result.write(slr1.read());
         }
-    gemv32_cf_2: for (int i = 0; i < 12; ++i) {
+gemv32_cf_2: for (int i = 0; i < 12; ++i) {
 #pragma HLS pipeline II=1
             result.write(slr2.read());
         }
@@ -2246,6 +3390,11 @@ gemv32_store_fill: for (uint32_t i = 0; i < total_opacks; ++i) {
 #pragma HLS unroll
                 uint32_t r = (p << 4) + lane;
                 float candidate = value.data[lane];
+#ifndef __SYNTHESIS__
+                if (gdn_native_logits_debug != NULL && r < rows_per_ch) {
+                    gdn_native_logits_debug[c * rows_per_ch + r] = candidate;
+                }
+#endif
                 if (r < rows_per_ch && candidate > lane_best[lane]) {
                     lane_best[lane] = candidate;
                     lane_best_index[lane] = c * rows_per_ch + r;
@@ -2293,6 +3442,89 @@ gemv32_store_fill: for (uint32_t i = 0; i < total_opacks; ++i) {
     }
 }
 
+/* Head-streamed QKVG producer. Normal GEMVs retain the routed URAM
+ * reorder/store path. In QKVG mode, two pack-major collector rounds contain a
+ * complete head. Convolve that head and emit three bounded streams to the
+ * independent recurrent actor while the GEMV produces later heads. */
+static void gemv32_store_or_qkvg_conv_stream(
+    hls::stream<Pack16> &result,
+    hls::stream<Pack16> &q_stream,
+    hls::stream<Pack16> &k_stream,
+    hls::stream<Pack16> &v_stream,
+    Pack16 *out,
+    uint32_t rows_per_ch,
+    uint32_t opacks_per_ch,
+    uint32_t total_opacks,
+    bool qkvg_recurrent_mode,
+    Pack16 *gate_out,
+    const Pack16 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    Pack16 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 16]
+) {
+#pragma HLS inline off
+#pragma HLS aggregate variable=conv_weights compact=bit
+#pragma HLS aggregate variable=conv_tails compact=bit
+    if (!qkvg_recurrent_mode) {
+        gemv32_store(result, out, rows_per_ch, opacks_per_ch, total_opacks);
+        return;
+    }
+
+    Pack16 head_value[4][GDN_HEAD_DIM / 16];
+    Pack16 convolved_head[GDN_HEAD_DIM / 16];
+#pragma HLS array_partition variable=head_value complete dim=1
+qkvg_stream_head: for (uint32_t head = 0; head < GDN_HEADS; ++head) {
+#pragma HLS loop_tripcount min=8 max=8
+    qkvg_stream_half: for (uint32_t half = 0; half < 2; ++half) {
+        qkvg_stream_channel: for (uint32_t channel = 0;
+                                  channel < GEMV_CHANNELS; ++channel) {
+#pragma HLS loop_tripcount min=32 max=32
+#pragma HLS pipeline II=1
+                uint32_t kind = channel / (GEMV_CHANNELS / 4);
+                uint32_t segment = channel % (GEMV_CHANNELS / 4);
+                head_value[kind][segment * 2 + half] = result.read();
+            }
+        }
+
+    qkvg_stream_gate_store: for (uint32_t p = 0;
+                                     p < GDN_HEAD_DIM / 16; ++p) {
+#pragma HLS loop_tripcount min=16 max=16
+#pragma HLS pipeline II=1
+            gate_out[head * (GDN_HEAD_DIM / 16) + p] = head_value[3][p];
+        }
+
+    qkvg_stream_conv_kind: for (uint32_t kind = 0; kind < 3; ++kind) {
+#pragma HLS loop_tripcount min=3 max=3
+            gdn_depthwise_conv_silu_head_kind(
+                convolved_head, head_value,
+                conv_weights, conv_tails, head, kind);
+        qkvg_stream_conv_emit: for (uint32_t p = 0;
+                                     p < GDN_HEAD_DIM / 16; ++p) {
+#pragma HLS loop_tripcount min=16 max=16
+#pragma HLS pipeline II=1
+                Pack16 value = convolved_head[p];
+                if (kind == 0)
+                    q_stream.write(value);
+                else if (kind == 1)
+                    k_stream.write(value);
+                else
+                    v_stream.write(value);
+            }
+        }
+
+        /* All three actors have consumed this head's old three-row context.
+         * Reuse tail row 0 for the new raw row; the final packed store emits
+         * old rows 1/2 followed by this row without another BRAM buffer. */
+    qkvg_stream_capture_new_tail: for (uint32_t p = 0;
+                                           p < GDN_HEAD_DIM / 16; ++p) {
+#pragma HLS loop_tripcount min=16 max=16
+#pragma HLS pipeline II=1
+            uint32_t destination = head * (GDN_HEAD_DIM / 16) + p;
+            conv_tails[0][destination] = head_value[0][p];
+            conv_tails[1][destination] = head_value[1][p];
+            conv_tails[2][destination] = head_value[2][p];
+        }
+    }
+}
+
 /* Decode GEMV with 32 compact weight shards on independent HBM masters. Sixteen
  * two-port clusters consume private activation copies and feed hierarchical
  * collectors. The store stage restores natural output-row order; it also
@@ -2306,9 +3538,18 @@ static void gdn_gemv(
     const float *w16, const float *w17, const float *w18, const float *w19,
     const float *w20, const float *w21, const float *w22, const float *w23,
     const float *w24, const float *w25, const float *w26, const float *w27,
-    const float *w28, const float *w29, const float *w30, const float *w31,
+    float *w28, float *w29, float *w30, float *w31,
     uint32_t shard_off,
-    uint32_t num_rows, uint32_t in_dim, uint32_t out_dim
+    uint32_t num_rows, uint32_t in_dim, uint32_t out_dim,
+    bool qkvg_recurrent_mode,
+    Pack16 *attn_out, Pack16 *gate_out,
+    const Pack16 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    Pack16 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 16],
+    const float a[GDN_HEADS],
+    const float b[GDN_HEADS],
+    const float layer_a_log[GDN_HEADS],
+    const float layer_dt_bias[GDN_HEADS],
+    uint32_t layer_index
 ) {
     #pragma HLS inline off
 
@@ -2344,6 +3585,18 @@ static void gdn_gemv(
     const Pack16 *sh29 = reinterpret_cast<const Pack16 *>(w29);
     const Pack16 *sh30 = reinterpret_cast<const Pack16 *>(w30);
     const Pack16 *sh31 = reinterpret_cast<const Pack16 *>(w31);
+    const Pack16 *state_in28 = reinterpret_cast<const Pack16 *>(
+        w28 + GDN_COMPILED_WEIGHT_SHARD_FLOATS);
+    const Pack16 *state_in29 = reinterpret_cast<const Pack16 *>(
+        w29 + GDN_COMPILED_WEIGHT_SHARD_FLOATS);
+    const Pack16 *state_in30 = reinterpret_cast<const Pack16 *>(
+        w30 + GDN_COMPILED_WEIGHT_SHARD_FLOATS);
+    const Pack16 *state_in31 = reinterpret_cast<const Pack16 *>(
+        w31 + GDN_COMPILED_WEIGHT_SHARD_FLOATS);
+    float *state_out28 = w28 + GDN_COMPILED_WEIGHT_SHARD_FLOATS;
+    float *state_out29 = w29 + GDN_COMPILED_WEIGHT_SHARD_FLOATS;
+    float *state_out30 = w30 + GDN_COMPILED_WEIGHT_SHARD_FLOATS;
+    float *state_out31 = w31 + GDN_COMPILED_WEIGHT_SHARD_FLOATS;
 
     uint32_t k_packs      = in_dim / 16;
     uint32_t rows_per_ch  = out_dim / GEMV_CHANNELS;
@@ -2354,7 +3607,11 @@ static void gdn_gemv(
     hls::stream<Pack16> ws[GEMV_CHANNELS];
     hls::stream<Pack16> xr[GEMV_CLUSTERS + 1];
     hls::stream<Pack16> ys[GEMV_CLUSTERS];
-    hls::stream<Pack16> slr0_result, slr1_result, slr2_result, result;
+    hls::stream<Pack16> slr0_result, slr1_result, slr2_result;
+    hls::stream<Pack16> slr0_boundary, slr1_boundary, slr2_boundary, result;
+    hls::stream<Pack16> q_stream, k_stream, v_stream;
+    hls::stream<Pack16> state_stream0, state_stream1;
+    hls::stream<Pack16> state_stream2, state_stream3;
     #pragma HLS array_partition variable=ws complete
     #pragma HLS array_partition variable=xr complete
     #pragma HLS array_partition variable=ys complete
@@ -2379,14 +3636,42 @@ static void gdn_gemv(
     #pragma HLS stream variable=slr0_result depth=64
     #pragma HLS stream variable=slr1_result depth=64
     #pragma HLS stream variable=slr2_result depth=64
+    /* One complete local collector burst must fit so the final collector's
+     * fixed 4/6/6 drain order cannot backpressure another branch. HLS measured
+     * a 14-entry requirement on the first branch; round all three tiny LUTRAM
+     * queues to the natural 16-word burst boundary. */
+    #pragma HLS stream variable=slr0_boundary depth=16
+    #pragma HLS stream variable=slr1_boundary depth=16
+    #pragma HLS stream variable=slr2_boundary depth=16
     #pragma HLS stream variable=result depth=64
+    #pragma HLS stream variable=q_stream depth=32
+    #pragma HLS stream variable=k_stream depth=32
+    #pragma HLS stream variable=v_stream depth=32
+    /* Ports 28--31 interleave each head's 4,096 weight packs with a
+     * 1,024-word recurrent-state burst. Buffering one complete state burst
+     * prevents the state write from blocking delivery of the next head's
+     * weights and keeps the dataflow graph strictly forward-only. */
+    #pragma HLS stream variable=state_stream0 depth=2048
+    #pragma HLS stream variable=state_stream1 depth=2048
+    #pragma HLS stream variable=state_stream2 depth=2048
+    #pragma HLS stream variable=state_stream3 depth=2048
     #pragma HLS bind_storage variable=ws type=fifo impl=bram
     #pragma HLS bind_storage variable=xr type=fifo impl=bram
     #pragma HLS bind_storage variable=ys type=fifo impl=bram
     #pragma HLS bind_storage variable=slr0_result type=fifo impl=bram
     #pragma HLS bind_storage variable=slr1_result type=fifo impl=bram
     #pragma HLS bind_storage variable=slr2_result type=fifo impl=bram
+    #pragma HLS bind_storage variable=slr0_boundary type=fifo impl=lutram
+    #pragma HLS bind_storage variable=slr1_boundary type=fifo impl=lutram
+    #pragma HLS bind_storage variable=slr2_boundary type=fifo impl=lutram
     #pragma HLS bind_storage variable=result type=fifo impl=bram
+    #pragma HLS bind_storage variable=q_stream type=fifo impl=bram
+    #pragma HLS bind_storage variable=k_stream type=fifo impl=bram
+    #pragma HLS bind_storage variable=v_stream type=fifo impl=bram
+    #pragma HLS bind_storage variable=state_stream0 type=fifo impl=bram
+    #pragma HLS bind_storage variable=state_stream1 type=fifo impl=bram
+    #pragma HLS bind_storage variable=state_stream2 type=fifo impl=bram
+    #pragma HLS bind_storage variable=state_stream3 type=fifo impl=bram
 
     #pragma HLS dataflow disable_start_propagation
     gemv32_load_x_and_w0(in, sh0, shard_off, xr[0], ws[0],
@@ -2418,10 +3703,18 @@ static void gdn_gemv(
     gemv32_mm2s<25>(sh25, shard_off, ws[25], n_packs);
     gemv32_mm2s<26>(sh26, shard_off, ws[26], n_packs);
     gemv32_mm2s<27>(sh27, shard_off, ws[27], n_packs);
-    gemv32_mm2s<28>(sh28, shard_off, ws[28], n_packs);
-    gemv32_mm2s<29>(sh29, shard_off, ws[29], n_packs);
-    gemv32_mm2s<30>(sh30, shard_off, ws[30], n_packs);
-    gemv32_mm2s<31>(sh31, shard_off, ws[31], n_packs);
+    gemv32_mm2s_with_state<28>(
+        sh28, state_in28, shard_off, ws[28], state_stream0,
+        n_packs, layer_index, qkvg_recurrent_mode);
+    gemv32_mm2s_with_state<29>(
+        sh29, state_in29, shard_off, ws[29], state_stream1,
+        n_packs, layer_index, qkvg_recurrent_mode);
+    gemv32_mm2s_with_state<30>(
+        sh30, state_in30, shard_off, ws[30], state_stream2,
+        n_packs, layer_index, qkvg_recurrent_mode);
+    gemv32_mm2s_with_state<31>(
+        sh31, state_in31, shard_off, ws[31], state_stream3,
+        n_packs, layer_index, qkvg_recurrent_mode);
 
     gemv32_cluster2(ws[0],  ws[1],  xr[0],  xr[1],  ys[0],  k_packs, rows_per_ch);
     gemv32_cluster2(ws[2],  ws[3],  xr[1],  xr[2],  ys[1],  k_packs, rows_per_ch);
@@ -2440,13 +3733,33 @@ static void gdn_gemv(
     gemv32_cluster2(ws[28], ws[29], xr[14], xr[15], ys[14], k_packs, rows_per_ch);
     gemv32_cluster2(ws[30], ws[31], xr[15], xr[16], ys[15], k_packs, rows_per_ch);
     gemv32_drain_x(xr[16], k_packs);
+    /* Restore the routed 4/6/6 collector cut. Only the three small relay
+     * actors are physically constrained; clusters, local collectors and
+     * almost all FIFO endpoints remain free for SSI spreading. */
     gemv32_collect4(ys[0], ys[1], ys[2], ys[3],
                     slr0_result, opacks_per_ch);
     gemv32_collect6(ys[4], ys[5], ys[6], ys[7], ys[8], ys[9],
                     slr1_result, opacks_per_ch);
     gemv32_collect6(ys[10], ys[11], ys[12], ys[13], ys[14], ys[15],
                     slr2_result, opacks_per_ch);
-    gemv32_collect_final(slr0_result, slr1_result, slr2_result,
+    gemv32_boundary_relay<0>(slr0_result, slr0_boundary,
+                             8 * opacks_per_ch);
+    gemv32_boundary_relay<1>(slr1_result, slr1_boundary,
+                             12 * opacks_per_ch);
+    gemv32_boundary_relay<2>(slr2_result, slr2_boundary,
+                             12 * opacks_per_ch);
+    gemv32_collect_final(slr0_boundary, slr1_boundary, slr2_boundary,
                          result, opacks_per_ch);
-    gemv32_store(result, out, rows_per_ch, opacks_per_ch, total_opacks);
+    gemv32_store_or_qkvg_conv_stream(
+        result, q_stream, k_stream, v_stream,
+        out, rows_per_ch, opacks_per_ch, total_opacks,
+        qkvg_recurrent_mode, gate_out,
+        conv_weights, conv_tails);
+    gdn_recurrent_attention_islands(
+        q_stream, k_stream, v_stream,
+        state_stream0, state_stream1, state_stream2, state_stream3,
+        attn_out,
+        state_out28, state_out29, state_out30, state_out31,
+        a, b, layer_a_log, layer_dt_bias,
+        layer_index, qkvg_recurrent_mode);
 }

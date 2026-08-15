@@ -1,7 +1,10 @@
 # GatedDeltaNet Decode Accelerator Architecture
 
-**Status:** Current routed production architecture (Iter36), measured
-2026-07-31 on an Alveo U55C.
+**Status:** Current production architecture (Iter57), routed, timing-closed,
+and exact on an Alveo U55C on 2026-08-15. It is HLS-synthesized at 150 MHz and
+links at the requested **100 MHz** without automatic clock scaling. The exact
+64-token run measures **42.023540 ms/token / 4.202354M cycles**, making Iter57
+both the fastest wall-clock image and the lowest-cycle timing-closed image.
 
 The accelerator in `c_impl/` is decode-only. Prompt prefill runs on the GPU and
 exports fixed-size recurrent and convolution state. The FPGA then advances one
@@ -13,15 +16,34 @@ token per `gdn_forward` invocation. The successful design combines:
 - a 4/6/6 cluster distribution across SLR0/SLR1/SLR2;
 - transient activations resident in local BRAM for the complete 24-layer
   forward;
-- a 16-bank, head-local recurrent-state buffer with HBM restore/retrieval and
-  update/save fused into the two required attention passes;
+- four packed recurrent-state stripes appended to HBM weight ports 28--31;
+- two concurrent 16-column, head-local recurrent islands with HBM retrieval and
+  update fused into the two required attention passes;
+- concurrent transfer from all four state ports into packed low/high URAM
+  pairs;
+- head-serial/all-port Q/K/V/gate (`QKVG`) and pair-interleaved MLP gate/up
+  (`GU`) weight layouts, each issued as one shared-GEMV command;
+- a time-shared head-local Q/K/V convolution actor that consumes each QKVG
+  head while later heads are still streaming;
+- immediate head-local Q/K/V streams from that convolution actor into the
+  recurrent actor, avoiding whole-hidden Q/K/V materialization;
+- state reads on ports 28--31 interleaved with each QKVG head's weights and
+  decoupled through four two-head, depth-2048 BRAM queues;
+- duplicated Q/K/V head streams feeding the two recurrent islands, followed by
+  a deterministic half-head merge;
+- explicit registered relay actors between each 4/6/6 SLR-local GEMV collector
+  and the final collector;
+- one forward-only dataflow graph that overlaps later QKVG heads with
+  convolution, state transfer, and recurrence of earlier heads;
 - packed external recurrent-state and convolution-tail transfers; and
 - on-chip LM-head argmax, with no external logits materialization.
 
-The production image routes with zero failed nets, zero unrouted nets, and zero
-node overlaps at 100 MHz. It produces an exact 64-token trajectory at
-59.578 ms/token mean latency, 2.04x faster than the 121.4 ms eight-port
-baseline and 1.26x faster than Iter35.
+The architecture routes with zero failed nets, zero unrouted nets, and zero
+node overlaps and preserves exact 64-token parity. Post-route physical
+optimization closes the 100 MHz kernel clock at **+0.060 ns WNS** and the fixed
+250 MHz DMA clock at **+0.003 ns WNS**. Iter57 is 2.48% faster and uses 2.48%
+fewer cycles than Iter39C; it is 2.889x faster than the 121.4 ms eight-port
+baseline.
 
 ## Fixed Model Shape
 
@@ -61,7 +83,7 @@ XRT host
 |                                                                     |
 |  workspace[X] --> local activation BRAMs --> 24 GDN layers          |
 |                         |                     |                      |
-|                         |                     +--> recurrent state --+--> HBM0
+|                         |                     +--> recurrent state --+--> HBM28..31
 |                         |                     +--> convolution tails +--> HBM0
 |                         v                                            |
 |             32 HBM readers --> 16 GEMV clusters --> local results   |
@@ -93,20 +115,29 @@ master. The successful connectivity is:
 
 | AXI bundle | HBM bank | Contents |
 |---|---:|---|
-| `mem_weights_mm0` | HBM[0] | GEMV shard 0, compact auxiliary weights, workspace, recurrent state, convolution tails, embedding ingress, token egress |
-| `mem_weights_mm1` ... `mem_weights_mm31` | HBM[1] ... HBM[31] | One compact GEMV shard per bank, read-only during decode |
+| `mem_weights_mm0` | HBM[0] | GEMV shard 0, compact auxiliary weights, workspace, convolution tails, embedding ingress, token egress |
+| `mem_weights_mm1` ... `mem_weights_mm27` | HBM[1] ... HBM[27] | One compact GEMV shard per bank, read-only during decode |
+| `mem_weights_mm28` ... `mem_weights_mm31` | HBM[28] ... HBM[31] | One GEMV shard plus one 12 MiB recurrent-state stripe per bank |
 
-Every large matrix, including `lm_head`, is split across the 32 compact shards.
-There is one total copy of the projection weights: channel `c` holds output rows
-`[c * out_dim/32, (c + 1) * out_dim/32)`. Within every shard the matrices are
-stored in this order:
+Every large matrix, including `lm_head`, is split across the 32 compact shards,
+with one total copy of every projection weight. Conventional O, MLP-down, and
+LM-head sections retain output-row stripes. For each sequential head, QKVG
+concatenates its 256 Q, K, V, and gate rows and stripes those 1,024 rows across
+all 32 ports: channels 0--7 carry Q segments, 8--15 K, 16--23 V, and 24--31
+gate. Two collector rounds therefore expose one complete head every roughly
+4,096 weight beats. GU assigns channel `c = chunk*2 + kind` one 352-row chunk.
+Within every shard the sections are stored in this order:
 
 ```text
-per layer: q, k, v, gate, output, mlp_gate, mlp_up, mlp_down
+per layer: head-serial/all-port qkvg, output, pair-interleaved gu, mlp_down
 global:    lm_head
 ```
 
-One shard contains 43,728,896 FP32 values (166.8125 MiB). The small norms,
+The host-side exact shard validator compares every copied FP32 weight against
+the source blob before native decode, rather than relying only on token parity.
+
+One weight shard contains 43,728,896 FP32 values (166.8125 MiB). Ports 28--31
+append 3,145,728 FP32 state values (12 MiB) after that fixed boundary. The small norms,
 A/B projections, convolution kernels, and final norm are packed into
 `aux_weights`; the full 5.6 GB source weight blob is not duplicated on the
 device.
@@ -122,22 +153,25 @@ The host-visible `GDN_WS_OFF_*` layout is unchanged from Iter31. This preserves
 the external ABI and XRT allocation behavior, but most activation offsets are
 now reserved compatibility space rather than active HBM traffic.
 
-| Workspace region | Iter36 synthesized use |
+| Workspace region | Current synthesized use |
 |---|---|
 | `GDN_WS_OFF_X` | Host writes one 2,048-float embedding; kernel reads it once |
 | `GDN_WS_OFF_X_NORM` | Kernel writes one 512-bit result line; lane zero is the selected token |
 | Q/K/V, gate, attention, temporary, MLP and logits offsets | Reserved but not accessed by the activation datapath |
-| `GDN_WS_OFF_REC_STATE` | Persistent packed recurrent-state read/update/write |
+| `GDN_WS_OFF_REC_STATE` | Reserved compatibility space; recurrent state moved to weight-shard tails 28--31 |
 | `GDN_WS_OFF_HEAD_BUF` | Persistent packed Q/K/V convolution-tail read/update/write |
 
 The recurrent state cannot remain on chip across the complete decode. One layer
 is 2 MiB; all 24 layers would require roughly 2,304 URAMs before any other
-storage, versus 960 URAMs on the U55C. Iter36 instead buffers one 256 x 256 FP32
-head at a time in 16 cyclic URAM banks. The retrieval loop loads each 512-bit
-state word from HBM while consuming it, and the update loop writes each updated
-word back immediately. The unavoidable packed state round trip remains, but
-the two redundant full-layer restore/save traversals and the 128-URAM
-all-head buffer are gone.
+storage, versus 960 URAMs on the U55C. Iter38 buffers one 256 x 256 FP32 head at
+a time. Within each state row, the eight low-half Pack16 words alternate between
+ports 28/29 and the eight high-half words alternate between ports 30/31. All
+four ports now advance together at one Pack16 word per port per cycle. Each
+low/high column pair is stored as one compact 64-bit word in a 32-bank cyclic
+URAM array, allowing both halves to share a bank address without doubling URAM.
+The update loop writes all four striped words concurrently and immediately.
+Every port retains a monotonic 1,024-beat transfer per head; no new AXI master
+or public `.gdnstate` format is required.
 
 ## Activation-Resident Datapath
 
@@ -145,28 +179,37 @@ The embedding is loaded once from HBM into local `Pack16` storage. A `Pack16`
 is one 512-bit word containing 16 FP32 lanes. The activation lifetime then
 remains on chip until the final token is written.
 
-Six logical activation buffers hold the layer state, and two equally shaped
-buffers provide a single shared GEMV aperture:
+The residual and conventional projections use local activation buffers, while
+Q/K/V now pass through bounded head streams rather than whole-hidden storage.
+Two equally shaped buffers provide a single shared GEMV aperture:
 
 | Local storage | Physical size | Lifetime/reuse |
 |---|---:|---|
 | `x_storage` | 128 Pack16 / 8 KiB | Residual stream across all 24 layers |
 | `norm_attn_storage` | 128 Pack16 / 8 KiB | RMSNorm output, then reused for attention output |
-| `q_mlp_gate_storage` | 352 Pack16 / 22 KiB | Q for attention, then MLP gate |
-| `k_mlp_up_storage` | 352 Pack16 / 22 KiB | K for attention, then MLP up |
-| `v_storage` | 352 Pack16 / 22 KiB | V; only the first 128 words are logically used |
+| `q_mlp_gate_storage` | 352 Pack16 / 22 KiB | MLP gate after GU deinterleave |
+| `k_mlp_up_storage` | 352 Pack16 / 22 KiB | MLP up after GU deinterleave |
 | `gate_storage` | 128 Pack16 / 8 KiB | Attention output gate |
 | `gemv_in_storage` | 352 Pack16 / 22 KiB | Common input aperture for every large projection |
-| `gemv_out_storage` | 352 Pack16 / 22 KiB | Common output aperture and LM-head token result |
+| `gemv_out_storage` | 704 Pack16 / 44 KiB | Unified GU output aperture and LM-head token result |
 | `a_storage`, `b_storage` | 16 FP32 each | Fully partitioned eight-element head vectors |
 
-All large buffers are explicitly bound to dual-port BRAM. The equal 352-word
-shape for Q, K, V, and both GEMV apertures is deliberate: it makes HLS share one
-physical convolution implementation and one physical `gdn_gemv` graph across
-all projection shapes. The top also enforces
+All large buffers are explicitly bound to dual-port BRAM. The shared 352-word
+GEMV input and 704-word output apertures let HLS time-share one physical
+`gdn_gemv` graph across all projection shapes. The top also enforces
 `allocation function instances=gdn_gemv limit=1`. Without this, HLS specializes
 complete 32-reader fabrics for different pointer shapes and multiplies the
 hardware.
+
+Inside the QKVG command, bounded Q/K/V streams carry 16 Pack16 words per head
+and a broadcaster duplicates each head for the two recurrent islands. Four
+additional BRAM queues each hold two 1,024-word recurrent-state stripes. Their
+depth is a correctness condition, not speculative buffering: the registered
+collector boundary increases the Q/K/V round-trip latency beyond one head, so
+a one-head state queue forms a cyclic wait with the state-owning MM2S actors.
+One-layer RTL cosimulation reproduced that seven-actor deadlock at depth 1024;
+depths 2048 and 4096 both progressed more than 5.3x beyond it, so Iter57 retains
+the minimum sufficient depth of 2048.
 
 The aperture copies are local 512-bit II=1 loops. They cost tens of thousands
 of cycles per token, rather than the millions of cycles and dynamic stalls
@@ -179,41 +222,65 @@ Each of the 24 layers executes serially:
 ```text
 local x
   -> RMSNorm -> norm_attn
-  -> shared GEMV aperture
-       -> Q -> q_mlp_gate
-       -> K -> k_mlp_up
-       -> V -> v
   -> tiny GEMV A and B -> partitioned scalar arrays
-  -> shared GEMV aperture -> attention gate
-  -> Q/K/V depthwise convolution + SiLU, in place
-  -> recurrent gated-delta attention
-       reads local Q/K/V
-       fuses head-local HBM restore with retrieval
-       fuses head-local state update with HBM save
-       overwrites norm_attn with attention output
+  -> load packed Q/K/V convolution weights and old tails
+  -> shared GEMV aperture
+       -> one head-serial/all-port QKVG command
+       -> for each completed head while later heads stream:
+            store gate
+            run one shared head-local convolution actor for Q, K, and V
+            capture the new raw Q/K/V tail row
+            stream convolved Q/K/V directly to recurrence
+       -> on ports 28--31, after each head's QKVG weights:
+            stream four 1,024-word old-state stripes into depth-2048 queues
+       -> duplicate Q/K/V into two recurrent islands
+       -> recurrent islands, concurrently with later QKVG heads:
+            drain one head of Q/K/V and state into local scratch
+            process disjoint 128-column halves at 16 columns/cycle each
+            fuse head-local retrieval and update
+            write updated state directly to ports 28--31
+       -> merge the two half-head outputs into norm_attn
+  -> packed convolution-tail writeback
   -> output norm and gate, in place
   -> output-projection GEMV
   -> local residual accumulation into x
   -> RMSNorm
-  -> MLP gate GEMV -> reuse q_mlp_gate
-  -> MLP up GEMV   -> reuse k_mlp_up
+  -> one pair-interleaved GU GEMV
+  -> local deinterleave into reused Q/K buffers
   -> SwiGLU, in place
   -> MLP down GEMV
   -> local residual accumulation into x
 ```
 
-Q, K, and V convolution is safe in place because the convolution function
-captures the complete current input row before it emits the output row. Output
-projection and MLP-down results are added directly to local `x`, eliminating
-two external residual-materialization passes.
+The QKVG sink holds only one 256-element head. One convolution datapath is
+called serially for that head's Q, K, and V, then emits them to a broadcaster
+while the upstream graph produces later heads. Two independent recurrent
+actors each consume all Q/K/V values but own disjoint 128-column state/output
+halves; a small merge actor restores natural output order. The four state
+readers interleave a complete state-head burst between adjacent QKVG weight
+head bursts. Each island drains blocking FIFO reads in a narrow II=1 copy loop
+before touching its local URAM scratch. There is no feedback credit or
+readiness handshake in the graph. The two-head state FIFO depth makes the
+strictly forward schedule deadlock-free despite the registered GEMV collector
+boundaries.
 
-There are eight large GEMVs per layer and one global LM-head GEMV:
+The old three-row convolution tails and weights are staged through fixed-bank
+512-bit loops. After a head consumes its old context, obsolete tail row 0 stores
+the new raw row; the final writeback emits old rows 1/2 and that new row. Output
+projection and MLP-down results are added directly to local `x`.
+
+There are four shared-GEMV commands per layer and one global LM-head command:
 
 ```text
-24 * (Q + K + V + gate + output + MLP gate + MLP up + MLP down)
+24 * (QKVG + output + GU + MLP down)
   + LM head
-= 193 large GEMV calls per token
+= 97 large GEMV calls per token
 ```
+
+This call reduction does not reduce FP32 MACs or HBM weight bytes. It exposes a
+stream-friendly logical layout and removes top-level command boundaries. The
+raw HLS top minimum therefore overstates its direct cycle benefit; hardware
+measurement, not call count, determines the retained gain.
 
 The architecture does not wrap the whole layer in one HLS `dataflow` region.
 The shared GEMV fabric is time-multiplexed between projections; only the
@@ -313,90 +380,149 @@ Non-GEMV blocks remain shared, relatively narrow implementations:
 | RMSNorm/reductions | 8 lanes |
 | Tiny A/B GEMV | 2 output lanes |
 | Depthwise convolution, output gate, SwiGLU | 4 elementwise lanes |
-| Recurrent state arithmetic | 16 lanes |
+| Recurrent state arithmetic | **32 lanes** |
 
-Iter35 selectively restored recurrent-state arithmetic from 8 to 16 lanes.
-Wider normalization, output-gate, and SwiGLU variants were rejected because
-their measured cycle savings did not justify their DSP/LUT cost. Iter36 keeps
-those choices and changes recurrent-state materialization only.
+Iter35 selectively restored recurrent-state arithmetic from 8 to 16 lanes and
+Iter37 widened its aggregate width to 32. Wider normalization, output-gate, and
+SwiGLU variants were rejected because their measured cycle savings did not
+justify their DSP/LUT cost. Iter57 keeps those narrow auxiliary blocks and
+realizes the 32 recurrent columns as two concurrent physical 16-column islands,
+with both state halves supplied from all four stripes.
 
 ## Static Schedule and HLS Resources
 
-Because `gdn_gemv` accepts runtime dimensions, the raw top-level HLS latency
-uses the maximum LM-head trip count for all 193 calls and is not a token
-latency. Reconstructing the schedule with each real projection shape gives:
+Because `gdn_gemv` accepts runtime dimensions, its top-level call accounting is
+not a complete token-latency model. The last dimension-correct schedule before
+QKVG/GU command merging was:
 
-| Component | Iter32 cycles | Iter36 cycles |
-|---|---:|---:|
-| 193 large GEMVs | 2,785,524 | 2,785,524 |
-| RMSNorm | 139,405 | 139,405 |
-| Tiny GEMV | 103,584 | 103,584 |
-| Q/K/V convolution | 624,744 | 624,744 |
-| Recurrent attention | 5,760,144 | **1,841,112** |
-| Output norm/gate | 128,712 | 128,712 |
-| SwiGLU | 321,048 | 321,048 |
-| Activation handoff/copy/add/argmax | 54,069 | 54,069 |
-| **Reconstructed total** | **9,917,230** | **5,998,198** |
+| Component | Iter32 cycles | Iter36 cycles | Iter37 cycles |
+|---|---:|---:|---:|
+| Equivalent dense GEMV work | 2,785,524 | 2,785,524 | 2,785,524 |
+| RMSNorm | 139,405 | 139,405 | 139,405 |
+| Tiny GEMV | 103,584 | 103,584 | 103,584 |
+| Q/K/V convolution | 624,744 | 624,744 | 624,744 |
+| Recurrent attention | 5,760,144 | **1,841,112** | **1,057,944** |
+| Output norm/gate | 128,712 | 128,712 | 128,712 |
+| SwiGLU | 321,048 | 321,048 | 321,048 |
+| Activation handoff/copy/add/argmax | 54,069 | 54,069 | 54,069 |
+| **Reconstructed total** | **9,917,230** | **5,998,198** | **5,215,030** |
 
-Final Iter36 integrated csynth resources:
+Iter38 preserves that dense weight/MAC work, reduces the fixed-trip recurrence
+by **397,056 cycles/token**, and adds bounded QKVG/GU deinterleave loops. Its raw
+HLS top minimum is 2,744,183 cycles versus 3,957,551 for Iter37, but about
+0.816M of that difference is dynamic-call accounting rather than removed work.
+Iter39C then overlaps the three Q/K/V convolutions with head-serial QKVG
+production. Its top minimum is **2,270,495 cycles**, a fixed
+**473,688-cycle / 17.27%** reduction from Iter38; the measured hardware result
+is the authoritative total. Iter54c extends the bounded graph through recurrent
+attention and interleaves old-state reads with the QKVG weight stream. Its top
+minimum is **1,621,415 cycles**, 649,080 below Iter39C, while the on-card
+effective count falls by 196,905 cycles to **4.112395M**. The smaller measured
+reduction reflects dynamic HBM/control stalls omitted by the raw minimum.
+Iter57 trades some of that theoretical minimum for physical timing boundaries:
+two recurrent islands, duplicated head streams, a merge, and three registered
+collector relays raise the HLS minimum to **1,670,212 cycles**. On hardware it
+executes **4.202354M cycles**, still 106,646 cycles below Iter39C while restoring
+true 100 MHz timing closure.
 
-| Resource | Iter36 |
-|---|---:|
-| RAMB18 | 1,511 |
-| DSP | 3,323 |
-| FF | 798,733 |
-| LUT | 829,526 |
-| URAM | **32** |
+Final integrated csynth resources:
 
-The head-local fusion reduces the recurrent buffer from Iter35's 128 URAMs to
-16 and whole-kernel use from 144 to 32 URAMs. GEMV MAC II remains four, no AXI
-master was added, and all 32 MM2S readers remain II=1.
+| Resource | Iter37 | Iter38 | Iter39C | Iter54c | Iter57 |
+|---|---:|---:|---:|---:|---:|
+| RAMB18 | 1,511 | 1,527 | 1,543 | 1,632 | **1,728** |
+| DSP | 3,627 | 3,629 | 3,629 | 3,716 | **3,762** |
+| FF | 851,903 | 857,343 | 863,589 | 888,271 | **921,774** |
+| LUT | 912,694 | 929,941 | 937,707 | 868,961 | **869,262** |
+| URAM | 48 | 48 | 48 | 48 | **48** |
+
+The recurrent call falls from 43,873--44,081 cycles in Iter37 to
+**27,329--27,537 cycles**. The combined four-port state read and write loops
+both achieve II=1; GEMV MAC II remains four, no AXI master was added, and all
+32 MM2S readers remain II=1. Iter39C's six context-read and three tail-write
+loops are 512-bit II=1 transfers; its one shared head-convolution compute loop
+is II=1. Iter54c keeps all 16 GEMV cluster MAC loops at II=4 and all four
+state-owner streams at II=1. The added RAMB18 capacity is primarily the four
+depth-1024, 512-bit state FIFOs that eliminate the rejected credit-handshake
+feedback path.
+Iter57 preserves those IIs and the same 32 masters. Its four state FIFOs are
+depth 2048, while the recurrent arithmetic is split into two 16-column actors
+that preserve the prior aggregate 32-column width. The additional DSPs and
+registers are the cost of the duplicated Q/K/V-side arithmetic and control
+needed to create physically separable timing islands.
 
 ## Physical Implementation
 
-The reproducible build compiles HLS at 130 MHz and links the U55C image at
-100 MHz:
+The reproducible Iter57 build compiles HLS at 150 MHz and links a 100 MHz
+U55C link. The Make target uses only relocatable configuration/Tcl source:
 
 ```bash
-bash c_impl/build_iter36_headlocal.sh 100
+make -C c_impl run_hw
 ```
 
-The launcher is hash-guarded and refuses to overwrite its existing build
-directory. Its physical recipe uses:
+This single target builds the current 150 MHz HLS / 100 MHz image and
+then runs the exact 8-token smoke and 64-token on-card measurement. Historical
+iteration-specific Make targets are not part of the production interface.
+
+Its physical recipe uses:
 
 - exact 32-bank connectivity from the routed Iter31 topology;
-- `apply_iter22_cluster8_slr1_east.tcl`;
-- `apply_iter23_dma_fanout.tcl`;
-- `apply_iter35_dma_w15_fifoaddr_fanout.tcl` for the fixed 250 MHz DMA path;
+- the Iter35 DMA fanout repairs plus the measured Iter54 r15/AR-control repair;
+- hard containment of the two-island recurrent wrapper in the full SLR2;
+- hard full-SLR1 containment for clusters 8 and 10 and cluster 10's immediate
+  weight/activation streams;
+- hard SLR1 containment and `USER_SLL_REG` marking for the three registered
+  collector relays and the final collector;
+- clock-region replication of the 35,670-load kernel reset alias;
+- clock-region replication of the two measured r15 response-FIFO DMA cones;
+- hard containment of eight measured HMSS AR-control primitives in X2Y1/X3Y1;
 - BRAM implementation for all wide MM2S, activation-ripple, result, and
-  collector FIFOs;
-- `AltSpreadLogic_high` placement;
-- `Explore` routing; and
+  collector FIFOs, plus the four depth-2048 state queues;
+- a post-place structural gate that verifies all four pblocks and reports SLR,
+  SLL, CLB, and BRAM pressure without prematurely rejecting a routable design;
+- `SSI_SpreadSLLs` placement;
+- `NoTimingRelaxation` routing; and
 - pre-route and post-route `AggressiveExplore` physical optimization.
 
 Final implementation result:
 
 | Metric | Result |
 |---|---:|
-| Build duration | 7 h 47 m (7 h 26 m link) |
-| Kernel clock | 100 MHz |
+| Requested / encoded kernel clock | **100 / 100 MHz** |
 | Failed nets | 0 |
 | Unrouted nets | 0 |
 | Node overlaps | 0 |
-| Overall WNS / TNS | +0.003 ns / 0 |
-| Overall WHS / THS | +0.009 ns / 0 |
-| 100 MHz kernel WNS / WHS | +0.104 ns / +0.009 ns |
-| 250 MHz `dma_ip_axi_aclk_1` WNS / WHS | +0.003 ns / +0.009 ns |
-| Automatic clock scaling | None |
+| Kernel-clock WNS / TNS | **+0.060 ns / 0** |
+| Kernel-clock WHS / THS | **+0.009 ns / 0** |
+| Fixed 250 MHz DMA WNS | **+0.003 ns** |
+| Automatic clock scaling | **none** |
 
-Local routing remains dense: SLR0 reports effective south congestion level 6
-and west level 5. The design is therefore routed, but it does not have enough
-physical margin to justify casually widening compute blocks or changing FIFO
-implementation. Any such change requires a new full route.
+The final router reports 100% of nets fully routed. Routed whole-device usage
+is 636,109 CLB LUTs, 915,909 CLB registers, 1,667.5 BRAM tiles, 48 URAMs and
+3,772 DSPs. SLR0 remains physically critical at 98.92% CLB occupancy versus
+73.29% in SLR1 and 76.14% in SLR2. RAMB36/FIFO use is 585/576/337 across
+SLR0/SLR1/SLR2 (87.05/85.71/50.15%), so any additional storage, arithmetic, or
+cross-SLR control still requires a new full route rather than inference from
+HLS resources.
+
+### Previous Iter36 frequency result
+
+For comparison, the Iter36 source was built with a 130 MHz link request:
+
+```bash
+bash c_impl/build_iter36_headlocal.sh 130
+```
+
+Post-route `AggressiveExplore` improved the kernel paths but did not close the
+7.692 ns requirement. At the requested 130 MHz, the post-physopt report has
+WNS/TNS **-0.948/-10111.593 ns**, 19,904 failing setup endpoints, and WHS
+**+0.001 ns**. Vivado auto-frequency scaling encoded `DATA_CLK` at an achieved
+**115.7 MHz**. The fixed 250 MHz DMA same-clock setup path remained positive.
+The build completed in 31 h 31 m and emitted a valid XCLBIN; this is a routed,
+on-card-validated 115.7 MHz result, not a 130 MHz closure result.
 
 ## Correctness and On-Card Performance
 
-The final image passed:
+The Iter57 image passed:
 
 - native C++ build;
 - fast exact decode, 6/6;
@@ -406,28 +532,71 @@ The final image passed:
 
 Excluding the initial seed entry, 63 measured kernel calls produced:
 
-| Metric | Result |
+| Metric | Iter57 at 100 MHz |
 |---|---:|
-| Minimum | 59.517 ms/token |
-| Maximum | 59.851 ms/token |
-| Median | **59.563 ms/token** |
-| Mean | **59.578 ms/token** |
-| Speedup over Iter35, 75.062 ms | **1.260x** |
-| Speedup over Iter32, 98.660 ms | **1.656x** |
-| Speedup over eight-port baseline, 121.4 ms | **2.038x** |
+| Minimum | 41.968075 ms/token |
+| Maximum | 42.389207 ms/token |
+| Median | **42.009069 ms/token** |
+| Mean | **42.023540 ms/token** |
+| Effective cycles | **4.202354M** |
+| Cycle/latency reduction from Iter39C | **2.48%** |
+| Latency reduction from Iter38E, 47.079335 ms | **10.74%** |
+| Speedup over eight-port baseline, 121.4 ms | **2.889x** |
 
-The measured mean is within 0.40 ms of the reconstructed 59.982 ms static
-schedule. Head-local fusion therefore removes the recurrent restore/save cost
-almost one-for-one without introducing a material dynamic-stall gap.
+Iter57 is modestly higher-cycle than auto-scaled Iter54c, but it removes that
+image's frequency downgrade and is the first version of the timing-island arc
+to route, close at a true 100 MHz, and run exact on card. The deeper state
+queues are part of the functional architecture: the otherwise identical
+depth-1024 Iter56b bitstream closed timing but deadlocked on its first token.
 
-Reproducibility hashes:
+For comparison, the Iter39C image produced:
+
+| Metric | Iter39C at 100 MHz |
+|---|---:|
+| Minimum | 43.080 ms/token |
+| Maximum | 43.314 ms/token |
+| Median | **43.086 ms/token** |
+| Mean | **43.093 ms/token** |
+| Mean cycles at 100 MHz | **4.309M** |
+| Speedup over Iter38E, 47.079 ms | **1.093x / 8.47% latency reduction** |
+| Speedup over Iter37D, 51.451 ms | **1.194x** |
+| Speedup over Iter36 100 MHz, 59.578 ms | **1.382x** |
+| Speedup over eight-port baseline, 121.4 ms | **2.817x** |
+
+At 100 MHz, Iter39C removes 0.399M measured cycles from Iter38, capturing 84.2%
+of the 0.474M fixed static reduction. The residual difference confirms that
+the raw 2.270M HLS minimum is not an end-to-end prediction; external traffic
+and dynamic command stalls remain outside that minimum.
+
+For comparison, the previous Iter36 auto-scaled follow-up ran the same smoke
+and full fixtures with its 115.7 MHz image. Both remained exact. Excluding the
+seed, its 63 kernel calls measured:
+
+| Metric | Auto-scaled 115.7 MHz |
+|---|---:|
+| Minimum | 51.776 ms/token |
+| Maximum | 52.104 ms/token |
+| Median | **51.813 ms/token** |
+| Mean | **51.844 ms/token** |
+| Improvement over Iter36 100 MHz | **1.149x / 12.98%** |
+| Speedup over Iter35, 75.062 ms | **1.448x** |
+| Speedup over Iter32, 98.660 ms | **1.903x** |
+| Speedup over eight-port baseline, 121.4 ms | **2.342x** |
+
+The ideal clock-ratio prediction was 51.493 ms/token; the measured result is
+within 0.68%, so the frequency increase did not expose a material new stall.
+
+Reproducibility hashes for the retained Iter57 result:
 
 | Artifact | SHA-256 |
 |---|---|
-| `gdn_model.cpp` | `b0a380365d00a7535dd1256f62f6a21f97a3eee6158e3e4b53bb92ce2df5dafb` |
-| Iter35 link configuration reused by Iter36 | `240855bd65ba1cf4525c88b34f9d07012bf73c90e75f524b2c9547eaa9e5922b` |
-| Compiled XO | `c699dcc8c678cba970906d1a9ab0d62ab2315ad7d67c77fdcdf921dbd752171e` |
-| Successful XCLBIN | `b251ca1c89a2d56111c1c336e003db3c3c0bbaf02556207a50a184578c6f3c34` |
+| `gdn_model.cpp` | `2aa7d9c044af627f925a03ef9e42a2e997111235bba07177d6cce4d4b1e46cd6` |
+| Compiled XO | `4df8788f6221b84d38ee8ea795b1ed6a4c91ea22d83f2115f7e413b3751a7096` |
+| Relocatable link configuration | `4faf23ce87da7fb6c397305a82c3a22d24340198787dee9de1e037bd8b133436` |
+| Timing-island/floorplan hook | `6d36b0f1c52383c787d543d55a849ded1567113cf25bac4d8523f8cc0c12483f` |
+| Corrected Iter54 DMA hook | `aa0d8a155684444061aaffa9cfd1f687fc656c1d93745db96c792364683b6bdb` |
+| Timing-island placement gate | `ffca9307e73543c7e8a2408fd1a6678dfd2975fdd9b6628e28fb242c084b2e2b` |
+| Routed, timing-closed 100 MHz XCLBIN | `4178d442d956eece4d86d2812f12e8bd1894a5036646c14336d5f3de81cc1bcd` |
 
 ## Design Invariants
 
@@ -442,14 +611,33 @@ integrated csynth, full implementation, and on-card measurement:
    materialization.
 6. Keep recurrent state and convolution tails packed and externally
    persistent.
-7. Keep the recurrent buffer head-local and fuse HBM state transfer into the
-   required retrieval/update traversals.
+7. Keep the recurrent buffer head-local, its low/high pairs compacted into
+   64-bit URAM words, all four state ports concurrent, and HBM transfer fused
+   into the required retrieval/update traversals.
 8. Keep LM-head argmax on chip and preserve strict first-index tie behavior.
 9. Keep the external workspace offsets and host ABI stable.
-10. Treat the Iter22 floorplan and Iter23/Iter35 DMA hooks as part of the successful
-   physical architecture, not optional tuning.
+10. Treat the Iter35/54 DMA hooks, recurrent-SLR2 assignment, cluster 8/10
+    placement, and registered collector boundary placement as part of the
+    successful physical architecture.
 11. Judge changes against both 100 MHz timing and zero-conflict routing; HLS
     resource savings alone do not predict routability.
+12. Preserve the head-serial/all-port QKVG and pair-interleaved GU layouts,
+    including the full-byte host validation, until a replacement proves
+    exactness and a lower measured cycle count.
+13. Keep one time-shared head-local convolution actor inside the QKVG result
+    sink, plus fixed-bank packed context movers; do not restore three serial
+    whole-hidden convolution passes.
+14. Keep convolved Q/K/V head-local and streamed directly to recurrence; do not
+    restore whole-hidden Q/K/V buffers.
+15. Keep the state graph forward-only with a two-head depth-2048 BRAM queue per
+    state port. Depth 1024 is a proven hardware deadlock for this registered
+    collector topology. Do not reintroduce feedback credit/readiness handshakes
+    without a bounded proof and a better routed result.
+16. Keep the two concurrent 16-column recurrent islands and deterministic
+    half-head merge until a replacement proves equal correctness, lower cycles,
+    and at least the current 100 MHz timing margin.
+17. Keep native full-logits comparison enabled as a pre-hardware correctness
+    gate; token parity alone cannot detect non-argmax numerical regressions.
 
 Use [decode_disaggregated_gemv.md](decode_disaggregated_gemv.md) for the
 historical GEMV scaling progression and

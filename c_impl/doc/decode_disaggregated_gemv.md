@@ -1,17 +1,23 @@
 # Disaggregated Decode-Only Accelerator (GEMV datapath)
 
 **Status:** Historical GEMV scaling and optimization record. The current
-production design is the integrated Iter36 32-port/16-cluster,
-activation-resident, head-local-state kernel documented in
+production design is the integrated Iter57 32-port/16-cluster,
+activation-resident, timing-island recurrent-state kernel documented in
 [architecture.md](architecture.md).
 The standalone 32-port microbenchmark remains documented separately in
 [`../microbench/gemv_tile/README.md`](../microbench/gemv_tile/README.md).
 
-The final integrated U55C image routes at 100 MHz with zero failed/unrouted
-nets and zero overlaps. It passes exact 64-token parity at 59.578 ms/token mean
-latency, 2.04x faster than the 121.4 ms eight-port baseline. Sections below
-retain the progression that led to that design; older statements describing an
-eight-port kernel as “current” are historical in their section context.
+The Iter57 U55C image routes with zero failed/unrouted nets and zero overlaps,
+closes the kernel/DMA clocks at +0.060/+0.003 ns WNS, and passes exact 64-token
+parity at **42.023540 ms/token / 4.202354M cycles at 100 MHz**. It uses one
+head-serial/all-port QKVG command and one pair-interleaved GU command per layer
+while preserving the same dense FP32 weight bytes. The bounded QKVG sink spans
+convolution, four interleaved state streams, and two concurrent 16-column
+recurrent islands. Three registered collector relays break long SLR paths; one
+depth-2048 BRAM queue per state port prevents the resulting forward graph from
+deadlocking. Sections below retain the progression that led to this design;
+older statements describing an eight-port kernel as “current” are historical
+in their section context.
 
 This documents the pivot to a **decode-only** GatedDeltaNet accelerator: the GPU
 prefills the prompt and exports a constant-size recurrent + conv state to disk;
@@ -441,7 +447,7 @@ endpoints**. The failing path at xo@200 was a high-fanout loop-control reg → f
 xo@200 build ran bit-exact at **129 ms** despite −0.298 — the violation was benign — but a
 negative-WNS bitstream is not committed.)
 
-## 7. Current Integrated Result and Next Step
+## 7. Historical Eight-Port Integrated Result
 
 Decode-only is bit-exact and flat at **121.4 ms/token** *complete* decode steps
 (forward + lm_head + argmax all on-chip), **~3.9× over the 470 ms baseline** (§6f).

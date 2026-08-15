@@ -49,6 +49,23 @@ typedef struct {
     uint32_t completed_windows;
 } ProgressState;
 
+typedef struct {
+    uint32_t checked_steps;
+    uint64_t compared_values;
+    uint64_t cpu_tolerance_failures;
+    uint64_t exact_reference_mismatches;
+    uint32_t argmax_mismatches;
+    double max_abs_error;
+    double max_rel_error;
+} LogitsParity;
+
+typedef struct {
+    char magic[8];
+    uint32_t version;
+    uint32_t vocab_size;
+    uint32_t decode_steps;
+} LogitsDumpHeader;
+
 static void die(const char *message) {
     fprintf(stderr, "%s\n", message);
     exit(1);
@@ -344,6 +361,17 @@ static void load_gdnstate(const char *path, const GDNModel *model,
                        hdr->head_dim * hdr->value_dim;
     if (fread(run_state->recurrent_state, sizeof(float), rec_count, f) != rec_count)
         die(".gdnstate: truncated recurrent section");
+    {
+        float *state_stripes[GDN_RECURRENT_STATE_PORTS];
+        const size_t shard_floats = gdn_weight_shard_floats(c);
+        for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
+            state_stripes[p] =
+                run_state->weight_shards[GDN_RECURRENT_STATE_FIRST_PORT + p] +
+                shard_floats;
+        }
+        gdn_scatter_recurrent_state(state_stripes,
+                                    run_state->recurrent_state, rec_count);
+    }
     /* Section B: conv tails -> run_state->head_buffer (layers x 3 x (W-1) x hidden). */
     size_t conv_count = (size_t)hdr->num_layers * 3u *
                         (hdr->conv_size - 1u) * hdr->hidden;
@@ -362,7 +390,8 @@ static void load_gdnstate(const char *path, const GDNModel *model,
 
 static int run_decode_from_state(
     const GDNModel *model, GDNRunState *run_state, float *logits,
-    const char *state_path, uint32_t decode_len, const char *output_path
+    const char *state_path, uint32_t decode_len, const char *output_path,
+    const char *logits_dump_path, const char *logits_reference_path
 ) {
     GDNStateHeader hdr;
     load_gdnstate(state_path, model, run_state, &hdr);
@@ -370,6 +399,44 @@ static int run_decode_from_state(
     uint32_t n = (decode_len != 0) ? decode_len : 64;
     int32_t *traj = (int32_t *)xmalloc((size_t)n * sizeof(int32_t));
     double  *tpot = (double  *)xmalloc((size_t)n * sizeof(double));
+    float *final_hidden = (float *)xmalloc(
+        (size_t)model->config.hidden_size * sizeof(float));
+    float *reference_logits = (float *)xmalloc(
+        (size_t)model->config.vocab_size * sizeof(float));
+    float *saved_logits = NULL;
+    FILE *logits_dump = NULL;
+    FILE *logits_reference = NULL;
+    LogitsParity logits_parity;
+    memset(&logits_parity, 0, sizeof(logits_parity));
+
+    if (logits_dump_path != NULL) {
+        LogitsDumpHeader dump_header = {{'G','D','N','L','O','G','1','\0'}, 1,
+                                        model->config.vocab_size, n - 1};
+        logits_dump = fopen(logits_dump_path, "wb");
+        if (logits_dump == NULL ||
+            fwrite(&dump_header, sizeof(dump_header), 1, logits_dump) != 1) {
+            die("decode-from-state: cannot create logits dump");
+        }
+    }
+    if (logits_reference_path != NULL) {
+        LogitsDumpHeader reference_header;
+        logits_reference = fopen(logits_reference_path, "rb");
+        if (logits_reference == NULL ||
+            fread(&reference_header, sizeof(reference_header), 1,
+                  logits_reference) != 1 ||
+            memcmp(reference_header.magic, "GDNLOG1", 7) != 0 ||
+            reference_header.version != 1 ||
+            reference_header.vocab_size != model->config.vocab_size ||
+            reference_header.decode_steps < n - 1) {
+            die("decode-from-state: incompatible logits reference");
+        }
+        saved_logits = (float *)xmalloc(
+            (size_t)model->config.vocab_size * sizeof(float));
+    }
+
+#ifndef __SYNTHESIS__
+    gdn_set_native_debug_buffers(final_hidden, logits);
+#endif
 
     /* traj[0] = the GPU-exported seed (argmax of the prompt's last position);
      * each later token is one decode step against the persistent state. */
@@ -386,9 +453,68 @@ static int run_decode_from_state(
          * next token id into x_norm[0] — read it directly instead of recomputing
          * host-side, so native matches the kernel exactly. */
         traj[step] = (int32_t)run_state->x_norm[0];
-        (void)logits;
+        gdn_compute_logits(model, final_hidden, reference_logits);
+        uint32_t captured_argmax = 0;
+        float captured_best = logits[0];
+        for (uint32_t vocab_index = 0;
+             vocab_index < model->config.vocab_size; ++vocab_index) {
+            float captured = logits[vocab_index];
+            float reference = reference_logits[vocab_index];
+            double abs_error = fabs((double)captured - (double)reference);
+            double rel_error = abs_error /
+                fmax(1.0, fabs((double)reference));
+            if (abs_error > logits_parity.max_abs_error)
+                logits_parity.max_abs_error = abs_error;
+            if (rel_error > logits_parity.max_rel_error)
+                logits_parity.max_rel_error = rel_error;
+            if (!isfinite(captured) || !isfinite(reference) ||
+                abs_error > 1e-3 + 1e-4 * fabs((double)reference)) {
+                logits_parity.cpu_tolerance_failures++;
+            }
+            if (vocab_index != 0 && captured > captured_best) {
+                captured_best = captured;
+                captured_argmax = vocab_index;
+            }
+        }
+        logits_parity.checked_steps++;
+        logits_parity.compared_values += model->config.vocab_size;
+        if ((int32_t)captured_argmax != traj[step])
+            logits_parity.argmax_mismatches++;
+
+        if (logits_reference != NULL) {
+            if (fread(saved_logits, sizeof(float), model->config.vocab_size,
+                      logits_reference) != model->config.vocab_size) {
+                die("decode-from-state: truncated logits reference");
+            }
+            for (uint32_t vocab_index = 0;
+                 vocab_index < model->config.vocab_size; ++vocab_index) {
+                if (memcmp(&saved_logits[vocab_index], &logits[vocab_index],
+                           sizeof(float)) != 0) {
+                    logits_parity.exact_reference_mismatches++;
+                }
+            }
+        }
+        if (logits_dump != NULL &&
+            fwrite(logits, sizeof(float), model->config.vocab_size,
+                   logits_dump) != model->config.vocab_size) {
+            die("decode-from-state: failed while writing logits dump");
+        }
         tpot[step] = monotonic_ms() - t0;
     }
+#ifndef __SYNTHESIS__
+    gdn_set_native_debug_buffers(NULL, NULL);
+#endif
+
+    fprintf(stderr,
+            "[logits] steps=%u values=%llu max_abs=%.9g max_rel=%.9g "
+            "cpu_tol_fail=%llu exact_ref_mismatch=%llu argmax_mismatch=%u\n",
+            logits_parity.checked_steps,
+            (unsigned long long)logits_parity.compared_values,
+            logits_parity.max_abs_error, logits_parity.max_rel_error,
+            (unsigned long long)logits_parity.cpu_tolerance_failures,
+            (unsigned long long)logits_parity.exact_reference_mismatches,
+            logits_parity.argmax_mismatches);
+    fflush(stderr);
 
     FILE *out = open_output(output_path);
     fprintf(out, "{\"kind\": 2, \"decode_len\": %u, \"num_examples\": 1,\n", n);
@@ -398,12 +524,31 @@ static int run_decode_from_state(
     for (uint32_t j = 0; j < n; ++j) fprintf(out, "%s%d", j ? ", " : "", traj[j]);
     fprintf(out, "],\n   \"per_step_tpot_ms\": [");
     for (uint32_t j = 0; j < n; ++j) fprintf(out, "%s%.6f", j ? ", " : "", tpot[j]);
-    fprintf(out, "]}\n ]}\n");
+    fprintf(out, "]}\n ],\n");
+    fprintf(out,
+            " \"logits_parity\": {\"checked_steps\": %u, "
+            "\"compared_values\": %llu, \"max_abs_error\": %.17g, "
+            "\"max_rel_error\": %.17g, \"cpu_tolerance_failures\": %llu, "
+            "\"exact_reference_mismatches\": %llu, "
+            "\"argmax_mismatches\": %u}}\n",
+            logits_parity.checked_steps,
+            (unsigned long long)logits_parity.compared_values,
+            logits_parity.max_abs_error, logits_parity.max_rel_error,
+            (unsigned long long)logits_parity.cpu_tolerance_failures,
+            (unsigned long long)logits_parity.exact_reference_mismatches,
+            logits_parity.argmax_mismatches);
     if (output_path != NULL) fclose(out);
 
     free(traj);
     free(tpot);
-    return 0;
+    free(final_hidden);
+    free(reference_logits);
+    free(saved_logits);
+    if (logits_dump != NULL) fclose(logits_dump);
+    if (logits_reference != NULL) fclose(logits_reference);
+    return (logits_parity.cpu_tolerance_failures == 0 &&
+            logits_parity.exact_reference_mismatches == 0 &&
+            logits_parity.argmax_mismatches == 0) ? 0 : -1;
 }
 
 int main(int argc, char **argv) {
@@ -415,6 +560,8 @@ int main(int argc, char **argv) {
     int decode_mode = 0;
     const char *state_path = NULL;  /* --decode-from-state: disaggregated decode */
     uint32_t decode_len = 0;   /* 0 => use the fixture's golden cont_len */
+    const char *logits_dump_path = NULL;
+    const char *logits_reference_path = NULL;
     const char *positional[3];
     int positional_count = 0;
     int arg_index;
@@ -436,6 +583,12 @@ int main(int argc, char **argv) {
                 die("--decode-len requires a value");
             }
             decode_len = (uint32_t)strtoul(argv[++arg_index], NULL, 10);
+        } else if (strcmp(arg, "--logits-dump") == 0) {
+            if (arg_index + 1 >= argc) die("--logits-dump requires a path");
+            logits_dump_path = argv[++arg_index];
+        } else if (strcmp(arg, "--logits-reference") == 0) {
+            if (arg_index + 1 >= argc) die("--logits-reference requires a path");
+            logits_reference_path = argv[++arg_index];
         } else if (positional_count < 3) {
             positional[positional_count++] = arg;
         } else {
@@ -447,7 +600,8 @@ int main(int argc, char **argv) {
     if (positional_count < 2) {
         fprintf(stderr,
                 "usage (decode-only): %s <weights.gdnw> <fixture.gdnreq> [output.json]"
-                " --decode --decode-from-state <state.gdnstate> [--decode-len N]\n",
+                " --decode --decode-from-state <state.gdnstate> [--decode-len N]"
+                " [--logits-dump file] [--logits-reference file]\n",
                 argv[0]);
         return 1;
     }
@@ -471,6 +625,13 @@ int main(int argc, char **argv) {
     }
     log_progress_message("[progress] allocating run state");
     if (gdn_run_state_init(&run_state, &model, model.config.max_seq_len) != 0) {
+        gdn_model_free(&model);
+        return 1;
+    }
+    log_progress_message("[progress] validating exact weight-shard layout");
+    if (gdn_validate_weight_shards(model.weight_data, &model.config,
+                                   run_state.weight_shards) != 0) {
+        gdn_run_state_free(&run_state);
         gdn_model_free(&model);
         return 1;
     }
@@ -504,7 +665,11 @@ int main(int argc, char **argv) {
         }
         if (n == 0) die("decode-from-state: zero decode length");
         const char *decode_out = (argc == 4) ? argv[3] : "results_decode_c/decode.c.json";
-        run_decode_from_state(&model, &run_state, logits, state_path, n, decode_out);
+        if (run_decode_from_state(&model, &run_state, logits, state_path, n,
+                                  decode_out, logits_dump_path,
+                                  logits_reference_path) != 0) {
+            die("decode-from-state: full-logits parity failed");
+        }
         fprintf(stderr, "[progress] decode finished elapsed=%.0fs\n", elapsed_seconds(&progress));
         fflush(stderr);
         free_fixture(&fixture);

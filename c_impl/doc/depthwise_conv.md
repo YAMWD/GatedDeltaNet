@@ -1,9 +1,9 @@
-# Depthwise 1D Convolution + SiLU (`gdn_depthwise_conv_silu`)
+# Depthwise 1D Convolution + SiLU
 
-**Status:** Active decode compute block. Synthesis tables below are from the
-historical prefill top unless stated otherwise.
+**Status:** Iter39C production decode block. Synthesis tables in the lower
+historical section are from the retired prefill top.
 
-**Location:** `gdn_model.cpp` (`gdn_depthwise_conv_silu`, static helper)
+**Location:** `gdn_model.cpp` (`gdn_depthwise_conv_silu_head_kind`)
 
 ## Overview
 
@@ -20,10 +20,42 @@ For the first decode token that tail is imported from the GPU prefill state;
 after every call the newest three input rows are written back for the next
 token.
 
-The function is called three times per layer (Q, K, V) — once per parameter
-tensor — and operates on `(num_rows × num_cols)` activation tensors with
-`num_rows = num_tokens` and `num_cols = hidden = 2048`. The kernel size is
-fixed at 4.
+Iter39C no longer calls a whole-hidden function three times after QKVG. The
+QKVG collector emits one complete 256-element head every two 32-channel result
+rounds. A bounded sink then invokes one time-shared 256-column actor for Q, K,
+and V before consuming the next head. The actor's convolution runs while later
+heads are still being produced by the upstream GEMV dataflow graph.
+
+## Current Iter39C Data Movement
+
+Before QKVG, six fixed-bank loops stage the three 32 KiB convolution-weight
+tensors and three 24 KiB old-tail tensors from HBM0 into partitioned BRAM. HLS
+infers 512-bit bursts and II=1 for every loop; the combined context load is
+3,137 cycles/layer.
+
+For each head, the actor:
+
+1. loads that head's 64 packed weight words;
+2. restores 48 packed old-tail words;
+3. shifts in 16 packed words from the raw Q, K, or V result;
+4. computes 256 four-tap convolutions with four element lanes; and
+5. stores the convolved head into its local activation buffer.
+
+After all three kinds consume a head, the sink reuses obsolete tail row 0 for
+the new raw Q/K/V row. Three final fixed-bank stores emit old rows 1/2 followed
+by that new row in 1,371 cycles/layer. This preserves the `.gdnstate` tail ABI,
+FP32 order, and exact multi-token behavior without allocating another tail
+buffer.
+
+Integrated Iter39C synthesis reports one physical head-convolution actor,
+512-bit context movers at II=1, unchanged GEMV MM2S II=1/MAC II=4, and a
+473,688-cycle fixed reduction versus Iter38. The routed 100 MHz image measures
+4.309M cycles/token versus 4.708M for Iter38, with exact 64-token parity.
+
+## Historical Whole-Tensor Implementation
+
+The remaining sections document the earlier generic whole-tensor helper and
+the prefill optimization history; they are not the current decode schedule.
 
 ## Compile-time bounds
 

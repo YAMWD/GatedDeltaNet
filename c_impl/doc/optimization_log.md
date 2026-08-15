@@ -1931,9 +1931,2364 @@ one command: `bash c_impl/build_iter36_headlocal.sh 100`. Artifact hashes are:
 | XO | `c699dcc8c678cba970906d1a9ab0d62ab2315ad7d67c77fdcdf921dbd752171e` |
 | XCLBIN | `b251ca1c89a2d56111c1c336e003db3c3c0bbaf02556207a50a184578c6f3c34` |
 
-The gated 130 MHz follow-up launched only after this correctness/performance
-gate passed; it is a separate experiment and does not change the committed
-100 MHz milestone.
+#### Iter36 frequency follow-up — requested 130 MHz, validated at 115.7 MHz
+
+The gated follow-up reused the exact Iter36 source and physical recipe and
+changed only the link request from 100 to 130 MHz. Source SHA-256 remained
+`b0a380365d00a7535dd1256f62f6a21f97a3eee6158e3e4b53bb92ce2df5dafb`;
+the config SHA-256 remained
+`240855bd65ba1cf4525c88b34f9d07012bf73c90e75f524b2c9547eaa9e5922b`.
+The one-line reproduction command is
+`bash c_impl/build_iter36_headlocal.sh 130`.
+
+The build completed all routing, post-route `AggressiveExplore`, DRC, and
+bitstream phases in **31 h 31 m 16 s**. At the requested 130 MHz, the final
+post-physopt report has overall WNS/TNS **-0.948/-10111.593 ns**, 19,904
+failing setup endpoints, and WHS **+0.001 ns**. The kernel setup paths therefore
+did not close at 130 MHz. Vivado auto-frequency scaling selected an achieved
+**115.7 MHz** `DATA_CLK`; the fixed 250 MHz DMA same-clock setup path remained
+positive. The emitted 79,292,496-byte XCLBIN is a valid 115.7 MHz artifact, not
+a 130 MHz closure result.
+
+The automatic eight-token smoke test and full 64-token decode both matched the
+golden trajectory exactly with first divergence `-1`. Excluding the initial
+seed, 63 kernel calls measured:
+
+| Metric | Iter36 auto-scaled 115.7 MHz |
+|---|---:|
+| Mean | **51.844010 ms/token** |
+| Median | **51.813378 ms/token** |
+| Min / max | 51.776322 / 52.103974 ms |
+| Improvement over Iter36 100 MHz | **1.149x / 12.98%** |
+| Speedup over Iter35 75.061694 ms | **1.448x** |
+| Speedup over Iter32 98.659598 ms | **1.903x** |
+| Speedup over 121.4 ms reference | **2.342x** |
+
+The ideal 100/115.7 clock-ratio prediction from the 59.577939 ms control is
+51.493465 ms. The measured mean is only 0.68% above it, confirming that the
+higher clock did not introduce a material dynamic stall. This is a retained
+performance improvement even though the original 130 MHz timing objective was
+not met.
+
+| Artifact | SHA-256 |
+|---|---|
+| XO | `01b8bf9f19fd62c4762fe16d77235212731cad0b31e48601fbc0f37608ef7f6f` |
+| XCLBIN | `7f631a7941f5614c91a1eb80246c0dd7fe3e8e83f1eceb1e171487c04498505f` |
+
+### iter37A — four-port recurrent-state striping, first scheduling attempt (rejected)
+
+*Tested 2026-08-02; stopped during integrated csynth before hardware link.*
+
+This sub-variant moved the unchanged FP32 recurrent-state tensor from the
+single HBM0 workspace region to four Pack16-striped tails on existing weight
+ports 28--31 and widened recurrent column arithmetic from 16 to 32 lanes. The
+native fast 6-token and full 32-token decode gates were both exact. HLS also
+inferred the intended 1,024-beat, 512-bit bursts for all four read streams and
+all four write streams; the 32 GEMV MM2S loops remained at II=1.
+
+The first flattened low/high implementation did not meet its recurrent-loop
+schedule gate:
+
+| Loop | Target II | Achieved II |
+|---|---:|---:|
+| Low-half state read (`fused_rd01`) | 1 | **1** |
+| High-half state read (`fused_rd23`) | 1 | **2** |
+| Low-half update/write (`fused_wr01`) | 1 | **2** |
+| High-half update/write (`fused_wr23`) | 1 | **3** |
+
+The high-half read alias is caused by sharing one dynamically indexed
+low/high accumulator array. The write-loop warnings are false state-array
+carried dependencies: `(row,column)` is unique for every flattened loop
+iteration, so no state element is revisited in that pass. Because these IIs
+would miss the planned <=50K recurrent cycles/layer, synthesis was terminated
+during RTL generation and no link was launched. Iter37B splits low/high
+accumulator arrays and applies an explicit false inter-iteration dependency
+only to the one-write state update loops. This rejected source/config is not a
+commit candidate.
+
+### iter37B — four-port recurrent-state striping, 115 MHz routing failure
+
+*Tested 2026-08-02; implementation failed during route verification.*
+
+Iter37B retained Iter37A's four-way Pack16-striped recurrent-state placement on
+the existing weight ports 28--31 and its 32 recurrent arithmetic lanes. It
+split the low/high accumulator storage and applied a false inter-iteration
+dependency only to the flattened one-write update loops. Native fast 6-token
+and full 32-token decode checks remained exact. Integrated Vitis HLS 2022.2
+synthesis achieved II=1 on all four state read/write loops, with a top-level
+minimum latency estimate of **3,957,551 cycles** versus Iter36's 4,741,679.
+Each recurrent layer was estimated at 43,873--44,081 cycles. Whole-kernel HLS
+resources were 1,511 RAMB18, 3,627 DSP, 851,903 FF, 912,694 LUT, and 48 URAM;
+the 32 weight movers remained II=1 and the 16 GEMV clusters remained II=4.
+
+The full implementation used the accepted source SHA-256
+`88e68abdcba29f4355216571440d70d8611f0855717466e8f73891a3db58b216` and XO SHA-256
+`5846289626acf27d200a098038ed934432fe16730071c8e185d9e9c5fc766626`.
+It requested 115 MHz while preserving the Iter36/Iter35 physical recipe. The
+placer completed, but routing reported global/short congestion level 6 and
+timing congestion level 7. Rip-up/reroute reduced the first iteration from
+1,140,068 to 3,784 overlapping nodes, but the next iteration did not converge.
+Final verification reported **6,708 failed-to-route signals** and **5,845 node
+overlaps**, then `route_design` failed with partially conflicted nets. No
+XCLBIN was emitted, so there is no timing or on-card performance result.
+
+Post-failure checkpoint analysis localized the new pressure. The recurrent
+hierarchy was placed almost entirely in SLR1: 17,681 CLBs, 71,153 LUTs,
+67,399 registers, 568 DSPs, 32 URAMs, and 13.5 BRAM tiles were in SLR1; only
+781 CLBs and 1,921 registers spilled into SLR0, and none entered SLR2. It
+accounted for 47% of a level-7 long-routing congestion window. Relative to the
+successful Iter36 130 MHz-request placement, total SLL use rose from 26,417 to
+31,643, SLR0--SLR1 crossings rose from 16,938 to 19,455, and SLR1--SLR2
+crossings rose from 9,479 to 12,188. SLR0 was 99.54% occupied by CLBs and SLR1
+was 87.11%, while SLR2 remained only 50.36% occupied. These measurements make
+the next repair a recurrent-specific redistribution/reduction problem, not a
+clock-frequency problem or a shortage of total device resources.
+
+This is a **negative implementation result** and must not be committed as an
+improvement. It shows that the additional recurrent-state striping/32-lane
+logic exceeds the routability margin of the current 115 MHz physical recipe;
+the preliminary -0.013 ns timing seen before detailed rerouting is not a final
+timing verdict. A 100 MHz fallback was not launched from this status check.
+
+### iter37C — recurrent-only SLR2 redistribution (rejected hook guard)
+
+*Tested 2026-08-02--03 at 115 MHz; stopped before `opt_design`.*
+
+Iter37C keeps the exact bit-exact Iter37B source and verified XO. Its only
+changes are physical: retain the Iter22 cluster-8 and Iter35 DMA repairs,
+assign the complete `grp_gdn_recurrent_attention_fu_*` hierarchy to the full
+SLR2 without a rectangular pblock, use `SSI_SpreadSLLs` placement, and use
+`AlternateCLBRouting`. Post-route `AggressiveExplore` remains enabled. The
+goal is to move the 17,681 recurrent CLBs and their 568 DSP/32 URAM anchors out
+of SLR1 while leaving Vivado free to spread them within the underused SLR2.
+
+The checksum-guarded command was `make -C c_impl iter37c`. It reused
+the accepted XO SHA-256
+`5846289626acf27d200a098038ed934432fe16730071c8e185d9e9c5fc766626`;
+the relocatable config-template SHA-256 is
+`e31edd150c44f7745de470b5e95405c7e539a6f8c0ad3e07783ac2393abb0952`
+and the recurrent-placement hook SHA-256 is
+`3826b82f3266b59a36f8552fdfab46a67825f77ba01a9fa0cf5e3e0e5c014a5c`.
+The build completed synthesis, then the pre-optimization hook rejected its own
+selector: `NAME =~ */grp_gdn_recurrent_attention_fu_*` matched the hierarchy
+root and all descendants because Vivado's glob `*` spans `/`, producing
+204,004 matches instead of one. Placement and routing never ran, so this is a
+**negative recipe result with no physical-design verdict**. No source, XO, or
+frequency result is implicated, and no 100 MHz fallback was launched. Iter37D
+replaces the glob with the checkpoint-validated anchored regexp
+`^.*/grp_gdn_recurrent_attention_fu_[0-9]+$` and reruns the same experiment.
+
+### iter37D — corrected recurrent-only SLR2 redistribution, routed at 100 MHz
+
+*Tested 2026-08-03--04; 115 MHz timing failed and Vitis emitted an
+automatically scaled 100 MHz XCLBIN.*
+
+Iter37D is the corrected retry of Iter37C. It preserves the exact Iter37B
+source and XO and changes only the physical recipe. The pre-optimization hook
+now uses `get_cells -hierarchical -regexp` with the checkpoint-validated exact
+root pattern `^.*/grp_gdn_recurrent_attention_fu_[0-9]+$`; the one selected
+recurrent hierarchy is assigned to the full SLR2. Iter22's cluster-8 placement,
+Iter35's DMA fanout repair, `SSI_SpreadSLLs`, `AlternateCLBRouting`, and
+post-route `AggressiveExplore` remain enabled.
+
+The reproducible command is `make -C c_impl iter37 ITER37_FREQ=115`. The source
+SHA-256 remains
+`88e68abdcba29f4355216571440d70d8611f0855717466e8f73891a3db58b216`,
+the reused XO SHA-256 remains
+`5846289626acf27d200a098038ed934432fe16730071c8e185d9e9c5fc766626`,
+the corrected hook SHA-256 is
+`15587403b5e904345abdee72cd84cfc0fa24f8be559f94f1e5554cdcedbd059e`,
+and the relocatable config-template SHA-256 is
+`998b71e3a8cb3b7f818f12cbe6581f0ffd2e04010dba5db3f20ca2ae844aa08f`.
+No independent 100 MHz implementation was launched; this same run was allowed
+to fall back only after its 115 MHz timing failure was established.
+
+The corrected hook selected exactly one recurrent root and implementation
+completed routing with **zero failed/unrouted nets and zero node overlaps**.
+This confirms that moving the enlarged recurrent block into SLR2 resolves the
+Iter37B routing failure. At the requested 115 MHz, however, routed timing was
+WNS -1.775 ns/TNS -8697.074 ns before post-route physical optimization.
+`AggressiveExplore` recovered 0.479 ns, finishing at **WNS -1.296 ns**, TNS
+-5314.403 ns, WHS +0.001 ns, and THS 0.000 ns. The failing path group was the
+kernel data clock and included recurrent state RAM/control paths as well as
+GEMV-cluster datapaths; this is a broad physical-timing failure rather than the
+single DMA path seen in earlier iterations.
+
+Vitis therefore scaled `DATA_CLK` from 115 to **100 MHz**, generated the
+bitstream, and exited successfully after 14 h 32 min. The resulting XCLBIN is
+77,620,790 bytes with SHA-256
+`5dd2c7c460f635f3bc3cbe931c365549f47d33653d679871953c161b62da3524`.
+The eight-token smoke run and full 64-token decode-from-state run on U55C device
+0 both matched the golden trajectory exactly, with first divergence `-1` and
+100% top-1 agreement. Excluding the initial seed, the 63 full-run kernel calls
+measured:
+
+| Metric | Iter37D, auto-scaled 100 MHz |
+|---|---:|
+| Minimum | 51.422932 ms/token |
+| Maximum | 51.784876 ms/token |
+| Median | **51.437899 ms/token** |
+| Mean | **51.450918 ms/token** |
+| Speedup over Iter36 100 MHz, 59.577939 ms | **1.158x / 13.64%** |
+| Speedup over Iter36 115.7 MHz, 51.844010 ms | **1.0076x / 0.76%** |
+| Speedup over 121.4 ms reference | **2.360x** |
+
+This is a **retained positive result**. Four-port state striping plus 32
+recurrent lanes saves about 0.813 million measured cycles/token relative to
+Iter36 at the same 100 MHz, and is narrowly faster than the previous best even
+though that image ran at 115.7 MHz. The achieved 51.451 ms is higher than the
+3.958-million-cycle integrated HLS minimum because the external state streams
+still incur about 1.19 million cycles of dynamic transfer/backpressure, nearly
+the same residual term as Iter36. The architecture, reproducible physical
+recipe, and measured result are therefore commit candidates; the unachieved
+115 MHz target remains explicitly recorded as a timing failure.
+
+### iter38A — head-major unified Q/K/V/gate layout (csynth-positive foundation)
+
+*Tested 2026-08-04; no hardware build launched.*
+
+Iter38A changes the first per-layer shard section from four independent
+output-striped Q, K, V, and attention-gate matrices into one head-major QKVG
+section. Channel `4*head+kind` owns all 256 rows of one Q/K/V/gate head. A
+single 8,192-output call to the existing one physical `gdn_gemv` graph replaces
+four 2,048-output calls. Weight bytes, row order within each matrix, inner
+dimension order, FP32 dot-product order, 32 MM2S readers, 16 two-port clusters,
+and the external ABI are unchanged. A native-only validator compares every
+copied shard float against its source tensor, including all unaffected matrix
+sections and the LM head.
+
+Validation and identities:
+
+- source SHA-256: `a0774f91ab2ca305c605d3daa59618ffac562e21be89369ce9a94b0ed8cd68b4`;
+- header SHA-256: `7bf6bf9d567241028d916a5def4924c6efb7031e416e573921c11d4b10fa2e74`;
+- evaluator SHA-256: `2712848cab0e054a3e43b6d10e4ef4d2e50e5abc149dc2d6dea5ea12c17db953`;
+- `make -C c_impl -j2`: PASS with only pre-existing warnings;
+- `bash scripts/decode_correctness_check.sh --fast`: exact 6/6 positions,
+  first divergence `-1`;
+- `bash scripts/decode_correctness_check.sh`: exact 32/32 positions, first
+  divergence `-1`; and
+- Vitis HLS 2022.2 integrated csynth at 7.692 ns using Tcl SHA-256
+  `b93fb3d3e84bdd0c4f3f8eeff42c04ea9508b65b6f63819eab6971c130f54258`:
+  PASS, MM2S II=1 and cluster MAC II=4 unchanged.
+
+| Integrated HLS metric | Iter37D | Iter38A | Delta |
+|---|---:|---:|---:|
+| Static minimum cycles | 3,957,551 | **3,343,751** | -613,800 |
+| RAMB18 | 1,511 | 1,511 | 0 |
+| DSP | 3,627 | 3,627 | 0 |
+| FF | 851,903 | **851,782** | -121 |
+| LUT | 912,694 | **911,889** | -805 |
+| URAM | 48 | 48 | 0 |
+
+The 0.614M static-cycle reduction is **not** accepted as a predicted on-card
+gain. Because the shared GEMV retains runtime dimensions, top-level csynth
+charges each call the module's 8,435-cycle minimum; removing three calls per
+layer mechanically removes about 0.607M reported cycles even though the MAC
+and weight-stream work is unchanged. The demonstrated result is narrower but
+useful: the streaming-friendly head-major layout is exact, has no II or
+resource regression, and eliminates three engine startups/activation reloads.
+The variant is retained in the working tree as foundation for Iter38B and head
+streaming, but is not independently committed or promoted to a hardware
+performance result.
+
+### iter38B — pair-interleaved unified MLP gate/up layout (retained foundation)
+
+*Tested 2026-08-04; no hardware build launched.*
+
+Iter38B keeps Iter38A QKVG and changes the two 5,632-row MLP gate/up shard
+sections into one pair-interleaved GU section. Channel `2*chunk+kind` owns one
+352-row gate or up block, so one 11,264-output GEMV replaces two 5,632-output
+calls and exposes bounded gate/up pairs for later chunk streaming. MLP-down,
+weight bytes, FP32 dot-product order, the 32-reader/16-cluster engine, and all
+external interfaces remain unchanged. The exact shard validator was extended
+to cover every GU chunk.
+
+Validation and identities:
+
+- source SHA-256: `92e65cb24e4dbed510a8c9164d4fac118e43206e4da0f3e9d91666b48846b79a`;
+- header SHA-256: `7bf6bf9d567241028d916a5def4924c6efb7031e416e573921c11d4b10fa2e74`;
+- evaluator SHA-256: `2712848cab0e054a3e43b6d10e4ef4d2e50e5abc149dc2d6dea5ea12c17db953`;
+- `make -C c_impl -j2`: PASS with only pre-existing warnings;
+- `bash scripts/decode_correctness_check.sh --fast`: exact 6/6 positions,
+  first divergence `-1`, including the full-byte shard-layout gate; and
+- Vitis HLS 2022.2 integrated csynth at 7.692 ns using Tcl SHA-256
+  `f2df1b8633bcf718032e0c482d3abdc8e3f37df94c925211415dd9c539764f67`:
+  PASS, GU unpack II=1, MM2S II=1, cluster MAC II=4, estimated Fmax
+  167.98 MHz.
+
+| Integrated HLS metric | Iter38A | Iter38B | Delta |
+|---|---:|---:|---:|
+| Static minimum cycles | 3,343,751 | **3,141,239** | -202,512 |
+| RAMB18 | 1,511 | 1,527 | +16 |
+| DSP | 3,627 | 3,629 | +2 |
+| FF | 851,782 | 851,881 | +99 |
+| LUT | 911,889 | **911,752** | -137 |
+| URAM | 48 | 48 | 0 |
+
+As with Iter38A, almost all of the reported cycle reduction is the shared
+dynamic GEMV module's 8,435-cycle minimum being charged one fewer time per
+layer; it is not an on-card prediction. The 16 RAMB18 increase is the enlarged
+704-Pack16 common result aperture and the two DSPs are address arithmetic for
+the 22-pack chunk mapping. This remains inside the Stage-3 acceptance bound,
+does not change any throughput II, and enables tagged/chunk consumption. It is
+retained as foundation in the working tree, but is not independently committed
+or claimed as a demonstrated hardware-speed improvement.
+
+### iter38C — merged four-port recurrent-state loops (rejected)
+
+*Tested and stopped during integrated csynth on 2026-08-04.*
+
+Iter38C merged the serial low-port-pair and high-port-pair state traversals
+into one four-port read loop and one four-port write loop. The arithmetic order
+within every state column was unchanged, and both native gates passed: exact
+6/6 fast positions and exact 32/32 full positions with first divergence `-1`.
+The candidate source SHA-256 was
+`4e44e0e2faf29e8e116dbd86ee9f16eb571bb507a6635ff0e9a7fc334c565ba6`;
+the 7.692 ns csynth Tcl SHA-256 was
+`20ec24a5a719005755ec85d9f835de72bb1155c42f6ee746971f500076a610d8`.
+
+Integrated HLS rejected the schedule before report completion:
+
+- `fused_rd0123`: target II=1, **final II=2**;
+- `fused_wr0123`: target II=1, **final II=3**; and
+- both violations were explicitly attributed to limited ports on the single
+  cyclically partitioned `state` array. Low and high columns select the same
+  modulo-32 URAM bank, so the merged loop requests two read-modify-write accesses
+  per bank per cycle.
+
+At II=2 the merged read merely equals the two former 1,024-cycle II=1 loops;
+at II=3 the merged write is about 1,024 cycles/head worse than the two former
+write loops. The synthesis was stopped after this decisive negative result to
+avoid spending time on RTL/report generation. This variant is rejected and
+must not be committed. Iter38D retains concurrent HBM access but splits the
+head-local state into independent low/high URAM arrays so each half has its own
+bank ports.
+
+### iter38D — concurrent state with struct-paired local storage (superseded)
+
+*Tested 2026-08-04; no hardware build launched.*
+
+Iter38D fixed Iter38C's port conflict by storing each low/high column pair in a
+`GDNStatePair` element at the same cyclic bank address. Native compilation and
+the six-token exact gate passed, and integrated HLS achieved II=1 for both the
+1,024-word four-port read and four-port write loops. Recurrent latency fell
+from 43,873--44,081 to **27,329--27,537 cycles/layer**, or 3,416--3,442
+cycles/head instead of 5,484--5,510. Unlike the QKVG/GU call-count effect, this
+16,544-cycle/layer reduction is a real fixed-trip-count schedule change.
+
+The candidate source SHA-256 was
+`eb5cbf5e566e62eac6e25084c94f2c337a4360fe75b567e4a8147904bd20f05f`;
+the Vitis HLS 2022.2 7.692 ns Tcl SHA-256 was
+`3dd3e05a817b40230b3f0c9ef97b65d46f773f9bf76cbfbcd477f072d2dcbd79`.
+
+| Integrated HLS metric | Iter38B | Iter38D | Delta |
+|---|---:|---:|---:|
+| Static minimum cycles | 3,141,239 | **2,744,183** | -397,056 |
+| Recurrent cycles/layer, minimum | 43,873 | **27,329** | -16,544 |
+| RAMB18 | 1,527 | 1,527 | 0 |
+| DSP | 3,629 | 3,629 | 0 |
+| FF | 851,881 | 859,711 | +7,830 |
+| LUT | 911,752 | 933,045 | +21,293 |
+| URAM | 48 | **80** | +32 |
+
+The C struct was automatically decomposed into 32 separate low-field and 32
+separate high-field 1,024x32 memories, doubling recurrent URAM from 32 to 64
+instead of producing the intended 32 memories at 1,024x64. The cycle result is
+positive, but this avoidable 32-URAM and 21K-LUT routing risk is not accepted as
+the final implementation. Iter38D is superseded and not committed; Iter38E
+adds an explicit aggregate/packing directive and requires the same II/cycles
+with the original URAM count before any hardware build.
+
+### iter38E — packed four-port concurrent state, QKVG, and GU (hardware candidate)
+
+*Native, integrated csynth, 100 MHz implementation, and on-card validation
+completed 2026-08-04.*
+
+Iter38E adds `aggregate compact=bit` to the Iter38D state-pair array. HLS now
+implements exactly 32 banks of 1,024 x 64-bit URAM words instead of decomposing
+the struct fields into 64 banks. The four external state readers and writers
+remain concurrent at II=1, recurrent latency remains 27,329--27,537
+cycles/layer, and total URAM returns from 80 to the Iter37/Iter38B value of 48.
+The candidate also includes the exact head-major QKVG and pair-interleaved GU
+layouts from Iter38A/B.
+
+Pre-hardware evidence and identities:
+
+- source SHA-256: `0791d1d158dc476e7f2cc1e44b6bf7790038ea8bf0458138ea2e015ca7184708`;
+- header SHA-256: `7bf6bf9d567241028d916a5def4924c6efb7031e416e573921c11d4b10fa2e74`;
+- evaluator SHA-256: `2712848cab0e054a3e43b6d10e4ef4d2e50e5abc149dc2d6dea5ea12c17db953`;
+- Vitis HLS 2022.2 7.692 ns Tcl SHA-256:
+  `380d76359b4c477d4d353173d09eb8ab602ccde21bc5a267c907b1d0e09d9118`;
+- native full-byte weight-shard validation: PASS;
+- six-token fast trajectory: exact, first divergence `-1`;
+- 32-token full trajectory: exact, first divergence `-1`; and
+- integrated csynth: PASS, MM2S II=1, GEMV MAC II=4, recurrent read/write
+  II=1, estimated Fmax 167.98 MHz.
+
+| Integrated HLS metric | Iter37D | Iter38E | Delta |
+|---|---:|---:|---:|
+| Static minimum cycles | 3,957,551 | **2,744,183** | -1,213,368* |
+| Recurrent cycles/layer, minimum | 43,873 | **27,329** | -16,544 |
+| RAMB18 | 1,511 | 1,527 | +16 / +1.06% |
+| DSP | 3,627 | 3,629 | +2 / +0.06% |
+| FF | 851,903 | 857,343 | +5,440 / +0.64% |
+| LUT | 912,694 | 929,941 | +17,247 / +1.89% |
+| URAM | 48 | 48 | 0 |
+
+\*About 0.816M of the top-level static delta is the known dynamic-GEMV
+call-count accounting artifact from QKVG/GU. The fixed-trip recurrent delta is
+0.397M cycles/token and is the defensible pre-hardware gain. Concurrent use of
+all four state ports may also reduce dynamic HBM backpressure, but only the
+on-card run can measure that. At 100 MHz the conservative expectation is about
+4.75M cycles / 47.5 ms per token versus Iter37D's measured 5.145M / 51.451 ms.
+
+The one-line build command was:
+
+```bash
+make -C c_impl iter38
+```
+
+It compiled HLS at 130 MHz and linked only at 100 MHz with the exact Iter37D
+connectivity, cluster-8 placement, recurrent-SLR2 placement, DMA fanout hook,
+BRAM FIFOs, `SSI_SpreadSLLs`, `AlternateCLBRouting`, and pre/post-route
+`AggressiveExplore`. The wrapper ran from 01:57:53 to 10:34:16 +03 (8 h 36 m)
+and exited zero. Artifact hashes were:
+
+- XO: `8533474f648ded537f7b0b7f92d1f3dc17f8d3670c940a7846858e561a144034`;
+- XCLBIN: `c209a41b28ee97d6d897c4eaea66974ebb88773c46079c0aeb059d839b9d79dc`.
+
+Implementation completed with zero failed nets, zero unrouted nets, zero
+partially routed nets, and zero node overlaps. One hundred percent of nets were
+fully routed. Timing closed without automatic clock scaling:
+
+| Routed timing metric | Result |
+|---|---:|
+| Encoded kernel frequency | **100 MHz** |
+| Design WNS / TNS | **+0.003 ns / 0** |
+| Design WHS / THS | **+0.006 ns / 0** |
+| Kernel clock WNS | **+0.032 ns** |
+| Fixed 250 MHz DMA WNS | **+0.003 ns** |
+
+The automatic on-card target completed both runs; its final summary-only `jq`
+command initially failed because a quoted Make continuation passed literal
+backslashes to `jq`. The already-written JSON and parity results were valid,
+and the Makefile quoting was corrected without rebuilding or rerunning. Both
+the 8-token smoke and 64-token decode matched exactly with first divergence
+`-1`. Excluding the seed, 63 kernel invocations measured:
+
+| On-card metric | Iter37D | Iter38E | Change |
+|---|---:|---:|---:|
+| Minimum | 51.422932 ms | **47.066309 ms** | -- |
+| Maximum | 51.784876 ms | **47.109197 ms** | -- |
+| Median | 51.437899 ms | **47.076699 ms** | -- |
+| Mean | 51.450918 ms | **47.079335 ms** | **1.0929x / -8.50% latency** |
+| Mean cycles at 100 MHz | 5.145M | **4.708M** | **-0.437M / -8.50%** |
+| Speedup over 121.4 ms | 2.360x | **2.579x** | -- |
+
+The measured 0.437M-cycle reduction is close to the 0.397M fixed-trip
+recurrent prediction. It confirms that the 2.744M HLS minimum is not an
+end-to-end hardware cycle count, while demonstrating a real benefit from the
+concurrent four-port packed state traversal. Iter38E is therefore a **retained
+positive result**. The QKVG/GU layouts, packed state pairs, concurrent state
+loops, exact shard validator, and Makefile-only reproducible build/on-card
+recipe become the new production baseline.
+
+### iter39A — head-serial/all-port QKVG prerequisite (native + csynth)
+
+*Logged: 2026-08-04.*
+
+**Hypothesis.** Iter38 called its QKVG layout head-major, but tracing the actual
+collector order showed that channel `c = head*4 + kind` assigns only four HBM
+ports to a head. All eight heads therefore advance concurrently and become
+visible together; the layout cannot feed a bounded head pipeline. Re-stripe
+each head's 1,024 concatenated Q/K/V/gate rows across all 32 ports, storing
+heads sequentially within each shard. This preserves all dot-product FP32
+orders and bytes while making one complete head visible every approximately
+4,096 weight beats.
+
+**Change.** `gdn_build_weight_shards` and its full-byte validator now map
+channels 0--7 to Q segments, 8--15 to K, 16--23 to V, and 24--31 to the gate;
+each channel stores two `Pack16` results per head. The local unpack reverses
+the collector's channel-major order back to the existing natural Q/K/V/gate
+buffers. No kernel ABI, AXI master, GEMV arithmetic, weight volume, or model
+operation changed.
+
+**Identity and validation.** Working source SHA-256 was
+`1811e9ca931ea0519839f3fc2553fc2e5161434bcdb9bdcda21982fd6dee2271`
+on Iter38 base `ccb16f32f`. `make -C c_impl -j8`, the fast exact decode gate,
+and the full 32-token gate passed; the full gate reported exact trajectory,
+100% top-1 agreement, and first divergence `-1`. Integrated synthesis used
+Vitis HLS 2022.2 and
+`c_impl/diagnostics/iter39a_headserial_qkvg/csynth.tcl`; report SHA-256 was
+`2e953e303a31e154ec2fe0323c57ffda23ae083f5596aaa1aab3e63c20e6ce1e`.
+An initial invocation through the 2022.1 executable stopped during front-end
+analysis because that older path did not expand macro-valued HLS pragma
+factors; it generated no design result and the production 2022.2 run replaced
+it.
+
+**Synthesis result versus Iter38.** The schedule is deliberately unchanged:
+2,744,183 minimum cycles, 8,435-cycle minimum shared-GEMV call, 514-cycle QKVG
+unpack, all 32 MM2S loops at II=1, and all 16 cluster MAC loops at II=4.
+Estimated Fmax remains 167.98 MHz. Resources are 1,527 RAMB18, 3,629 DSP,
+857,342 FF, 929,926 LUT, and 48 URAM (only -1 FF/-15 LUT versus Iter38).
+
+**Verdict: neutral enabling prerequisite, not independently committed.** It
+does not lower the current serial schedule and therefore is not a positive
+iteration under the commit discipline. Keep it only in the working tree for
+Iter39B, whose bounded QKVG-result consumer must overlap each completed head's
+three depthwise convolutions with production of later heads. If that overlap
+does not yield a material integrated cycle reduction, revert both Iter39A and
+Iter39B to the committed Iter38 baseline.
+
+### iter39B — first head-local QKVG/convolution overlap (rejected csynth)
+
+*Logged: 2026-08-04.*
+
+**Hypothesis.** Consume each complete 256-element Q/K/V/gate head directly
+from the head-serial QKVG collector, persist the gate, and run one time-shared
+head-local depthwise-convolution actor for Q, K, and V while the GEMV engine
+produces subsequent heads. The actor should replace three serial whole-hidden
+convolutions without triplicating their arithmetic.
+
+**Direct-AXI subvariant.** The first implementation passed convolution weights
+and tails on `mem_weights_mm0` directly into the GEMV result sink. Vitis HLS
+rejected it before scheduling because the dataflow region then had two reader
+processes on one bundled master: `gemv32_load_x_and_w0` and the result sink.
+This confirms that the shared AXI interface must remain outside the GEMV
+dataflow region.
+
+**Preloaded-context subvariant.** The second implementation staged the three
+convolution weight arrays and tails into partitioned BRAM before QKVG, invoked
+one head-local convolution call site three times per completed head, and wrote
+the staged tails back afterward. Native compilation, the fast exact gate, and
+the full 32-token exact gate passed with first divergence `-1`. Integrated
+synthesis used Vitis HLS 2022.2 and
+`c_impl/diagnostics/iter39b_qkvg_conv_overlap/csynth.tcl`. Working source
+SHA-256 was
+`3abaca74ba96350f3972ab2e206c90fe3a285ea7bdb4bd53023ee016f4e0c767`;
+report SHA-256 was
+`ff0d1ab6a78a38a867e9ebc6b3d46306da6ff66458863147ee5e4920812b06dc`.
+
+**Synthesis result versus Iter38.** Arithmetic sharing succeeded: the report
+contains one `gdn_depthwise_conv_silu_head_kind`, and the GEMV engine retained
+its 8,435-cycle minimum, 32 MM2S loops at II=1, and 16 cluster loops at II=4.
+However, the runtime `kind` pointer selection caused HLS to scalarize every
+`Pack16` context transfer into 16 narrow AXI/BRAM operations. The context load
+took 43,459 cycles per layer and the store 18,655, with the critical loops at
+II=16. Top minimum latency regressed from 2,744,183 to **3,653,039 cycles**
+(+908,856), and layer minimum latency rose from 113,854 to 151,723. Resources
+rose from 1,527 to **1,591 RAMB18**, 857,343 to **886,566 FF**, and 929,941 to
+**1,041,897 LUT**; DSP stayed at 3,629 and URAM at 48. Estimated Fmax remained
+167.98 MHz.
+
+**Verdict: rejected negative implementation; no hardware build and no
+commit.** The overlap structure remains plausible, but this generic context
+mover destroys both schedule and area. The next bounded subvariant must use
+explicit fixed-bank 512-bit load/store loops, keep the staged tail read-only
+during head convolution, and capture only each head's new raw Q/K/V row for a
+packed final writeback. Iter39A remains an uncommitted prerequisite only while
+that corrected subvariant is evaluated.
+
+### iter39C — packed context and head-local QKVG/convolution overlap (retained)
+
+*Logged: 2026-08-04.*
+
+**Change.** The corrected overlap keeps the one time-shared 256-column
+convolution actor from Iter39B but removes every runtime-selected external
+pointer from the context movers. Six explicit Q/K/V loops load convolution
+weights and old tails as 512-bit `Pack16` bursts. The head actor treats the old
+tail as read-only; after all three Q/K/V calls consume a head, the result sink
+reuses obsolete tail row 0 to capture that head's new raw Q/K/V row. Three
+explicit packed stores finally emit old rows 1/2 followed by the captured new
+row. This needs no extra tail buffer and preserves the exact recurrent-tail
+ABI and FP32 operation order.
+
+**Identity and validation.** Working source SHA-256 is
+`d2674931f90897d932fc73915981866e38a233cb6efa4138caaef2029f3d5bbb`
+on Iter38 base `ccb16f32f`. `make -C c_impl -j8`, the fast exact gate, and the
+full 32-token exact gate passed; both parity reports had first divergence
+`-1`. Integrated synthesis used Vitis HLS 2022.2 and
+`c_impl/diagnostics/iter39c_packed_qkvg_context/csynth.tcl`; report SHA-256 is
+`5c35c51f3e32c3ffafb1ebc4059f69a5149c8786b9618cf31959092fd183b7f8`.
+
+**Synthesis result versus Iter38.** HLS inferred 512-bit bursts for all six
+context-read loops and all three tail-write loops. The load takes 3,137 cycles
+per layer and the store 1,371, with every external mover loop at II=1. QKVG
+retains one physical `gdn_depthwise_conv_silu_head_kind`; its compute loop is
+II=1, and its 16-cycle new-tail capture is II=1. The 32 GEMV MM2S readers
+remain II=1, all 16 cluster MAC loops remain II=4, and the shared GEMV minimum
+remains 8,435 cycles.
+
+| Integrated metric | Iter38 | Iter39C | Delta |
+|---|---:|---:|---:|
+| Top minimum cycles | 2,744,183 | **2,270,495** | **-473,688 / -17.27%** |
+| Layer minimum cycles | 113,854 | **94,117** | **-19,737** |
+| RAMB18 | 1,527 | **1,543** | +16 / +1.05% |
+| DSP | 3,629 | **3,629** | 0 |
+| FF | 857,343 | **863,589** | +6,246 / +0.73% |
+| LUT | 929,941 | **937,707** | +7,766 / +0.84% |
+| URAM | 48 | **48** | 0 |
+
+Estimated Fmax remains 167.98 MHz. Unlike the unified-call accounting in
+Iter38, this 473,688-cycle reduction is exactly 24 times the fixed per-layer
+reduction and represents removed serial convolution work.
+
+**Hardware implementation.** `make -C c_impl iter39` compiled at 130 MHz and
+linked only at 100 MHz using the exact Iter38 connectivity, cluster-8 and
+recurrent-SLR2 floorplans, DMA fanout repair, BRAM FIFOs, and pre/post-route
+`AggressiveExplore`. The build ran from 12:50:04 to 21:09:07 +03. The link
+reported 7 h 56 m 30 s and exited zero. Artifact hashes are:
+
+- XO: `53a47efc2098f6967fd256edce29aedfbe4dfe4da0383f609bc8b006e73131c0`;
+- XCLBIN: `5c81e79ceb51d3faa00a4ae80a5055f716bbedac884700840011257494f11021`.
+
+Routing completed with zero failed nets, zero unrouted nets, zero partially
+routed nets, and zero node overlaps. Timing closed without automatic clock
+scaling: design WNS/TNS **+0.003/0 ns**, design WHS/THS **+0.009/0 ns**,
+kernel-clock WNS **+0.289 ns**, and fixed 250 MHz DMA WNS **+0.003 ns**.
+
+**On-card result.** `make -C c_impl iter39-oncard` passed both the 8-token
+smoke and exact 64-token decode with first divergence `-1` and 100% top-1
+agreement. Excluding the seed, 63 calls measured:
+
+| On-card metric | Iter38 | Iter39C | Change |
+|---|---:|---:|---:|
+| Minimum | 47.066309 ms | **43.080265 ms** | -- |
+| Maximum | 47.109197 ms | **43.313968 ms** | -- |
+| Median | 47.076699 ms | **43.085956 ms** | -- |
+| Mean | 47.079335 ms | **43.093000 ms** | **1.0925x / -8.47%** |
+| Mean cycles at 100 MHz | 4.707934M | **4.309300M** | **-0.398634M** |
+| Speedup over 121.4 ms | 2.579x | **2.817x** | -- |
+
+The measured 0.399M-cycle gain captures 84.2% of the 0.474M static prediction;
+the difference is dynamic HBM/control stall outside the HLS minimum.
+
+**Verdict: retained positive result and new production baseline.** Iter39C is
+exact, routable, timing-closed, and materially faster than Iter38. Retain the
+head-serial/all-port QKVG layout, packed fixed-bank context movers, shared
+head-local Q/K/V convolution actor, and one-line Iter39 build/on-card targets.
+
+### iter40A — direct head-streamed recurrence (rejected by dataflow checking)
+
+*Logged: 2026-08-04.*
+
+**Hypothesis.** Extend Iter39C's bounded QKVG consumer so each convolved Q/K/V
+head streams directly into the existing recurrent-attention arithmetic. This
+removes full-layer Q/K/V BRAM materialization and should overlap the eight
+serial 27.3--27.5K-cycle recurrent calls with later QKVG head production.
+
+**Change and validation.** The first implementation added bounded Q/K/V
+streams between the existing head-local convolution actor and a single
+head-serial recurrent actor. The latter read the four packed state stripes
+directly from weight/state ports 28--31. Native compilation, the fast exact
+decode gate, and the full 32-token exact gate passed. Integrated synthesis used
+Vitis HLS 2022.2 and
+`c_impl/diagnostics/iter40a_headstream_recurrent/csynth.tcl`.
+
+**Synthesis failure.** Vitis HLS stopped during dataflow validation with
+`HLS 200-1013`/`HLS 200-984` on each of `mem_weights_mm28` through
+`mem_weights_mm31`: the existing GEMV MM2S actor and the new recurrent actor
+both read the same bundled AXI master. No latency, resource, implementation, or
+on-card result exists.
+
+**Verdict: rejected structural subvariant; no hardware build and no commit.**
+The bounded Q/K/V stream is correct, but every shared weight/state AXI bundle
+must have one read owner. Iter40B retains the stream edge and replaces the two
+readers with one owner per port.
+
+### iter40B — single-owner state prefetch and head-streamed recurrence (rejected at route)
+
+*Logged: 2026-08-04.*
+
+**Change.** Ports 28--31 now use one `gemv32_mm2s_with_state` actor each. For a
+normal GEMV the actor emits the unchanged weight stream. For QKVG it emits one
+head's 4,096 weight packs and then prefetches that head's 1,024 packed state
+words into a bounded URAM FIFO before advancing to the next head. The
+head-local convolution actor emits Q/K/V packs directly to a single recurrent
+actor, which preserves the original scalar and FP32 reduction order, consumes
+the four state streams concurrently, writes updated state to the same four
+ports, and writes attention output directly to the resident activation buffer.
+The Q/K/V whole-layer buffers and standalone recurrent call are removed. Tiny
+A/B projections and the eight layer gate scalars are staged before entering
+the bounded dataflow graph. The external ABI, weight bytes, 32 masters,
+16-cluster GEMV arithmetic, and state representation are unchanged.
+
+**Identity and validation.** Working `gdn_model.cpp` SHA-256 is
+`8a2eccae41599d6bfc0fbb311f020d394833b7ad240bf3f2e37026bb0820cc5b`.
+Integrated synthesis used Vitis HLS 2022.2 and
+`c_impl/diagnostics/iter40b_state_owner_stream/csynth.tcl` (SHA-256
+`e898e05ced5cd59f094fc9c9df9ec033c81f6ef92bc4d38d74d95bafea6a712c`).
+The top report SHA-256 is
+`0e9165218f45e9db7d0fa520b4de31cd40d042967eb167143a15629785786336`.
+Native compilation and the fast exact gate passed. The full native gate then
+matched all 32 compared token positions with first divergence `-1` and 100%
+top-1 agreement.
+
+**Synthesis result versus Iter39C.** All four state-owner weight and prefetch
+loops run at II=1, all 32 effective MM2S paths remain II=1, all 16 cluster MAC
+loops remain II=4, and recurrent packed state read/write remain II=1. The
+recurrent actor is 28,857 cycles for eight heads and is now inside the QKVG
+dataflow graph. Estimated Fmax remains 167.98 MHz.
+
+| Integrated metric | Iter39C | Iter40B | Delta |
+|---|---:|---:|---:|
+| Top minimum cycles | 2,270,495 | **1,939,866** | **-330,629 / -14.56%** |
+| Layer minimum cycles | 94,117 | **80,204** | **-13,913** |
+| Shared GEMV minimum | 8,435 | 11,718 | +3,283 |
+| RAMB18 | 1,543 | 1,572 | +29 / +1.88% |
+| DSP | 3,629 | 3,716 | +87 / +2.40% |
+| FF | 863,589 | 889,277 | +25,688 / +2.97% |
+| LUT | 937,707 | 959,323 | +21,616 / +2.31% |
+| URAM | 48 | 80 | +32 |
+
+The minimum-cycle saving clears the 0.25M integrated gate and projects the
+4.309M-cycle Iter39C hardware result to about 3.98M cycles/token. The increase
+in shared-GEMV minimum is real accounting/flush overhead from the conditional
+bounded dataflow graph and is already included in the top saving. The four
+1,024x512-bit state FIFOs account for the 32 extra URAMs. HLS also reports a
+roughly 28K-fanout control cone in the recurrent read pipeline, so routing and
+timing remain explicit acceptance gates rather than assumed consequences of
+the positive schedule.
+
+**Verdict: rejected after 100 MHz routing failure; no commit.** The positive
+native/csynth schedule did not survive physical implementation. Iter39C remains
+the production baseline and no Iter40 source/config change is committable.
+
+**Hardware launch.** The backward-compatible recurrent-SLR2 hook now accepts
+either the old standalone recurrent root or Iter40's nested
+`gdn_recurrent_attention_stream_U0`, while still requiring exactly one match;
+its SHA-256 is
+`f00964b6e9455b35ece5fb4927f8d4fb78ddb0e24d7a33e34ad3482ef68358ce`.
+The source/config-only build was launched with
+`make -C c_impl run_hw RUN_HW_DIR=diagnostics/iter40b_state_owner_stream/hardware`
+at 130 MHz HLS / 100 MHz link. PID, persistent wrapper output, exit marker, and
+source/config hashes are under
+`c_impl/diagnostics/iter40b_state_owner_stream/hardware/`. The XO compile
+completed successfully in 23m49s; implementation and automatic on-card gates
+were then attempted.
+
+**Hardware result.** The link ran for 6h58m23s and failed in `route_design`.
+Both the Iter22 cluster-8 placement and the updated recurrent-SLR2 hook applied
+successfully; the latter matched exactly the nested streamed recurrent root.
+Placement completed, but post-placement physical optimization still estimated
+WNS/TNS at -1.503/-142.164 ns. Initial routing reached global and timing
+congestion level 7. Peak directional demand was 103.731% north, 108.89% south,
+and 118.105% east. Localized SLL demand exceeded one column's capacity on both
+boundaries: SLR0--1 peaked at 127% and SLR1--2 at 120%. Route verification then
+reported partially conflicted nets spanning GEMV clusters 3/5, resident helper
+loops, and several streamed recurrent control cones. The error checkpoint is
+`build.hw.gdn32.h130.f100.o8/_x_temp/link/vivado/vpl/prj/prj.runs/impl_1/level0_wrapper_routed_error.dcp`.
+
+The synthesized kernel used 571,832 LUTs, 615,340 registers, 1,301 BRAM tiles,
+3,721 DSPs, and 80 URAMs. Relative to Iter39C, the 32 new whole-head state FIFO
+URAMs and the recurrent actor's placement inside the GEMV dataflow hierarchy
+created substantial new control and URAM-to-DSP routing pressure. No XCLBIN was
+produced and the automatic on-card smoke/performance tests did not run. A
+follow-up must first reduce or physically localize the state-buffer/control
+cone; retrying the same netlist or changing frequency does not address this
+level-7 routing failure.
+
+The post-failure `report_route_status` run on the 2022.2 error checkpoint
+confirmed that this was not a timing-only exit or a small set of ordinary
+unrouted nets. After the failed recovery, 89 logical nets retained routing
+errors, 45 retained resource conflicts, and the discarded/partial route left
+1,493,300 routable nets unrouted. The affected set included global constants
+and shell reset/control loads as well as the kernel conflicts printed by
+`route_design`, which is characteristic of a device-wide routing collapse once
+the local level-7 windows can no longer be escaped.
+
+### iter40C — shallow BRAM state drain before recurrent MAC (rejected at route)
+
+*Logged: 2026-08-05.*
+
+**Failure analysis and hypothesis.** Iter39C also began routing with locally
+over-capacity SLL columns (up to 145%) but recovered from global congestion
+level 6 and routed completely. Iter40B instead entered global level 7, with
+post-place WNS already degraded from Iter39C's -0.006 ns to -2.028 ns before
+physical optimization. The new whole-head state streams were not merely four
+additional memories: because `fused_rd0123` performed four blocking FIFO reads
+inside its 32-lane state MAC, HLS converted that dense loop to a free-running
+pipeline and estimated a 28,294-load control cone. Four 1,024x512 queues also
+added 32 URAMs. Those are the actionable deltas; changing only the link clock
+or route directive would leave the failed netlist intact.
+
+**Change.** The four single-owner MM2S actors and the head-streamed Q/K/V edge
+are retained. Each recurrent head now immediately drains the four state
+streams in a dedicated 1,024-cycle II=1 copy loop into `state_pair`, the same
+32-bank head-local URAM buffer already required by the recurrence. The dense
+`fused_rd0123` loop subsequently reads only that local buffer, so its 32 MAC
+lanes no longer carry FIFO-empty/backpressure control. The external queues are
+reduced from depth 1,024 URAM to depth 64 BRAM. They absorb collector/convolution
+skew, then naturally backpressure until the state-drain loop starts; no second
+whole-head buffer, AXI owner, state-layout change, or FP32 reordering is added.
+
+**Identity and correctness.** Working `gdn_model.cpp` SHA-256 is
+`7c7b3d7a3225da4396171981846cf999e2eb1c4eb937fc4e9dde67ba8d396632`.
+Integrated synthesis used
+`c_impl/diagnostics/iter40c_local_state_drain/csynth.tcl` (SHA-256
+`98f071d619b049c5713fad1d5420e6dfaaf406b9ad6e629e519d56c0addb4ab0`);
+the top report SHA-256 is
+`89e0d33a859dd3df542a36d4bbab1dfe16fdb8e9ed55bdbeb6ef1102678b221b`.
+Native compilation, the fast gate, and the full 32-token gate passed. The full
+gate compared all 32 positions exactly, with first divergence `-1` and 100%
+top-1 agreement.
+
+**Synthesis result.** All four state-owner weight/state loops remain II=1, all
+16 GEMV cluster MAC loops remain II=4, and the new state drain, local fused
+read, and fused write are II=1. The 28,294-fanout free-running
+`fused_rd0123` message is absent; HLS emits ordinary unified pipeline control
+for the local read. Estimated Fmax remains 167.98 MHz.
+
+| Integrated metric | Iter39C | Iter40B | Iter40C | Iter40C vs Iter40B |
+|---|---:|---:|---:|---:|
+| Top minimum cycles | 2,270,495 | 1,939,866 | **1,621,415** | **-318,451 / -16.42%** |
+| Layer minimum cycles | 94,117 | 80,204 | **67,072** | **-13,132** |
+| Shared GEMV minimum | 8,435 | 11,718 | **8,435** | **-3,283** |
+| Recurrent actor maximum | 27,537 | 28,857 | 32,721 | +3,864 |
+| RAMB18 | 1,543 | 1,572 | **1,632** | +60 |
+| DSP | 3,629 | 3,716 | **3,716** | 0 |
+| FF | 863,589 | 889,277 | **888,696** | -581 |
+| LUT | 937,707 | 959,323 | **959,673** | +350 |
+| URAM | 48 | 80 | **48** | **-32** |
+
+The explicit local copy lengthens the standalone recurrent actor, but it is
+hidden behind the state-owner/weight pipeline in the bounded graph; the top
+schedule therefore improves rather than regresses. Relative to Iter39C, the
+static saving is 649,080 cycles/token (28.59%). BRAM cost rises because a
+512-bit FIFO is width-dominated, but BRAM is distributed across the SLR whereas
+the removed URAM queues and their stream-controlled MAC cone were column-local
+routing pressure.
+
+**Pre-build verdict: accepted as a hardware candidate, not yet retained.** It
+clears native correctness and static schedule gates and directly removes both
+identified Iter40B routing structures. It remains uncommittable until the
+100 MHz implementation routes, closes timing, and improves exact on-card
+latency. The hardware result will be appended here.
+
+**Hardware launch.** A clean, iteration-specific build directory was launched
+through the single supported Makefile entry:
+`make run_hw BUILD_DIR=build.hw.iter40c.local_state_drain.f100.o8.v2022_2
+RUN_HW_DIR=diagnostics/iter40c_local_state_drain/hardware`. HLS targets 130 MHz
+and link targets 100 MHz. The build retains Iter39C's connectivity, Iter22
+cluster-8 placement, recurrent-SLR2 placement, DMA fanout hook, BRAM GEMV
+FIFOs, and pre/post-route `AggressiveExplore`. The detached tmux session is
+`gdn_iter40c_build`, root PID is `2546112`, and a separate completion monitor
+will normalize the exit marker after automatic exact 8/64-token on-card gates.
+Source/config hashes and the start timestamp are in
+`diagnostics/iter40c_local_state_drain/hardware/build.manifest`.
+
+**Hardware result: REJECTED AT ROUTE.** The build ran 09:33--16:58 on
+2026-08-05 and exited `run_hw.exit=1` with no XCLBIN. `place_design` completed
+legally (design state Fully Placed, 0 node overlaps), then `route_design` failed
+in global routing:
+
+```
+ERROR: [Route 35-3] Design is not routable as its global congestion level is 7.
+ERROR: [VPL 18-1000] Routing results verification failed due to
+                     partially-conflicted nets
+```
+
+The source change did what it claimed: HLS emitted no 28,294-fanout
+free-running `fused_rd0123`, URAM returned to 48, and post-place estimated WNS
+recovered from Iter40B's **-1.503 ns to -0.412 ns**. It failed for a reason
+unrelated to the schedule.
+
+**Root cause: the recurrent SLR2 placement constraint silently stopped
+binding.** Measured on the routed-error checkpoint versus Iter39C's routed
+checkpoint:
+
+| Metric | Iter39C (routed) | Iter40C (failed) |
+|---|---:|---:|
+| Recurrent actor leaves in SLR0 / SLR1 / SLR2 | 1,151 / 608 / **220,117** | **238,859** / 514 / 2 |
+| SLR0 CLB sites | 99.31% | 99.77% |
+| SLR0 CLB LUTs | 281,679 (**64.06%**) | 352,952 (**80.27%**) |
+| SLR2 CLB LUTs | 187,200 | 110,395 |
+| Recurrent URAM | 48 in SLR2 | **32 in SLR0** |
+| Global congestion windows | 16x16 / 64x64 / 8x8 | **128x128 N, S and W** |
+
+Iter39C's hook moved `gdn_forward_1/inst/grp_gdn_recurrent_attention_fu_1833`,
+a top-level sibling of `gdn_gemv`. Iter40 nests the actor as
+`grp_gdn_gemv_fu_1407/gdn_recurrent_attention_stream_U0`, inside a dataflow
+graph anchored to HBM at the south edge of SLR0. The soft
+`USER_SLR_ASSIGNMENT SLR2` lost to that gravity: 238,859 leaves, roughly 30% of
+everything in SLR0, landed there on top of GEMV clusters 10--15. SLR0 CLB
+sites are ~99% occupied in both designs, so the discriminator is **LUT density
+inside those sites, 64% versus 80%**, which exhausts local interconnect and
+produces device-wide rather than localized congestion. The hook still reports
+`GDN_RECURRENT_SLR2 ... slr=SLR2`; it sets the property successfully and the
+placer overrides it, so the marker is not evidence that placement obeyed.
+
+**Hypotheses tested and eliminated.** Each was measured, not assumed:
+
+- *SLR-crossing congestion.* Router SLL demand per Laguna column: Iter39C
+  needed 19,510 SLLs with **six** SLR0-1 columns over capacity, peaking at
+  **145%**; Iter40C needed 18,801 with five columns peaking at 125%. The design
+  that routed had the worse crossing profile. An Iter22-style column-steering
+  fix is not indicated.
+- *High control fanout.* Nets above 1,000 pins: Iter39C **29,858**, Iter40C
+  **27,956**; in both, the largest are `ap_clk`/`WCLK` global clock nets at
+  ~694k pins. The failing design has fewer. Control-cone replication
+  (roadmap 10.4) is not indicated by this evidence.
+- *Relocation cost.* The recurrent actor's hierarchical boundary is **7,864
+  nets in Iter40C versus 13,132 in Iter39C**, and in both designs essentially
+  none of them cross an SLR (1 and 4 respectively). The actor is monolithic:
+  >99.7% of its leaves sit in one SLR and its neighbourhood follows it. It is
+  therefore *cheaper* to relocate than the block that relocated successfully.
+- *`[Place 30-1239]` "failed to find partition obeying SLR constraint".*
+  Present exactly once in Iter39C, Iter40B and Iter40C. Not a discriminator.
+
+**Verdict: negative implementation result, not committable.** Iter39C remains
+production at 43.093 ms/token. The Iter40C source
+(`7c7b3d7a3225da4396171981846cf999e2eb1c4eb937fc4e9dde67ba8d396632`) stays in
+the working tree unlanded. Its schedule and correctness evidence remain valid
+and are reused unchanged by Iter41A, which changes only the physical recipe.
+
+### iter41A — bind the recurrent actor to SLR2 with a hard pblock (rejected at route; refutes the placement hypothesis)
+
+*Tested 2026-08-05--06; placement gate passed, routing failed at congestion 7.*
+
+**Hypothesis.** Iter40C fails only because a 238,859-leaf block is placed in the
+wrong SLR. If the constraint is made binding, SLR0 LUT density falls from 80%
+toward Iter39C's 64% and the design routes, retaining Iter40C's measured
+schedule gain.
+
+**Change: physical recipe only; source and XO frozen.** The verified Iter40C
+`.xo` is reused, so any outcome is attributable to placement alone.
+
+1. `apply_iter37c_recurrent_slr2.tcl` is replaced by
+   `apply_iter41_recurrent_slr2_pblock.tcl`. It still sources the Iter22
+   cluster-8/`ws16`/`ws17`/`xr8` hook and its `CELL_BLOAT_FACTOR` settings, but
+   constrains the recurrent actor with a **pblock covering all of SLR2**
+   (clock regions `X0Y8:X7Y11`, queried from the part, not assumed) with
+   `CONTAIN_ROUTING 0`, plus the original soft assignment. A pblock is a hard
+   constraint the placer must satisfy; `USER_SLR_ASSIGNMENT` alone is advisory
+   and demonstrably lost. This is one hierarchy contained to a full SLR, which
+   is materially different from Iter17's rejected 7/7/2 sub-SLR floorplan.
+2. A new `PLACE_DESIGN.TCL.POST` gate,
+   `check_iter41_recurrent_placement.tcl`, counts recurrent leaves per SLR and
+   **errors before routing** if fewer than 80% are in SLR2, and reports SLR0 LUT
+   density. Iter40B and Iter40C each spent ~7 h to discover a placement problem
+   that was already decided at ~2 h; this converts that into a ~2 h answer.
+
+Everything else is byte-identical to Iter40C: `SSI_SpreadSLLs`,
+`AlternateCLBRouting`, `AggressiveExplore` at both physical-optimization
+stages, the Iter35 DMA fanout pre-place hook, Iter23 fanout, 130 MHz HLS and
+100 MHz link.
+
+**Capacity check.** SLR2 has ~54,000 CLB sites and Iter40C uses 25,859
+(47.89%). At Iter40C's SLR0 density (~14.4 leaves/CLB), 238,859 recurrent
+leaves need ~16,600 CLBs, projecting SLR2 to ~79% and SLR0 down to ~70%.
+Iter39C ran with 220,117 recurrent leaves in SLR2 at 72.17%. URAM in SLR2 is
+16/320 used and DSP 22%, so the actor's 32 URAMs and its DSPs are not
+constraints. The SLR1-2 SLL boundary is the least used resource in every build
+(39.5--42.9%), and it is the boundary any new crossings would consume.
+
+**Acceptance gates, in order.** (1) >=80% of recurrent leaves in SLR2 and SLR0
+LUT <=75% at post-place, else abort; (2) route with 0 failed, 0 unrouted, 0
+overlaps and congestion <=6; (3) kernel and `dma_ip_axi_aclk_1` WNS >=0 at
+100 MHz; (4) exact 8- and 64-token on-card trajectories; (5) mean below
+43.093 ms/token, else neutral and not committable.
+
+**If the placement gate fails**, the pblock is not binding either and the next
+step is Iter41B: keep Iter40C's local state drain and BRAM queues but restore
+the recurrent actor as a top-level sibling of `gdn_gemv`, recreating the
+Iter39C structure that placed correctly. That costs a resynthesis.
+
+**Hook validation before the build.** Both hooks were sourced against the
+Iter40C routed-error checkpoint first. This caught a real defect:
+`resize_pblock` rejects clock-region objects with
+`[Place 30-342] pblock resize has invalid range X0Y8` and requires a
+`CLOCKREGION_X0Y8:CLOCKREGION_X7Y11` range string. Uncaught, that would have
+killed the run ~2 h in at `opt_design`. The corrected range derivation was
+re-verified on a bare part in ~1 min. The placement gate was validated in the
+same pass by confirming it **aborts** on Iter40C's known-bad placement, quoting
+`SLR0=238859 SLR1=514 SLR2=2`, which is a third independent confirmation of the
+Iter40C diagnosis.
+
+**Result: the placement fix worked completely, and the design still does not
+route.** Ran 19:41--00:07 (4 h 26 m), `run_hw.exit=2`, no XCLBIN.
+
+The pblock bound perfectly and the post-place gate passed:
+
+```
+GDN_ITER41_PBLOCK    requested=CLOCKREGION_X0Y8:CLOCKREGION_X7Y11
+                     ranges=CLOCKREGION_X0Y8:CLOCKREGION_X7Y11
+GDN_ITER41_PLACEMENT SLR0=0 SLR1=0 SLR2=239362 total=239362 slr2_frac=1.0000
+GDN_ITER41_GATE_PASS proceeding_to_route
+```
+
+Every macroscopic physical metric then converged on the routable Iter39C
+baseline:
+
+| Metric | Iter39C (routed) | Iter40C (failed) | **Iter41A (failed)** |
+|---|---:|---:|---:|
+| Recurrent leaves in SLR2 | 220,117 (99.2%) | 2 (0.0%) | **239,362 (100%)** |
+| SLR0 CLB LUTs | 281,679 (64.06%) | 352,952 (80.27%) | **294,091 (66.89%)** |
+| SLR2 CLB LUTs | 187,200 (43.33%) | 110,395 (25.55%) | **197,035 (45.61%)** |
+| URAM placement | 48 all in SLR2 | 32 in SLR0 | **48 all in SLR2** |
+| SLR1-0 SLL | 19,463 (84.47%) | 18,954 (82.27%) | 20,399 (88.54%) |
+| Post-place estimated WNS | **+0.003 ns** | -0.412 ns | **+0.003 ns** |
+
+Placement, memory placement and post-place timing are now indistinguishable
+from the run that routed -- WNS matches Iter39C to the picosecond. Iter41A also
+progressed further than either Iter40 build, reaching `Phase 4 Initial Routing
+Verification` where Iter40B and Iter40C both stopped inside `Phase 3 Initial
+Routing`. It nevertheless ended at global/short **congestion level 7 (128x128)**
+and timing congestion level 7, and `route_design` failed verification on
+partially-conflicted nets.
+
+**This is the decisive experiment, and it refutes the placement hypothesis.**
+SLR0 over-density was real, was fully corrected, and was not sufficient. The
+conflicted nets are unchanged in class and now span both ends of the die:
+`flow_control_loop_pipe_sequential_init_U/ap_loop_init_int` and `ap_done_cache`
+inside `gdn_recurrent_attention_stream_U0` (SLR2), the top-level
+`grp_gdn_forward_Pipeline_copy_local*` loops, and
+`proc_sys_reset_kernel_slr0/U0/peripheral_aresetn_BUFG[0]`.
+
+The mechanism is now fully explained by the measured boundary data. Iter39C's
+recurrent actor is **buffer-coupled** to top-level peers that are free to
+migrate, so the whole island moved to SLR2 together and only **4** of its 13,132
+boundary nets crossed an SLR. Iter40's actor is **stream-coupled inside
+`gdn_gemv`**, whose MM2S readers are pinned to HBM at the south edge of SLR0 and
+cannot follow it. Both available placements therefore lose: leaving it south
+packs SLR0 to 80% LUT density, and forcing it north converts its 7,864 boundary
+nets into SLR crossings that concentrate into a few Laguna columns -- the
+Iter41A router reported a single column at **169%** on SLR0-1 and **182%** on
+SLR1-2, worse than any prior build.
+
+**Verdict: negative implementation result, not committable.** Iter39C remains
+production at 43.093 ms/token. Placement is exhausted as a lever for the nested
+topology: two opposite placements have now been built and both fail at
+congestion level 7. The remaining fix is structural, not physical -- Iter41B
+must un-nest the recurrent actor back to a top-level sibling of `gdn_gemv`,
+retaining Iter40C's local state drain and BRAM queues, so the actor is once
+again buffer-coupled to peers that can migrate with it. Do not spend another
+physical-recipe iteration on this netlist.
+
+### iter42 — reduce GEMV weight-stream depth from 64 to 32 (rejected neutral synthesis)
+
+*Tested: 2026-08-06.*
+
+**Hypothesis.** The Iter41 routing failures might be relieved by halving all
+32 `ws` queues while retaining BRAM decoupling. The experiment changed only
+the `ws` depth from 64 to 32. Integrated synthesis used Vitis HLS 2022.2 and
+`diagnostics/iter42_ws_depth32/csynth.tcl` (SHA-256
+`64deb0a06f59f0ec90344b1d3d13728f94c22763a6c5ef82b049e0e29dba277c`);
+the report SHA-256 is
+`3eec07c65864cf57d8744d69aa238b5b8663775cdde7db8902dbffbf8d4330a3`.
+
+**Result.** HLS still implemented every 512-bit queue as BRAM. Because width,
+not depth, determines its RAMB18 footprint in this range, top-level BRAM stayed
+at **1,632**. The 1,621,415-cycle minimum, 3,716 DSPs, 48 URAMs and 167.98 MHz
+estimate were unchanged. FF fell only 96 (888,696 to 888,600) and LUT only 128
+(959,673 to 959,545), far below a meaningful physical change.
+
+**Verdict: rejected neutral; no hardware build and no commit.** Depth 64 was
+restored. It provides more decoupling for effectively the same BRAM footprint.
+
+### iter43 — replicate the kernel-reset fanout cone (stopped/inconclusive)
+
+*Tested: 2026-08-06.*
+
+**Hypothesis and identity.** The conflicted Iter41 route contained shell reset
+and HLS flow-control nets. This physical-only run reused the frozen Iter40C XO
+`d8c706414fa02dac493c8f4199c6db6ac0ea55b01496a11fcf1b00bc502726b4`
+and added `MAX_FANOUT_MODE=CLOCK_REGION` plus `FORCE_MAX_FANOUT=512` to the
+kernel reset cone. The source/config/Tcl hashes are recorded in
+`diagnostics/iter43_reset_fanout/hardware/build.manifest`.
+
+**Result.** The run placed and reached `route_design`/initial timing update,
+then the wrapper was externally terminated at 17:39. There is no exit marker,
+routed checkpoint, XCLBIN, timing report or on-card result. Therefore this run
+cannot establish either benefit or regression.
+
+**Verdict: stopped/inconclusive; no commit.** No reset-fanout change is retained
+on this evidence.
+
+### iter44 — force the GEMV reduction fadds into fabric (rejected neutral synthesis)
+
+*Tested: 2026-08-06.*
+
+**Hypothesis.** Move the clustered GEMV reduction tree away from the dense DSP
+columns to reduce localized interconnect pressure. Integrated synthesis used
+`diagnostics/iter44_fadd_fabric/csynth.tcl` (SHA-256
+`eb5597c4dd77de83c30e18422cf487799589ca15c25692533490f7a0e238ad24`);
+the report SHA-256 is
+`3360e742f41eb60433e81f7d077d54751671fdf1d28f7b706f3a1402c83e11ef`.
+
+**Result.** The top report was byte-for-metric identical to Iter40C:
+1,621,415 minimum cycles, 1,632 RAMB18, 3,716 DSP, 888,696 FF, 959,673 LUT,
+48 URAM and estimated Fmax 167.98 MHz. The directive did not produce a usable
+physical delta in the integrated hierarchy.
+
+**Verdict: rejected neutral; no hardware build and no commit.** The proven DSP
+implementation was restored.
+
+### iter45 — reduce AXI read-outstanding capacity to four (routes and times; rejected by on-card deadlock)
+
+*Tested: 2026-08-06--07.*
+
+**Change and identity.** `num_read_outstanding` on weight masters 1--31 was
+reduced from 8 to 4; master 0 retained its separately proven setting. The
+source SHA-256 is
+`9a9582bb7840df6c7689e5c72aa1594948176a3cb27242b0dd8b97453cc67934`.
+The 100 MHz physical recipe remained
+`hw_iter37c_state4_recur32_slr2_f115.cfg` SHA-256
+`998b71e3a8cb3b7f818f12cbe6581f0ffd2e04010dba5db3f20ca2ae844aa08f`.
+The integrated report SHA-256 is
+`787b6165805d54801647a5ecdcbf5179247dbd3dabbff0ecfe06c27152f6b54f`;
+the complete identities and command are in
+`diagnostics/iter45_axi_outstanding4/hardware/build.manifest`.
+
+**Synthesis and implementation.** Static latency and compute II were unchanged:
+1,621,415 minimum cycles, state-owner read loops II=1 and all 16 cluster MAC
+loops II=4. HLS LUT estimate fell from 959,673 to **868,905** while BRAM/DSP/
+URAM stayed at 1,632/3,716/48. The 130 MHz HLS / 100 MHz link completed in
+9 h 10 m. Routing finished with zero failed, unrouted or partially routed nets
+and recovered from global congestion level 6. The design closed timing with
+WNS/TNS **+0.003/0 ns**, WHS/THS **+0.008/0 ns**, kernel-clock WNS
+**+0.237 ns**, and fixed 250 MHz DMA WNS **+0.003 ns**. Routed kernel use was
+509,192 LUT, 27,390 LUTRAM, 613,586 registers, 1,331 BRAM tiles, 48 URAM and
+3,721 DSPs.
+
+**On-card failure.** The eight-token gate launched and never completed its
+first kernel call. After seven hours the control state remained
+`ap_start=1, ap_done=0, ap_idle=0`; the host was blocked in `run.wait()`.
+The run was terminated without a token or latency measurement. This is an RTL
+liveness failure, not a routing or timing failure.
+
+**Verdict: rejected functional result; no commit.** Iter45 proved the
+outstanding-depth reduction is a strong routability lever, but that source is
+not usable until the state-owner protocol is made live.
+
+### iter46 — enlarge the four state queues to one complete head (inconclusive RTL liveness experiment)
+
+*Tested: 2026-08-07.*
+
+**Hypothesis.** Iter45's four depth-64 state streams can fill and backpressure
+ports 28--31 before the Q/K/V consumer becomes ready. Raising each queue to
+1,024 words permits one complete head of state to be buffered. Integrated
+synthesis used `diagnostics/iter46_state_fifo_burst/csynth.tcl`; the report
+SHA-256 is
+`69f842b7f24b90f3715d12b3b910779932a4d519a6e331fe75f888a94d91eaa9`.
+
+**Result.** Native exact gates passed and HLS inferred four
+`fifo_w512_d1024_B` BRAM queues. Top minimum latency remained 1,621,415 cycles,
+with 1,632 RAMB18, 3,716 DSP, 888,271 FF, 868,961 LUT, 48 URAM and 167.98 MHz
+estimated Fmax. A one-layer RTL simulation with depth 64 stopped progressing
+near 44K cycles; the depth-1,024 variant advanced beyond 186K cycles. Neither
+completed within its 2.5 h / 5 h observation window, so that comparison was a
+useful clue but not a liveness proof.
+
+**Verdict: inconclusive; no commit.** The depth-1,024 source advanced to the
+separate Iter47 hardware acceptance test.
+
+### iter47 — whole-head state FIFOs with outstanding four (rejected at placement)
+
+*Tested: 2026-08-07.*
+
+**Identity.** Source SHA-256
+`fd200e3c552c76a0172d5e3993dfd93be2c827eb8eb1f3e6946cb77146d0c2a1`
+combines Iter45 outstanding depth four with Iter46 state depth 1,024. The
+unchanged 100 MHz config SHA-256 is
+`998b71e3a8cb3b7f818f12cbe6581f0ffd2e04010dba5db3f20ca2ae844aa08f`.
+The command and rationale are preserved in
+`diagnostics/iter47_state_depth1024/hardware/build.manifest`.
+
+**Result.** The 130 MHz compile succeeded, but 100 MHz implementation failed
+after 2 h 32 m in `place_design`: 114 instances remained unplaced, including
+43 Laguna/SLL-related cells around the HBM path-12 crossing plus shell
+clock-converter registers. No routing, timing, XCLBIN or on-card result exists.
+
+**Verdict: rejected negative implementation; no commit.** The four additional
+whole-head memories consume the placement margin recovered by Iter45.
+
+### iter48 — steer cluster 4 away from the exhausted Laguna column (rejected at route)
+
+*Tested: 2026-08-08.*
+
+**Change and identity.** Keep Iter47 source and constrain cluster 4 plus its
+`ws_8`/`ws_9` queues into eastern SLR0 clock regions, targeting the measured
+HBM path-12 Laguna collision. Config SHA-256 is
+`ec279d277285a0944da0aabb9c339f87fdcb0d5569fa7496c41505011e05d48d`;
+Tcl SHA-256 is
+`d6377be4c3fe227f6b08f561d1d41a128d084b22169b40e5b241bf6d93b58f11`.
+The exact command and source identity are in
+`diagnostics/iter48_cluster4_sll/hardware/build.manifest`.
+
+**Result.** The targeted placement failure was removed: all cells placed with
+zero overlaps and SLR0--1 demand was 18,991/23,040 SLLs. Routing nevertheless
+failed at global, short and timing congestion level 7. Southbound demand
+peaked at 114.91%, and route verification ended on partially conflicted HLS
+control/recurrent nets. No XCLBIN or timing/on-card result exists.
+
+**Measured root cause (per-block SLR histograms, not inference).** The two
+checkpoints were opened and every child of the gemv hierarchy was mapped to its
+physical SLR with `diagnostics/iter48_cluster4_sll/gemv_children.tcl`
+(Iter45 `level0_wrapper_routed.dcp`, Iter48 `level0_wrapper_routed_error.dcp`).
+One block explains the failure:
+
+| Block | Leaves | Iter45 (routed, cong 6) | Iter48 (failed, cong 7) |
+|---|---:|---|---|
+| `gdn_recurrent_attention_stream_U0` | 254,502 | SLR2 **238,300** (94%) | SLR0 **238,062** (94%) |
+| `gemv32_mm2s_with_state_28..31_U0` | 4 x ~2,930 | SLR1 ~2,055 each | SLR0 ~2,910 each |
+| `gemv32_store_or_qkvg_conv_stream_U0` | 46,662 | SLR2 43,341 (93%) | split 5,304/9,637/28,397 |
+
+The largest block in the design, ~23% of the gemv hierarchy, changed SLR. That
+is the entire SLR0 overload: SLR0 CLB LUTs 61.90% -> 80.50%, CLB occupancy
+99.78%, and the router's worst window is SOUTH 114.911% over
+`INT_X0Y0 -> INT_X127Y79`, i.e. SLR0 in full. The 16 clusters merely permuted
+(net-neutral), and total gemv leaves are unchanged (1,113,664 vs 1,113,913).
+
+**This was not caused by the deep state queues' routing footprint.** At
+synthesis the two netlists differ by **+78 flops and +28 BRAM tiles**, with
+identical DSP (3,725) and URAM (48) - too small to relocate 158k leaves. The
+`ws_8`/`ws_9` pin also did not cause it directly: both FIFOs occupied SLR0 in
+Iter45 too (68/73 leaves) and were only moved west->east *within* SLR0. The pin
+perturbed a placer sitting on a knife edge into a different global solution.
+
+Note that solution bought **nothing** in SLR crossings, so this is not a
+crossings-versus-congestion trade. Directional SLL demand from
+`slr_util_placed.rpt`:
+
+| Boundary | Iter45 (routed) | Iter48 (failed) |
+|---|---:|---:|
+| SLR0 -> SLR1 | 13,478 (58.50%) | 14,720 (63.89%) |
+| SLR1 -> SLR0 | 6,462 (28.05%) | 4,371 (18.97%) |
+| SLR0 <-> SLR1 total | 19,940 | 19,091 |
+| SLR1 <-> SLR2 total | 14,319 | 14,004 |
+
+Total crossings are essentially unchanged and the *dominant* direction got
+worse. Iter48 therefore paid SLR0 congestion for no crossing saving. (An
+earlier reading of "65.90%" for Iter48 came from a non-comparable summary row
+and is superseded by these directional figures.)
+
+Iter37C's `USER_SLR_ASSIGNMENT SLR2` is advisory; it printed `slr=SLR2` and the
+placer overrode it, the same failure mode Iter41A recorded for Iter40C.
+
+**Consequence for Iter41A's generalization.** Iter41A concluded "placement is
+exhausted as a lever for the nested topology ... do not spend another
+physical-recipe iteration on this netlist." That holds for the Iter40C netlist,
+which never routed under any placement. It does **not** generalize: Iter45
+(`num_read_outstanding` 8->4) routed at congestion 6 with 238,300 recurrent
+leaves in SLR2 - the configuration Iter41A declared unroutable. The nested actor
+demonstrably routes on the current netlist when it is actually held in SLR2.
+
+**Verdict: rejected negative implementation; no commit.** The targeted Laguna
+fix worked (0 unplaced vs Iter47's 114) and should be retained; the run failed
+for an unrelated reason. Two follow-ups exist. Iter49 (credit protocol) removes
+the deep queues entirely and is the preferred path because it keeps the netlist
+close to Iter45's. If a build again places the recurrent actor outside SLR2,
+the fix is a binding pblock rather than the advisory property: the bundle
+`build_iter50_recurrent_hard.sh` / `hw_iter50_recurrent_hard_f100.cfg` /
+`apply_iter50_recurrent_hard_ws_east.tcl` is prepared for that, and pairs it
+with `check_iter41_recurrent_placement.tcl` as a post-place gate so a
+non-binding constraint costs ~5 h instead of ~7.5 h. The frozen depth-1024
+source it requires is preserved at
+`diagnostics/iter48_cluster4_sll/gdn_model.cpp.d1024`
+(SHA-256 `fd200e3c...`), because the working tree has since moved to Iter49.
+
+### iter49 — per-head state credit with shallow queues (rejected at placement)
+
+*Tested: 2026-08-08; hardware build rejected.*
+
+**Fix.** Retain Iter45's routable outstanding depth of four and restore all
+four state streams to depth 64. Add one depth-2 Boolean credit stream per
+state-owning port. Each owner emits exactly 4,096 contiguous weight packs for
+one QKVG head, waits for a credit, then emits that head's 1,024 contiguous
+state words. The recurrent actor first captures all 16 Q/K/V packs, returns
+the four credits, and immediately drains the state words into its existing
+head-local buffer. Thus state can never block delivery of the weights needed
+to create the credit, while no full-head FIFO is required. Native-only builds
+guard the reverse handshake because C execution serializes dataflow actors;
+the synthesized feedback protocol is validated separately at RTL.
+
+**Identity and validation.** Working `gdn_model.cpp` SHA-256 is
+`1a3552d0f09c9090891c6b0e96175241dec46744d21e9cc6c704b3266a2e2fa6`.
+`make -C c_impl -j8`, the six-position fast exact gate, and the full 32-position
+exact gate passed with no divergence. Integrated HLS used
+`diagnostics/iter49_state_credit/csynth.tcl` SHA-256
+`e5a8348edca3739ba2d3ed3133ccaee228b93ae3fe9152aa6df0716d3631a2c6`;
+report SHA-256 is
+`162f741bab56baccc401c2461541f6d134d1a949b4afcfbb0f6813c1587706f6`.
+
+**Focused RTL liveness gate.** A bounded four-owner/eight-head protocol harness
+used the same 4,096-weight/credit/1,024-state sequence, depth-64 BRAM data
+queues and depth-2 SRL credits. C simulation, synthesis and Verilog C/RTL
+cosimulation all passed. HLS explicitly reports four backward dataflow
+channels and implements `state_credit[0:3]` as `fifo_w1_d2_S`, while all four
+state streams are `fifo_w512_d64_B`. The harness source/Tcl hashes are recorded
+under `diagnostics/iter49_state_credit_protocol/`.
+
+**Integrated synthesis.** Static latency is unchanged from Iter45/Iter47:
+1,621,415 top minimum cycles, 67,072 per layer and 8,435 shared-GEMV minimum.
+Every state-owner weight/prefetch loop remains II=1 and all cluster MAC loops
+remain II=4. Estimated Fmax is 167.98 MHz. Relative to Iter45, only 32 FF and
+114 LUT are added; totals are 1,632 RAMB18, 3,716 DSP, 888,263 FF, 869,019 LUT
+and 48 URAM. This restores the routable Iter45 memory footprint while directly
+removing its demonstrated circular wait.
+
+**Pre-build verdict: accepted as a 100 MHz hardware candidate, but not
+retained.** The hardware command was
+`make run_hw BUILD_DIR=build.hw.iter49.credit.f100.o8.v2022_2
+RUN_HW_DIR=diagnostics/iter49_state_credit/hardware HLS_FREQ=130 FREQ=100
+LINK_FREQ=100 JOBS=8 HW_DEVICE=0`. The XO compiled, but the detached build
+exited 2 at 2026-08-08 17:42:01 +03:00 after 4 h 56 min 55 s total
+(4 h 30 min 53 s in link).
+
+**Hardware result: failed placement before routing.** Vivado required 19,036
+of 23,040 SLLs across SLR0 to SLR1, classified the design as highly
+congested, and failed `place_design` with 70 unplaced instances. Of those, 45
+are in `gdn_recurrent_attention_stream`, 15 are other kernel/AXI logic, and
+10 are HBM path-31 interconnect registers. The illegal placement's diagnostic
+timing degraded from estimated WNS -2.769 ns to post-placement WNS -9.486 ns
+and post-replication WNS -8.804 ns; these values are not timing-closure results
+because placement never completed. No routed checkpoint, xclbin, or on-card
+result was produced.
+
+**Failure diagnosis.** This is not global resource exhaustion: relative to
+the routed Iter45 post-link synthesis, Iter49 has only 84 more CLB LUTs
+(571,716 versus 571,632), 40 fewer CLB registers (617,142 versus 617,182), and
+identical 1,331 BRAM tiles, 48 URAMs and 3,721 DSPs. Nor is aggregate SLL count
+the discriminator: Iter45 routed despite a larger placement warning of 19,979
+SLLs. Every Iter49 unplaced cell is soft logic (48 FDREs and 22 LUTs), with 45
+inside recurrence, 15 in kernel AXI ports 29--31, and 10 in HBM path 31. This
+localization, together with the post-placement timing collapse, indicates a
+bad coarse partition/local CLB-packing solution for the coupled
+recurrence/state-owner cone. The four reverse credit channels add only 32 FF
+and 114 LUT at HLS level, but turn that cone into a cyclic dataflow component
+and perturb a placer already known from Iter48 to sit on a knife edge. The
+`USER_SLR_ASSIGNMENT SLR2` hook matched the recurrent root, but remains
+advisory; Vivado has overridden it in prior runs. Because placement never
+completed, there is no placed DCP from which to measure an authoritative
+per-SLR histogram, so attribution of the bad partition specifically to the
+feedback edge is a high-confidence physical inference rather than a measured
+SLR mapping.
+
+**Final verdict: rejected and not committable.** The credit protocol passed
+native, integrated-synthesis, and focused RTL-liveness gates, but its physical
+netlist did not fit the established 100 MHz floorplan. Iter39C remains the
+last demonstrated production improvement at 43.093 ms. Do not retry the same
+netlist unchanged; retain this result only as a negative experiment in the
+working optimization log.
+
+### iter50 — hard-bind the Iter49 recurrent actor to SLR2 (rejected at route)
+
+*Started: 2026-08-09.*
+
+**Hypothesis.** Iter49 failed from a bad coarse partition/local CLB-packing
+solution rather than resource growth. Reuse its exact XO and replace the
+advisory recurrent `USER_SLR_ASSIGNMENT` with the previously validated full-
+SLR2 hard pblock. Preserve Iter22 cluster-8 placement and the DMA fanout hook,
+but deliberately omit Iter48's cluster-4/`ws_8`/`ws_9` steering because that
+physical perturbation moved the recurrent actor into SLR0. A post-place hook
+reports the exact recurrent per-SLR histogram and aborts before route if less
+than 80% of its placed leaves are in SLR2.
+
+**Frozen identity and command.** The reused Iter49 XO SHA-256 is
+`7b10631b9dae728dc05a9b9fac9f2b851342b7848467910cc2b6f52039a7d270`;
+the unchanged source SHA-256 is
+`1a3552d0f09c9090891c6b0e96175241dec46744d21e9cc6c704b3266a2e2fa6`.
+`make -q xo` returned zero after seeding the new build directory, proving HLS
+compilation will be skipped. The physical-only command is `make run_hw
+HW_CFG_TEMPLATE=hw_iter41_recur_pblock_f100.cfg
+BUILD_DIR=build.hw.iter50.credit.recurhard.f100.o8.v2022_2
+RUN_HW_DIR=diagnostics/iter50_credit_recurrent_hard/hardware HLS_FREQ=130
+FREQ=100 LINK_FREQ=100 JOBS=8 HW_DEVICE=0`. Complete source/config/Tcl hashes
+are in `diagnostics/iter50_credit_recurrent_hard/hardware/build.manifest`.
+
+**Placement result.** Placement completed and the hard-placement gate passed:
+all 239,764 placed recurrent leaves were in SLR2 (`SLR0=0`, `SLR1=0`,
+`SLR2=239764`, fraction 1.0000). Post-place WNS was -0.006 ns and pre-route
+physical optimization recovered setup to +0.003 ns; the provisional hold
+result was WHS -0.248 ns and was not a final timing result. The build therefore
+proved that the full-SLR2 pblock enforces the intended recurrent partition,
+unlike Iter49's advisory assignment.
+
+**Physical side effect.** The enforced recurrence placement displaced the rest
+of GEMV into the wrong SLRs. A read-only checkpoint comparison measured placed
+GEMV primitive counts of SLR0/SLR1/SLR2 =
+415,186/365,236/333,242 in routed Iter45 versus
+464,889/307,837/341,591 in Iter50: SLR0 gained 49,703 primitives while SLR1
+lost 57,399. The routed SLR utilization reports show the same redistribution.
+Relative to Iter45, Iter50 moved SLR0 from 54,442 to 54,785 occupied CLBs
+(99.06% to 99.68%), 272,191 to 284,319 CLB LUTs, 578.5 to 642 BRAM tiles,
+and 1,341 to 1,523 DSPs. SLR1 fell from 44,463 to 41,276 CLBs and from
+1,170 to 969 DSPs. This is not an aggregate-capacity failure; the hard pblock
+perturbed cluster/FIFO placement and packed more hard and soft GEMV resources
+into the already saturated SLR0.
+
+The direct-child histogram identifies the dominant mover rather than merely
+correlating whole-SLR totals. Cluster 10 had 48,970 placed leaves in SLR1 and
+zero in SLR0 in routed Iter45; Iter50 put 46,986 in SLR0 and only 2,001 in
+SLR1. Its two weight FIFOs `ws20`/`ws21` and activation FIFO `xr10` moved from
+SLR1 to SLR0 with it. Cluster 8 also spilled from 2,001 to 12,943 SLR0 leaves
+(SLR1 fell from 47,528 to 36,588). Cluster 0 and cluster 15 largely exchanged
+SLR1/SLR2 positions, which changes topology but does not explain the SLR0
+density jump. Therefore cluster 10 plus `ws20`, `ws21`, and `xr10` is the
+minimal measured relocation cone for the next physical candidate; cluster 8
+spill is a secondary gate to monitor rather than grounds for another broad
+floorplan.
+
+The route prepass consequently reported severe localized SLL demand. Across
+SLR1--SLR2, total demand was only 11,383/23,040 (49.41%), but the worst column
+was 2,662/1,440 (185%). Across SLR0--SLR1, total demand was 16,251/23,040
+(70.53%), while the worst column was 3,209/1,440 (223%). Vivado emitted
+`Route 35-3311` and then `Route 35-447`; estimated global/short and timing
+congestion were both level 7.
+
+**Routing result.** `AlternateCLBRouting` spent 4 h 50 min in `route_design`.
+The first rip-up pass reduced overlap nodes from 1,209,590 through 514,334,
+209,420, 92,786, 43,957, and 24,222, but ended with intermediate WNS
+-8.522 ns. A later global iteration reintroduced 944,961 overlaps. Final route
+verification reported 44 completely unrouted nets, 20,070 overlapping nodes,
+and 26,879 routable nets with resource conflicts. This distinction matters:
+the design was not merely 44 isolated nets from success. The conflict report
+includes the global-logic-zero distribution, shell/control AXI nets, top-level
+FP adders, and recurrent FP adders, confirming device-wide fallout from the
+localized hot regions. Vivado wrote
+`level0_wrapper_routed_error.dcp`, emitted `Constraints 18-1000`, and exited
+the detached wrapper with code 2 at 2026-08-09 09:42:10 +03:00 after about
+9 h 41 min total. No xclbin, final timing report, smoke test, or on-card
+measurement exists.
+
+**Final verdict: rejected and not committable.** The hard SLR2 pblock fixes
+Iter49's coarse recurrent partition but damages the surrounding GEMV placement
+enough to create level-7 routing conflicts. Do not retry this full-SLR hard
+pblock unchanged and do not treat a route-directive-only change as sufficient:
+the next candidate must preserve recurrence in SLR2 while explicitly preventing
+the measured 49.7k-primitive GEMV migration into SLR0. Iter39C remains the last
+demonstrated production result at 43.093 ms; the Iter49 credit protocol remains
+functionally promising but has not produced hardware.
+
+### iter51 — return the measured cluster-10 relocation cone to SLR1 (rejected at placement gate)
+
+*Prepared: 2026-08-09.*
+
+**Hypothesis.** Keep Iter50's effective full-SLR2 recurrent pblock, but correct
+the specific GEMV displacement measured in its failed placed checkpoint.
+Cluster 10 moved from 48,970 leaves in SLR1 and zero in SLR0 in routed Iter45
+to 46,986 leaves in SLR0 and only 2,001 in SLR1 in Iter50. Its `ws20`, `ws21`,
+and `xr10` FIFOs moved with it. Assign only those four hierarchy roots to SLR1;
+retain the Iter22 cluster-8 constraint and leave every other cluster, FIFO, and
+route unconstrained. This should recover most of Iter50's 0.62 percentage-point
+SLR0 CLB overfill without recreating the rejected broad cluster floorplans.
+
+**Frozen identity.** The C++ source remains unchanged at SHA-256
+`1a3552d0f09c9090891c6b0e96175241dec46744d21e9cc6c704b3266a2e2fa6`.
+The build will reuse the exact native-, integrated-csynth-, and focused-RTL-
+verified Iter49/Iter50 XO at SHA-256
+`7b10631b9dae728dc05a9b9fac9f2b851342b7848467910cc2b6f52039a7d270`;
+therefore this is a physical-only experiment and HLS must be skipped. The new
+files and SHA-256 identities are `apply_iter51_cluster10_slr1.tcl`
+`2a5e0c24deb3238fe4f1d184c1dafe5a7a464b0d2c0c50793ac9df7eb55271e7`,
+`check_iter51_placement.tcl`
+`b8e00e617a4fce49064b71e96347ad8e7e7cb4448af21b978cd7f005997fd112`,
+and `hw_iter51_cluster10_slr1_f100.cfg`
+`d08a7633e6ff0db2226a2d74c8c721e9e76059f9a48b88220a877f5c3c6dd508`.
+
+**Early physical gate.** The post-place hook first runs the established
+recurrent gate, then requires cluster 10 and each of `ws20`, `ws21`, and
+`xr10` to have at least 80% of its placed primitives in SLR1. It also requires
+SLR0 occupied-CLB utilization to be at most 99.30%, between routed Iter45's
+99.06% and failed Iter50's 99.68%, and reports cluster 8's histogram for spill
+diagnosis. Failure aborts before `route_design`; passing placement is not a
+success claim.
+
+**Acceptance.** Route must finish with zero failed, unrouted, and overlapping
+nets; final WNS and WHS must both be nonnegative at an achieved 100 MHz with
+no clock scaling. Only then may the automatic exact 8-token smoke and exact
+64-token on-card run execute. A positive performance result must improve the
+current production objective; otherwise the constraint remains uncommittable.
+The build command and outcome will be added here at launch and completion.
+
+**Prepared command.** `make run_hw
+HW_CFG_TEMPLATE=hw_iter51_cluster10_slr1_f100.cfg
+BUILD_DIR=build.hw.iter51.credit.c10slr1.f100.o8.v2022_2
+RUN_HW_DIR=diagnostics/iter51_credit_cluster10_slr1/hardware HLS_FREQ=130
+FREQ=100 LINK_FREQ=100 JOBS=8 HW_DEVICE=0`. The exact XO was reflinked into
+the new build directory and `make -q xo` returned zero, proving that the run
+will enter directly at the 100 MHz hardware link. The frozen manifest is
+`diagnostics/iter51_credit_cluster10_slr1/hardware/build.manifest`.
+
+**Launch.** An initial 2026-08-09 12:50:13 +03:00 detach inside the transient
+sandbox was reaped before `v++` produced output; it performed no synthesis or
+implementation and is not a physical attempt. The identical recorded command
+was relaunched persistently at 13:31:32 +03:00 under host wrapper PID 1843509.
+Its wrapper log, exit marker, timestamps, and PID are under
+`diagnostics/iter51_credit_cluster10_slr1/hardware/`; detailed Vivado progress
+is in the build directory's `impl_1/runme.log` once implementation starts.
+
+**Placement result.** The persistent run ended with wrapper exit 2 at
+2026-08-09 18:21:06 +03:00, after 4 h 49 min. The pre-placement hook proved
+that every requested property was present: cluster 10 and `ws20`/`ws21`/
+`xr10` all reported `USER_SLR_ASSIGNMENT=SLR1`. Vivado nevertheless overrode
+the advisory properties. Post-place, cluster 10 was SLR0/SLR1/SLR2 =
+46,986/2,001/0 placed primitives, only 4.08% in SLR1. Each of the three local
+FIFOs had all 73 measured primitives in SLR0 and none in SLR1. Cluster 8 was
+12,943/36,588/0 (73.87% in SLR1).
+
+The hard recurrent pblock remained fully effective: all 239,764 recurrent
+primitives were in SLR2. However, SLR0 stayed at 54,785 occupied CLBs
+(99.68%) and 284,316 LUTs, statistically identical to failed Iter50; SLR1 was
+41,276 CLBs (76.44%) and SLR2 41,450 (76.76%). Post-place WNS was -0.006 ns.
+The congestion estimate remained device-scale (global and short congestion up
+to 128x128). The gate correctly aborted before `route_design`, so no route,
+xclbin, timing-closure result, smoke test, or on-card measurement exists.
+
+**Final verdict: rejected and not committable.** The measured target cone was
+correct, but another soft SLR assignment cannot counter the full-SLR2 recurrent
+pblock. The next physical attempt must keep the scope surgical while making
+the already-proven Iter45 cluster-10 partition compulsory: a hard pblock over
+the full of SLR1 for cluster 10 plus `ws20`, `ws21`, and `xr10`. This has
+physical capacity evidence—SLR1 is only 76.44% occupied in the failed
+placement and the same cluster occupied SLR1 in routed Iter45—while avoiding a
+broad all-cluster floorplan.
+
+### iter52 — hard-pblock the cluster-10 relocation cone in SLR1 (rejected after on-card deadlock)
+
+*Prepared: 2026-08-09.*
+
+**Hypothesis.** Preserve the full-SLR2 recurrent pblock and replace only
+Iter51's demonstrably ineffective cluster-10 advisory assignments with a
+non-soft pblock spanning all SLR1 clock regions. Add cluster 10 and its three
+local FIFO hierarchies to that pblock, leave routing uncontained, and retain
+all other physical levers unchanged. This should reproduce the routed Iter45
+coarse partition for the measured mover while leaving Vivado freedom within
+SLR1 and everywhere else.
+
+**Gates and acceptance.** Reuse the exact Iter49--Iter51 XO and skip HLS. At
+post-place, require the recurrent actor to remain at least 80% in SLR2,
+cluster 10 and each local FIFO to be at least 95% in SLR1, and SLR0 occupied
+CLBs to fall to at most 99.30%; report cluster 8 for secondary spill. Only a
+passing placement may enter route. Final acceptance remains zero failed,
+unrouted, or overlapping nets, nonnegative WNS/WHS at 100 MHz with no scaling,
+then exact 8-token and 64-token on-card runs.
+
+**Frozen identity and command.** Source and XO remain SHA-256
+`1a3552d0f09c9090891c6b0e96175241dec46744d21e9cc6c704b3266a2e2fa6`
+and `7b10631b9dae728dc05a9b9fac9f2b851342b7848467910cc2b6f52039a7d270`.
+The new apply/check/config hashes are respectively
+`e8fc4bf76867b1913acc3f210a356fce27538f8447315f90db64525400b02f7b`,
+`3db132b7bcb660fe4e5d253532f4d1a22de9573a03e83338f546e803cffc2f12`,
+and `f498c1d8158e624f1f072af1c853da9c911d1130fcc73350545a0ba7cc20f2cc`.
+Both Tcl files are syntactically complete, the utilization parser matches the
+measured report format, and `make -q xo` returned zero after reflinking the XO.
+The command is `make run_hw
+HW_CFG_TEMPLATE=hw_iter52_cluster10_slr1_pblock_f100.cfg
+BUILD_DIR=build.hw.iter52.credit.c10hard.f100.o8.v2022_2
+RUN_HW_DIR=diagnostics/iter52_credit_cluster10_hard/hardware HLS_FREQ=130
+FREQ=100 LINK_FREQ=100 JOBS=8 HW_DEVICE=0`; the complete frozen manifest is
+under the run directory.
+
+**Launch.** The detached build started at 2026-08-09 19:07:30 +03:00 under
+wrapper PID 2309064. The harmless Make warning that the new config timestamp
+was 24 seconds ahead of the shell clock does not affect its content or hashes.
+The wrapper entered `v++` hardware link using the reused XO.
+
+**Placement and routing result.** The mandatory placement gate passed. The
+recurrent actor was entirely in SLR2 (239,762/239,762 leaves); cluster 10 was
+entirely in SLR1 (48,998/48,998), and `ws20`, `ws21`, and `xr10` were likewise
+entirely in SLR1 (73 leaves each). SLR0/1/2 occupied-CLB counts were
+54,237/39,076/44,658, or 98.68%/72.36%/82.70%. Cluster 8 spilled from SLR0
+into SLR1 (30,848/18,687 leaves), which was the principal compensating move.
+The hard pblock therefore achieved its intended SLR0 density relief.
+
+The SLR0--SLR1 boundary used 16,593/23,040 SLLs (72.02% total), with its
+worst physical column at 2,538/1,440 (176%). SLR1--SLR2 used 11,308/23,040
+(49.08% total), with its worst column at 2,973/1,440 (206%). Relative to
+Iter50, the lower-boundary worst column improved from 223% to 176%, while the
+upper-boundary worst column regressed from 185% to 206%. Despite this, the
+router converged from 709,476 initial node overlaps to zero. Final route
+verification reported zero failed, unrouted, partially routed, or overlapping
+nets. This is the first routable credit-protocol implementation and confirms
+that the cluster-10 hard relocation solved the Iter50 physical failure.
+
+**Timing and artifact.** The final routed timing report was WNS -0.226 ns,
+TNS -4.106 ns over 53 endpoints, and WHS +0.009 ns. Post-route
+`AggressiveExplore` improved kernel-clock TNS to -3.724 ns but did not recover
+WNS. Vitis consequently auto-scaled the requested 100 MHz DATA clock to
+97.7 MHz and encoded 97 MHz in the xclbin. Linking and bitstream generation
+completed after 11 h 31 min. The 81,085,994-byte `gdn_forward.xclbin` has
+SHA-256
+`77182b287ace19765253644e3e94d5756621bc6c8e7e87e4b399f4c270cf2361`.
+This misses the no-scaling timing gate but was retained long enough for the
+mandatory functional smoke test.
+
+**On-card result.** The automatic 8-token decode loaded the device, xclbin,
+weights, 50.3316 MB recurrent-state fixture, and all buffers successfully.
+The host reached `run.start()`, which returned, then remained blocked in
+`run.wait()` for more than four hours. It never printed the post-wait marker,
+produced no smoke JSON, and therefore provided neither parity nor performance.
+During the hang, `xbutil examine --report dynamic-regions` showed one use of
+`gdn_forward_1` but reported the CU as `IDLE`; the host itself was sleeping at
+0% CPU. The host was terminated after preserving these diagnostics, causing
+the wrapper to exit 2 (`make` exit 143) at 2026-08-10 11:05:20 +03:00. The
+exact last marker is in
+`diagnostics/iter52_credit_cluster10_hard/hardware/on_card/oncard_smoke8.log`.
+
+**Deadlock root cause.** The per-head credit boundary is one GEMV input row too
+early. Each state-owning MM2S actor writes exactly 4,096 weight packs (32 rows
+times 128 input packs) and then waits for the recurrent credit. The clustered
+GEMV, however, double-buffers row accumulation: at the end of row `r` it emits
+row `r-1`, and only its whole-command epilogue emits the final pending row.
+Consequently, after row 31 the cluster has emitted only through row 30. The
+second Pack16 for head 0 (rows 16--31) is not written to `ys14`/`ys15` until
+row 32 completes, which requires 128 weights from head 1. Ports 28--31 are
+already waiting for a credit at that point. The collector therefore cannot
+complete head 0, the QKVG/convolution actor cannot emit complete Q/K/V, and
+recurrence cannot generate the credit. This is a closed wait cycle:
+state-owner credit wait -> cluster weight wait -> collector/result wait ->
+recurrent Q/K/V wait -> missing credit.
+
+The earlier integrated depth-128 RTL experiment independently exposed the
+same physical channel chain (`ys_14` empty, `ws_29` empty, state owner blocked,
+recurrence waiting for Q/K/V); the focused Iter49 protocol harness missed it
+because it assumed 4,096 accepted weights immediately produce one complete
+head and did not model the cluster's one-row delayed result emission. FIFO
+depth and HBM latency can change when the cycle becomes visible, but cannot
+make this token graph live.
+
+**Required correction before another build.** Remove the reverse credit FIFOs
+and make each state owner supply a one-row lookahead before switching from
+weights to state. Head 0 must send 4,224 weights; heads 1--6 then send 4,096
+new weights each; head 7 sends the remaining 3,968. This preserves the exact
+32,768 total weights per QKVG command and their order. After each boundary the
+cluster has all tokens required to emit that head, so a depth-64 state FIFO may
+backpressure safely without starving the result that causes recurrence to
+drain it. The final head uses the cluster's existing command-end flush. A full
+integrated one-layer RTL cosimulation—not the reduced owner-only harness—is a
+mandatory liveness gate for this correction.
+
+**Final verdict: rejected and not committable.** The physical intervention is
+successful evidence and should be reused, but the synthesized credit-protocol
+architecture is not functionally live on hardware. Exact 8/64-token checks and
+latency measurement did not run. Before another long link, diagnose the full
+32-reader/collector/QKV-convolution/recurrent dataflow cycle with the corrected
+one-row-lookahead schedule. Do not treat the routed xclbin as a successful
+build.
+
+### iter53 — restore forward-only state owners with whole-head queues (timing failure)
+
+*Prepared: 2026-08-10.*
+
+**Hypothesis and change.** Remove Iter49--Iter52's four reverse credit streams
+entirely and return ports 28--31 to Iter45's simple forward-only schedule:
+4,096 weight packs followed by 1,024 state packs for each head. Increase only
+the four packed state queues from depth 64 to depth 1,024 and bind them to
+BRAM. A queue can therefore accept the complete state burst without blocking
+its owner. The owner then starts the next head's weights; the first 128 packs
+complete the clustered GEMV's one-row-delayed result for the previous head,
+which releases Q/K/V and lets recurrence drain the buffered state. This removes
+the deadlocked feedback edge while preserving weight order, traffic, GEMV
+arithmetic, and the static schedule. Physically, reuse Iter52's successful hard
+recurrent-SLR2 and cluster-10-SLR1 floorplan.
+
+**Source and native validation.** The source SHA-256 is
+`8c666c47c8f0143ef948bb41aa61d8319114cde71c538b4b3b86867f04c23ca1`.
+`make -C c_impl -j8`, the fast six-token exact gate, and the full 32-token
+exact gate passed with first divergence -1 and 100% top-1 agreement. No new
+AXI master or external ABI change was introduced.
+
+**Integrated synthesis.** Vitis HLS 2022.2 synthesis used
+`diagnostics/iter53_state_fifo1024_no_credit/csynth.tcl`; the report SHA-256 is
+`9493c999d7d2cb9b5d21bac8622fafb84ff724fdd8973e27d3a118a1023ca197`.
+All 16 `gemv32_cl_flat` loops remain II=4. The four state-owner weight loops
+remain II=1 for 4,096 words and the state-prefetch loops remain II=1 for 1,024
+words. HLS inferred exactly four `fifo_w512_d1024_B` queues using BRAM and no
+`state_credit` process or FIFO. Estimated Fmax is 167.98 MHz. The top report is
+identical to Iter46: 1,632 RAMB18, 3,716 DSP, 888,271 FF, 868,961 LUT and 48
+URAM. Relative to Iter49's credit design, this removes 58 LUT and eight FF in
+the HLS estimate while exchanging the shallow queues for complete state-burst
+buffers. The earlier one-layer depth-1,024 RTL run advanced beyond 186K cycles
+without the depth-64 deadlock signature but timed out before completion, so
+on-card completion remains the decisive liveness gate.
+
+**Hardware command and acceptance.** The 130 MHz HLS / 100 MHz link command is
+`make run_hw HW_CFG_TEMPLATE=hw_iter52_cluster10_slr1_pblock_f100.cfg
+BUILD_DIR=build.hw.iter53.nocredit.state1024.c10hard.f100.o8.v2022_2
+RUN_HW_DIR=diagnostics/iter53_state_fifo1024_no_credit/hardware HLS_FREQ=130
+FREQ=100 LINK_FREQ=100 JOBS=8 HW_DEVICE=0`. The config/apply/check SHA-256 values
+remain `f498c1d8158e624f1f072af1c853da9c911d1130fcc73350545a0ba7cc20f2cc`,
+`e8fc4bf76867b1913acc3f210a356fce27538f8447315f90db64525400b02f7b`,
+and `3db132b7bcb660fe4e5d253532f4d1a22de9573a03e83338f546e803cffc2f12`.
+Acceptance requires the Iter52 placement gate, zero route defects,
+nonnegative setup/hold timing without clock scaling, exact eight-token parity,
+and then an exact 64-token performance result. **Status: hardware build
+failed timing and the iteration is rejected.** The detached wrapper ran from
+2026-08-10 11:54:27 +03:00 to 2026-08-11 07:09:55 +03:00 and exited with
+`run_hw.exit=2`; its persistent log, exit marker, timestamps and frozen
+manifest are under
+`diagnostics/iter53_state_fifo1024_no_credit/hardware/`.
+
+**Implementation result.** Placement preserved the intended coarse
+distribution: the recurrent hierarchy was 100% in SLR2; cluster 10 and its
+three stream endpoints were 100% in SLR1; cluster 8 was 95.94% in SLR1 with
+2,011 leaves left in SLR0. Final SLR CLB occupancies were 98.85%, 80.98%, and
+75.65% for SLR0--2. Routing completed with zero failed, unrouted, partially
+routed, conflicting, or overlapping nets. The final SLR0--1 SLL demand was
+71.92% overall with a 143% worst column, while SLR1--2 was 45.52% overall with
+a 99% worst column. Thus the hard floorplan and deeper forward-only queues
+preserved routability and substantially reduced the earlier SLR1--2 local SLL
+peak, but did not close timing.
+
+Post-route `AggressiveExplore` improved overall setup from WNS -3.741 ns to
+WNS **-0.874 ns**, TNS -223.064 ns; hold closed at WHS +0.001 ns. The fixed
+250 MHz `dma_ip_axi_aclk_1` remained fatal at WNS -0.874 ns, TNS -86.321 ns
+over 409 endpoints. Its dominant paths were the r15 response FIFO
+`state[0]` and `fifoaddr_reg[5]` high-fanout cones (529 and 521 loads), followed
+by a physically detoured six-LUT path from the path-12 `s01_mmu` reset register
+to the `s01_ar_node` payload FIFO. The 100 MHz kernel clock also missed at WNS
+-0.550 ns, TNS -136.743 ns over 651 endpoints. Its leading failures were an
+SLR0-to-SLR2 reset-to-BRAM path with 99.2% routed delay and a cluster-8 path
+that crossed SLR0-to-SLR1 and returned to the 4.06% of cluster leaves left in
+SLR0. The final timing report SHA-256 is
+`f445b276bbb43aa5c2a0ced013f5b12030a05db10fe9fe77b829a47cc81ee82a`.
+No XCLBIN was emitted, so neither on-card liveness nor performance was tested.
+The architecture remains a functional native/csynth candidate, but this
+physical realization is negative and must not be committed.
+
+### iter54a — target Iter53's routed timing cones at 100 MHz (pre-opt guard failure)
+
+*Prepared: 2026-08-11.*
+
+**Hypothesis and scope.** Keep Iter53's forward-only depth-1,024 state queues,
+130 MHz HLS schedule, 100 MHz link target, 32 HBM readers, hard recurrent-SLR2
+placement, and hard cluster-10-SLR1 placement byte-for-byte unchanged. Repair
+the measured physical timing paths without another architectural perturbation:
+
+- hard-contain cluster 8 in the full SLR1 while keeping `ys_8` movable, so the
+  2,011 cluster leaves that spilled into SLR0 cannot create the measured
+  SLR0-to-SLR1-to-SLR0 512-load return path;
+- apply `MAX_FANOUT_MODE=CLOCK_REGION` and `FORCE_MAX_FANOUT=64` to the exact
+  platform-reset driver that produced Iter53's SLR0-to-SLR2 reset-to-BRAM
+  path, rather than constraining hundreds of hierarchical aliases as Iter43
+  did;
+- extend the proven DMA hook to the actual Iter53 r15 response-FIFO
+  `state[0]` and `fifoaddr_reg[5]` sources, also at a forced fanout of 64;
+- hard-contain only the eight primitives on the measured path-12 AR-control
+  path to `CLOCKREGION_X2Y1:CLOCKREGION_X3Y1`, eliminating its detour through
+  X4Y2 without constraining the complete HMSS path; and
+- retain `SSI_SpreadSLLs` placement but use route directive
+  `NoTimingRelaxation`, because Iter53 completed routing cleanly and timing is
+  now the acceptance blocker.
+
+**Identity and pre-build validation.** The source remains
+`8c666c47c8f0143ef948bb41aa61d8319114cde71c538b4b3b86867f04c23ca1`.
+This physical-only run reuses Iter53's bit-identical XO, SHA-256
+`fd9c4165dcd3b23ee11dc3498bd6445f66e1a7ebf0b5c5c902d007f874623ee5`;
+therefore Iter53's exact native fast/full results and integrated HLS result
+(1,621,415 minimum cycles, all 16 clusters II=4) remain applicable. The
+config, pre-opt hook, pre-place hook, and post-place check SHA-256 values are
+`39a3e907806f3c8864de3960b1f7ffef93641ff488436087b11a5bc715e97329`,
+`cd9455dbf6d6b3f299f43a3b940912ca1b29903003343079bdbd172c166b7ebd`,
+`e1508e6a8b1567d541a8f74e77056b1c59bccecd221ca37fe8ca03b25f71ed39`,
+and `887611568dede19279333584821cd3489cb5441484224765d2e67543971fa627`.
+All Tcl files are syntactically complete; the resolved config contains no
+placeholder and has SHA-256
+`399288483828ba10c824621e70f150db442a9b16b0848084cbd4f135c35e93f1`.
+Every exact cell regexp matched one object in the Iter53 final checkpoint,
+including all eight AR-control primitives. Vivado 2022.2's command help
+confirmed `NoTimingRelaxation` is a supported `route_design` directive.
+
+**Command and acceptance.** The command is `make run_hw
+HW_CFG_TEMPLATE=hw_iter54_timing_f100.cfg
+BUILD_DIR=build.hw.iter54.timing.f100.o8.v2022_2
+RUN_HW_DIR=diagnostics/iter54_timing/hardware HLS_FREQ=130 FREQ=100
+LINK_FREQ=100 JOBS=8 HW_DEVICE=0`. The post-place gate requires Iter52's
+recurrent/cluster-10/utilization checks, at least 99.9% of cluster 8 in SLR1,
+and all eight AR primitives inside X2Y1:X3Y1. Final acceptance requires zero
+route defects, DMA and kernel setup/hold slack all nonnegative without clock
+scaling, exact eight-token on-card parity, and an exact 64-token performance
+run. **Status: stopped before optimization; rejected as a preflight failure.**
+The physical-only link ran from 2026-08-11 12:07:46 to 14:37:22 +03:00 in
+persistent tmux session `gdn_iter54` with wrapper PID 2264605 and exited
+`run_hw.exit=2`. All 227 block-level synthesis jobs and top-level synthesis
+completed, then the pre-opt hook stopped with `reset direct fanout 0 is below
+the expected pre-opt floor`. The reset driver cell matched exactly; however,
+its local Q-net is a hierarchy-boundary stub with no direct leaf pins at this
+stage. The actual flattened kernel-root reset alias carries the loads. No
+`opt_design`, placement, routing, timing, XCLBIN, or on-card test ran, so this
+result says nothing about the proposed physical fixes. The manifest, wrapper
+log, exit marker, and timestamps are under
+`diagnostics/iter54_timing/hardware/`. **Verdict: rejected infrastructure
+failure; no commit.**
+
+### iter54b — select the flattened reset alias and retry the timing repair (pre-place guard failure)
+
+*Prepared: 2026-08-11.*
+
+**Correction.** Preserve every Iter54a physical constraint, frequency, source,
+XO, config, and acceptance gate. Keep the exact platform reset-driver cell as
+a hierarchy guard, but set the fanout properties on exactly one flattened
+kernel-root alias, `level0_i/ulp/gdn_forward_1/inst/ap_rst_n_inv`. The
+inconclusive Iter43 pre-opt log measured this alias at 35,811 flattened pins;
+the repaired hook accepts only 20,000--60,000 pins and aborts otherwise. This
+selects the physical reset net once without Iter43's 616 repeated hierarchical
+aliases. The repaired pre-opt hook SHA-256 is
+`ae19a25c10245fbc6a7e2de08ef93ac09c0b3102b41fae199736c7ce50c0730a`.
+The config, DMA hook, placement gate, resolved config, and reused XO hashes
+remain `39a3e907806f3c8864de3960b1f7ffef93641ff488436087b11a5bc715e97329`,
+`e1508e6a8b1567d541a8f74e77056b1c59bccecd221ca37fe8ca03b25f71ed39`,
+`887611568dede19279333584821cd3489cb5441484224765d2e67543971fa627`,
+`399288483828ba10c824621e70f150db442a9b16b0848084cbd4f135c35e93f1`,
+and `fd9c4165dcd3b23ee11dc3498bd6445f66e1a7ebf0b5c5c902d007f874623ee5`.
+
+**Command and result.** Retry with `make run_hw
+HW_CFG_TEMPLATE=hw_iter54_timing_f100.cfg
+BUILD_DIR=build.hw.iter54.timing.f100.o8.v2022_2
+RUN_HW_DIR=diagnostics/iter54b_timing_reset_alias/hardware HLS_FREQ=130
+FREQ=100 LINK_FREQ=100 JOBS=8 HW_DEVICE=0`. Reuse the current build directory
+and unchanged XO; the modified hook invalidates the failed link while avoiding
+a redundant HLS compile. The retry ran from 2026-08-11 14:44:54 to 15:32:06
++03:00 in persistent tmux session `gdn_iter54b` with wrapper PID 2931041 and
+exited `run_hw.exit=2`. The two new r15 DMA sources matched exactly, with
+direct fanouts 529 and 521, so that part of the repaired pre-place hook was
+validated. The hook then stopped before `place_design` because
+`get_clock_regions {CLOCKREGION_X2Y1 CLOCKREGION_X3Y1}` matched zero objects.
+The `CLOCKREGION_` spelling is valid in a pblock grid range but is not the
+clock-region object-name spelling accepted by `get_clock_regions` in this
+checkpoint. Consequently the reset-alias pre-opt repair completed, but the
+cluster-8 placement, AR-path placement, routing, timing, XCLBIN, and on-card
+tests did not run. This is another script/preflight result and provides no
+evidence for or against timing closure. Persistent artifacts are under
+`diagnostics/iter54b_timing_reset_alias/hardware/`. **Verdict: rejected
+infrastructure failure; no commit.**
+
+### iter54c — correct clock-region object names and retry at 100 MHz (cycle-count improvement; on-card exact)
+
+*Prepared: 2026-08-11.*
+
+**Correction and validation.** Preserve Iter54b's source, XO, 130 MHz HLS
+schedule, 100 MHz link target, floorplan, fanout properties, route directive,
+and acceptance gates. Correct only the Vivado clock-region naming mismatch:
+`get_clock_regions` and the post-place object-name check now use `X2Y1 X3Y1`,
+while the pblock resource range correctly remains
+`CLOCKREGION_X2Y1:CLOCKREGION_X3Y1`. An independent Vivado 2022.2 query on the
+U55C checkpoint resolved exactly two objects, `X2Y1 X3Y1`, and confirmed that
+the prefixed names resolve zero objects. Both Tcl files pass `info complete`
+and `git diff --check`. The corrected DMA hook and placement-check SHA-256
+values are `aa0d8a155684444061aaffa9cfd1f687fc656c1d93745db96c792364683b6bdb`
+and `ad6f1e0188775fb16ac8d0a5a3f33c918e9261a2db5786c68cffb00fc5b63af9`.
+The pre-opt hook, config, and reused XO remain
+`ae19a25c10245fbc6a7e2de08ef93ac09c0b3102b41fae199736c7ce50c0730a`,
+`39a3e907806f3c8864de3960b1f7ffef93641ff488436087b11a5bc715e97329`,
+and `fd9c4165dcd3b23ee11dc3498bd6445f66e1a7ebf0b5c5c902d007f874623ee5`.
+
+**Command.** Launch `make run_hw
+HW_CFG_TEMPLATE=hw_iter54_timing_f100.cfg
+BUILD_DIR=build.hw.iter54.timing.f100.o8.v2022_2
+RUN_HW_DIR=diagnostics/iter54c_timing_region_fix/hardware HLS_FREQ=130
+FREQ=100 LINK_FREQ=100 JOBS=8 HW_DEVICE=0`. Reuse the existing XO and rerun
+link plus the automatic exact eight-token and 64-token on-card gates if an
+XCLBIN is emitted. The detached run started at 2026-08-11 15:36:42 +03:00 in
+tmux session `gdn_iter54c`, with persistent wrapper PID 3263699. Its wrapper
+log, PID, exit marker, link artifacts, and on-card results are under
+`diagnostics/iter54c_timing_region_fix/hardware/`.
+
+**Implementation result.** Placement honored every hard gate: the 239,370-leaf
+recurrent actor was wholly in SLR2, clusters 8 and 10 were wholly in SLR1, and
+all eight selected HMSS AR-control primitives were in X2Y1/X3Y1. Routed SLR
+CLB occupancy was 98.84/76.87/82.91% for SLR0/1/2. Routing completed with zero
+failed/unrouted nets and zero node overlaps and emitted an 81,279,703-byte
+XCLBIN. Post-route `AggressiveExplore` improved the routed kernel setup result
+from WNS/TNS -1.453/-837.976 ns to **-0.625/-338.949 ns** (1,457 failing
+endpoints); hold closed at +0.001 ns. The fixed 250 MHz DMA clock closed at
+WNS/WHS **+0.003/+0.009 ns**. Because the kernel did not close at the requested
+100 MHz, Vitis auto-scaled it to **94.1 MHz**. This is a routable and usable
+image, but it is not 100 MHz timing closure.
+
+**On-card result.** The automatic run first exited `run_hw.exit=2` because the
+card was left in a deadlocked XRT load state; this was not an implementation
+failure. Resetting the card and rerunning the unchanged XCLBIN completed with
+`oncard.rerun.exit=0`. The eight-token smoke and full 64-token trajectory both
+passed exact parity (`first_divergence_index=-1`, 100% top-1 agreement). Across
+the 63 measured post-seed tokens, kernel latency was 43.667998--43.742944 ms,
+median 43.695297 ms and mean **43.702388 ms/token**. At the achieved 94.1 MHz
+this is **4.112395M effective cycles/token**, 4.57% fewer cycles than Iter39C's
+4.309M. Wall time is 7.17% below Iter38E's 47.079335 ms, but 1.41% above the
+100 MHz Iter39C latency record of 43.093 ms; the clock loss masks the cycle
+reduction.
+
+**Verdict: retained as a positive cycle-count iteration.** This result advances
+the cycle-first roadmap by proving head-streamed QKVG/convolution/recurrent
+execution and deep forward-only state queues in a routable, bit-exact image.
+Iter39C remains the fastest wall-clock image until timing is recovered. Do not
+quote the 1.07727 speedup ratio in `performance_summary.json` as a 7.73%
+latency reduction: it corresponds to a correct 7.17% reduction relative to
+Iter38E, and it does not compare against Iter39C.
+
+### iter55 — 150 MHz physical islands plus full-logits parity (in progress)
+
+*Prepared: 2026-08-12.*
+
+**Objective and architecture.** Recover and exceed the requested kernel clock
+without reducing the 32 weight ports or the 32 aggregate recurrent MAC lanes.
+The GEMV chain/collectors are changed from the noncontiguous historical
+4/6/6 grouping to contiguous 6/7/3 physical islands, preserving cluster and
+result order while limiting each inter-SLR activation/result path to one
+boundary crossing. Recurrent attention is split into two concurrent natural
+16-column actors: island 0 owns recurrent ports 28/30 and island 1 owns 29/31.
+This follows the packed state layout directly, avoids a 32-lane control cone,
+and retains 32 aggregate columns/cycle. Q/K/V are duplicated through bounded
+BRAM FIFOs and the two outputs are merged in natural Pack16 order. The QKVG
+context, tiny-GEMV, and recurrent-scalar reads from the HBM0 auxiliary master
+now terminate in explicit producer/consumer streams so the AXI adapter is not
+directly coupled to the downstream compute cone.
+
+The corresponding pre-opt floorplan hard-contains clusters 0--5 in SLR0,
+6--12 in SLR1, and 13--15 in the west of SLR2; it puts the two recurrent
+actors in east SLR2. It retains Iter54c's proven DMA timing hook, uses
+clock-region-local reset replication with forced fanout 32, and adds a
+post-place gate that recursively checks the placed primitive leaves below all
+four hard pblocks. The only Makefile hardware path remains `run_hw`; its
+defaults are now HLS/link 150 MHz and
+`hw_f150_physical_islands.cfg`.
+
+**Full-logits correctness gate.** The prior standard test compared only
+`gen_traj`/`tf_argmax`; it did not preserve or compare the 32,000 values before
+argmax. Native-only debug capture now records the final hidden vector and the
+actual natural-order LM-head reorder-buffer values without changing the
+synthesized ABI or datapath. For every decoded step, `gdn_eval` computes an
+independent scalar CPU LM head, compares all 32,000 logits with tolerance
+`1e-3 + 1e-4*abs(reference)`, and verifies that the captured-logits argmax is
+the token returned by the kernel. It can additionally dump/load a bitwise
+reference via `--logits-dump`/`--logits-reference`. The Python parity report
+and the one-command decode gate now explicitly fail on any logits tolerance,
+exact-reference, or argmax mismatch instead of gating only on token
+trajectory.
+
+Before the architecture edit, one Iter54c decode step was frozen as a
+32,000-float exact reference at SHA-256
+`a11f6981d1bb270abd60f778318471892bf8e599ddea8014aed885ad79272f08`.
+After the recurrent split, collector regrouping, and auxiliary buffering, the
+same step has zero bitwise mismatches. The fast six-token gate passes the exact
+golden trajectory and compares 160,000 logits with maximum absolute/relative
+differences `2.86102295e-05`/`7.86781311e-06`, zero CPU tolerance failures,
+zero exact-reference mismatches, and zero argmax mismatches. The full
+32-token decode-from-state gate also passed: exact trajectory, first
+divergence -1, 100% top-1, and 992,000 logits over 31 FPGA-equivalent decode
+steps with maximum absolute/relative differences
+`4.38690186e-05`/`8.40425491e-06`, zero tolerance failures, and zero argmax
+mismatches. Its log SHA-256 is
+`90e00db3f06ba33e0eae81bfc843299ef5d7af20a275a25023b680c2f6047bd9`.
+
+**Integrated 150 MHz synthesis.** Vitis HLS 2022.2 completed with report
+SHA-256
+`f5339ab0f9490fad1497a9a0562f034bb23789fa44d3e323de7110f49cd1be66`.
+The 6.667 ns target has 4.867 ns estimated delay plus 1.80 ns uncertainty
+(estimated Fmax 205.47 MHz). All 16 `gemv32_cl_flat` loops retain II=4. The
+two recurrent actors are concurrent and each is 43,009--43,233 cycles; the
+combined wrapper is 43,010--43,234 cycles. Top minimum latency is 1,670,212
+cycles versus Iter54c's 1,621,415 (+3.01%). Resources are 1,848 RAMB18,
+3,762 DSP, 912,803 FF, 863,815 LUT, and 48 URAM (45.8%, 41.7%, 35.0%, 66.3%,
+and 5.0% device-wide). The critical GEMV II and URAM count are unchanged;
+the principal cost is 216 RAMB18 for the explicit frequency-boundary FIFOs.
+
+**Identity and pending acceptance.** Current source identities are
+`gdn_model.cpp` `7a0457fb...b98d1c3`, `gdn_model.h`
+`af4fcf50...e11479`, and `gdn_eval.cpp` `7c3f3e33...b20d9`.
+The config/apply/check identities are `4faf23ce...b133436`,
+`2a69f4c5...af15b0`, and `ccfb8ef4...4b354`; the Makefile is
+`5a53e457...34667b`. The explicit Python logits/trajectory gate is
+`13343b8f...d95ab`. With all native and HLS gates passed, launch the single
+reproducible command `make -C c_impl run_hw`. Acceptance requires the
+four post-place physical gates, zero route defects, WNS/WHS nonnegative at an
+achieved 150 MHz without auto-scaling, exact eight-token smoke, and an exact
+64-token on-card run.
+
+**Hardware launch.** The fresh v++ XO compilation completed in 29 min 25 s,
+again reporting 205.47 MHz estimated Fmax and all 16 GEMV clusters at II=4.
+The 17 MiB XO SHA-256 is
+`e7c25887f45a156cb2b2e934471424e12b00a38ed4917b9f5bbfd90516812333`.
+Inspection of the packaged RTL verified the exact
+`gemv32_cluster2[_N]_U0`, `ws_N_U`, `xr_N_U`, `ys_N_U`,
+`gemv32_collect6/7/3_U0`, and
+`gdn_recurrent_attention_islands_U0` instance names used by the physical
+hook. The resolved config SHA-256 is
+`3d8d96487a72efd17877b79380e9b61fdd4890d754b87497edf67a5e23b2802b`.
+The detached `make run_hw
+RUN_HW_DIR=diagnostics/iter55_f150_arch/hardware` link started at
+2026-08-12 13:06 +03:00 under persistent wrapper PID 859293. Frozen manifest,
+wrapper log, PID, timestamps, and eventual exit marker are in that directory;
+the detailed link/implementation tree is
+`build.hw.gdn32.h150.f150.o8/_x_temp/`. Status is **native full-logits and
+csynth positive; 150 MHz hardware link running, not yet committable**.
+
+**Iter55a implementation result: rejected infrastructure failure.** The first
+150 MHz link exited with `run_hw.exit=2` at 2026-08-12 15:42:01 +03:00. All
+227 block-synthesis jobs and top-level synthesis completed, but the pre-
+`opt_design` floorplan hook stopped before optimization, placement, or routing:
+
+```text
+ERROR: [Common 17-161] Invalid option value
+'.../gemv32_cluster2_U0' specified for 'objects'.
+```
+
+The island lists had been assembled with ordinary Tcl `concat`, which retained
+the hierarchy names but stringified Vivado's opaque cell-object handles. The
+first `f150_make_pblock` consequently passed a plain cluster name to an
+`objects` argument. This is not congestion or timing evidence: no physical
+optimization, reset replication, placement, route, timing report, XCLBIN, or
+on-card run occurred. The BRAM sufficiency message was a non-fatal platform
+utilization warning; the Tcl exception is the sole terminating error. The
+wrapper and detailed run log are retained under
+`diagnostics/iter55_f150_arch/hardware/` and
+`build.hw.gdn32.h150.f150.o8/_x_temp/link/vivado/vpl/prj/prj.runs/impl_1/`.
+
+**Iter55b infrastructure correction and retry.** Preserve the Iter55 source,
+XO, 150 MHz clocks, collector/recurrent architecture, physical regions, reset
+fanout 32, and all acceptance gates. Correct only `f150_make_pblock`: re-resolve
+the accumulated names with `get_cells -hierarchical`, require the resolved
+collection count to match the requested count, and pass that collection as a
+whole to `add_cells_to_pblock` and `set_property USER_SLR_ASSIGNMENT`. The
+corrected hook is Tcl-complete, passes `git diff --check`, and has SHA-256
+`12b2919811e842f218b8ab5453343cd914cb19920f199135cd69615f3a796aa8`.
+The unchanged XO remains
+`e7c25887f45a156cb2b2e934471424e12b00a38ed4917b9f5bbfd90516812333`.
+The detached retry launched at 2026-08-12 16:27:49 +03:00 with wrapper PID
+1034912 using `make run_hw
+RUN_HW_DIR=diagnostics/iter55b_f150_object_fix/hardware`. Its manifest,
+wrapper log, timestamps, PID, eventual exit marker, and automatic on-card
+outputs are retained under that directory. Status is **infrastructure retry
+running; not committable**.
+
+**Iter55b result: rejected lookup-semantics failure.** The retry completed the
+cached 55-job synthesis stage, then exited at 2026-08-12 17:06:56 +03:00,
+again before `opt_design`, with the new guard reporting
+`pb_f150_clusters_slr0 resolved 0 of 31 cells`. Direct read-only testing
+against the synthesized 350 MB kernel checkpoint proved the Vivado 2022.2
+lookup behavior: an exact full hierarchy name returns one object with
+`get_cells -quiet $full`, while `get_cells -hierarchical -quiet $full` returns
+zero. Thus the count guard correctly prevented a silently empty floorplan, but
+the re-resolution form was wrong. There is still no placement, reset,
+congestion, routing, timing, XCLBIN, or on-card evidence from this attempt.
+**Verdict: rejected infrastructure attempt; no commit.**
+
+**Iter55c exact-object correction.** Preserve the architecture, XO, clocks,
+physical intent, and acceptance gates unchanged. Resolve every stored full
+hierarchy name individually using exact `get_cells -quiet $cell_name`, require
+exactly one match, and combine the returned opaque objects using
+`add_to_collection`. The corrected hook is Tcl-complete, passes
+`git diff --check`, and has SHA-256
+`c4b7d7dffe7387f7c8ce570362ad1c09dc7368638555f15b06f2f989cb7b002f`.
+The direct checkpoint experiment supplied positive API-level evidence for the
+exact lookup before this retry. The detached retry launched at
+2026-08-12 17:21:44 +03:00 under wrapper PID 1049458 using `make run_hw
+RUN_HW_DIR=diagnostics/iter55c_f150_exact_objects/hardware`; its manifest,
+wrapper log, timestamps, exit marker, and automatic on-card outputs are kept
+there. Status is **corrected retry running; not committable**.
+
+**Iter55c result: rejected non-Vivado collection command.** The retry reused
+all cached synthesis products and reached the pre-`opt_design` hook, then
+exited at 2026-08-12 17:59:19 +03:00 with `invalid command name
+"add_to_collection"`. Exact cell lookup was no longer the failure;
+`add_to_collection` is a Synopsys-style collection command absent from Vivado
+2022.2. No pblock, reset replication, optimization, placement, route, timing
+report, XCLBIN, or on-card run resulted. **Verdict: rejected infrastructure
+attempt; no commit.**
+
+**Iter55d Vivado-native pblock correction.** Preserve all architectural and
+physical intent. Preflight every exact hierarchy name, create the pblock, then
+resolve and pass each opaque cell object individually to Vivado's native
+`add_cells_to_pblock` and `set_property USER_SLR_ASSIGNMENT` commands. Require
+the final pblock root count to equal the requested count. The post-place check
+similarly resolves each primitive name independently. A read-only API test on
+the cached `bd_85ad_switch_2to1_12_0.dcp` demonstrated the complete operation
+before relaunch: 468 hierarchical candidates, exact lookup 1, pblock roots 1,
+and `USER_SLR_ASSIGNMENT=SLR0`. Both corrected hooks are Tcl-complete and pass
+`git diff --check`; their SHA-256 values are
+`063dafda71428cf106855f087752e4c0eacae859945d7675493ff671a5346210`
+and `137b9fc7188178713c24fc02baeda6be5fe501229df77a6480252f3d626f4ffb`.
+The detached retry launched at 2026-08-12 18:09:51 +03:00 under wrapper PID
+1209174 using `make run_hw
+RUN_HW_DIR=diagnostics/iter55d_f150_vivado_objects/hardware`; its manifest,
+wrapper log, timestamps, exit marker, and automatic on-card outputs are kept
+there.
+
+**Iter55d result: rejected localized-SLL routing failure.** This was the first
+Iter55 attempt to complete the physical-hook infrastructure and exercise the
+new architecture in implementation. All requested hard pblocks were accepted,
+and the post-place checker found every assigned primitive inside its requested
+region: 305,667 leaves in the SLR0 cluster group, 356,253 in the SLR1 cluster
+group, 152,937 in the SLR2-west cluster group, and 213,477 in the SLR2-east
+recurrent group, with zero outside each region. The reset constraint also
+applied (`reset_fanout=32`), and `opt_design`, placement, and post-place
+physical optimization completed. Physical optimization improved estimated WNS
+from -8.639 ns to -2.641 ns, but this is only pre-route evidence and does not
+meet the 150 MHz target.
+
+Routing then failed during its first global-routing iteration, before detailed
+routing, with `[Route 35-3339] unable to resolve localized SLL routing demand`
+and `[Route 35-368] Router failed to resolve global congestion`. Aggregate SLL
+use was not exhausted, but individual columns were impossible: the SLR1-SLR2
+boundary requested 12,967/23,040 SLLs (56.28%) in total while peaking at
+2,516/1,440 (175%) in one column and 2,052/1,440 (142%) in another; the
+SLR0-SLR1 boundary requested 18,146/23,040 (78.76%) while peaking at
+2,582/1,440 (179%), with five other columns above 100%. Global-routing
+congestion fell from 13,979 to 2,665 and then stalled. The reported 1,480,023
+failed nets, 1,304,768 unrouted nets, 175,255 partially routed nets, and 95 node
+overlaps describe this early aborted global route, not an almost-complete
+route. Intermediate route timing was WNS -2.538 ns/TNS -2,407.626 ns, but it
+is non-signoff timing because routing never completed. Linked utilization was
+592,774 LUTs, 796,658 registers, 1,475.5/1,776 BRAMs, and 3,768 DSPs. The run
+exited 2 at 2026-08-13 01:04:57 +03:00; it produced only
+`level0_wrapper_routed_error.dcp`, no XCLBIN and therefore no on-card or logits
+comparison result. The reset repair was successfully exercised and is not the
+reported fatal blocker; the hard whole-hierarchy 6/7/3 plus SLR2-east
+partition concentrated inter-SLR data/control traffic into too few SLL
+columns. **Verdict: rejected physical architecture/floorplan; no commit.**
+
+### iter56 — surgical 4/6/6 placement and registered result boundaries
+
+*Prepared: 2026-08-13.*
+
+**Hypothesis and measured basis.** Iter55d's post-place report used
+22,080/23,040 SLLs (95.83%) at SLR0--SLR1 and 17,044/23,040 (73.98%) at
+SLR1--SLR2, including 8,075 direct SLR0--SLR2 signals. Its BRAM distribution
+was 93.30/62.50/92.93% across SLR0--2, and none of the 39,124 crossing signals
+used dedicated TX/RX crossing registers. The broad hard pblocks therefore
+removed useful placement freedom and concentrated both BRAM endpoints and
+SLLs. Iter56 retains the two concurrent 16-column recurrent actors but restores
+the routed 4/6/6 result-collector cut. It removes the 6/7/3 whole-cluster,
+whole-FIFO, local-collector, auxiliary-reader/consumer, and SLR2-west/east
+pblocks. Only the full recurrent wrapper in all of SLR2, cluster 8 in SLR1,
+cluster 10 plus `ws20`/`ws21`/`xr10` in SLR1, and the small result-boundary
+relay/final-collector group in SLR1 are hard-contained.
+
+Three explicit II=1 Pack16 relay actors now separate the local 4/6/6
+collectors from the final collector. Their sequential leaves are marked
+`USER_SLL_REG` for SSI placement. The six depth-32 Q/K/V duplication FIFOs and
+two depth-16 recurrent-output FIFOs are changed from BRAM to LUTRAM. This is a
+targeted approximately 3.6K-LUT exchange expected to free roughly 112 RAMB18
+equivalents; all 69 high-traffic GEMV MM2S, activation, and result decouplers
+remain in BRAM. Reset replication remains clock-region-local at forced fanout
+32, and the proven Iter54 DMA timing hook is unchanged.
+
+**Early rejection gate.** The post-place hook requires every surgical pblock
+to be honored, at least one `USER_SLL_REG` leaf to survive, SLR0--SLR1
+connectivity at most 85%, SLR1--SLR2 at most 65%, direct SLR0--SLR2 signals at
+most 6,000, every SLR below 95% occupied CLBs, and every SLR below 90% BRAM.
+Failure aborts before routing rather than spending hours on an already
+nonviable placement. The 150 MHz HLS/link target, `SSI_SpreadSLLs`,
+`NoTimingRelaxation`, and pre/post-route `AggressiveExplore` remain unchanged.
+
+**Native validation and identity.** `make -C c_impl -j8`, the fast exact gate,
+and the full 32-token gate pass. Fast validation compared 160,000 pre-argmax
+logits with maximum absolute error 2.86102295e-05, zero tolerance failures,
+zero exact-reference mismatches, zero argmax mismatches, and exact token
+trajectory. Full validation compared 992,000 logits with maximum absolute
+error 4.38690186e-05 and the same zero-failure/exact-token result. Source,
+apply hook, post-place hook, DMA hook, config, and Makefile SHA-256 values are
+respectively `f52b6b64c2267333247b4cbed5f8ffae6f6b582a8f47035e217b58814076a5ff`,
+`6d36b0f1c52383c787d543d55a849ded1567113cf25bac4d8523f8cc0c12483f`,
+`1cb422d8fc52d91fa5b4de65582e5b9440a8814e76a541a69f0ce9783a05e6fe`,
+`aa0d8a155684444061aaffa9cfd1f687fc656c1d93745db96c792364683b6bdb`,
+`4faf23ce87da7fb6c397305a82c3a22d24340198787dee9de1e037bd8b133436`,
+and `5a53e457a49a1a199f82e31b170b8adb2b4722a8d9c56881babb87759934667b`.
+All Tcl sources are syntactically complete and `git diff --check` passes.
+
+**Integrated synthesis and launch gate.** The final 150 MHz XO export
+completed successfully after increasing each result-boundary relay FIFO from
+the exploratory depths of 2 and 8 to depth 16. HLS had measured a maximum
+required depth of 14 on the SLR0 relay; rounding all three complete-burst
+buffers to 16 removes every relay-depth/deadlock recommendation while retaining
+distributed RAM implementation. The final report estimates 1,670,212 minimum
+top-level cycles, 205.47 MHz Fmax, 1,728 RAMB18, 3,762 DSPs, 921,774 FFs,
+869,262 LUTs, and 48 URAMs. Relative to Iter55 synthesis this saves 120 RAMB18,
+keeps DSP and minimum cycles unchanged, and adds 8,971 FFs and 5,447 LUTs.
+The `gemv32_cl_flat` loop remains at its requested and achieved II=4. The
+exported XO SHA-256 is
+`e7a6153b0b0c7784fb99fd0a85d85c70ecf56c199a4d6e2fcf6b49e1876b34aa`.
+These are synthesis results only; routability, 150 MHz timing closure, logits
+parity, and on-card latency remain unproven. **Status: hardware launch ready;
+not committable.** The detached hardware flow launched at
+2026-08-13 03:28:59 +03:00 under wrapper PID 1575633 using `make run_hw
+RUN_HW_DIR=diagnostics/iter56_surgical_f150/hardware HLS_FREQ=150
+LINK_FREQ=150 FREQ=150 JOBS=8 HW_DEVICE=0`. Its manifest, wrapper log, PID,
+eventual exit marker, and automatic 8/64-token on-card outputs are retained
+under that run directory. **Implementation status: running.**
+
+**Iter56 result: inconclusive post-place density/SLL gate.** The detached flow
+exited 2 at 2026-08-13 07:37:42 +03:00. Synthesis, `opt_design`, and placement
+completed, and every surgical pblock was honored: all 217,406 placed recurrent
+leaves were in SLR2, all 50,078 cluster-8 leaves and all 50,266 leaves in the
+cluster-10/FIFO cone were in SLR1, and all 865 result-boundary leaves were in
+SLR1. The placement gate then stopped the flow before `phys_opt_design` and
+`route_design`; no routed checkpoint, XCLBIN, or on-card result exists.
+
+The architectural correction did relieve the Iter55d inter-SLR problem.
+SLR0--SLR1 connectivity fell from 95.83% to **90.08%**, SLR1--SLR2 fell from
+73.98% to **61.05%**, direct SLR0<->SLR2 signals fell from 8,075 to **2,986**,
+and total SLL use fell from 39,124 to **34,820**. Post-place estimated WNS also
+improved from -2.641 ns to **-1.565 ns**. However, freeing most actors let the
+placer collapse too much logic and memory toward HBM: SLR0/1/2 occupied CLBs
+became **99.32/85.89/64.61%**, while BRAM became
+**93.30/92.63/53.87%**. The run would therefore also have failed the 95% CLB
+and 90% BRAM gates even if the lower-boundary SLL threshold had been relaxed.
+Vivado explicitly classified the placed design as highly congested, with
+128x128 global congestion to the north and 128x128 short congestion in several
+directions. Although 80 relay registers retained `USER_SLL_REG`, the SLR report
+showed zero crossings using dedicated TX/RX registers, so the relay constraint
+did not materialize into dedicated Laguna crossings in this placement.
+
+**Gate calibration correction.** These thresholds were more conservative than
+the latest successful routed/on-card Iter54c image. Iter54c routed with SLR0
+at 54,322 occupied CLBs (**98.84%**), lower-boundary connectivity at **88.87%**
+and 34,646 total SLLs. Iter56 had 54,585 occupied SLR0 CLBs (**99.32%**),
+lower-boundary connectivity **90.08%**, and 34,820 total SLLs: only +263 CLBs,
++1.21 percentage points on the lower boundary, and +174 total SLLs. Iter54c
+also routed despite congestion levels reaching 7. The meaningful negative
+delta is memory distribution: Iter56 used 93.30/92.63/53.87% BRAM versus
+Iter54c's routed 86.68/83.93/61.38%. This raises risk but does not prove route
+failure. Therefore Iter56 must not be described as an unroutable realization;
+the router was never invoked, and the experiment is **inconclusive**.
+
+The malformed text fragment after `90.08` in the fatal line is VPL's rendering
+of percent signs in a Tcl error string; the parsed 90.08% value and comparison
+were correct and it is not the cause of failure. **Verdict: inconclusive due to
+an over-conservative user gate; no commit.** A valid follow-up is to convert
+the CLB/BRAM/SLL thresholds to reporting-only checks and let this exact placed
+topology enter routing. Redistribution toward SLR2 remains a fallback if that
+route actually fails, not a prerequisite inferred from placement alone.
+
+**Reporting-only correction prepared.** The post-place script now keeps exact
+pblock placement, complete-report parsing, and missing `USER_SLL_REG` checks
+fatal, but converts the SLL, CLB, BRAM, and direct-SLR thresholds into
+`GDN_ITER56_ADVISORY` messages. It always emits
+`GDN_ITER56_REPORT_ONLY ... proceeding_to_route` after a structurally valid
+placement. The corrected script is Tcl-complete, passes `git diff --check`, and
+has SHA-256
+`ffca9307e73543c7e8a2408fd1a6678dfd2975fdd9b6628e28fb242c084b2e2b`.
+No retry has been launched yet. The stopped 150 MHz run contains no placed or
+post-physopt DCP—the failed post-place hook prevented the standard checkpoint
+write—so it cannot resume directly at `route_design`. A same-clock Vitis retry
+can reuse synthesized artifacts but must repeat optimization and placement; a
+100 MHz link is a distinct clock-constrained implementation and must likewise
+repeat placement before routing.
+
+### iter56b — reporting-only retry at 100 MHz
+
+*Prepared: 2026-08-13.*
+
+Preserve the exact Iter56 architecture, 150 MHz HLS compilation, 4/6/6
+collector graph, recurrent split, surgical pblocks, DMA hook, and validated XO.
+Change only the link clock to 100 MHz and use the corrected reporting-only
+post-place script. Reuse the Iter56 XO at SHA-256
+`e7a6153b0b0c7784fb99fd0a85d85c70ecf56c199a4d6e2fcf6b49e1876b34aa`
+instead of repeating HLS. Source/apply/check/DMA/config/Makefile SHA-256 values
+are respectively
+`f52b6b64c2267333247b4cbed5f8ffae6f6b582a8f47035e217b58814076a5ff`,
+`6d36b0f1c52383c787d543d55a849ded1567113cf25bac4d8523f8cc0c12483f`,
+`ffca9307e73543c7e8a2408fd1a6678dfd2975fdd9b6628e28fb242c084b2e2b`,
+`aa0d8a155684444061aaffa9cfd1f687fc656c1d93745db96c792364683b6bdb`,
+`4faf23ce87da7fb6c397305a82c3a22d24340198787dee9de1e037bd8b133436`,
+and `5a53e457a49a1a199f82e31b170b8adb2b4722a8d9c56881babb87759934667b`.
+The build uses the ordinary `run_hw` target with a fresh
+`build.hw.gdn32.h150.f100.o8` link directory and, if implementation succeeds,
+automatically runs exact 8-token and 64-token on-card gates. Acceptance is zero
+route errors, nonnegative setup/hold slack at an actual 100 MHz kernel clock
+without automatic scaling, exact token/logits parity, and a measured 63-token
+mean latency. **Status: launch pending; not committable.**
+
+The detached retry launched at 2026-08-13 13:42:56 +03:00 under wrapper PID
+2307534 using the command recorded above. Its manifest, wrapper log, PID,
+eventual exit marker, and automatic on-card outputs are under
+`diagnostics/iter56b_surgical_f100/hardware/`. **Status: 100 MHz link running;
+not committable.**
+
+**Outcome of the Iter56b link.** The 100 MHz link completed and produced an
+XCLBIN (80.9 MB, v++ 12 h 01 m). Both clocks met: `clk_kernel_00` WNS
+**+0.016 ns** and `dma_ip_axi_aclk_1` **0.000 ns**, zero failing endpoints, so
+the image is a true 100 MHz build with no automatic scaling. **On card it
+hung.** `host.exe` blocked in `run.wait()` for 4 h 22 m having consumed 16 s of
+CPU, `wchan=do_sys_poll`, log frozen after `decode-from-state seed=21225 N=8`.
+Killed with SIGTERM; device `0000:c2:00.1` reset; all four cards returned Ready.
+**Verdict: rejected by on-card hang; not committable.** Cause identified in
+Iter57 below.
+
+### iter57 — state queues of two heads for the island recurrence (retained; 42.023540 ms/token on card)
+
+*Tested: 2026-08-14--15. Evidence: on-card, bit-exact, timing-closed.*
+
+**Cause, localised by C/RTL cosimulation rather than inference.** The Iter56b
+hang was reproduced in simulation and the AESL detector named a seven-node
+dependence cycle (`cosim_isl150_d32`, deadlock at 145,101,420 ps):
+
+```
+(1) gdn_recurrent_attention_islands_U0  <- q/k/v empty      from store_or_qkvg_conv_stream
+(2) gemv32_store_or_qkvg_conv_stream_U0 <- result_U empty   from collect_final
+(3) gemv32_collect_final_U0             <- slr2_boundary_U  from boundary_relay_2
+(4) gemv32_boundary_relay_2_U0          <- slr2_result_U    from collect6_16
+(5) gemv32_collect6_16_U0               <- ys_14_U          from cluster2_14
+(6) gemv32_cluster2_14_U0               <- ws_29_U empty    from mm2s_with_state_29
+(7) gemv32_mm2s_with_state_29_U0        <- state_stream1_U FULL, read by (1)
+```
+
+`gemv32_mm2s_with_state_29` emits, per head, 4,096 weight packs then 1,024 state
+packs, and `state_stream1` was depth 1024 -- **exactly one head**. It fills head
+*h*'s state, streams head *h+1*'s weights, then blocks writing head *h+1*'s
+state because head *h*'s is still unread; island 1 cannot drain it until head
+*h*'s q/k/v arrives, and those are in flight behind the island redesign's new
+`gemv32_boundary_relay_2` stage. The relay lengthened the q/k/v round trip past
+one head, so a buffer that was exactly sufficient before the redesign no longer
+is. This is why depth 1024 worked in Iter54c (no boundary relay in that path)
+and fails here.
+
+**A wrong hypothesis was eliminated by measurement, not argument.** The initial
+suspicion was the `out0`/`out1` merge fan-in. Bisecting it (16/32/64/128) is
+decisive against: `d32` and `d64` deadlock at the *identical* simulated time,
+145,035,000 ns, so quadrupling the output depth changes nothing. `out0`/`out1`
+remain at 16 in the shipped design.
+
+**Fix and bisection.** `state_stream0..3` depth 1024 -> **2048** (two heads).
+Cosim with depth 2048 and 4096 both ran to 766,076,490 ps and 762,167,070 ps
+respectively -- **5.3x past the depth-1024 deadlock point** -- with no banner and
+no frozen interval across twelve consecutive five-minute polls. 4096 bought
+nothing over 2048, so 2048 is the minimum sufficient depth. Harnesses were
+generated by `make_cosim_islands.sh`, which asserts the only differences from
+production are the header include, `GDN_LAYERS 24->1`, the 34 rescaled m_axi
+depths and the depth under test (`unexpected=0` on every variant).
+
+**Identity.** `gdn_model.cpp` SHA-256 `2aa7d9c044af627f925a03ef...`;
+`hw_f150_physical_islands.cfg` `4faf23ce87da7fb6c397305a...`;
+`apply_f150_physical_islands.tcl` `6d36b0f1c52383c787d543d5...`; XCLBIN
+`4178d442d956eece...`. Command:
+`make run_hw HW_CFG_TEMPLATE=hw_f150_physical_islands.cfg
+BUILD_DIR=build.hw.gdn32.h150.f100.o32 HLS_FREQ=150 FREQ=100 LINK_FREQ=100
+JOBS=32 HW_DEVICE=0`. Everything except the queue depth is byte-identical to the
+Iter56b recipe, so the outcome is attributable to that one change.
+
+**Validation.** Fast decode-correctness gate passed before launch. Route: zero
+failed nets, zero unrouted, zero overlaps. Timing closed on both clocks --
+`clk_kernel_00` **WNS +0.060 ns, 0 failing**, `dma_ip_axi_aclk_1` **+0.003 ns,
+0 failing** -- so this is a genuine 100 MHz image, not an auto-scaled one.
+
+**Cost.** RAMB36 585/576/337 across SLR0/1/2 (87.05/85.71/50.15%), total 1,498
+against Iter54c's 1,424: **+74 tiles**. Predicted +64 from capacity arithmetic
+(512 bits x 2048 / 32,768 usable = 32 RAMB36 per FIFO, x4, less the 64 already
+present); the extra ten are surrounding logic. Note the tiles landed mostly in
+SLR0/SLR1 (+32/+31) rather than in SLR2 where the islands live (+11), so SLR0
+and SLR1 are now the BRAM-tight SLRs at ~86-87%.
+
+**On-card result, 63 timed runs, one token per call:**
+
+| Metric | Value |
+|---|---:|
+| mean | **42.023540 ms/token** |
+| median | 42.009 |
+| min / max | 41.968 / 42.389 |
+| vs Iter39C 43.093 | **1.025x** |
+| vs Iter38E 47.079 | 1.120x |
+| vs 8-port 121.4 | 2.889x |
+
+Both gates exact: 8-token and 64-token trajectories match the GPU golden
+bit-for-bit (`RESULT: PASS` on `oncard_smoke8_parity.log` and
+`oncard_decode64_parity.log`).
+
+**Verdict: retained.** First image of this arc that routes, closes timing at a
+true 100 MHz, and runs bit-exact, and it improves on the Iter39C production
+baseline by 2.5%. Artifacts under `diagnostics/iter57_state2048/`.
 
 ### Superseded plan (written before iter12 ran)
 

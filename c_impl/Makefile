@@ -36,33 +36,41 @@ XILINX_HLS_INC ?= /tools/Xilinx/Vitis_HLS/2022.1/include
 # ----------------------------------------------------------------------------
 # Vitis / XRT install paths (override via env or `make XILINX_XRT=...`)
 # ----------------------------------------------------------------------------
-XILINX_VITIS   ?= /tools/Xilinx/Vitis/2022.1
+XILINX_VITIS   := /tools/Xilinx/Vitis/2022.2
 XILINX_XRT     ?= /opt/xilinx/xrt
-VPP            ?= $(XILINX_VITIS)/bin/v++
+VPP            := $(XILINX_VITIS)/bin/v++
+VITIS_SETTINGS := $(XILINX_VITIS)/settings64.sh
 
 
 # ----------------------------------------------------------------------------
 # v++ build knobs
 # ----------------------------------------------------------------------------
 # TARGET: sw_emu | hw_emu | hw
-# FREQ:   kernel clock in MHz. Default 100 MHz to match the HLS source's
-#         10 ns synthesis target. Without this, gen3x16 platforms (U55C) would
-#         use the platform default of 300 MHz, leaving WNS ≈ -8.7 ns in the
-#         router and making the design effectively unroutable.
+# The retained timing-friendly island design is synthesized at 150 MHz so HLS
+# inserts the required pipeline boundaries, then linked at its demonstrated
+# timing-closed 100 MHz operating point. HLS and link clocks remain independently
+# overridable so an experiment cannot silently reuse an XO synthesized for a
+# different schedule.
 PLATFORM       ?= xilinx_u55c_gen3x16_xdma_3_202210_1
 TARGET         ?= hw
-FREQ           ?= 130
-JOBS           ?= 8
+FREQ           ?= 100
+HLS_FREQ       ?= 150
+LINK_FREQ      ?= $(FREQ)
+JOBS           ?= 32
 VPP_DEBUG      ?= 0
 
 KERNEL         := gdn_forward
 KERNEL_SRC     := gdn_model.cpp gdn_model.h
-HW_CFG         := $(abspath ./hw.cfg)
 HLS_PRE_TCL    := $(abspath ./hls_gdn_forward.tcl)
 
-BUILD_DIR      := build.$(TARGET).gdn32.f$(FREQ).o8
+# Include both clocks so changing only the HLS target cannot silently reuse an
+# XO synthesized for a different period.
+BUILD_DIR      := build.$(TARGET).gdn32.h$(HLS_FREQ).f$(LINK_FREQ).o$(JOBS)
 XO             := $(BUILD_DIR)/$(KERNEL).xo
 XCLBIN         := $(BUILD_DIR)/$(KERNEL).xclbin
+HW_CFG_TEMPLATE ?= hw_f150_physical_islands.cfg
+RESOLVED_HW_CFG := $(BUILD_DIR)/resolved_hw.cfg
+HW_CFG          ?= $(RESOLVED_HW_CFG)
 
 XSA            := $(strip $(patsubst %.xpfm,%,$(shell basename $(PLATFORM))))
 
@@ -72,12 +80,13 @@ ifeq ($(VPP_DEBUG),1)
 VPP_FLAGS      += -g
 endif
 VPP_FLAGS      += --hls.jobs $(JOBS)
-# --kernel_frequency overrides the platform's default kernel clock (300 MHz on
-# U55C gen3x16). The retained 32-port implementation requests and closes at
-# 130 MHz. Set it unconditionally; v++ accepts it on both -c and -l.
-VPP_FLAGS      += --kernel_frequency $(FREQ)
+# Compile and link clocks are deliberately separate. The routed decode designs
+# synthesize HLS at 150 MHz, then request the independently chosen physical
+# DATA_CLK during link (100 MHz for the retained Iter57 image).
+VPP_COMPILE_FLAGS := $(VPP_FLAGS) --kernel_frequency $(HLS_FREQ)
+VPP_LINK_FLAGS    := $(VPP_FLAGS) --kernel_frequency $(LINK_FREQ)
 
-VPP_LDFLAGS    := --config $(HW_CFG)
+VPP_LDFLAGS    := --config $(abspath $(HW_CFG))
 VPP_LDFLAGS    += --vivado.synth.jobs $(JOBS) --vivado.impl.jobs $(JOBS)
 # `-g` and --profile.data invoke Vitis debug/profiling automation. With this
 # 32-master DFX design, the empty-monitor path crashes design initialization with
@@ -101,24 +110,23 @@ HOST_LIB       := -L$(XILINX_XRT)/lib -Wl,-rpath,$(XILINX_XRT)/lib \
 
 
 # ----------------------------------------------------------------------------
-# On-card run knobs (consumed by the `run_hw` target)
+# On-card validation knobs (consumed by the `run_hw` target)
 # ----------------------------------------------------------------------------
 #   WEIGHTS   flat .gdnw weight blob (~5.6 GB for GDN-1.3B)
-#   FIXTURE   pretokenised .gdnreq fixture to score
-#   HW_OUT    JSON result file (defaults to hw_<fixture-stem>.json)
 #   HW_DEVICE XRT device index (0 if multiple U55Cs are on the host)
-#   HW_MAX_EX optional cap on examples processed; leave empty for "all"
 WEIGHTS        ?= artifacts/gdn-1.3b-f32.gdnw
-FIXTURE        ?= fixtures_smoke/wikitext.gdnreq
-HW_OUT         ?= hw_$(basename $(notdir $(FIXTURE))).json
 HW_DEVICE      ?= 0
-HW_MAX_EX      ?=
+DECODE_FIXTURE ?= fixtures_decode/decode.gdnreq
+DECODE_STATE   ?= fixtures_decode/decode_ex0.gdnstate
+DECODE_GOLDEN  ?= results_decode_golden/decode.decode.json
+RUN_HW_DIR     ?= diagnostics/run_hw_h$(HLS_FREQ)_f$(LINK_FREQ)
+ONCARD_DIR     ?= $(RUN_HW_DIR)/on_card
 
 
 # ----------------------------------------------------------------------------
 # Default target
 # ----------------------------------------------------------------------------
-.PHONY: all host_tb xo xclbin host run_hw reproduce_iter24_success clean clean_hw distclean help
+.PHONY: all host_tb xo xclbin host run_hw clean clean_hw distclean help
 
 all: host_tb
 
@@ -128,8 +136,7 @@ help:
 	@echo "  xo          v++ compile  → $(XO)"
 	@echo "  xclbin      v++ link     → $(XCLBIN)"
 	@echo "  host        XRT host    → $(HOST_BIN)"
-	@echo "  run_hw      xo + xclbin + host + ./host.exe ... (full hardware run)"
-	@echo "  reproduce_iter24_success  rebuild the correct, routable iter24b XCLBIN"
+	@echo "  run_hw      reproduce Iter57 at 100 MHz, then run exact 8/64-token validation"
 	@echo "  clean       remove host-tb binaries"
 	@echo "  clean_hw    remove build.\$$(TARGET), _x/, v++ logs"
 	@echo "  distclean   clean + clean_hw + remove host.exe"
@@ -138,15 +145,18 @@ help:
 	@echo "  PLATFORM=$(PLATFORM)"
 	@echo "  TARGET=$(TARGET)        (sw_emu | hw_emu | hw)"
 	@echo "  FREQ=$(FREQ) MHz"
+	@echo "  HLS_FREQ=$(HLS_FREQ) MHz"
+	@echo "  LINK_FREQ=$(LINK_FREQ) MHz"
 	@echo "  JOBS=$(JOBS)"
 	@echo "  VPP_DEBUG=$(VPP_DEBUG)       (0 normally; 1 enables v++ -g)"
 	@echo ""
-	@echo "run_hw knobs (override on cmdline, e.g. make run_hw FIXTURE=fixtures_smoke/piqa.gdnreq):"
+	@echo "run_hw knobs:"
 	@echo "  WEIGHTS=$(WEIGHTS)"
-	@echo "  FIXTURE=$(FIXTURE)"
-	@echo "  HW_OUT=$(HW_OUT)"
+	@echo "  DECODE_FIXTURE=$(DECODE_FIXTURE)"
+	@echo "  DECODE_STATE=$(DECODE_STATE)"
+	@echo "  DECODE_GOLDEN=$(DECODE_GOLDEN)"
 	@echo "  HW_DEVICE=$(HW_DEVICE)"
-	@echo "  HW_MAX_EX=$(if $(HW_MAX_EX),$(HW_MAX_EX),(all))"
+	@echo "  ONCARD_DIR=$(ONCARD_DIR)"
 
 
 # ----------------------------------------------------------------------------
@@ -177,9 +187,23 @@ gdn_matmul_test: gdn_matmul_test.cpp gdn_model.cpp gdn_model.h
 # ----------------------------------------------------------------------------
 xo: $(XO)
 
+$(RESOLVED_HW_CFG): $(HW_CFG_TEMPLATE) \
+                    apply_f150_physical_islands.tcl \
+                    apply_iter54_dma_timing.tcl \
+                    apply_iter35_dma_w15_fifoaddr_fanout.tcl \
+                    check_f150_physical_islands.tcl
+	@mkdir -p $(@D)
+	@sed 's|@C_IMPL_DIR@|$(CURDIR)|g' $< > $@
+	@if grep -q '@C_IMPL_DIR@' $@; then \
+	    echo "run_hw: unresolved path placeholder in $@" >&2; \
+	    rm -f $@; \
+	    exit 1; \
+	fi
+
 $(XO): $(KERNEL_SRC) $(HLS_PRE_TCL)
 	@mkdir -p $(BUILD_DIR)
-	$(VPP) $(VPP_FLAGS) \
+	@source '$(VITIS_SETTINGS)'; \
+	$(VPP) $(VPP_COMPILE_FLAGS) \
 	    --temp_dir $(BUILD_DIR)/_x_compile \
 	    --report_dir $(BUILD_DIR)/reports_compile \
 	    --hls.pre_tcl $(HLS_PRE_TCL) \
@@ -194,7 +218,8 @@ xclbin: $(XCLBIN)
 
 $(XCLBIN): $(XO) $(HW_CFG)
 	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && $(VPP) -l $(VPP_FLAGS) $(VPP_LDFLAGS) \
+	@source '$(VITIS_SETTINGS)'; \
+	cd $(BUILD_DIR) && $(VPP) -l $(VPP_LINK_FLAGS) $(VPP_LDFLAGS) \
 	    --temp_dir _x_temp/ \
 	    --report_dir reports/ \
 	    -o $(KERNEL).xclbin \
@@ -218,30 +243,37 @@ $(HOST_BIN): $(HOST_SRC) gdn_model.cpp gdn_model.h
 # ----------------------------------------------------------------------------
 # End-to-end hardware run
 # ----------------------------------------------------------------------------
-# Builds the .xo (if missing), links the .xclbin (if missing), builds the
-# host program (if missing), then invokes host.exe to score $(FIXTURE) on the
-# Alveo card. Reuses cached build artefacts when the prerequisite files have
-# not changed, so a re-run after only editing $(FIXTURE) skips straight to
-# the on-card invocation.
+# Builds the .xo (if missing), links the .xclbin (if missing), builds the host
+# program, then runs the exact 8-token smoke and 64-token measurement on the
+# Alveo card. Make's normal prerequisites reuse a current bitstream; changing
+# the kernel, physical configuration, or Tcl hooks rebuilds it automatically.
 run_hw: $(XCLBIN) $(HOST_BIN)
-	@echo "=== Running on hardware ==="
-	@echo "  xclbin : $(XCLBIN)"
-	@echo "  weights: $(WEIGHTS)"
-	@echo "  fixture: $(FIXTURE)"
-	@echo "  output : $(HW_OUT)"
-	@echo "  device : $(HW_DEVICE)"
-	@echo "  max_ex : $(if $(HW_MAX_EX),$(HW_MAX_EX),(all))"
-	./$(HOST_BIN) $(XCLBIN) $(WEIGHTS) $(FIXTURE) $(HW_OUT) $(HW_DEVICE) $(HW_MAX_EX)
-
-
-# ----------------------------------------------------------------------------
-# Preserved successful implementation
-# ----------------------------------------------------------------------------
-# This target deliberately uses a dedicated, checksum-guarded recipe rather
-# than the mutable default hardware knobs above. It rebuilds both the XO and
-# XCLBIN for the correct, routable iter24b physical result.
-reproduce_iter24_success:
-	bash $(CURDIR)/reproduce_iter24_success.sh
+	@set -euo pipefail; \
+	test -s '$(XCLBIN)'; \
+	mkdir -p '$(ONCARD_DIR)'; \
+	for spec in '8 smoke8' '64 decode64'; do \
+	    read -r decode_len stem <<< "$$spec"; \
+	    output='$(ONCARD_DIR)/oncard_'"$${stem}"'.json'; \
+	    log="$${output%.json}.log"; \
+	    parity="$${output%.json}_parity.log"; \
+	    stdbuf -oL -eL ./$(HOST_BIN) \
+	        '$(XCLBIN)' \
+	        '$(WEIGHTS)' \
+	        '$(DECODE_FIXTURE)' \
+	        "$$output" '$(HW_DEVICE)' 1 \
+	        --decode --decode-from-state '$(DECODE_STATE)' \
+	        --decode-len "$$decode_len" 2>&1 | tee "$$log"; \
+	    python3 ../scripts/check_gdn_c_parity.py \
+	        --decode --golden '$(DECODE_GOLDEN)' --c "$$output" \
+	        2>&1 | tee "$$parity"; \
+	done; \
+	output='$(ONCARD_DIR)/oncard_decode64.json'; \
+	jq 'def median: sort as $$s | ($$s | length) as $$n | if $$n % 2 == 1 then $$s[($$n / 2 | floor)] else (($$s[$$n / 2 - 1] + $$s[$$n / 2]) / 2) end; [.examples[0].kernel_ms[] | select(. > 0)] as $$runs | {decode_len, measured_runs: ($$runs | length), min_kernel_ms: ($$runs | min), max_kernel_ms: ($$runs | max), median_kernel_ms: ($$runs | median), mean_kernel_ms: ($$runs | add / length), speedup_vs_iter39c_43_093ms: (43.093 / ($$runs | add / length)), speedup_vs_iter38e_47_079335ms: (47.079335 / ($$runs | add / length)), speedup_vs_8port_121_4ms: (121.4 / ($$runs | add / length))}' \
+	    "$$output" | tee '$(ONCARD_DIR)/performance_summary.json'; \
+	jq -e '.measured_runs == 63 and .mean_kernel_ms > 0' \
+	    '$(ONCARD_DIR)/performance_summary.json' >/dev/null; \
+	sha256sum $(HOST_BIN) '$(XCLBIN)' \
+	    > '$(ONCARD_DIR)/artifact_hashes.txt'
 
 
 # ----------------------------------------------------------------------------
