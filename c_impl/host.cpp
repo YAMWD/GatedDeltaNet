@@ -651,11 +651,10 @@ struct DecodeExample {
 // The fixture provides the golden continuation length (and example indices).
 // The device starts from the exported seed token and performs one single-token
 // decode step per call, updating persistent recurrent/conv state in device memory.
-//   - gen_traj / per_step_tpot_ms / kernel_ms: free-running greedy. The forward
-//     clears recurrent state every call, so each step re-prefills the whole
-//     growing prefix (O(n^2) — the honest current-kernel baseline). per-step
-//     wall time is chrono around the run_forward + argmax; kernel_ms is the
-//     on-card kernel time run_forward returns (seconds * 1000).
+//   - gen_traj / per_step_tpot_ms / kernel_ms: free-running greedy O(1) decode.
+//     Persistent recurrent and convolution state advances in device memory on
+//     every call. Per-step wall time surrounds run_forward; kernel_ms is the
+//     on-card kernel time returned by run_forward (seconds * 1000).
 //
 // N = min(cont_len, decode_len) (decode_len == 0 means use cont_len);
 // E = min(num_examples, limit) (limit == 0 means all).

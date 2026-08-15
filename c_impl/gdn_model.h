@@ -200,6 +200,14 @@ int gdn_forward(
 int gdn_decode_step_host(const GDNModel *model, GDNRunState *state, const int32_t *token);
 void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logits_out);
 
+/* Native-only visibility into the final normalized hidden vector and the
+ * complete LM-head result immediately before the synthesized argmax.  HLS
+ * removes both the setter and all associated stores under __SYNTHESIS__, so
+ * this does not add an AXI port or alter the production kernel ABI. */
+#ifndef __SYNTHESIS__
+void gdn_set_native_debug_buffers(float *final_hidden, float *logits);
+#endif
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

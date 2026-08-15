@@ -18,3 +18,4 @@ source ./hls_gdn_forward.tcl
 csynth_design
 #cosim_design -argv {artifacts/gdn-1.3b-f32.gdnw fixtures_smoke/mini_mc.gdnreq}
 #export_design -format ip_catalog
+exit
