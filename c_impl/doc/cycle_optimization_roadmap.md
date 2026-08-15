@@ -1,14 +1,18 @@
-# Cycle-First Optimization Roadmap After Iter39C
+# Cycle-First Optimization Roadmap After Iter57
 
-**Status:** Iter39C implements the first bounded head-streaming edge: each
-head's Q/K/V convolution overlaps production of later QKVG heads. It is routed,
-timing-closed at 100 MHz, and exact on card. Recurrent and output-projection
-head overlap remain proposed.
+**Status:** Iter57 preserves the completed recurrent-head portion of Stage 4
+and adds the timing-friendly physical decomposition needed to close a true
+100 MHz image: two concurrent 16-column recurrent islands, registered GEMV
+collector boundaries, and two-head state queues. It is routed, timing-closed,
+and exact on card. Output-projection head-chunk accumulation and chunk-streamed
+MLP remain open.
 
-**Current reference:** Iter39C preserves the 32-port/16-cluster FP32 GEMV
-topology and measures **4.309M cycles/token** (43.093000 ms at 100 MHz) with
-exact 64-token parity. It closes timing with design WNS/WHS +0.003/+0.009 ns.
-Iter38E is the immediate rollback at 4.708M cycles.
+**Current cycle reference:** Iter57 preserves the 32-port/16-cluster FP32 GEMV
+topology and measures **4.202354M cycles/token / 42.023540 ms/token** with exact
+64-token parity at a true 100 MHz. Kernel/DMA WNS are +0.060/+0.003 ns. This is
+a 2.48% cycle and latency reduction from Iter39C. Iter54c remains a historical
+lower-cycle result at 4.112395M, but its 100 MHz request auto-scaled to 94.1 MHz
+and is not the production timing reference.
 
 **Primary objective:** minimize exact single-token decode cycles first. Perform
 only the 100 MHz implementation checkpoints required to verify real cycles and
@@ -21,12 +25,12 @@ Iter38 stripes the 48 MiB recurrent state over tails appended to weight ports
 28--31 and advances all four ports concurrently. Compact 64-bit low/high state
 pairs let the same 32 URAM banks serve both halves without a second address.
 
-| Metric | Iter36 | Iter37 | Iter38 | Iter39C |
-|---|---:|---:|---:|---:|
-| Clock used on card | 100 MHz | 100 MHz | 100 MHz | 100 MHz |
-| Mean cycles/token | 5.958M | 5.145M | 4.708M | **4.309M** |
-| Mean latency | 59.578 ms | 51.451 ms | 47.079 ms | **43.093 ms** |
-| Recurrent HLS cycles/layer | 76.7K | 43.9--44.1K | 27.3--27.5K | **27.3--27.5K** |
+| Metric | Iter36 | Iter37 | Iter38 | Iter39C | Iter54c | Iter57 |
+|---|---:|---:|---:|---:|---:|---:|
+| Clock used on card | 100 MHz | 100 MHz | 100 MHz | 100 MHz | 94.1 MHz | **100 MHz** |
+| Mean cycles/token | 5.958M | 5.145M | 4.708M | 4.309M | **4.112M** | 4.202M |
+| Mean latency | 59.578 ms | 51.451 ms | 47.079 ms | 43.093 ms | 43.702 ms | **42.024 ms** |
+| Recurrent HLS cycles/layer | 76.7K | 43.9--44.1K | 27.3--27.5K | 27.3--27.5K | streamed | two streamed islands |
 
 The dimension-correct Iter37 schedule is:
 
@@ -53,6 +57,21 @@ by removing the serial whole-hidden Q/K/V convolution passes. Hardware removes
 0.399M cycles, or 84.2% of the 0.474M static prediction. The remaining gap is
 dynamic traffic/control stall and must be measured rather than inferred.
 
+Iter54c reduces the integrated HLS minimum again to 1,621,415 cycles by making
+QKVG, convolution, state delivery, and recurrence one bounded forward graph.
+Hardware removes 0.197M effective cycles from Iter39C. This is a 4.57% cycle
+reduction, although the 94.1 MHz clock makes wall latency 1.41% slower than the
+timing-closed Iter39C image. Continue using achieved-clock on-card cycles, not
+raw HLS minimum or wall time alone, for the cycle-first phase.
+
+Iter57 adds timing boundaries and splits the recurrent actor into two physical
+islands. Its HLS minimum rises from 1,621,415 to 1,670,212 cycles and its
+measured count rises by 0.090M versus Iter54c, but it closes the requested
+100 MHz and lowers wall latency to 42.024 ms. Against the prior timing-closed
+Iter39C reference, it still saves 0.107M measured cycles. Treat this as a
+timing-friendly milestone with a modest cycle win, not as completion of the
+remaining cycle-streaming roadmap.
+
 ## 2. Hard Floors and Target Outcome
 
 The dense FP32 weight stream is approximately 2,733,056 cycles/token per fully
@@ -78,7 +97,7 @@ measurements.
 
 | Outcome | Cycles/token | 100 MHz | 115 MHz | 130 MHz |
 |---|---:|---:|---:|---:|
-| Current Iter39C | 4.309M | 43.09 ms | 37.47 ms | 33.15 ms |
+| Current Iter57 | 4.202M | 42.02 ms | 36.54 ms | 32.33 ms |
 | Conservative streamed FP32 | 3.5M | 35.0 ms | 30.4 ms | 26.9 ms |
 | Primary target | 3.3M | 33.0 ms | 28.7 ms | 25.4 ms |
 | Stretch target | 3.0M | 30.0 ms | 26.1 ms | 23.1 ms |
@@ -164,10 +183,14 @@ This completes only the `QKVG -> convolution` edge of head-streamed attention.
 Recurrent attention still waits for all eight convolved heads, and output norm
 and projection still wait for the complete recurrent output.
 
-## 4. Stage 3B — Persistent Services
+## 4. Stage 3B — Bounded Services
 
-The layouts and concurrent four-port state traversal are complete. The next
-foundation is turning them into independently scheduled bounded services.
+The layouts and concurrent four-port state traversal are complete. Iter57
+implements the attention-specific bounded services without a general command
+protocol: the QKVG invocation owns weight, state, convolution, and recurrent
+actors in one dataflow region. A broader persistent command service is still a
+possible enabler for MLP streaming, not a prerequisite for completed attention
+head overlap.
 
 ### Matrix layout
 
@@ -179,52 +202,58 @@ foundation is turning them into independently scheduled bounded services.
 Merging matrices does not reduce weight traffic. Its purpose is to make one
 head or MLP chunk visible before the complete projection finishes.
 
-### Persistent GEMV actor
+### Shared GEMV actor
 
-Convert the single shared GEMV engine into a command-driven service while
-retaining:
+The retained single shared GEMV engine preserves:
 
 - 32 MM2S readers and 16 two-port clusters;
 - BRAM FIFO decoupling;
 - activation ripple and 4/6/6 SLR-local collectors; and
 - one physical GEMV graph.
 
-A command identifies matrix section, head/chunk, dimensions, output tag, and
-store/accumulate mode. First execute QKVG and GU commands serially and require
-unchanged MM2S II=1, cluster II=4, exact parity, and weight byte count.
+Runtime dimensions and the QKVG/recurrent mode select the result sink while all
+matrix calls still time-share one physical graph. All MM2S actors remain II=1,
+cluster MAC loops remain II=4, and the weight byte count is unchanged. If Stage
+5 needs a command/tag protocol, add it only around bounded GU/down chunks.
 
-### Persistent state services
+### State service result
 
-Give each selected state port one owner that arbitrates weight reads, old-state
-prefetch, and updated-state writeback. Use two or three rotating 256 KiB
-head-buffer slots so all four ports can transfer concurrently while the 32-lane
-recurrent core processes another head. Flush pending writes before kernel exit.
+Iter57 gives ports 28--31 one MM2S owner each. After the current head's QKVG
+weights, every owner emits a 1,024-word old-state stripe into a two-head BRAM
+queue, then resumes later weights. Two 16-column recurrent islands drain the
+four queues into disjoint URAM state halves and write updated state directly to
+the four AXI ports. This forward-only schedule replaces the rejected
+credit-handshake experiments. Depth 1024 is insufficient once the GEMV result
+path contains registered SLR boundaries: RTL cosimulation exposed the exact
+seven-actor wait cycle and the otherwise timing-closed Iter56b image deadlocked
+on card. Depth 2048 is the minimum measured safe capacity.
 
 Acceptance gates:
 
 - exact multi-token state and token parity;
 - no new AXI master;
 - no GEMV II regression;
-- no more than 0.10M added cycles/token before overlap is enabled; and
+- lower measured effective cycles than the retained reference; and
 - bounded FIFOs and control fanout, with no whole-layer dataflow region.
 
-Expected direct saving is only 0.04--0.10M cycles. The stage is retained only
-when it enables tagged head/chunk consumption without regressing the current
-4.309M-cycle behavior.
+Measured Iter57 result: 4.202354M cycles/token, exact on card, clean route, and
+true 100 MHz closure with no new AXI master or GEMV II regression. The four
+two-head queues raise BRAM pressure but provide the bounded proof needed for
+deadlock-free forward progress in the registered topology.
 
 ## 5. Stage 4 — Head-Streamed Attention
 
-Build a bounded per-head pipeline:
+The bounded per-head pipeline now is:
 
 ```text
 QKVG head
     -> Q/K/V convolution for that head       [complete in Iter39C]
-    -> recurrent attention
-    -> output norm and gate
-    -> output-projection partial accumulation
+    -> two-island recurrent attention        [complete in Iter57]
+    -> output norm and gate                   [still whole-hidden]
+    -> output-projection partial accumulation [next]
 ```
 
-Approximate steady work after Iter39C is:
+Approximate steady work per head is:
 
 | Actor | Approximate cycles/head |
 |---|---:|
@@ -234,19 +263,21 @@ Approximate steady work after Iter39C is:
 | Output norm and gate | 629 |
 | O-projection input-head chunk | 1,024 |
 
-QKVG streaming is now the largest individual per-head actor. Iter39C hides the
-standalone convolution pass, but recurrence remains a serial full-layer
-consumer. The next step is a rotating state prefetch/compute/writeback service:
-prefetch old state for head `h+1` while head `h` computes, and defer head `h`
-writeback while later heads proceed. For output
-projection, retain partial accumulators across input-head chunks, visit chunks
-in increasing input-index order, and preserve the existing FP32 partial and
-final-combination order.
+Iter57 demonstrates timing-closed recurrent-head overlap at **4.202M measured
+cycles**. It does not reach the old 3.7--4.0M estimate because dynamic
+weight/state/control stalls remain outside the HLS minimum and the physical
+boundaries add fill/drain work. The next step remains head-chunked output
+projection: retain four FP32 residue accumulators per output row across the
+eight increasing input-head chunks so the final sum reproduces the current
+cluster's partial-combination order. Consume each completed attention head
+without waiting for the whole hidden vector, and fuse output norm/gate only if
+that exact order can be preserved.
 
-Target after recurrent-head overlap: **3.7--4.0M cycles/token**. A subsequent
-head-chunked output projection can approach **3.5--3.8M**. Each is large enough
-for an explicit 100 MHz implementation and exact on-card measurement. Do not
-attempt 115 or 130 MHz during this stage.
+Rebased target after head-chunked output projection: **3.7--3.9M measured
+cycles/token**. A result below 4.0M is sufficient for a fresh 100 MHz
+implementation and exact on-card measurement. Preserve the Iter57 timing
+boundaries during this stage; do not attempt 115 or 130 MHz until the
+cycle-minimized topology is stable.
 
 ## 6. Stage 5 — Chunk-Streamed MLP
 
@@ -306,14 +337,18 @@ Every sub-variant must pass the evidence level appropriate to its size:
 3. isolated actor synthesis when interfaces or buffering change;
 4. integrated csynth and a dimension-correct token schedule;
 5. no GEMV MM2S/cluster II regression;
-6. resource comparison against Iter39C; and
+6. resource comparison against Iter57, Iter54c, and the timing-closed Iter39C
+   reference;
+   and
 7. optimization-log entry whether retained or rejected.
 
 For the major attention and MLP milestones, additionally require:
 
 1. explicit 100 MHz implementation;
 2. zero failed/unrouted nets and zero node overlaps;
-3. non-negative setup and hold slack at 100 MHz;
+3. setup/hold report at the requested 100 MHz and the encoded clock after any
+   automatic scaling; a small setup miss is acceptable during the cycle-first
+   phase only when routing is clean and achieved-clock cycles improve;
 4. exact eight-token on-card smoke parity; and
 5. exact 64-token measurement with 63 non-seed kernel calls.
 
@@ -328,24 +363,33 @@ Begin this phase only after the exact-FP32 cycle architecture reaches a stable
 minimum and the last positive cycle result is committed. Do not optimize an
 intermediate topology for a higher clock.
 
-The final source must first route and close at 100 MHz. Then:
+Iter57 has completed the required 100 MHz foundation. Its retained changes are:
+
+- physically exposing the logical 32-lane recurrence as two concurrent
+  16-column islands;
+- localizing the recurrent wrapper in SLR2 and the selected GEMV clusters and
+  collector boundary in SLR1;
+- registering all three SLR-local collector outputs before the final merge;
+- applying measured DMA/reset fanout repairs; and
+- using depth-2048 state queues to keep that registered graph deadlock-free.
+
+After the cycle topology reaches a stable minimum:
 
 1. remove obsolete buffers, muxes, and service modes without increasing the
    measured cycle schedule;
-2. expose the logical 32-lane recurrence as physically local 16-lane halves
-   associated with their state-port pairs;
-3. localize bounded stream actors and their buffers near relevant HBM/SLR
-   endpoints;
-4. replicate high-fanout enables, resets, and FIFO address/control cones per
+2. localize any newly added bounded stream actors and their buffers near the
+   relevant HBM/SLR endpoints;
+3. replicate high-fanout enables, resets, and FIFO address/control cones per
    actor, cluster, or clock region;
-5. pipeline long paths only when added fill/drain cycles are negligible and
+4. pipeline long paths only when added fill/drain cycles are negligible and
    included in the cycle comparison; and
-6. try explicit 110 MHz, then 115 MHz, and only then 130 MHz when checkpoint
+5. try explicit 110 MHz, then 115 MHz, and only then 130 MHz when checkpoint
    timing predicts it is plausible.
 
-Re-extract critical paths from the final architecture. Do not blindly reuse a
-fix from Iter35--38: Iter39C closes 100 MHz with only +0.003 ns design WNS, so
-the final cycle-reduced netlist must be analyzed from its own routed checkpoint.
+Re-extract critical paths from the final architecture. Iter57's +0.060 ns
+kernel WNS is evidence only for its exact netlist and 100 MHz target; it is not
+enough margin to predict 110 MHz closure, and any later source change can alter
+placement materially.
 
 Frequency changes do not count as cycle improvements. If a timing repair adds
 cycles, retain it only when the achieved frequency produces a lower measured
