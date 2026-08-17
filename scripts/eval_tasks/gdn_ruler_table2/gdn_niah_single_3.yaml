@@ -1,0 +1,3 @@
+include: gdn_niah_single_1.yaml
+task: gdn_niah_single_3
+custom_dataset: !function ruler_table2_utils.niah_single_3

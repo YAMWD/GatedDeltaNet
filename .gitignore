@@ -63,7 +63,8 @@ c_impl/device_trace_*.csv
 c_impl/summary.csv
 c_impl/xrt.run_summary
 c_impl/xclbin_*.log
-scripts/__pycache__/
+__pycache__/
+*.pyc
 
 # Disaggregated decode: GPU-exported state blobs (large, regenerable)
 c_impl/fixtures_decode/*.gdnstate
