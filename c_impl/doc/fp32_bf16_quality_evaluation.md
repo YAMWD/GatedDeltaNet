@@ -346,6 +346,63 @@ untruncated. No change has been made to the configuration.
 Under truncation, 11 of 14 tasks match or beat the paper and the only
 material remaining deficit is repobench-p at 4.04 below.
 
+### BF16 recurrent state (follow-up, Table 3 only)
+
+*Measured 2026-08-20, after the three arms above.*
+
+The arms above all keep the recurrent state in FP32 — that is not a
+configuration choice but a property of FLA's kernel, which allocates its
+accumulator and its returned final state as `torch.float32` regardless of model
+dtype (`fla/ops/gated_delta_rule/fused_recurrent.py:87`, `:183`). Measured
+directly: with `dtype=bfloat16` the cache holds **24 float32 tensors of shape
+(1, 8, 256, 256)** — the 24 layers of recurrent state — while the *convolution*
+state (72 tensors of shape (1, 2048, 4)) does become BF16. The document's
+FP32-state claim therefore holds for the recurrent state; the conv-state
+detail was previously unrecorded.
+
+A separate question is whether the recurrent state could itself be BF16, which
+would halve it from 48 MiB to 24 MiB and bring it within the U55C's 33.8 MiB of
+URAM. That was tested by patching the kernel to round the accumulator to BF16 at
+the end of **every token**, modelling hardware that computes in FP32 and stores
+the state in BF16 memory; the output is taken from the unrounded state, matching
+a design that computes from registers and rounds only on the store. Weights BF16,
+activations FP32 (Arm B), so the state is the only new variable.
+
+| Metric | FP32 | BF16 weights (Arm B) | BF16 weights + BF16 state | state vs FP32 |
+|---|---:|---:|---:|---:|
+| WikiText PPL | 16.82 | 16.82 | 16.83 | +0.01% |
+| LAMBADA PPL | 9.72 | 9.70 | 9.69 | -0.32% |
+| LAMBADA accuracy | 51.81 | 51.80 | 51.85 | +0.04 |
+| PIQA | 73.78 | 73.72 | 73.67 | -0.11 |
+| HellaSwag | 60.13 | 60.14 | 60.17 | +0.04 |
+| WinoGrande | 61.88 | 61.88 | 61.88 | +0.00 |
+| ARC-Easy | 72.31 | 72.22 | 72.22 | -0.08 |
+| ARC-Challenge | 40.78 | 40.70 | 40.70 | -0.09 |
+| SocialIQA | 42.37 | 42.48 | 42.48 | +0.10 |
+| BoolQ | 61.68 | 61.56 | 61.59 | -0.09 |
+| **Accuracy average** | **58.09** | **58.06** | **58.07** | **-0.02** |
+
+**Verdict: pass, and effectively free.** The accuracy average falls 0.02 points
+against a 0.5-point limit, and is marginally *better* than BF16 weights alone.
+This is a stronger result than expected: the state is a running accumulator, so
+rounding error compounds at every token, unlike weights which are rounded once.
+
+**Boundaries of this result.** Table 3 is short-context only, and the
+compounding argument bites hardest on long sequences — RULER and LongBench would
+be the real test and have not been run. The patch was temporary and the kernel
+was restored afterwards; no BF16-state result exists for any other table.
+
+**Why it does not unblock the accelerator.** Quality is no longer the obstacle,
+but the physical one stands: 24 MiB of BF16 state is **683 URAM of 960**, while
+each SLR holds only **320** and the recurrent islands are pblock-pinned to SLR2.
+The state cannot sit in the SLR that consumes it, so the recurrent step would
+reach across SLRs on 512-bit paths. Iter59 already measured a weaker version of
+exactly that — 600 URAM moved on chip made congestion worse in all four
+directions and `route_design` refused at level 7. One layer alone is 28 URAM and
+fits easily, but leaving the other 23 in HBM keeps the traffic. The prize is
+also bounded: state traffic is 1.9% of per-token bytes, and the latency upside
+from the recurrent critical path is on the order of 10-15%.
+
 ### FP32 summary across the three tables
 
 Removing the two cells whose construction is disputed, the three tables
