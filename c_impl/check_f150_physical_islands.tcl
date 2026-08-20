@@ -114,3 +114,35 @@ if {[llength $sll_regs] == 0} {
     error "iter56 gate: no USER_SLL_REG boundary registers survived placement"
 }
 puts "GDN_ITER56_REPORT_ONLY advisories=$advisory_count sll_regs=[llength $sll_regs] proceeding_to_route"
+
+# ---------------------------------------------------------------------------
+# Post-place checkpoint.
+#
+# v++ carries the design in memory across place -> phys_opt -> route and writes
+# no intermediate DCP of its own, so an interrupted link (node shutdown, OOM,
+# dropped session) loses hours of placement with nothing to resume from. This
+# hook already runs after place_design, so writing the checkpoint here costs a
+# couple of minutes and makes routing restartable:
+#
+#   open_checkpoint <this file>
+#   route_design -directive NoTimingRelaxation
+#   write_checkpoint -force post_route.dcp
+#
+# Written outside the build tree so a `make clean` or a rebuilt build directory
+# does not take it with them.
+# ---------------------------------------------------------------------------
+# NOTE: @C_IMPL_DIR@ is substituted by the Makefile into the *cfg* file only,
+# never inside a sourced Tcl script -- Iter59 wrote its checkpoint into a
+# directory literally named "@C_IMPL_DIR@" under impl_1. Derive the path from
+# this script's own location instead, which is always absolute.
+set gdn_ckpt_dir [file join [file dirname [file normalize [info script]]] diagnostics checkpoints]
+if {[catch {file mkdir $gdn_ckpt_dir} gdn_ckpt_err]} {
+    puts "GDN_CKPT_WARN could not create $gdn_ckpt_dir: $gdn_ckpt_err"
+} else {
+    set gdn_ckpt_path [file join $gdn_ckpt_dir "post_place.dcp"]
+    if {[catch {write_checkpoint -force $gdn_ckpt_path} gdn_ckpt_err]} {
+        puts "GDN_CKPT_WARN write_checkpoint failed: $gdn_ckpt_err"
+    } else {
+        puts "GDN_CKPT_OK post-place checkpoint written to $gdn_ckpt_path"
+    }
+}

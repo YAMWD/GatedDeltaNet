@@ -36,7 +36,8 @@ token per `gdn_forward` invocation. The successful design combines:
 - one forward-only dataflow graph that overlaps later QKVG heads with
   convolution, state transfer, and recurrence of earlier heads;
 - packed external recurrent-state and convolution-tail transfers; and
-- on-chip LM-head argmax, with no external logits materialization.
+- on-chip LM-head argmax, plus (Iter61) the full GDN_VOCAB logit vector
+  streamed out to the workspace for benchmark scoring.
 
 The architecture routes with zero failed nets, zero unrouted nets, and zero
 node overlaps and preserves exact 64-token parity. Post-route physical
@@ -91,6 +92,7 @@ XRT host
 |                  final norm + LM head                                |
 |                         |                                            |
 |                  on-chip strict argmax                               |
+|          + logit vector -> FIFO -> top-level HBM write               |
 |                         v                                            |
 |                workspace[X_NORM][0] = token                          |
 +---------------------------------------------------------------------+
@@ -157,7 +159,8 @@ now reserved compatibility space rather than active HBM traffic.
 |---|---|
 | `GDN_WS_OFF_X` | Host writes one 2,048-float embedding; kernel reads it once |
 | `GDN_WS_OFF_X_NORM` | Kernel writes one 512-bit result line; lane zero is the selected token |
-| Q/K/V, gate, attention, temporary, MLP and logits offsets | Reserved but not accessed by the activation datapath |
+| Q/K/V, gate, attention, temporary and MLP offsets | Reserved but not accessed by the activation datapath |
+| Logits offset (`GDN_WS_OFF_LOGITS`) | Written once per token by the top level, drained from the LM-head FIFO (Iter61) |
 | `GDN_WS_OFF_REC_STATE` | Reserved compatibility space; recurrent state moved to weight-shard tails 28--31 |
 | `GDN_WS_OFF_HEAD_BUF` | Persistent packed Q/K/V convolution-tail read/update/write |
 
@@ -434,6 +437,25 @@ Final integrated csynth resources:
 | FF | 851,903 | 857,343 | 863,589 | 888,271 | **921,774** |
 | LUT | 912,694 | 929,941 | 937,707 | 868,961 | **869,262** |
 | URAM | 48 | 48 | 48 | 48 | **48** |
+
+### Iter61 — LM-head logit export
+
+The LM head additionally emits its full 32,000-value logit vector. `gemv32_store`
+pushes whole `Pack16` lines into an `hls::stream`; `gdn_forward` drains that
+queue and writes `workspace + GDN_WS_OFF_LOGITS`, beside the token-id handoff.
+The fused strict argmax is unchanged, so the decode trajectory and its
+exact-match gate are untouched.
+
+The queue, not a memory port, is the point. Two earlier attempts gave
+`gemv32_store` its own AXI write; because the island pblocks distribute that
+block across all three SLRs, a port there is a port everywhere, and
+`route_design` refused at global congestion level 7. Filling a FIFO adds no
+port to the GEMV region: BRAM is unchanged at 1728, URAM rises by 8 of 912
+free, LUT by 0.4%, cycles by 0.003%.
+
+Measured on card at 100 MHz: **42.170227 ms/token** median, 64 of 64 tokens
+bit-identical to the GPU golden, post-route WNS +0.003 ns with zero overlaps and
+zero failed nets. The export costs **+0.35%** against Iter57's 42.023540.
 
 The recurrent call falls from 43,873--44,081 cycles in Iter37 to
 **27,329--27,537 cycles**. The combined four-port state read and write loops

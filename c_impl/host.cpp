@@ -419,7 +419,8 @@ public:
           hidden_(model.config.hidden_size),
           vocab_(model.config.vocab_size),
           embeddings_(model.weight_data.data()),
-          x_norm_host_(hidden_, 0.0f) {
+          x_norm_host_(hidden_, 0.0f),
+          logits_host_(GDN_WSF_LOGITS, 0.0f) {
         const size_t shard_floats = gdn_weight_shard_floats(&model.config);
         const size_t shard_bytes = shard_floats * sizeof(float);
         if (shard_floats != GDN_COMPILED_WEIGHT_SHARD_FLOATS) {
@@ -540,6 +541,16 @@ public:
         sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_FROM_DEVICE, x_norm_bytes, xn_off);
         workspace_bo_.read(x_norm_host_.data(), x_norm_bytes, xn_off);
 
+        // Iter61: the LM head streams its full logit vector to the workspace
+        // logits region; pull it back for benchmark scoring. 32,000 floats is
+        // 128 KB per call, negligible beside the ~5.2 GB of weights the same
+        // call streams. The greedy token still comes from x_norm[0], so the
+        // existing exact-match decode gate is unaffected.
+        const size_t lg_off = GDN_WS_OFF_LOGITS * sizeof(float);
+        const size_t lg_bytes = static_cast<size_t>(GDN_WSF_LOGITS) * sizeof(float);
+        sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_FROM_DEVICE, lg_bytes, lg_off);
+        workspace_bo_.read(logits_host_.data(), lg_bytes, lg_off);
+
         return seconds;
     }
 
@@ -579,6 +590,9 @@ public:
     const float *hidden_row(uint32_t row) const {
         return x_norm_host_.data() + static_cast<size_t>(row) * hidden_;
     }
+
+    // Full pre-argmax logit vector the kernel streamed out this step.
+    const float *device_logits() const { return logits_host_.data(); }
 
     double total_kernel_seconds() const { return total_kernel_seconds_; }
     uint64_t kernel_runs() const { return kernel_runs_; }
@@ -632,6 +646,7 @@ private:
     xrt::bo workspace_bo_;
     std::vector<xrt::bo> weight_bos_;
     std::vector<float> x_norm_host_;
+    std::vector<float> logits_host_;
     double total_kernel_seconds_ = 0.0;
     uint64_t kernel_runs_ = 0;
 };

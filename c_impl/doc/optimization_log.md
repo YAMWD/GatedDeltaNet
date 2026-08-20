@@ -4593,3 +4593,320 @@ the 100 MHz target — the design closes timing with zero margin.
    stages on the longest fadd combinational paths. `bind_op op=fadd
    latency=8` on the tree-reduce sites would buy headroom at the cost of
    ~2 % more cycles in those pipelines.
+
+## Iter58 — LM head emits full logits instead of on-chip argmax
+
+*Logged: 2026-08-18. Status at time of writing: **native-only** (csim). Build
+not yet run; no csynth, routed, timing, or on-card evidence.*
+
+**Hypothesis.** Returning the full `GDN_VOCAB` logit vector instead of a single
+greedy token id is a prerequisite for scoring log-likelihood benchmark suites
+(lm-eval Table 3) on-card. The added HBM traffic should be negligible against
+the ~5.195 GB/token of weight streaming, and removing the fused argmax should
+not hurt timing.
+
+**Change.**
+- `gemv32_store` LM-head branch (`rows_per_ch == GDN_VOCAB / GEMV_CHANNELS`):
+  the fused `gemv32_argmax_*` reduction is replaced by `gemv32_logits_pack`,
+  which assembles each output `Pack16` completely in registers and issues one
+  full 512-bit store. **This shape is the reason the write must be
+  pack-assembled:** `rows_per_ch` is 1000, so per-channel spans are not
+  pack-aligned, and the pre-existing scalar path at
+  `gemv32_store_scalar_r` does a per-lane `out[pack].data[lane] = ...`
+  read-modify-write. Against local BRAM that is harmless; aimed at HBM it
+  degenerates into 4-byte AXI transactions — the same failure mode that once
+  cost 1610 ms/token at 0.99% bus efficiency. `GDN_VOCAB` is a multiple of 16,
+  so the natural-order vector is a whole number of packs and no partial line is
+  ever written.
+- The LM-head `gdn_gemv` call now targets `workspace + GDN_WS_OFF_LOGITS`
+  (a workspace region that was already reserved but unused) rather than
+  `gemv_out_storage`, which is sized for the 5632-wide MLP at 704 packs and
+  could not hold the 2000-pack logit vector.
+- The `x_norm[0]` token-id handoff is removed. `gdn_eval.cpp` and `host.cpp`
+  now compute the greedy argmax host-side with strict `>` and first-index tie
+  breaking, reproducing the retired on-chip reduction exactly.
+
+**Expected cost.** 2000 extra 512-bit writes per token, ~18k cycles at the
+scalar-scan II of ~9, against a 4.202354M-cycle token: under 0.5%. Removing the
+argmax comparators and their partitioned lane registers should free LUTs.
+
+**Identity.** `gdn_model.cpp` 38285cdd1641074d, `gdn_model.h` af4fcf5048fd941c,
+`host.cpp` a23b8e2603b6ca68, `gdn_eval.cpp` 6dfdb65ade937959,
+`hw_f150_physical_islands.cfg` 4faf23ce87da7fb6 (unchanged from Iter57).
+
+**Validation so far (native only).**
+- `scripts/decode_correctness_check.sh --fast`: PASS.
+- `scripts/decode_correctness_check.sh` (full, 32 steps): PASS — exact
+  trajectory, first divergence index -1, top-1 agreement 100.00%, and
+  **992,000 pre-argmax logits** checked against the independent scalar LM head
+  with `cpu_tol_fail=0`, `exact_ref_mismatch=0`, `argmax_mismatch=0`
+  (max abs 4.39e-05, max rel 8.40e-06 — the usual reduction-order difference).
+- `make host`: builds clean against XRT.
+
+**Result: REJECTED at place_design — device BRAM overflow.** The build ran
+5 h 35 m (02:52:42 → 08:27:28) and failed DRC before the placer started:
+
+```
+[VPL UTLZ-1] RAMB36E2 over-utilized in Top Level Design:
+             requires 2045, only 2016 available          (29 over)
+[VPL UTLZ-1] RAMB18 and RAMB36/FIFO over-utilized:
+             requires 4303, only 4032 available
+[VPL UTLZ-1] RAMB36E2 over-utilized in pblock_dynamic_region:
+             requires 1799, only 1776 available          (23 over)
+[VPL 4-23]   Error(s) found during DRC. Placer not run.
+```
+
+HLS estimated **3019 BRAM (74%)** and **1,211,412 LUT (92%)** against Iter57's
+routed 1,728 RAMB18 / 869,262 LUT.
+
+**Root cause (from the reports, not inferred).** `gdn_gemv` carries
+`#pragma HLS inline off`, so its `out` parameter is *one shared interface*
+across every GEMV call in the design. Routing the LM head's output through it
+meant `out` was indexed to `GDN_VOCAB/16 = 2000` packs, so HLS sized that
+shared buffer for the entire logit vector — 128 KB, about 29 RAMB36. The
+device overflow is 29 RAMB36E2. The costs match, and the pblock overflow of 23
+is the same buffer seen inside the dynamic region.
+
+The failure had nothing to do with the pack-aligned HBM write, which was the
+risk this entry was written to guard against, and nothing to do with timing —
+the placer never ran.
+
+**Remedy (Iter58b, native-validated).** Give the store path its own AXI
+pointer, `float *logits_out`, threaded through `gemv32_store`,
+`gemv32_store_or_qkvg_conv_stream`, and `gdn_gemv`. The LM-head branch writes
+logits there; `out` reverts to `gemv_out_storage` and keeps its MLP size, so
+the shared buffer is never sized for the vocabulary. Every `gdn_gemv` call
+site passes `workspace + GDN_WS_OFF_LOGITS`; only the LM-head shape reads it.
+
+Full native gate re-passes after the fix: exact trajectory, 992,000 logits,
+zero mismatches. `make host` clean.
+
+**Process note.** This iteration cost 5 h 35 m to learn a resource fact that a
+30–60 minute `make xo` would have reported. A csynth resource check now
+precedes any link on a change that touches buffer sizing or interfaces.
+`test.tcl` cannot serve that purpose as it stands — it fails compilation on
+`GDN_NORM_LANES` and friends, so `make xo` is the check to use.
+
+**Iter58b csynth confirms the remedy (measured, 32 min).**
+
+| | BRAM | DSP | FF | LUT | URAM |
+|---|---:|---:|---:|---:|---:|
+| Iter58 shared `out` (rejected) | 3019 (74%) | 6416 (71%) | 1,440,496 | 1,211,412 (92%) | 64 |
+| **Iter58b dedicated `logits_out`** | **1728 (42%)** | 3777 (41%) | 920,110 (35%) | 867,476 (66%) | 48 |
+| Iter57 routed, for reference | 1728 | 3762 | 921,774 | 869,262 | 48 |
+
+A single shared interface was costing 1,291 BRAM, 2,639 DSP and 344k LUT. The
+remedy returns the design to Iter57's footprint and is marginally *below* it on
+LUT and FF, since the fused argmax comparators and their partitioned lane
+registers are gone. BRAM at 42% clears the 2016-cell RAMB36E2 limit that Iter58
+overflowed by 29.
+
+Whole-design HLS latency rises 0.84% against the rejected variant
+(70,824,933 vs 70,231,813 cycles), consistent with adding ~2000 pack writes per
+token. The per-token cost that matters is the on-card measurement, still to come.
+
+Status: **native-validated and csynth-validated; link not yet run.** Timing
+remains the open question — Iter57 closed at +0.060 ns / +0.003 ns WNS, so the
+margin is thin even at an unchanged footprint.
+
+## Iter59 — memory rebalanced BRAM -> URAM from measured congestion evidence
+
+*Logged: 2026-08-19. Status: **native-validated and csynth-validated**; no link,
+no routing, no timing, no on-card evidence.*
+
+**Why.** `report_design_analysis -congestion` on the Iter57 **routed**
+checkpoint (the design that closes timing) shows every congestion window shares
+one signature: **26 of 29 windows at RAMB >= 96%, and 27 of 27 at URAM = 0%**.
+Device BRAM was 1885/2016 (93.5%) against URAM 48/960 (5.0%), with SLR0 and
+SLR1 holding zero URAM between them. The named contributors are the GEMV
+clusters — `gemv32_cluster2_{1,2,3,4,5,7,9,11}` — plus the shell's `hmss_0`.
+Vivado's own `report_qor_suggestions` raises **RQS_UTIL-211: "High BRAM usage.
+Convert some BRAM to URAM"** on the same checkpoint, estimating -598 RAMB18 for
++38 URAM.
+
+**Change.** `ws[32]` and the four depth-2048 state queues bind to URAM;
+`xr[17]` and `ys[16]` stay in BRAM.
+
+**Measured (csynth, four variants):**
+
+| variant | BRAM | URAM | LUT | FF | latency |
+|---|---:|---:|---:|---:|---:|
+| A all-BRAM (iter58b) | 1728 (42%) | 48 (5%) | 867,476 | 920,110 | 70,824,933 |
+| B +state queues | 1668 (41%) | 80 (8%) | 867,776 | 920,654 | 70,824,933 |
+| C ws+xr+ys+state | 693 (17%) | 600 (62%) | 873,561 | 930,144 | 70,824,933 |
+| **D balanced (retained)** | **1188 (29%)** | **336 (35%)** | 870,624 | 925,326 | 70,824,933 |
+
+Latency and DSP are identical in all four. D costs +3,148 LUT over A (+0.36%).
+
+**Why D and not C.** C frees the most BRAM but the device has only **five URAM
+column positions** (clock-region X = 1,3,4,5,6; none at X0/X2/X7), 16 per clock
+region, 320 per SLR — queried from the part, not inferred. Distributed like the
+clusters (SLR0 49% / SLR1 39% / SLR2 12%), C's 600 blocks put SLR0 near **92%
+URAM**, which relocates the congestion rather than relieving it. D projects to
+roughly **SLR0 BRAM 63% / URAM 51%** — the only variant where neither memory
+type approaches saturation in the worst SLR.
+
+**Pblock interaction — checked, no change needed.** `f150_slr_range` builds
+ranges as `CLOCKREGION_X..Y..`, and a clock-region range includes every site
+type in those regions, URAM included. Explicit `SLICE_X…`/`RAMB18_X…` ranges
+would have excluded URAM and failed at placement. `pb_iter56_cluster10_slr1`
+pins `ws_20_U`, `ws_21_U`, `xr_10_U` by name; the two `ws` FIFOs are now
+URAM-backed and confined to SLR1, needing 16 of its 320.
+
+**Vivado suggestion triage** (from `diagnostics/congestion_forensics/gdn_iter59.rqs`):
+- **RQS_UTIL-211** (BRAM->URAM): the useful one, and the same direction as this change.
+- **RQS_UTIL-206** (BRAM->LUTRAM): -598 RAMB18 but **+81,665 LUTRAM**. Must stay
+  disabled — SLR0 is at 98.83% CLB with 30,786 LUTRAM already.
+- **RQS_UTIL-12** (SRL->register): targets **exactly one** FSM cell, worth 1 FF.
+  Negligible; it does **not** address SLR0's 16,297 SRLs, which Vivado examined
+  and left alone.
+
+**Validation.** `decode_correctness_check.sh` full: PASS — exact trajectory,
+992,000 pre-argmax logits, zero mismatches. Source `gdn_model.cpp` c688fccca52e6a0b.
+
+**Result: REJECTED at route_design — congestion level 7, worse than baseline.**
+Link ran 6 h 15 m (00:52:56 -> 07:09:42) and failed:
+
+```
+ERROR: [VPL 35-3]    Design is not routable as its global congestion level is 7.
+ERROR: [VPL 18-1000] Routing results verification failed due to
+                     partially-conflicted nets
+```
+
+**Post-place congestion got worse in every direction, none improved:**
+
+| direction | Iter57 (routes, closes timing) | Iter59 URAM |
+|---|---|---|
+| North | 128x128 / 128x128 / **64x64** | 128x128 / 128x128 / **128x128** |
+| South | **32x32** / 128x128 / **64x64** | **128x128** / 128x128 / **128x128** |
+| East | **32x32** / **16x16** / 128x128 | **128x128** / **64x64** / 128x128 |
+| West | **64x64** / 32x32 / 128x128 | **128x128** / 32x32 / 128x128 |
+
+Global congestion reached 128x128 on all four directions; Iter57 holds 32x32 on
+South and East.
+
+**Why the hypothesis was wrong.** The entry above reasoned that because 26 of 29
+congestion windows sat at RAMB >= 96% with URAM at 0%, BRAM scarcity was
+*causing* the congestion. That is correlation, not causation: memory columns are
+inherently dense regions, so they show high occupancy inside any congestion
+window. Cutting BRAM 42% -> 29% changed routability not at all and perturbed a
+placement that was only marginally routable to begin with. **Vivado's own
+RQS_UTIL-211 pointed the same way and was equally wrong** — a QoR suggestion is
+a hypothesis, not a verdict, and must be judged by a routed result.
+
+**What the failure actually points at.** The partially-conflicted nets are not
+in the GEMV clusters that dominate the congestion windows. They are dataflow
+*control* nets inside the SLR2-pinned recurrent island:
+
+```
+.../gdn_recurrent_attention_island_0_U0/grp_gdn_tree_reduce_256_fu_1203/
+    grp_gdn_tree_reduce_256_Pipeline_L16_fu_138_ap_start_reg
+.../..._Pipeline_recur_island_alpha_product_fu_1232/
+    flow_control_loop_pipe_sequential_init_U/ap_done_cache
+.../..._Pipeline_recur_island_load_state_fu_1155/..._ap_loop_init_int
+.../grp_gdn_tree_reduce_256_fu_1203_arr_0_ce0
+```
+
+`ap_start`, `ap_done_cache`, `ap_loop_init_int` and clock enables — handshake
+and control, not datapath. Any future attempt should start there rather than on
+memory binding.
+
+**Timing was nearly acceptable and is not the reason it failed:** WNS **+0.003**
+after physical optimisation, drifting to **-0.013** during routing; hold was the
+weak axis (WHS -0.249, THS -657.248).
+
+**Retained artifacts.** `diagnostics/checkpoints/iter59_post_place.dcp` (891 MB)
+and `iter59_routed_error.dcp` (890 MB). Routing can be retried from placement
+without repeating the ~4 h place, and the error checkpoint can be opened to
+inspect the conflicted control nets directly.
+
+**Checkpoint-hook bug found and fixed.** The Iter58b hook fired correctly but
+wrote to a directory literally named `@C_IMPL_DIR@` under `impl_1`: that token
+is substituted by the Makefile into the *cfg* file only, never inside a sourced
+Tcl script. `check_f150_physical_islands.tcl` now derives the directory from
+`[file dirname [file normalize [info script]]]`.
+
+**Reverted.** All `bind_storage` FIFO bindings restored to `impl=bram`,
+byte-identical to committed HEAD; only the pre-existing `reorder`/`state_pair`
+URAM bindings remain. Fast decode gate re-passes. Nothing from Iter59 is
+committed.
+
+## Iter61 — LM-head logits streamed to the top level (RETAINED; on-card exact)
+
+*Tested 2026-08-19/20. Evidence: **on-card**, routed, timing-closed.*
+
+**Goal.** Emit the full 32,000-value logit vector from the on-chip LM head so
+benchmark suites that need log-likelihoods can be scored on hardware, without
+losing the exact-FP32 decode contract.
+
+**Change.** `gemv32_store`'s existing LM-head branch (entered only when
+`rows_per_ch == GDN_VOCAB / GEMV_CHANNELS`) additionally assembles the logit
+vector into whole `Pack16` lines and pushes them into an `hls::stream`. The top
+level drains that queue and writes to `workspace + GDN_WS_OFF_LOGITS`, beside
+the token-id handoff Iter57 already performs. The fused strict argmax is
+untouched, so the token path and the exact-match gate are unaffected; the
+logits are purely additive.
+
+The queue is depth 2048 (the producer completes before the sequential caller
+drains it) and bound to URAM, costing 8 blocks of the 912 free and no BRAM.
+
+**Why the queue rather than a memory port.** Two prior attempts put an AXI
+write inside `gemv32_store`, which the island pblocks distribute across all
+three SLRs:
+
+| | approach | result |
+|---|---|---|
+| Iter58 | logits through the shared `out` pointer | `out` is one interface across every GEMV call, so HLS sized it for the vocabulary: **+1291 BRAM**, place_design DRC failed |
+| Iter58b | dedicated `logits_out` AXI pointer | placed; routing never determined (node shutdown) |
+| Iter59 | Iter58b + BRAM->URAM rebinding | congestion **level 7 in all four directions**, `route_design` refused at Phase 3.1 |
+| **Iter61** | **stream to the top level** | **routed, timing met, on card** |
+
+Filling a FIFO adds no memory port to the GEMV region at all.
+
+**Resources (csynth) vs Iter57:**
+
+| | BRAM | DSP | FF | LUT | URAM | cycles |
+|---|---:|---:|---:|---:|---:|---:|
+| Iter57 | 1728 | 3762 | 921,774 | 869,262 | 48 | 70,825,004 |
+| **Iter61** | **1728** | 3778 | 923,732 | 873,019 | **56** | 70,827,077 |
+
+BRAM identical, +8 URAM, +0.4% LUT, +0.003% cycles -- the smallest footprint
+change of any variant tried.
+
+**Implementation.** Post-place congestion **global 128/64/32/64**
+(N/S/E/W), against Iter57's 128/32/32/64 and Iter59's 128 in all four. SLL
+crossing 20,590 of 23,040 (89.4%), in line with Iter57's 20,713. Vivado
+reported the SLL demand as "currently routable", which it did not for Iter59.
+Route completed with **0 node overlaps and 0 failed nets**. Post-route
+**WNS +0.003 ns, TNS 0.000, WHS +0.009, THS 0.000**; `dma_ip_axi_aclk_1` clean
+over all 309,621 endpoints.
+
+**On-card (U55C, 100 MHz).** 8-token and **64-token** decode both **exact**:
+64/64 tokens bit-identical to the GPU golden, first divergence index -1.
+**42.170227 ms/token median** (mean 42.167, min 42.121) against Iter57's
+42.023540 -- **+0.35%** for the added logit export.
+
+**Native.** Full 32-step gate passes. The stream output was additionally
+verified value-by-value against the argmax loop's capture: **0 of 32,000
+mismatched, worst absolute difference 0.000000e+00, on every step.** That check
+mattered -- the standard gate compares `gdn_native_logits_debug`, which is
+filled by the argmax path and would not have caught a fault in the new stream.
+
+**Identity.** `gdn_model.cpp` 7591b223e7b8ac4e, `host.cpp` b47afba5e6791544,
+`hw_f150_physical_islands.cfg` 4faf23ce87da7fb6 (unchanged),
+`check_f150_physical_islands.tcl` d67c4ca4a13c9730.
+
+**Build environment (both were blockers, both cost a full run):**
+- Vivado peaked at **51 GB**. The `light` Slurm partition caps a job at 32 GB
+  and killed an earlier attempt at 27 GB during Design Initialization. Use
+  `--partition=build --mem=64G`; `run_hw_sbatch.sh` records the recipe.
+- `build`-partition nodes `acclnode03/04/05` **cannot write to /home/yaoz0b** --
+  probe jobs complete there and produce no files, so batch output vanishes and
+  the job fails with exit 2. Pin to `harrier`.
+- After a node relaunch the host presented **different hardware** (XRT 2022.2,
+  and a U280 added). **XRT device index 0 is the U280; the U55C is index 2.**
+  Loading the U55C image on index 0 fails `err = -22`. Confirm the index by BDF
+  (`xbutil examine -d 0000:41:00.1`) before any on-card run.
+
+**Verdict: RETAINED.** First design to emit full logits from hardware while
+keeping the exact 64-token trajectory. Costs +0.35% per token.

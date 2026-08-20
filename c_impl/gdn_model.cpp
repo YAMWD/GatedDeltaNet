@@ -2400,7 +2400,7 @@ add_local: for (uint32_t i = 0; i < count16; ++i) {
 
 /* Forward decl: the decode-only clustered GEMV engine. */
 static void gdn_gemv(
-    Pack16 *out, const Pack16 *in,
+    Pack16 *out, hls::stream<Pack16> &logits_stream, const Pack16 *in,
     const float *w0, const float *w1, const float *w2, const float *w3,
     const float *w4, const float *w5, const float *w6, const float *w7,
     const float *w8, const float *w9, const float *w10, const float *w11,
@@ -2576,6 +2576,16 @@ int gdn_forward(
 #pragma HLS bind_storage variable=gate_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=gemv_in_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=gemv_out_storage type=ram_2p impl=bram
+
+    /* Iter61: LM-head logit queue. Deep enough to hold the whole GDN_VOCAB
+     * vector, because gdn_gemv is called from this sequential region: the
+     * producer finishes before this function drains it, so there is no
+     * concurrency to shrink the depth. 2048 x 512-bit in URAM is 8 blocks out
+     * of 960, of which only 48 are in use. Bound to URAM deliberately so this
+     * costs no BRAM -- BRAM sits at 90-91% in SLR0/SLR1. */
+    static hls::stream<Pack16> logits_stream;
+#pragma HLS stream variable=logits_stream depth=2048
+#pragma HLS bind_storage variable=logits_stream type=fifo impl=uram
 #pragma HLS bind_storage variable=conv_weight_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=conv_tail_storage type=ram_2p impl=bram
 #pragma HLS array_partition variable=conv_weight_storage complete dim=1
@@ -2680,7 +2690,7 @@ int gdn_forward(
             conv_weight_storage, conv_tail_storage,
             layer_q_conv, layer_k_conv, layer_v_conv,
             q_tail, k_tail, v_tail);
-        gdn_gemv(gemv_out_storage, gemv_in_storage,
+        gdn_gemv(gemv_out_storage, logits_stream, gemv_in_storage,
                  GDN_GEMV_SHARD_ARGUMENTS,
                  (uint32_t)soff, num_tokens, hidden, 4 * hidden,
                  true,
@@ -2695,7 +2705,7 @@ int gdn_forward(
                                  head_dim, GDN_NORM_EPS);
         gdn_pack16_copy_local(gemv_in_storage, norm_attn_storage,
                               hidden / 16);
-        gdn_gemv(gemv_out_storage, gemv_in_storage,
+        gdn_gemv(gemv_out_storage, logits_stream, gemv_in_storage,
                  GDN_GEMV_SHARD_ARGUMENTS,
                  (uint32_t)soff, num_tokens, hidden, hidden,
                  false,
@@ -2709,7 +2719,7 @@ int gdn_forward(
                          num_tokens, hidden, GDN_NORM_EPS);
         gdn_pack16_copy_local(gemv_in_storage, norm_attn_storage,
                               hidden / 16);
-        gdn_gemv(gemv_out_storage, gemv_in_storage,
+        gdn_gemv(gemv_out_storage, logits_stream, gemv_in_storage,
                  GDN_GEMV_SHARD_ARGUMENTS,
                  (uint32_t)soff, num_tokens, hidden, 2 * intermediate,
                  false,
@@ -2722,7 +2732,7 @@ int gdn_forward(
         gdn_swiglu_inplace(q_mlp_gate_storage, k_mlp_up_storage, mlp_count);
         gdn_pack16_copy_local(gemv_in_storage, q_mlp_gate_storage,
                               intermediate / 16);
-        gdn_gemv(gemv_out_storage, gemv_in_storage,
+        gdn_gemv(gemv_out_storage, logits_stream, gemv_in_storage,
                  GDN_GEMV_SHARD_ARGUMENTS,
                  (uint32_t)soff, num_tokens, intermediate, hidden,
                  false,
@@ -2750,7 +2760,7 @@ int gdn_forward(
         size_t lm_soff = (size_t)GDN_LAYERS * shard_per_layer;
         gdn_pack16_copy_local(gemv_in_storage, norm_attn_storage,
                               hidden / 16);
-        gdn_gemv(gemv_out_storage, gemv_in_storage,
+        gdn_gemv(gemv_out_storage, logits_stream, gemv_in_storage,
                  GDN_GEMV_SHARD_ARGUMENTS,
                  (uint32_t)lm_soff, num_tokens, hidden, GDN_VOCAB,
                  false,
@@ -2769,6 +2779,20 @@ int gdn_forward(
         }
         token_line.data[0] = gemv_out_storage[0].data[0];
         reinterpret_cast<Pack16 *>(workspace_out)[0] = token_line;
+    }
+
+    /* Drain the LM-head logit queue to HBM. This is the only new AXI traffic
+     * in Iter61 and it lives here, at the top level, next to the token write
+     * above -- the same master and the same code region that Iter57 already
+     * routes. Full 512-bit lines only; GDN_VOCAB is a multiple of 16. */
+    {
+        Pack16 *logits_out =
+            reinterpret_cast<Pack16 *>(workspace + GDN_WS_OFF_LOGITS);
+    drain_logits: for (uint32_t k = 0; k < GDN_VOCAB / 16; ++k) {
+#pragma HLS loop_tripcount min=2000 max=2000
+#pragma HLS pipeline II=1
+            logits_out[k] = logits_stream.read();
+        }
     }
     return 0;
 }
@@ -3353,6 +3377,7 @@ gemv32_cf_2: for (int i = 0; i < 12; ++i) {
  * in URAM and restore the original layout. The scalar fallback handles the
  * lm_head's 1000-row channel stripes, which are not Pack16 aligned. */
 static void gemv32_store(hls::stream<Pack16> &result, Pack16 *out,
+                         hls::stream<Pack16> &logits_stream,
                          uint32_t rows_per_ch, uint32_t opacks_per_ch,
                          uint32_t total_opacks) {
 #pragma HLS inline off
@@ -3365,6 +3390,41 @@ gemv32_store_fill: for (uint32_t i = 0; i < total_opacks; ++i) {
     }
 
     if (rows_per_ch == GDN_VOCAB / GEMV_CHANNELS) {
+        /* Iter61: emit the full GDN_VOCAB logit vector into a stream that the
+         * top level drains and writes to HBM. This branch is entered only by
+         * the LM head (rows_per_ch == 1000), so every other GEMV call pushes
+         * nothing and needs no special casing.
+         *
+         * The point of the stream is that this block gains no AXI port. Iter58b
+         * and Iter59 gave gemv32_store its own m_axi write pointer; Iter59 then
+         * failed route_design at global congestion level 7. gemv32_store is
+         * distributed across all three SLRs by the island pblocks, so a memory
+         * port here is a memory port everywhere. Filling a FIFO instead keeps
+         * every AXI access at the top level, beside the token-id write that
+         * Iter57 already performs and routes.
+         *
+         * Natural row order: channel c owns rows [c*rows_per_ch, (c+1)*...),
+         * and GDN_VOCAB is a multiple of 16, so the vector is a whole number of
+         * Pack16 lines with no partial line. Each line is assembled in
+         * registers from 16 URAM reads.
+         *
+         * The argmax reduction below is unchanged, so the token trajectory and
+         * the existing exact-match decode gate are untouched; the logits are
+         * purely additive. */
+    gemv32_logits_pack: for (uint32_t k = 0; k < GDN_VOCAB / 16; ++k) {
+#pragma HLS loop_tripcount min=2000 max=2000
+            Pack16 line;
+        gemv32_logits_lane: for (uint32_t lane = 0; lane < 16; ++lane) {
+#pragma HLS unroll
+                uint32_t n = (k << 4) + lane;
+                uint32_t c = n / rows_per_ch;
+                uint32_t r = n - c * rows_per_ch;
+                line.data[lane] =
+                    reorder[(size_t)(r >> 4) * GEMV_CHANNELS + c].data[r & 15];
+            }
+            logits_stream.write(line);
+        }
+
         /* Read every reordered Pack16 exactly once. A scalar natural-order
          * scan makes HLS reread the same URAM word for all 16 lanes and
          * schedules at II=9. These fully partitioned lane winners preserve
@@ -3452,6 +3512,7 @@ static void gemv32_store_or_qkvg_conv_stream(
     hls::stream<Pack16> &k_stream,
     hls::stream<Pack16> &v_stream,
     Pack16 *out,
+    hls::stream<Pack16> &logits_stream,
     uint32_t rows_per_ch,
     uint32_t opacks_per_ch,
     uint32_t total_opacks,
@@ -3464,7 +3525,8 @@ static void gemv32_store_or_qkvg_conv_stream(
 #pragma HLS aggregate variable=conv_weights compact=bit
 #pragma HLS aggregate variable=conv_tails compact=bit
     if (!qkvg_recurrent_mode) {
-        gemv32_store(result, out, rows_per_ch, opacks_per_ch, total_opacks);
+        gemv32_store(result, out, logits_stream, rows_per_ch, opacks_per_ch,
+                     total_opacks);
         return;
     }
 
@@ -3530,7 +3592,7 @@ qkvg_stream_head: for (uint32_t head = 0; head < GDN_HEADS; ++head) {
  * collectors. The store stage restores natural output-row order; it also
  * handles the lm_head's partial final pack (1000 rows per channel). */
 static void gdn_gemv(
-    Pack16 *out, const Pack16 *in,
+    Pack16 *out, hls::stream<Pack16> &logits_stream, const Pack16 *in,
     const float *w0, const float *w1, const float *w2, const float *w3,
     const float *w4, const float *w5, const float *w6, const float *w7,
     const float *w8, const float *w9, const float *w10, const float *w11,
@@ -3752,7 +3814,7 @@ static void gdn_gemv(
                          result, opacks_per_ch);
     gemv32_store_or_qkvg_conv_stream(
         result, q_stream, k_stream, v_stream,
-        out, rows_per_ch, opacks_per_ch, total_opacks,
+        out, logits_stream, rows_per_ch, opacks_per_ch, total_opacks,
         qkvg_recurrent_mode, gate_out,
         conv_weights, conv_tails);
     gdn_recurrent_attention_islands(
