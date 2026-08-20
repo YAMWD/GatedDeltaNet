@@ -49,6 +49,11 @@ def write_i32_array(handle, values: list[int]) -> None:
 
 
 def load_snapshot(model_name: str) -> Path:
+    # Accept a local directory as well as a Hub repo id, so a converted
+    # checkpoint (e.g. the BF16 cast) can be exported without publishing it.
+    candidate = Path(model_name)
+    if candidate.is_dir() and (candidate / "config.json").exists():
+        return candidate
     return Path(snapshot_download(model_name, local_files_only=True))
 
 

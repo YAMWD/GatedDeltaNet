@@ -558,6 +558,15 @@ public:
     // recurrent_state holds all layers (48 MB); head_buffer is the conv-tail
     // store (~1.7 MB). The decode kernel restores from these at each layer start
     // and saves the update at layer end, so they persist across token calls.
+    // Zero the persistent recurrent + conv state. Each rolling window is
+    // scored independently, so it must start from the same blank state the
+    // model would have at the beginning of a document.
+    void reset_decode_state() {
+        static const std::vector<float> zr(GDN_WSF_STATE, 0.0f);
+        static const std::vector<float> zc(GDN_WSF_HEADBUF, 0.0f);
+        upload_decode_state(zr, zc);
+    }
+
     void upload_decode_state(const std::vector<float> &recurrent,
                              const std::vector<float> &conv) {
         size_t rbytes = recurrent.size() * sizeof(float);
@@ -812,19 +821,43 @@ static double score_pair_hw(
         throw std::runtime_error("token sequence exceeds max_seq_len");
     }
 
-    std::vector<int32_t> tokens(total_tokens);
-    std::copy(pair.ctx.begin(), pair.ctx.end(), tokens.begin());
-    if (pair.cont_len > 1) {
-        std::copy(pair.cont.begin(), pair.cont.end() - 1, tokens.begin() + pair.ctx_len);
-    }
+    // Decode-only teacher-forced scoring (Iter61).
+    //
+    // The prefill-era version fed a whole window to run_forward and read back
+    // one hidden row per token. The decode kernel processes exactly one token
+    // per call, so the window is walked sequentially instead, and the logits
+    // come straight from the kernel's own LM head rather than a host-side one.
+    //
+    // Position i consumes tokens[i] and yields the distribution over token
+    // i+1, so scoring continuation token c requires the call that consumed the
+    // token before it.
+    runner.reset_decode_state();
 
-    *kernel_seconds = runner.run_forward(tokens);
+    std::vector<int32_t> tokens;
+    tokens.reserve(pair.ctx_len + pair.cont_len);
+    tokens.insert(tokens.end(), pair.ctx.begin(), pair.ctx.end());
+    tokens.insert(tokens.end(), pair.cont.begin(), pair.cont.end());
 
+    const uint32_t vocab = model.config.vocab_size;
     double logprob = 0.0;
-    for (uint32_t token_index = 0; token_index < pair.cont_len; ++token_index) {
-        uint32_t row = pair.ctx_len + token_index - 1;
-        logprob += score_hidden_step(model, runner.hidden_row(row), pair.cont[token_index], logits);
+    double ksec = 0.0;
+    const size_t last = tokens.size() - 1;   // final token is never fed
+
+    for (size_t i = 0; i < last; ++i) {
+        std::vector<int32_t> one(1, tokens[i]);
+        ksec += runner.run_forward(one);
+
+        if (i + 1 >= pair.ctx_len) {          // this call predicts a scored token
+            const float *lg = runner.device_logits();
+            double m = lg[0];
+            for (uint32_t v = 1; v < vocab; ++v) if (lg[v] > m) m = lg[v];
+            double sum = 0.0;
+            for (uint32_t v = 0; v < vocab; ++v) sum += std::exp((double)lg[v] - m);
+            logprob += ((double)lg[tokens[i + 1]] - m) - std::log(sum);
+        }
     }
+    *kernel_seconds = ksec;
+    (void)logits;
     return logprob;
 }
 

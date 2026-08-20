@@ -414,6 +414,60 @@ than the paper's model. The raw spread of +4.53 / +2.77 / -1.53 is
 dominated by harness differences in both directions and should not be
 quoted as a reproduction of the paper's numbers.
 
+## On-hardware result (WikiText, BF16 weights + FP32 math)
+
+*Measured 2026-08-20 on the U55C with the Iter61 image. This is the first
+benchmark number produced by the accelerator itself rather than by a GPU.*
+
+**Configuration.** `scripts/export_gdn_c.py` forces FP32 storage
+(`.float()` at the tensor write), so exporting the BF16 checkpoint yields a
+`.gdnw` blob holding **BF16-rounded values in FP32 words** -- precisely
+"BF16 weights, FP32 arithmetic", and it needs **no kernel change**. Verified on
+the blob: 100% of values carry zero low-16 mantissa bits, worst relative change
+3.8908e-3 against the BF16 round-to-nearest bound of 3.906e-3.
+
+**Method.** WikiText-2 is `loglikelihood_rolling` -- sequential scoring with no
+prefill and no generation -- which is what a decode-only accelerator does
+natively. `host.cpp`'s rolling scorer was prefill-era (one `run_forward` per
+window, N hidden rows back) and was rewritten to walk each window one token at
+a time, resetting the recurrent state per window and taking log-probabilities
+from **the kernel's own on-chip LM head** via the Iter61 logit stream.
+
+**Bridge validation.** Scoring example 0 with **FP32** weights reproduced the
+committed Python golden: **-3017.65073425** on card against **-3017.65085554**
+on GPU, a difference of 1.2e-4 over 1,512 sequential forward passes (4e-8
+relative).
+
+**Result.** 62 documents, 183 windows, **360,389 forward passes**, 4.3 h at a
+sustained **42.182 ms/token**.
+
+| Configuration | word perplexity |
+|---|---:|
+| **FPGA, BF16 weights + FP32 math** | **16.824190767** |
+| GPU, BF16 weights + FP32 math (Arm B) | 16.824191512 |
+| **FPGA - GPU (matched reference)** | **-0.0000007  (-0.000004%)** |
+| GPU, FP32 weights (context only) | 16.823770819 |
+| FPGA vs FP32 GPU | +0.000420  (+0.0025%) |
+
+**Compare against the matched reference, not the FP32 golden.** The +0.0025%
+gap against FP32 is the BF16 weight cast, exactly as this document's GPU study
+measured (+0.0025% on the same metric); attributing it to the hardware would be
+wrong. Against the configuration the FPGA actually runs, the hardware
+difference is **7e-7 perplexity**.
+
+Two cross-checks worth keeping: the committed `.gdnreq` golden (16.823771361)
+and lm-eval's FP32 WikiText (16.823770819) agree to 5e-7 despite different
+harnesses and windowing; and byte perplexity and bits-per-byte track the same
+way (1.695336 vs 1.695328, 0.761571 vs 0.761565).
+
+**What this establishes and what it does not.** It establishes that the
+decode-only sequential scoring path is correct at scale, that the Iter61 logit
+stream is trustworthy over 360,389 tokens rather than the 64 the decode gate
+covers, and that BF16 weights cost what the GPU predicted. It is **one row of
+Table 3**. The other eight tasks need per-candidate context replay, and Tables 2
+and 5 need a generation path that does not yet exist; at 42 ms/token the full
+three tables are an estimated 35-50 h of card time.
+
 ## Reproduction and raw evidence
 
 The evaluation launchers are:
