@@ -37,13 +37,16 @@ Checkpoint: `m-a-p/1.3B-100B-GatedDeltaNet-pure` (HuggingFace) — consumed by `
 
 | Document | Status |
 |---|---|
-| `c_impl/doc/architecture.md` | **Authoritative** description of the production kernel (currently Iter57) — data flow, HBM map, per-layer schedule, physical design, measured result. Start here. |
+| `c_impl/doc/architecture.md` | **Authoritative** description of the production kernel (currently Iter61) — data flow, HBM map, per-layer schedule, physical design, measured result. Start here. |
 | `c_impl/doc/optimization_log.md` | Exhaustive chronological record of *every* iteration, including failures. The §"Integrated 32-port `gdn_forward`" table is required reading before proposing any floorplan/config change — 30+ variants have already been built. |
 | `c_impl/doc/decode_disaggregated_gemv.md` | How the decode design got here (single-reader → 8 → 32 ports). History, not the current spec. |
 | `c_impl/doc/cycle_optimization_roadmap.md` | **Proposed** future stages. Targets, not implemented hardware. |
+| `c_impl/doc/recurrent_attention.md`, `depthwise_conv.md`, `output_norm.md` | The active non-GEMV compute blocks. Current as *block* descriptions; their embedded synthesis tables are historical. |
+| `c_impl/doc/decode_premise.md` | **Partly superseded — read the warning below.** Its GPU numbers are eager-mode PyTorch. A corrected version lives on branch `worktree-gpu-decode-opt`; on this branch the "why GDN looks slow on GPU" argument is still the old, wrong one. |
+| `c_impl/doc/fp32_bf16_quality_evaluation.md` | **In progress** (see *Checkpoint quality evaluation* below) — a GPU-side precision study, not a statement about the kernel. |
 | `c_impl/microbench/gemv_tile/README.md` | The standalone 32-port GEMV microbenchmark (separate kernel from `gdn_forward`). |
 | `c_impl/README.md` | **Stale** — still describes the retired C/prefill design (`gdn_model.c`, `gdn_attn_forward`, `test_single_GDN_attn.tcl`, gcc/C11). Do not cite it for current behavior. |
-| `README.md` (root) | Mixed: its Python↔HLS function-mapping table is still valid; its performance and flow claims are prefill-era. |
+| `README.md` (root) | Mixed: most of its Python↔HLS function-mapping table still holds, but the `gdn_attn_forward` and `gdn_matmul` rows name functions that **no longer exist** in `gdn_model.cpp`/`.h` (decode replaced them with `gdn_gemv`). Its performance and flow claims are prefill-era. |
 
 Every status claim must say which thing it refers to: the production integrated kernel, a historical iteration, a roadmap target, or the microbenchmark.
 
@@ -77,7 +80,7 @@ bash scripts/decode_correctness_check.sh --fast     # 1×6 smoke (~1–2 min) �
 ./c_impl/gdn_eval <w.gdnw> fixtures_decode/decode.gdnreq <out.json> --decode --decode-from-state <state.gdnstate> [--decode-len N]
 ./c_impl/host.exe <xclbin> <w.gdnw> fixtures_decode/decode.gdnreq <out.json> 0 --decode --decode-from-state <state.gdnstate> [--decode-len N]   # on-card
 ```
-The GPU prefills a prompt and exports the fixed-size recurrent+conv state with `scripts/export_gdn_state.py` → `.gdnstate` (~50 MB); the FPGA decodes from it through the `gdn_gemv` engine. The decode fixture (`fixtures_decode/decode.gdnreq`) and fp32 GPU golden (`results_decode_golden/`) are committed, but `decode_ex0.gdnstate` is **gitignored/regenerable** (like the `.gdnw` weight blob) — so the gate and the standing hook require both to be generated locally first (`export_gdn_state.py` + `export_gdn_c.py weights`). The Iter57 image is **bit-exact** over 64 tokens and measures **42.023540 ms/token at a timing-closed 100 MHz** for a complete decode step (forward + lm_head + argmax all on chip) — see `doc/architecture.md`. The native gate also checks every pre-argmax logit against an independent scalar LM head. A PostToolUse hook in `.claude/settings.json` auto-runs the fast check on every edit to `c_impl/gdn_model.{cpp,h}`, `host.cpp`, `gdn_eval.cpp`, `lit_gpt/gated_delta_net.py` — keep it passing.
+The GPU prefills a prompt and exports the fixed-size recurrent+conv state with `scripts/export_gdn_state.py` → `.gdnstate` (~50 MB); the FPGA decodes from it through the `gdn_gemv` engine. The decode fixture (`fixtures_decode/decode.gdnreq`) and fp32 GPU golden (`results_decode_golden/`) are committed, but `decode_ex0.gdnstate` is **gitignored/regenerable** (like the `.gdnw` weight blob) — so the gate and the standing hook require both to be generated locally first (`export_gdn_state.py` + `export_gdn_c.py weights`). The Iter61 image is **bit-exact** over 64 tokens and measures **42.170227 ms/token at a timing-closed 100 MHz** for a complete decode step (forward + lm_head + argmax + full logit export, all on chip) — see `doc/architecture.md`. The native gate also checks every pre-argmax logit against an independent scalar LM head. A PostToolUse hook in `.claude/settings.json` auto-runs the fast check on every edit to `c_impl/gdn_model.{cpp,h}`, `host.cpp`, `gdn_eval.cpp`, `lit_gpt/gated_delta_net.py` — keep it passing.
 
 ### Vitis HLS synthesis (csim/csynth/cosim — no board needed)
 ```bash
@@ -101,7 +104,7 @@ Phase times: `xo` ~30–60 min, `host` seconds. The 32-port `xclbin` link is **l
 **The link recipe (`hw_f150_physical_islands.cfg` plus its Tcl hooks) is where the physical design lives.** It carries:
 - `nk=gdn_forward:1:gdn_forward_1` and the **one-bank-per-master** HBM map: `weight_data_mm0..mm31` → `HBM[0..31]`. The shell's 32-master limit forces `aux_weights` and `workspace` to share the `mem_weights_mm0` master on `HBM[0]`. Overlapping `sp=` *ranges* cause `xrt::bo` `std::bad_alloc` on U55C — keep bank assignments disjoint (`probe_alloc.cpp` diagnoses this).
 - `prop=run.__KERNEL__.{STEPS.SYNTH_DESIGN.ARGS.MORE OPTIONS}={-directive Default}` — overrides the `sdx_optimization_effort_high` that `--optimize 2` injects, which got OOM-killed on this shared host.
-- relocatable `@C_IMPL_DIR@` Tcl paths, the Iter57 island/collector pblocks, measured DMA/reset fanout repairs, a structural post-place gate, `SSI_SpreadSLLs`, `NoTimingRelaxation`, and pre/post-route `AggressiveExplore` physical optimization.
+- relocatable `@C_IMPL_DIR@` Tcl paths, the Iter61 island/collector pblocks, measured DMA/reset fanout repairs, a structural post-place gate, `SSI_SpreadSLLs`, `NoTimingRelaxation`, and pre/post-route `AggressiveExplore` physical optimization.
 
 `pblock_pe_split.tcl` floorplanned the retired prefill systolic grid and is **disabled**; it is kept for reference only.
 
@@ -115,6 +118,13 @@ Only a demonstrated positive iteration becomes the next `run_hw` default;
 rejected variants are logged and reverted rather than retained as new targets.
 
 **Launch discipline for multi-hour builds** (also in `AGENTS.md`): detach the build so it survives a dropped session, record its PID/log/exit-marker, and *immediately* attach a watcher (`tail --pid=<pid> -F <build-dir>/.../impl_1/runme.log`) rather than checking back blind. Watch Vivado's detailed `runme.log`, not the quiet wrapper log. If the session dies, only the watcher stops — the build continues, and `diagnostics/*/build.exit` records the outcome.
+
+**Cluster environment — three traps, each of which has cost a full multi-hour build:**
+- **Memory.** Vivado peaks at **~51 GB** on this design (Iter57's complete build peaked 34.7 GB; Iter61's reached 51 GB). The `light` Slurm partition caps a job at **32 GB** and the OOM killer takes Vivado mid-flight — once at 27 GB during *Design Initialization*, before placement even ran. Submit with `c_impl/run_hw_sbatch.sh` (`--partition=build --mem=64G`). `light` and `vnc` (8 GB) cannot build this design at all.
+- **Filesystem.** `build`-partition nodes `acclnode03/04/05` run jobs but **cannot write to `/home/yaoz0b`** — a probe job completes there and produces no files, so Slurm cannot create the output file and the job dies with exit 2 and no log. Pin to `harrier`.
+- **Device index.** After a node relaunch the host may present **different hardware**. On the current box **XRT index 0 is a U280 and the U55C is index 2**; loading the U55C image on index 0 fails `err = -22`. Always confirm by BDF first (`xbutil examine -d 0000:41:00.1`), and note `xrt-smi` exists only on the newer XRT — the 2022.2 install has `xbutil`.
+
+**Two stale-artifact traps in reused build directories.** The build directory name embeds the job count, so `make xo JOBS=8` builds into `.o8` while `.o16` keeps an older report — comparing the wrong `csynth.rpt` produces a completely wrong resource delta. And `impl_1/runme.log` survives from the previous run, so a congestion table read early in a new build is the *previous* build's. Check the file's mtime against the job start before trusting either.
 
 Vivado `get_cells` glob gotcha, learned twice (iter8, iter37C): `*` **spans `/`**, so `NAME =~ */grp_foo_fu_*` matches the hierarchy root *and* all 200k descendants. Use `get_cells -hierarchical -regexp` with an anchored pattern like `^.*/grp_gdn_recurrent_attention_fu_[0-9]+$` and validate the match count against a checkpoint before launching.
 
@@ -133,6 +143,40 @@ python scripts/check_gdn_c_parity.py --python-dir c_impl/results_smoke_python --
 python scripts/fla_lm_eval.py               # lm-eval-harness evaluation
 ```
 
+### Checkpoint quality evaluation (GPU-only — FP32 vs BF16, paper Tables 2/3/5)
+
+A **separate workstream from the kernel**, on the `bf16` branch and now committed. It runs on an A100, touches no HLS
+code, and answers two questions before BF16 is considered as a hardware lever: (1) does the
+`m-a-p/1.3B-100B-GatedDeltaNet-pure` checkpoint reproduce the paper's Tables 2/3/5, and (2) does a
+BF16-weight/BF16-activation cast retain that quality while the recurrent kernel still accumulates
+state in FP32?
+
+```bash
+bash scripts/run_gdn_table3_eval.sh                     # Table 3: lm-eval short-context + commonsense
+bash scripts/run_gdn_table2_eval.sh                     # Table 2: RULER S-NIAH (custom tasks)
+python scripts/run_gdn_longbench_eval.py --model <ckpt-dir> --dtype float32|bfloat16 --output-dir <dir>
+python scripts/convert_gdn_checkpoint_bf16.py <src> <dst>    # cast every float safetensors tensor to BF16
+python scripts/summarize_gdn_quality_eval.py <root>          # root must contain fp32/ and bf16/
+```
+
+- **`DTYPE` defaults differ between the two shell launchers** — `run_gdn_table3_eval.sh` defaults to
+  `float16`, `run_gdn_table2_eval.sh` to `float32`. A precision comparison must set `DTYPE`
+  explicitly; taking the default silently evaluates a third precision. Both launchers are
+  env-var-driven (`MODEL_ID`, `DTYPE`, `BATCH_SIZE`, `TASKS`, `OUTPUT_DIR`, `GDN_ATTN_MODE`, …) and
+  forward extra argv to `fla_lm_eval.py`.
+- Evaluation goes through the **`gdn_hf` lm-eval model type** registered in `scripts/fla_lm_eval.py`
+  (an `HFLM` subclass that forces `config.attn_mode`, default `fused_recurrent`) — not stock `hf`.
+- Task definitions live in the repo: `scripts/eval_tasks/gdn_ruler_table2` (passed via
+  `--include_path`) and `scripts/eval_configs/longbench_v1_table5.json`.
+- **Artifacts are deliberately outside the Git tree** at `/home/yaoz0b/gdn_precision_eval_20260817/{fp32,bf16}`.
+  Converted checkpoints, lm-eval result JSON, and logs are never committed.
+- Per-arm runner and checks: `scripts/run_gdn_precision_eval_arm.sh` runs one complete arm (Tables 2/3/5) for a given `MODEL_ID`/`DTYPE` — the three recorded arms differ only in those two values; `scripts/verify_bf16_conversion.py` validates a conversion before spending GPU hours; `scripts/analyze_gdn_eval_artifacts.py` provides the two analyses the summarizer does not (first-line Table 5 rescoring, paired per-sample flip counts).
+- Acceptance thresholds were **fixed before results were inspected** and are recorded in the doc —
+  treat them as pre-registered and do not retune them to fit an outcome.
+- Status as of 2026-08-20: **complete** — FP32 and both BF16 arms have run all three tables at full sample counts, plus a BF16-recurrent-state follow-up. Earlier status as of 2026-08-17 was: **Table 3 FP32 complete and passing** (accuracy average 58.09 vs the
+  paper's 55.32); the BF16 column and all of Tables 2/5 are still pending. Do not describe the BF16
+  path as validated until those cells are filled.
+
 ## Architecture
 
 ### HLS Accelerator (`c_impl/`) — primary target
@@ -149,10 +193,13 @@ function-for-function (mapping table in the root `README.md`). `pretrain.py` and
 - The HLS C++ mirrors the Python computation graph exactly to maintain numerical parity (validated end-to-end within 1e-3, observed ~1e-5; on-card Wikitext perplexity matches Python golden to ~1e-7).
 - **Optimization arc (prefill, on U55C):** the runtime was weight-HBM-traffic bound. Sequenced levers took wikitext-2048 prefill from **25.9 min → 4.2 min (~6.2×)**: weight-stationary blocking (kills ~95× weight re-reads), 512-bit bursted weight reads (aligned base + dedicated AXI bundle), Pack16 activation widening, and splitting activations across 3 HBM channels. Prefill is now **compute-bound** (matmul ≈ 76% of the kernel). PE-grid widening (Phase C) was attempted and **reverted** — it's a prefill lever with high routing risk and no decode benefit.
 - **The accelerator is now decode-only (TPOT-focused).** Decode is a GEMV (1 token/step), **weight-bandwidth bound** not compute bound, so the prefill GEMM (16×16 systolic grid) was *removed* and replaced by the activation-stationary `gdn_gemv`. The disaggregated split (`doc/decode_disaggregated_gemv.md`): the GPU prefills + exports a fixed-size recurrent+conv state (`.gdnstate`, ~50 MB — free for a linear-attention model, no growing KV cache), and the FPGA decodes from it.
-- **Production status — Iter57, on-card, bit-exact and timing-closed.** The integrated 32-port kernel routes with zero failed/unrouted nets and zero node overlaps, closes the 100 MHz kernel and fixed 250 MHz DMA clocks at +0.060/+0.003 ns WNS, and produces an exact 64-token trajectory. It measures **42.023540 ms/token / 4.202354M cycles**, 2.48% faster than Iter39C and 2.889× faster than the eight-port reference. The design is `GEMV_CHANNELS=32` / `GEMV_CLUSTERS=16` / two channels per cluster, with a **4/6/6** SLR-local collector cut, BRAM MM2S decoupling, activation residency, four packed state ports, two concurrent 16-column recurrent islands, registered collector boundaries, depth-2048 state queues, and on-chip strict argmax.
-- **The measured ladder** (each step is an on-card, exact result): 121.4 ms (8-port reference) → 98.66 (Iter32, activation resident) → 75.06 (Iter35, DMA fanout repair) → 59.58 (Iter36, head-local recurrence) → 51.45 (Iter37, four state ports) → 47.08 (Iter38, merged layouts/concurrent state) → 43.09 (Iter39C, head-streamed convolution) → **42.02** (Iter57, timing-friendly recurrent islands). Total **2.889×** over the eight-port reference.
+- **Production status — Iter61, on-card, bit-exact and timing-closed.** The integrated 32-port kernel routes with zero failed nets and zero node overlaps, closes timing at **+0.003 ns WNS**, and produces an exact 64-token trajectory. It measures **42.170227 ms/token** at a timing-closed 100 MHz. Iter61 is Iter57 plus one thing: the LM head now streams its full 32,000-value logit vector to the workspace, costing **+0.35%** over Iter57's 42.023540. The design is `GEMV_CHANNELS=32` / `GEMV_CLUSTERS=16` / two channels per cluster, with a **4/6/6** SLR-local collector cut, BRAM MM2S decoupling, activation residency, four packed state ports, two concurrent 16-column recurrent islands, registered collector boundaries, depth-2048 state queues, on-chip strict argmax, and the logit FIFO.
+- **The Iter61 lesson, which generalizes: put the FIFO between the block and the memory port, not the port inside the block.** `gemv32_store` is distributed across all three SLRs by the island pblocks, so an AXI write there is an AXI write everywhere. Iter58 routed logits through `gdn_gemv`'s shared `out` pointer — one interface across every GEMV call — and HLS sized that buffer for the vocabulary: **+1291 BRAM**, place_design DRC failed. Iter59 then tried to buy the BRAM back by moving FIFOs to URAM and made congestion **worse in all four directions**; `route_design` refused at level 7. Iter61 has `gemv32_store` fill an `hls::stream` that the *top level* drains, adding no port to the GEMV region at all: BRAM unchanged at 1728, URAM +8 of 912 free, LUT +0.4%, cycles +0.003%. **Judge a lever by where it puts its interfaces, not by its resource total.**
+- **The GPU comparison has been corrected, and it changes what this project can claim.** `decode_premise.md` (on this branch) argues the accelerator is justified because GDN decodes at ~35 ms/token on an A100. That number is **eager-mode PyTorch**: profiling shows **1,981 kernel launches per token** with 58% of wall time in dispatch gaps, at 4.1% of the GPU's memory bandwidth. Capturing the step as **one CUDA graph gives 4.20 ms/token**, verified token-identical to eager on a real prompt (24/24, zero logit difference). `torch.compile` is a dead end here — dynamo recompiles per layer because fla's cache `__getitem__` specializes on `layer_idx` — and fp16 is indistinguishable from bf16. **So the A100 is ~10× faster than Iter61**, and both parts run at a similar fraction of their own bandwidth (GPU 36%, FPGA 27%); the gap is the 4.2× in peak bandwidth (1935 vs 460 GB/s), which no floorplan or scheduling change reaches. Scripts and the corrected doc are on branch **`worktree-gpu-decode-opt`** (`scripts/gpu_decode_{profile,optimize,verify}.py`), **not merged here**. Judge future accelerator work against **4.20 ms/token**, and frame the surviving claims as performance-per-watt, per-dollar, flat O(1) latency, and no KV cache — not raw speed.
+- **The measured ladder** (each step is an on-card, exact result): 121.4 ms (8-port reference) → 98.66 (Iter32, activation resident) → 75.06 (Iter35, DMA fanout repair) → 59.58 (Iter36, head-local recurrence) → 51.45 (Iter37, four state ports) → 47.08 (Iter38, merged layouts/concurrent state) → 43.09 (Iter39C, head-streamed convolution) → 42.02 (Iter57, timing-friendly recurrent islands) → **42.17** (Iter61, +0.35% for on-chip logit export). Total **2.879×** over the eight-port reference.
 - **Getting the integrated 32-port design to route was the hard part, and it is exhaustively documented.** 30+ build variants were attempted; `optimization_log.md` records each one's floorplan, stage reached, and measured failure. Two rules from that campaign: *judge a lever by its physical distribution, not its total resource saving* (iter16 won by moving FIFOs out of SLR0 CLB into BRAM), and *frequency is not a congestion lever* (iter20 dropped 150→130 MHz with no congestion relief). **Do not re-run a listed experiment without stating why the outcome would differ.**
-- **Open levers.** Continue the cycle roadmap from the timing-closed Iter57 base: head-chunked output projection, then chunk-streamed GU/SwiGLU/MLP-down. Preserve the physical island and registered-boundary structure until a replacement completes exact on-card validation. Longer-term compression (BF16/INT8, sparsity) can lower the dense weight floor but changes the exact-FP32 contract.
+- **Open levers, in order of measured promise.** (1) **Sub-byte weight compression** (INT4/INT3, non-power-of-two groups with dequantisation in the datapath) is the only lever with the right magnitude: it attacks the 4.2× bandwidth deficit directly, is something tensor cores cannot natively execute, and would take the per-token read from 5.195 GB toward 0.65 GB. (2) The cycle roadmap's remaining stages — head-chunked output projection, then chunk-streamed GU/SwiGLU/MLP-down — are percent-level; Iter57 gained 2.48% over Iter39C. (3) **BF16 weights** would roughly halve HBM bytes and land near 13–21 ms, but a GPU at 4.20 ms has had *no* quantisation applied, so BF16 buys no differentiation. All of these retire the bit-exact decode gate and need the quality work in `fp32_bf16_quality_evaluation.md` repeated for the new format. Preserve the physical island and registered-boundary structure until a replacement completes exact on-card validation.
+- **On-chip recurrent state is quality-safe but physically blocked.** BF16 state costs **0.02 accuracy points** on Table 3 (measured, `fp32_bf16_quality_evaluation.md`) and would halve the state to 24 MiB, inside the device's 33.8 MiB of URAM. But that is **683 URAM of 960 with only 320 per SLR**, while the recurrent islands are pblock-pinned to SLR2 — so the state cannot sit in the SLR that consumes it. Iter59 measured a weaker version of exactly this and congestion got worse in all four directions. The prize is also bounded: state traffic is 1.9% of per-token bytes.
 - **The standalone 32-port GEMV microbenchmark** (`c_impl/microbench/gemv_tile/`) is a *separate kernel* used to characterize the HBM ceiling in isolation: 32 512-bit readers, eight four-port clusters at 2/3/3 across SLRs, SLR-local collectors. At 130.6 MHz it sustains **263.063 GB/s / 131.531 GFLOP/s** — 98.353% of its clock-rate ceiling — and passes synthetic plus real layer-0 `q_proj` parity. Its numbers are **not** `gdn_forward` numbers; never quote them as decode performance.
   ```bash
   make -C c_impl/microbench/gemv_tile csim_full          # native parity, no board
