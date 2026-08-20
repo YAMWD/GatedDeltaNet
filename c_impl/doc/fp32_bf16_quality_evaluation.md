@@ -1,8 +1,15 @@
 # FP32 and BF16-Mixed Checkpoint Quality Evaluation
 
-Status: complete as of 2026-08-18. The FP32 arm and both BF16 arms have run
-Tables 2, 3, and 5 at their full reference sample counts. No on-card evidence
-is included; every number here is GPU-measured.
+Status: complete as of 2026-08-20. The FP32 arm and both BF16 arms have run
+Tables 2, 3, and 5 at their full reference sample counts, plus a BF16
+recurrent-state follow-up across all three tables and one on-hardware WikiText
+measurement. Everything is GPU-measured except the section explicitly marked
+on-hardware.
+
+Two caveats that apply throughout: RULER (Table 2) is not bit-reproducible and
+carries a measured +/-0.6 run-to-run band, so differences at or below that are
+not resolvable; and Table 5's as-run configuration understates every F1 task for
+an answer-length reason documented in its section.
 
 ## Scope and interpretation
 
@@ -387,10 +394,68 @@ against a 0.5-point limit, and is marginally *better* than BF16 weights alone.
 This is a stronger result than expected: the state is a running accumulator, so
 rounding error compounds at every token, unlike weights which are rounded once.
 
-**Boundaries of this result.** Table 3 is short-context only, and the
-compounding argument bites hardest on long sequences — RULER and LongBench would
-be the real test and have not been run. The patch was temporary and the kernel
-was restored afterwards; no BF16-state result exists for any other table.
+**Tables 2 and 5 were then run with the same patch** (2026-08-20), against the
+Arm B reference so the state is the only variable.
+
+**Table 2 (RULER), BF16 state vs BF16 weights only:**
+
+| Cell | wt only | wt + BF16 state | state effect |
+|---|---:|---:|---:|
+| S1 1K / 2K / 4K | 100.0 | 100.0 | +0.0 |
+| S1 8K | 97.4 | **100.0** | **+2.6** |
+| S2 1K / 2K | 100.0 | 100.0 | +0.0 |
+| S2 4K | 85.6 | **91.6** | **+6.0** |
+| S2 8K | 40.0 | **44.0** | **+4.0** |
+| S3 1K | 81.8 | 80.8 | -1.0 |
+| S3 2K | 80.4 | **82.8** | +2.4 |
+| S3 4K | 53.6 | **56.6** | +3.0 |
+| **Average** | **85.35** | **86.89** | **+1.55** |
+
+**Table 5 (LongBench, answers cut at the first line):** average 18.75 to 18.73,
+a change of **-0.02**. All six long-document QA tasks improved (+0.10 to +0.32);
+the four largest losses are the two multi-document summarisation tasks
+(multi_news -0.35, qmsum -0.19) and the two few-shot tasks (trec -1.50,
+triviaqa -0.99).
+
+**So BF16 recurrent state is strongly positive on pure needle retrieval and
+neutral everywhere else.** Every pre-registered limit passes on all three tables.
+
+**Harness noise, measured.** The RULER evaluation is *not* bit-reproducible: six
+runs of an identical configuration at S2 4K gave 85.6, 85.0, 85.0, 85.0, 85.0,
+85.0 - mean 85.10, standard deviation 0.22, full spread 0.6 (one sample in 500).
+The BF16-state result of 91.6 is **29 standard deviations above that mean and
+outside the entire observed range**, so the effect is not run-to-run variation.
+The likely source is Triton selecting different autotune configurations per
+process, which changes floating-point reduction order.
+
+**This noise band applies to every Table 2 number in this document.** In
+particular the BF16 Arm A macro figure of -0.31 lies *inside* it and must not be
+read as a real degradation. Differences at or below ~0.6 points on Table 2 are
+not resolvable without repeat runs.
+
+**Mechanism.** The effect is consistent with *swamping* (stagnation), the
+classical low-precision phenomenon in which adding a small value to a large
+accumulator under round-to-nearest discards it entirely - the same effect that
+makes stochastic rounding necessary for low-precision training. The recurrent
+state accumulates one strong needle contribution against thousands of weak
+distractor contributions; in BF16 each distractor term falls below the rounding
+threshold relative to the accumulated signal and never accumulates, whereas in
+FP32 it does. That predicts a task-dependent effect - retrieval gains,
+many-small-contribution tasks do not - which is what Table 5 shows.
+
+A literature check found the mechanism itself is textbook, but no published
+precision ablation on a linear-attention recurrent state, and prevailing practice
+is the opposite (keep the state in FP32 because error compounds). The KV-cache
+quantisation literature reports retrieval as the *most* quantisation-sensitive
+task; a recurrent state inverts that, plausibly because an attention cache is
+re-read exactly while a recurrent state is accumulated.
+
+**Boundaries of this result.** The patch was temporary and the kernel was
+restored and verified byte-identical afterwards. Every BF16-state measurement
+above uses **Arm B** (BF16 weights, FP32 activations). A GEMV-only mixed mode -
+BF16 operands with FP32 accumulation and FP32 activations elsewhere - is a
+different contract with **no quality data**, and would need its own run before
+being adopted in hardware. Results are one seed and one checkpoint.
 
 **Why it does not unblock the accelerator.** Quality is no longer the obstacle,
 but the physical one stands: 24 MiB of BF16 state is **683 URAM of 960**, while
