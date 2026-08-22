@@ -97,7 +97,7 @@ make run_hw JOBS=16 HW_DEVICE=1              # override build jobs / card index
 ```
 Phase times: `xo` ~30–60 min, `host` seconds. The 32-port `xclbin` link is **long and highly variable — 7 to 32 hours measured** across iter32–iter37 (`diagnostics/*/build.manifest` start/exit timestamps; Iter36's 130 MHz link took 31.9 h, mostly post-route `AggressiveExplore` phys-opt). Budget accordingly. Individual phases: `make xo|xclbin|host`. Clean: `make clean|clean_hw|distclean`.
 
-**`make run_hw` is the sole production build-and-run entry.** It resolves the relocatable physical configuration, builds HLS at 150 MHz, links the demonstrated 100 MHz image, then runs exact 8-token and 64-token on-card gates. Do not add iteration-specific Make targets or launcher scripts; preserve historical commands in `optimization_log.md` instead.
+**`make run_hw` is the production build-and-run recipe, and `bash run_hw_sbatch.sh` is how it reaches the cluster** (two chained Slurm jobs — see *Cluster environment* below; a card and 32 cores cannot be held by one job). It resolves the relocatable physical configuration, builds HLS at 150 MHz, links the demonstrated 100 MHz image, then runs exact 8-token and 64-token on-card gates. Do not add iteration-specific Make targets or launcher scripts; preserve historical commands in `optimization_log.md` instead.
 
 **Kernel frequency:** `HLS_FREQ` defaults to **150 MHz** and `LINK_FREQ`/`FREQ` to **100 MHz**. The U55C platform defaults to 300 MHz, which this kernel cannot meet, so never omit the link override. A requested frequency is not an achieved frequency: verify `DATA_CLK` in the XCLBIN and report the per-clock WNS. The fixed 250 MHz `dma_ip_axi_aclk_1` is a separate timing gate even when the scalable kernel clock closes.
 
@@ -119,10 +119,58 @@ rejected variants are logged and reverted rather than retained as new targets.
 
 **Launch discipline for multi-hour builds** (also in `AGENTS.md`): detach the build so it survives a dropped session, record its PID/log/exit-marker, and *immediately* attach a watcher (`tail --pid=<pid> -F <build-dir>/.../impl_1/runme.log`) rather than checking back blind. Watch Vivado's detailed `runme.log`, not the quiet wrapper log. If the session dies, only the watcher stops — the build continues, and `diagnostics/*/build.exit` records the outcome.
 
-**Cluster environment — three traps, each of which has cost a full multi-hour build:**
-- **Memory.** Vivado peaks at **~51 GB** on this design (Iter57's complete build peaked 34.7 GB; Iter61's reached 51 GB). The `light` Slurm partition caps a job at **32 GB** and the OOM killer takes Vivado mid-flight — once at 27 GB during *Design Initialization*, before placement even ran. Submit with `c_impl/run_hw_sbatch.sh` (`--partition=build --mem=64G`). `light` and `vnc` (8 GB) cannot build this design at all.
-- **Filesystem.** `build`-partition nodes `acclnode03/04/05` run jobs but **cannot write to `/home/yaoz0b`** — a probe job completes there and produces no files, so Slurm cannot create the output file and the job dies with exit 2 and no log. Pin to `harrier`.
-- **Device index.** After a node relaunch the host may present **different hardware**. On the current box **XRT index 0 is a U280 and the U55C is index 2**; loading the U55C image on index 0 fails `err = -22`. Always confirm by BDF first (`xbutil examine -d 0000:41:00.1`), and note `xrt-smi` exists only on the newer XRT — the 2022.2 install has `xbutil`.
+**All hardware work goes through Slurm on the `accl` cluster.** Never run a
+build, `xbutil`, or an on-card test outside a job, and never `ssh` to a node to
+reach a card — the device nodes are mode `0666`, so an SSH shell sits in no
+cgroup and can open a card allocated to someone else. The `accl-cluster` skill
+carries the full cluster contract; the rules that bite this project:
+
+- **Build and on-card run are two jobs, always.** `build` grants no FPGA and
+  `light` grants only 8 cores, so no single job can link the image and then run
+  it. `bash c_impl/run_hw_sbatch.sh [TAG]` submits both and chains the on-card
+  job with `afterok`, so it is cancelled automatically if the build fails.
+  `slurm/hw_build.slurm` and `slurm/hw_oncard.slurm` are the two halves.
+  **`make run_hw` is still the build-and-run recipe, but it can only be invoked
+  whole outside Slurm** — under Slurm the on-card job calls it with `-o` on the
+  image so make runs the gates and can never start a link in an 8-core job.
+- **Set `--time` on any link.** The `build` default is 12 h and links here have
+  taken 7–32 h; `MaxTime` is 3 days on every partition, so a long link must ask
+  for what it needs and can never exceed `3-00:00:00`.
+- **Never pass `--qos`.** The partition selects it. A real-but-mismatched QOS is
+  accepted and then pends forever.
+- **One FPGA and one GPU per user across all jobs**, even though `light` now
+  allows four concurrent jobs. An idle allocation still holds its card, so a
+  forgotten `salloc --no-shell` blocks every later on-card test while other
+  cards sit free. Check with `squeue -u $USER -o '%i %j %b %T %M'` before
+  blaming the queue.
+- **Memory.** Vivado peaks at **~51 GB** on this design (Iter57 peaked 34.7 GB;
+  Iter61 reached 51 GB). `light` caps a job at 32 GB and the OOM killer took
+  Vivado there at 27 GB, during *Design Initialization*, before placement ran.
+  `build` allows 196800M; the scripts ask for 128 GB. `light` and `vnc` (8 GB)
+  cannot build this design at all.
+- **Not every node can link for the U55C.** Probed 2026-08-22: the platform is
+  present on `acclnode01`, `acclnode03` and `harrier`, and **absent on
+  `acclnode04` and `acclnode05`** (`acclnode04` has no XRT either). The build
+  script excludes those two. Re-probe after any cluster change rather than
+  trusting this list — pinning to `harrier` also works but needlessly
+  serialises against card jobs.
+- **Device index.** Inside a `--gres=fpga:u55c:1` job, `ConstrainDevices=yes`
+  hides every card the job does not own, so the XRT index is **0** even on a
+  host with three cards. Do not carry over an index measured outside Slurm (the
+  old "U55C is index 2" note applied to a bare SSH shell). The on-card script
+  asserts exactly one visible card and that it is a U55C, then uses 0; a wrong
+  index fails with a bare `err = -22`.
+- **The filesystem trap is gone.** `/home/yaoz0b` is now the same NFS share
+  (`10.0.0.11:/mnt/homes`) on the login node and on every compute node —
+  verified by tailing, from `acclhead1`, a log being written by a job on
+  `acclnode01`. The old "acclnode03/04/05 cannot write to /home" note, and the
+  `--nodelist=harrier` pin it forced, no longer apply. Editing on `acclhead1`
+  and submitting is safe.
+- **Vivado on NFS is slower than on node-local NVMe** (`/tmp/$USER-$SLURM_JOB_ID`).
+  The current scripts still link in the repo directory, because the relocatable
+  `@C_IMPL_DIR@` substitution and the Tcl hooks are proven there and moving a
+  7–32 h link is not a change to make casually. Unmeasured on this design;
+  treat as an open lever, not a rule.
 
 **Two stale-artifact traps in reused build directories.** The build directory name embeds the job count, so `make xo JOBS=8` builds into `.o8` while `.o16` keeps an older report — comparing the wrong `csynth.rpt` produces a completely wrong resource delta. And `impl_1/runme.log` survives from the previous run, so a congestion table read early in a new build is the *previous* build's. Check the file's mtime against the job start before trusting either.
 

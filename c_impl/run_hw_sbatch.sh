@@ -1,34 +1,82 @@
 #!/bin/bash
-#SBATCH --job-name=gdn_iter61
-#SBATCH --partition=build
-#SBATCH --nodelist=harrier
-#SBATCH --mem=64G
-#SBATCH --cpus-per-task=16
-#SBATCH --time=2-00:00:00
-#SBATCH --chdir=/home/yaoz0b/GatedDeltaNet/c_impl
-#SBATCH --output=/home/yaoz0b/GatedDeltaNet/c_impl/diagnostics/iter61_stream/slurm-%j.out
-#SBATCH --error=/home/yaoz0b/GatedDeltaNet/c_impl/diagnostics/iter61_stream/slurm-%j.out
 #
-# Iter61 hardware build.
+# Submit the hardware flow to Slurm as two chained jobs.
 #
-# Two environment constraints, both measured:
-#   * the `light` partition caps a job at 32 GB, and Vivado was OOM-killed there
-#     at 27 GB during Design Initialization, before placement ran. `build`
-#     allows up to 192 GB; 64 GB is double the highest this design has been seen
-#     to reach (31.9 GB on the Iter59 routing run) and fits the ~72 GB currently
-#     schedulable on harrier.
-#   * pinned to harrier because acclnode03 runs jobs but CANNOT WRITE to
-#     /home/yaoz0b -- probe job 314 completed there and produced no file, which
-#     is why jobs 312/313 failed with exit 2 and no output. The other `build`
-#     nodes are unusable until that mount is fixed.
+#   usage:  bash run_hw_sbatch.sh [TAG]
+#   knobs:  JOBS HLS_FREQ LINK_FREQ BUILD_MEM BUILD_TIME ONCARD_TIME SKIP_ONCARD
+#
+# Why two jobs: the `build` QOS grants no FPGA and the `light` QOS grants only
+# 8 cores, so a single job cannot both link the image and run it on the card.
+# The on-card job is chained with afterok, so it starts only if the build
+# succeeds and is cancelled automatically if the build fails.
+#
+# This replaces the pre-migration single-job script, which ran `make run_hw`
+# (build *and* on-card) in the `build` partition, where the card gates could
+# never have worked, and pinned to harrier for a filesystem problem that no
+# longer exists -- /home is now the same NFS share on the login node and on
+# every compute node.
 
-echo "host=$(hostname) job=$SLURM_JOB_ID start=$(date --iso-8601=seconds)"
-awk '{printf "mem_limit=%.0f GB\n", $1/1073741824}' \
-  /sys/fs/cgroup/memory/slurm/uid_$(id -u)/job_$SLURM_JOB_ID/memory.limit_in_bytes 2>/dev/null
-sha256sum gdn_model.cpp gdn_model.h host.cpp hw_f150_physical_islands.cfg
+set -euo pipefail
 
-make run_hw JOBS=16
-rc=$?
-echo "EXIT_CODE=$rc end=$(date --iso-8601=seconds)"
-echo "$rc" > diagnostics/iter61_stream/sbatch_exit_code
-exit $rc
+C_IMPL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$C_IMPL"
+
+TAG="${1:-hw_$(date +%Y%m%d_%H%M%S)}"
+JOBS="${JOBS:-32}"
+HLS_FREQ="${HLS_FREQ:-150}"
+LINK_FREQ="${LINK_FREQ:-100}"
+BUILD_MEM="${BUILD_MEM:-128G}"
+BUILD_TIME="${BUILD_TIME:-2-00:00:00}"
+ONCARD_TIME="${ONCARD_TIME:-4:00:00}"
+
+DIAG="diagnostics/${TAG}"
+mkdir -p "$DIAG"
+
+echo "tag        : ${TAG}"
+echo "knobs      : JOBS=${JOBS} HLS_FREQ=${HLS_FREQ} LINK_FREQ=${LINK_FREQ}"
+echo "diagnostics: ${C_IMPL}/${DIAG}"
+
+# Pre-flight: the user is capped at one FPGA across all jobs at once. An idle
+# allocation still holds its card, so say so now rather than letting the
+# on-card job sit in the queue behind it with an opaque reason.
+held="$(squeue -u "$USER" -h -o '%i %j %b %T %M' 2>/dev/null | grep -i 'fpga' || true)"
+if [ -n "$held" ]; then
+    echo
+    echo "note: you already hold a job requesting an FPGA. The on-card job will"
+    echo "      queue until it ends -- the per-user cap is 1 FPGA, regardless of"
+    echo "      how many cards are free."
+    printf '        %s\n' "$held"
+fi
+
+sha256sum gdn_model.cpp gdn_model.h host.cpp hw_f150_physical_islands.cfg \
+    > "${DIAG}/source_hashes.txt" 2>/dev/null || true
+
+build_id="$(sbatch --parsable \
+    --job-name="${TAG}_build" \
+    --chdir="$C_IMPL" \
+    --mem="$BUILD_MEM" \
+    --time="$BUILD_TIME" \
+    --output="${C_IMPL}/${DIAG}/build.slurm-%j.log" \
+    --export=ALL,TAG="$TAG",JOBS="$JOBS",HLS_FREQ="$HLS_FREQ",LINK_FREQ="$LINK_FREQ" \
+    slurm/hw_build.slurm)"
+echo
+echo "build  job ${build_id}  -> ${DIAG}/build.slurm-${build_id}.log"
+
+if [ "${SKIP_ONCARD:-0}" = "1" ]; then
+    echo "on-card    : skipped (SKIP_ONCARD=1)"
+else
+    oncard_id="$(sbatch --parsable \
+        --job-name="${TAG}_oncard" \
+        --chdir="$C_IMPL" \
+        --time="$ONCARD_TIME" \
+        --dependency="afterok:${build_id}" \
+        --kill-on-invalid-dep=yes \
+        --output="${C_IMPL}/${DIAG}/oncard.slurm-%j.log" \
+        --export=ALL,TAG="$TAG",JOBS="$JOBS",HLS_FREQ="$HLS_FREQ",LINK_FREQ="$LINK_FREQ" \
+        slurm/hw_oncard.slurm)"
+    echo "oncard job ${oncard_id}  -> ${DIAG}/oncard.slurm-${oncard_id}.log   (afterok:${build_id})"
+fi
+
+echo
+echo "watch  : tail -F ${C_IMPL}/${DIAG}/build.slurm-${build_id}.log"
+echo "queue  : squeue -u ${USER}"
