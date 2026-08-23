@@ -474,11 +474,137 @@ and the same per-token state-rounding patch.
 | Table 5 macro (as run) | 15.13 | 15.01 | 15.09 | 15.01 | **15.18** |
 | Table 5 macro (first line) | — | — | 18.75 | 18.73 | **18.88** |
 
-**Every pre-registered limit passes, three of them as gains over FP32:** Table 2
-macro **+1.00**, Table 3 accuracy **+0.05**, Table 5 macro **+0.05**, WikiText
-perplexity **+0.10%** (limit 1%), worst Table 2 cell **-3.8** at S3 1K (limit
-5.0). S3 1K is the one place this arm is the weakest of the five and is worth
-watching; everything else is flat or better.
+#### Full five-arm tables
+
+Regenerated from the stored artifacts of all five arms through one extraction,
+which reproduces this document's existing FP32 / BF16 A / BF16 B figures exactly
+(Table 2 85.44 / 85.13 / 85.35, Table 3 58.09 / 58.03 / 58.06, Table 5 first-line
+18.82 / 18.69 / 18.75) — so the new column is on the same footing as the old ones.
+
+**Table 2 — RULER S-NIAH (accuracy %)**
+
+| Cell | Paper | FP32 | BF16 A | BF16 B | B+state | ALL BF16 | ALL - FP32 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| S1 1K | 98.4 | 100.0 | 100.0 | 100.0 | 100.0 | 100.0 | +0.0 |
+| S1 2K | 88.4 | 100.0 | 100.0 | 100.0 | 100.0 | 100.0 | +0.0 |
+| S1 4K | 91.4 | 100.0 | 100.0 | 100.0 | 100.0 | 100.0 | +0.0 |
+| S1 8K | 91.8 | 97.4 | 97.6 | 97.4 | 100.0 | 100.0 | **+2.6** |
+| S2 1K | 100.0 | 100.0 | 100.0 | 100.0 | 100.0 | 100.0 | +0.0 |
+| S2 2K | 99.8 | 100.0 | 100.0 | 100.0 | 100.0 | 100.0 | +0.0 |
+| S2 4K | 92.2 | 85.6 | 85.4 | 85.6 | 91.6 | 90.6 | **+5.0** |
+| S2 8K | 29.6 | 40.0 | 39.2 | 40.0 | 44.0 | 43.4 | **+3.4** |
+| S3 1K | 86.6 | 82.0 | 80.2 | 81.8 | 80.8 | 78.2 | **-3.8** |
+| S3 2K | 84.2 | 81.6 | 81.4 | 80.4 | 82.8 | 83.2 | +1.6 |
+| S3 4K | 27.6 | 53.2 | 52.6 | 53.6 | 56.6 | 55.4 | +2.2 |
+| **Macro average** | **80.91** | **85.44** | **85.13** | **85.35** | **86.89** | **86.44** | **+1.00** |
+
+Every gain is at long context; the only loss, S3 1K, is the shortest, and is the
+one cell where the all-BF16 arm is the weakest of the five.
+
+**Table 3 — short-context and commonsense**
+
+| Task | Paper | FP32 | BF16 A | BF16 B | B+state | ALL BF16 | ALL - FP32 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| LAMBADA accuracy | 46.65 | 51.81 | 51.48 | 51.80 | 51.85 | 51.58 | -0.23 |
+| PIQA | 72.25 | 73.78 | 73.72 | 73.72 | 73.67 | 73.72 | -0.05 |
+| HellaSwag | 55.76 | 60.13 | 60.15 | 60.14 | 60.17 | 60.16 | +0.03 |
+| WinoGrande | 57.45 | 61.88 | 61.80 | 61.88 | 61.88 | 62.35 | +0.47 |
+| ARC-Easy | 71.21 | 72.31 | 72.22 | 72.22 | 72.22 | 72.47 | +0.17 |
+| ARC-Challenge | 38.39 | 40.78 | 40.87 | 40.70 | 40.70 | 40.96 | +0.17 |
+| SocialIQA | 40.63 | 42.37 | 42.32 | 42.48 | 42.48 | 42.48 | +0.10 |
+| BoolQ | 60.24 | 61.68 | 61.68 | 61.56 | 61.59 | 61.74 | +0.06 |
+| **Accuracy average** | **55.32** | **58.09** | **58.03** | **58.06** | **58.07** | **58.18** | **+0.09** |
+| WikiText word PPL *(lower better)* | 16.42 | 16.824 | 16.841 | 16.824 | 16.825 | 16.841 | +0.105% |
+| LAMBADA PPL *(lower better)* | 12.17 | 9.720 | 9.704 | 9.701 | 9.689 | 9.687 | -0.334% |
+
+**Table 5 — LongBench v1, as run**
+
+| Task | Paper | FP32 | BF16 A | BF16 B | B+state | ALL BF16 | ALL - FP32 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| narrativeqa | 14.10 | 2.51 | 2.52 | 2.52 | 2.54 | 2.56 | +0.05 |
+| qasper | 14.00 | 7.12 | 6.71 | 7.09 | 6.99 | 6.85 | -0.27 |
+| multifieldqa_en | 23.30 | 13.58 | 13.45 | 13.58 | 13.82 | 13.93 | +0.35 |
+| hotpotqa | 13.70 | 7.05 | 6.88 | 6.98 | 7.02 | 6.89 | -0.16 |
+| 2wikimqa | 14.40 | 8.87 | 8.97 | 8.70 | 8.81 | 9.01 | +0.14 |
+| musique | 5.80 | 3.16 | 3.16 | 3.12 | 3.32 | 3.34 | +0.18 |
+| gov_report | 7.50 | 8.98 | 8.86 | 8.99 | 9.28 | 8.85 | -0.13 |
+| qmsum | 16.40 | 18.47 | 18.52 | 18.42 | 18.24 | 18.02 | -0.45 |
+| multi_news | 7.90 | 12.68 | 12.70 | 12.71 | 12.35 | 13.14 | +0.46 |
+| trec | 30.00 | 36.50 | 36.00 | 36.50 | 35.00 | 36.50 | +0.00 |
+| triviaqa | 22.40 | 26.27 | 25.44 | 26.21 | 25.22 | 25.58 | -0.69 |
+| samsum | 23.00 | 30.15 | 30.04 | 29.95 | 30.53 | 30.77 | +0.62 |
+| lcc | 18.70 | 18.46 | 18.50 | 18.45 | 18.83 | 18.78 | +0.32 |
+| repobench-p | 22.10 | 18.06 | 18.31 | 18.12 | 18.23 | 18.32 | +0.26 |
+| **Macro average** | **16.66** | **15.13** | **15.01** | **15.09** | **15.01** | **15.18** | **+0.05** |
+
+**Table 5 — first line only.** Only the six long-document QA tasks change; the
+other eight already emit a single line, so their rows are identical to as-run.
+
+| Task | Paper | FP32 | BF16 A | BF16 B | B+state | ALL BF16 | ALL - FP32 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| narrativeqa | 14.10 | 14.98 | 15.21 | 14.98 | 15.27 | 15.00 | +0.02 |
+| qasper | 14.00 | 15.72 | 15.12 | 15.21 | 15.44 | 15.51 | -0.21 |
+| multifieldqa_en | 23.30 | 25.56 | 25.13 | 25.46 | 25.64 | 26.23 | +0.67 |
+| hotpotqa | 13.70 | 15.99 | 15.59 | 15.93 | 16.17 | 15.67 | -0.32 |
+| 2wikimqa | 14.40 | 16.21 | 16.69 | 16.21 | 16.53 | 16.36 | +0.15 |
+| musique | 5.80 | 5.47 | 5.57 | 5.42 | 5.52 | 5.62 | +0.15 |
+| **Macro average** | **16.66** | **18.82** | **18.69** | **18.75** | **18.73** | **18.88** | **+0.06** |
+
+#### Do not read the ranking as a result
+
+The all-BF16 arm has the highest Table 3 average and the highest Table 5 macro of
+all five arms. **That is not evidence it is better.** Against per-task sampling
+error, every Table 3 difference is negligible:
+
+| Task | FP32 | ALL BF16 | diff | stderr | diff/se |
+|---|---:|---:|---:|---:|---:|
+| LAMBADA accuracy | 51.81 | 51.58 | -0.23 | 0.70 | -0.33 |
+| PIQA | 73.78 | 73.72 | -0.05 | 1.03 | -0.05 |
+| HellaSwag | 60.13 | 60.16 | +0.03 | 0.49 | +0.06 |
+| WinoGrande | 61.88 | 62.35 | +0.47 | 1.37 | +0.35 |
+| ARC-Easy | 72.31 | 72.47 | +0.17 | 0.92 | +0.18 |
+| ARC-Challenge | 40.78 | 40.96 | +0.17 | 1.44 | +0.12 |
+| SocialIQA | 42.37 | 42.48 | +0.10 | 1.12 | +0.09 |
+| BoolQ | 61.68 | 61.74 | +0.06 | 0.85 | +0.07 |
+| **Average** | **58.09** | **58.18** | **+0.09** | **0.36** | **+0.25** |
+
+Every task is under 0.35 standard errors and the average is 0.25. With five arms
+all sitting inside noise on Tables 3 and 5, **one of them has to rank first** —
+that is what a null result looks like with five samples, and it is the most
+likely explanation of the all-BF16 arm's lead there.
+
+The defensible statement is therefore narrower, and splits by quantity rather
+than by arm:
+
+- **BF16 costs nothing measurable** in weights, activations, or state, on any of
+  the three tables.
+- **BF16 recurrent state helps long-context retrieval**, by +1.3 to +1.5 macro
+  with per-cell moves of +2.6 to +6.0 — several times the band measured on one of
+  those very cells, so this one clears noise.
+- **BF16 activations alone are marginally negative**: Arm A trails Arm B on all
+  three tables (85.13 vs 85.35, 58.03 vs 58.06, 18.69 vs 18.75). Each gap is
+  sub-noise, but the sign is consistent across every table, which is the expected
+  direction.
+
+The first point is what matters for hardware: the exact 8x8 multiply and the
+halved activation storage are available without paying for them. The second is a
+bonus pointing the same way. Neither needs the stronger reading.
+
+Note also that the stderr column above is *sampling* error only. Run-to-run
+variation was measured on a single Table 2 cell (about +/-0.6) and never on Tables
+3 or 5, so these figures are a floor on the uncertainty, not all of it.
+
+
+**Every pre-registered limit passes**, and three of the figures land on the
+positive side of FP32: Table 2 macro **+1.00**, Table 3 accuracy **+0.09**,
+Table 5 macro **+0.05**, WikiText perplexity **+0.10%** (limit 1%), worst Table 2
+cell **-3.8** at S3 1K (limit 5.0). S3 1K is the one place this arm is the
+weakest of the five and is worth watching.
+
+Only the Table 2 figure is large enough to mean anything. The Table 3 and Table 5
+margins are far inside sampling error and must not be read as the all-BF16 arm
+being better — see *Do not read the ranking as a result* below, which quantifies
+this.
 
 **The state gain survives BF16 activations.** That was the open question, since
 both changes act on the same accumulator and could have cancelled:
