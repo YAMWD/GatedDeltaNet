@@ -1,9 +1,10 @@
 # FP32 and BF16-Mixed Checkpoint Quality Evaluation
 
-Status: complete as of 2026-08-20. The FP32 arm and both BF16 arms have run
+Status: complete as of 2026-08-23. The FP32 arm and both BF16 arms have run
 Tables 2, 3, and 5 at their full reference sample counts, plus a BF16
-recurrent-state follow-up across all three tables and one on-hardware WikiText
-measurement. Everything is GPU-measured except the section explicitly marked
+recurrent-state follow-up, an all-BF16 arm (weights, activations and state
+together — the configuration the accelerator would implement), and one
+on-hardware WikiText measurement. Everything is GPU-measured except the section explicitly marked
 on-hardware.
 
 Two caveats that apply throughout: RULER (Table 2) is not bit-reproducible and
@@ -456,6 +457,61 @@ above uses **Arm B** (BF16 weights, FP32 activations). A GEMV-only mixed mode -
 BF16 operands with FP32 accumulation and FP32 activations elsewhere - is a
 different contract with **no quality data**, and would need its own run before
 being adopted in hardware. Results are one seed and one checkpoint.
+
+### All three in BF16 together (2026-08-23)
+
+Every arm above varies **one** precision against a common reference, so the
+configuration the accelerator would actually implement — weights, activations
+and recurrent state all BF16 — had no data. This run supplies it, using the same
+runner and the same converted checkpoint, `DTYPE=bfloat16` for the activations
+and the same per-token state-rounding patch.
+
+| Metric | FP32 | Arm A (W+act) | Arm B (W only) | B + BF16 state | **All BF16** |
+|---|---:|---:|---:|---:|---:|
+| Table 2 macro | 85.44 | 85.13 | 85.35 | 86.89 | **86.44** |
+| Table 3 accuracy avg | 55.97 | 55.87 | 55.95 | 55.95 | **56.02** |
+| Table 3 WikiText PPL | 16.824 | 16.841 | 16.824 | 16.825 | **16.841** |
+| Table 5 macro (as run) | 15.13 | 15.01 | 15.09 | 15.01 | **15.18** |
+| Table 5 macro (first line) | — | — | 18.75 | 18.73 | **18.88** |
+
+**Every pre-registered limit passes, three of them as gains over FP32:** Table 2
+macro **+1.00**, Table 3 accuracy **+0.05**, Table 5 macro **+0.05**, WikiText
+perplexity **+0.10%** (limit 1%), worst Table 2 cell **-3.8** at S3 1K (limit
+5.0). S3 1K is the one place this arm is the weakest of the five and is worth
+watching; everything else is flat or better.
+
+**The state gain survives BF16 activations.** That was the open question, since
+both changes act on the same accumulator and could have cancelled:
+
+| Baseline | + BF16 state | gain |
+|---|---:|---:|
+| Arm B (FP32 activations) | 85.35 → 86.89 | **+1.54** |
+| Arm A (BF16 activations) | 85.13 → 86.44 | **+1.31** |
+
+Slightly attenuated, clearly present, and concentrated in the same cells: S1 8K
+97.4 → 100.0, S2 4K 85.6 → 90.6, S2 8K 40.0 → 43.4. All-BF16 and B+state differ
+by 0.45, which is inside the measured harness band, so on Table 2 the two are not
+distinguishable — the activation precision costs nothing once the state is BF16.
+
+**The patch was verified to apply, not assumed.** The earlier state experiment's
+patch was never saved and had to be rebuilt. Because Triton keys its JIT cache on
+kernel source, a rounding flag read from the environment can silently reuse a
+kernel compiled without it — producing a "no difference" result that reads like a
+finding. The rounding is therefore edited into the source, the Triton cache is
+cleared, and the job gates twice on measured state contents: unpatched control
+**0.000014** BF16-exact (so the state really is FP32), patched **1.000000** across
+all 24 layer tensors. The kernel was restored from an EXIT trap and confirmed at
+its original sha256 `752c117a…`.
+
+**Caveats.** One seed, one checkpoint. The harness band of about ±0.6 was measured
+on a single Table 2 cell, not on the macro average, so treat sub-point macro
+differences as unresolved rather than as ties. Table 5's absolute values remain
+depressed by the answer-length artifact documented in its own section; the
+first-line column is the like-for-like comparison. This is a GPU study of a
+numerical contract — it says nothing about whether the contract is routable, and
+the Iter62 build that implemented packed BF16 weights failed placement-and-route
+at congestion level 7.
+
 
 **Why it does not unblock the accelerator.** Quality is no longer the obstacle,
 but the physical one stands: 24 MiB of BF16 state is **683 URAM of 960**, while
