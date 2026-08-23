@@ -4,6 +4,10 @@
 #
 #   usage:  bash run_hw_sbatch.sh [TAG]
 #   knobs:  JOBS HLS_FREQ LINK_FREQ BUILD_MEM BUILD_TIME ONCARD_TIME SKIP_ONCARD
+#   data:   WEIGHTS DECODE_STATE DECODE_FIXTURE DECODE_GOLDEN LOGITS_REFERENCE
+#           exported here and forwarded to make by the on-card job. A packed-BF16
+#           kernel needs WEIGHTS=artifacts/gdn-1.3b-bf16w.gdnw -- it rejects the
+#           FP32 blob, and only after reading all 5.6 GB of it.
 #
 # Why two jobs: the `build` QOS grants no FPGA and the `light` QOS grants only
 # 8 cores, so a single job cannot both link the image and run it on the card.

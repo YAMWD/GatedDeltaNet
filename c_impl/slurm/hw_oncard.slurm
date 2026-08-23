@@ -64,10 +64,22 @@ echo "  image   : ${XCLBIN}"
 test -s "$XCLBIN" || { echo "FATAL: no image at ${XCLBIN}" >&2; exit 2; }
 test -x ./host.exe || { echo "FATAL: host.exe missing" >&2; exit 2; }
 
+# Data knobs are forwarded explicitly rather than left to the Makefile default.
+# They matter: a kernel built for packed BF16 weights rejects the FP32 blob
+# outright (`weight payload is not BF16-exact`), and it does so only after the
+# host has read the whole 5.6 GB file. Pass WEIGHTS=artifacts/gdn-1.3b-bf16w.gdnw
+# for a BF16 image; the FP32 default is correct for the FP32 production kernel.
+mk_args=(JOBS="$JOBS" HLS_FREQ="$HLS_FREQ" LINK_FREQ="$LINK_FREQ" HW_DEVICE="$HW_DEVICE")
+for knob in WEIGHTS DECODE_STATE DECODE_FIXTURE DECODE_GOLDEN LOGITS_REFERENCE; do
+    if [ -n "${!knob:-}" ]; then
+        mk_args+=("${knob}=${!knob}")
+        echo "  ${knob} = ${!knob}"
+    fi
+done
+
 # -o marks the image and host as up to date, so make runs only the gates and
 # can never start a 32-core link inside this 8-core, 32 GB allocation.
-make -o "$XCLBIN" -o host.exe run_hw \
-     JOBS="$JOBS" HLS_FREQ="$HLS_FREQ" LINK_FREQ="$LINK_FREQ" HW_DEVICE="$HW_DEVICE"
+make -o "$XCLBIN" -o host.exe run_hw "${mk_args[@]}"
 rc=$?
 
 echo "EXIT_CODE=${rc} end=$(date --iso-8601=seconds)"
