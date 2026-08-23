@@ -12,6 +12,11 @@ result that reads like a finding.
 """
 import argparse, sys
 import torch
+# Registers the `gated_deltanet` architecture with Transformers. Without this
+# import AutoConfig raises "Transformers does not recognize this architecture",
+# which is a missing registration, not a model problem. scripts/fla_lm_eval.py
+# does the same thing for the same reason.
+from fla.models.gated_deltanet import GatedDeltaNetConfig  # noqa: F401
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 

@@ -50,9 +50,17 @@ trap restore EXIT INT TERM
 
 echo "--- control: unpatched kernel must show unrounded FP32 state ---"
 scripts/gdn_bf16_state_patch.sh status
-if ! "$PY" scripts/verify_bf16_state_patch.py --model "$CKPT" \
-        --dtype bfloat16 --expect fp32 2>&1 | tee "$ARM_ROOT/verify_control.log"; then
-    echo "FATAL: control failed -- the state already looks BF16 without the patch." >&2
+"$PY" scripts/verify_bf16_state_patch.py --model "$CKPT" \
+    --dtype bfloat16 --expect fp32 2>&1 | tee "$ARM_ROOT/verify_control.log"
+vrc=${PIPESTATUS[0]}
+if [ "$vrc" -ne 0 ]; then
+    case "$vrc" in
+    1) echo "FATAL: control gate failed -- the state already looks BF16-exact" >&2
+       echo "       without the patch, so the comparison has no control." >&2 ;;
+    2) echo "FATAL: no recurrent-state tensor found in the cache." >&2 ;;
+    *) echo "FATAL: the verifier crashed (exit ${vrc}) -- a tooling fault, not" >&2
+       echo "       a measurement. See verify_control.log." >&2 ;;
+    esac
     exit 3
 fi
 
@@ -63,10 +71,16 @@ scripts/gdn_bf16_state_patch.sh status
 rm -rf "${HOME}/.triton/cache" 2>/dev/null || true
 
 echo "--- gate: patched kernel must show BF16-exact state ---"
-if ! "$PY" scripts/verify_bf16_state_patch.py --model "$CKPT" \
-        --dtype bfloat16 --expect bf16 2>&1 | tee "$ARM_ROOT/verify_patched.log"; then
-    echo "FATAL: the patch did not take effect. Not spending GPU hours on a" >&2
-    echo "       run whose headline variable is not actually applied." >&2
+"$PY" scripts/verify_bf16_state_patch.py --model "$CKPT" \
+    --dtype bfloat16 --expect bf16 2>&1 | tee "$ARM_ROOT/verify_patched.log"
+vrc=${PIPESTATUS[0]}
+if [ "$vrc" -ne 0 ]; then
+    if [ "$vrc" -eq 1 ]; then
+        echo "FATAL: the patch did not take effect. Not spending GPU hours on a" >&2
+        echo "       run whose headline variable is not actually applied." >&2
+    else
+        echo "FATAL: the verifier crashed (exit ${vrc}) -- a tooling fault." >&2
+    fi
     exit 4
 fi
 
