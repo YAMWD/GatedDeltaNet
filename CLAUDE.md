@@ -45,8 +45,8 @@ Checkpoint: `m-a-p/1.3B-100B-GatedDeltaNet-pure` (HuggingFace) — consumed by `
 | `c_impl/doc/decode_premise.md` | The GPU measurements that justify the decode-only partition (~35 ms/token, flat across context). Motivation, not a spec. Its "why GDN looks slow on GPU" section attributes the cost to launch overhead — that diagnosis is correct, but see the side-experiment caveat under *Key Design Patterns*: the overhead is also removable on the GPU. |
 | `c_impl/doc/fp32_bf16_quality_evaluation.md` | **In progress** (see *Checkpoint quality evaluation* below) — a GPU-side precision study, not a statement about the kernel. |
 | `c_impl/microbench/gemv_tile/README.md` | The standalone 32-port GEMV microbenchmark (separate kernel from `gdn_forward`). |
-| `c_impl/README.md` | **Stale** — still describes the retired C/prefill design (`gdn_model.c`, `gdn_attn_forward`, `test_single_GDN_attn.tcl`, gcc/C11). Do not cite it for current behavior. |
-| `README.md` (root) | Mixed: most of its Python↔HLS function-mapping table still holds, but the `gdn_attn_forward` and `gdn_matmul` rows name functions that **no longer exist** in `gdn_model.cpp`/`.h` (decode replaced them with `gdn_gemv`). Its performance and flow claims are prefill-era. |
+| `c_impl/README.md` | Current build and verification entry points for the decode-only accelerator. |
+| `README.md` (root) | Current repository overview and links to the authoritative architecture documents. |
 
 Every status claim must say which thing it refers to: the production integrated kernel, a historical iteration, a roadmap target, or the microbenchmark.
 
@@ -65,13 +65,7 @@ All accelerator work happens in `c_impl/`. The kernel is now **decode-only** —
 make -C c_impl                              # builds gdn_eval only (decode-only csim; c++ -O3 -std=c++14)
 ./c_impl/gdn_eval <weights.gdnw> <fixture.gdnreq> <out.json> --decode --decode-from-state <state.gdnstate> [--decode-len N]
 ```
-`gdn_eval` is now a **decode-only** csim and hard-requires `--decode --decode-from-state`. The native build `#include`s `hls_stream.h`, so it needs the Vitis HLS include dir (`XILINX_HLS_INC`, default `/tools/Xilinx/Vitis_HLS/2022.1/include`). The old `gdn_attn_test` / `gdn_matmul_test` harnesses are retired — the decode-only pivot removed the prefill tops (`gdn_attn_forward`, `gdn_matmul_top`/`gdn_matmul2d_top`) they drove, so the default `host_tb` builds only `gdn_eval`.
-
-### Parity testing (prefill era — vs Python golden)
-```bash
-cd c_impl && bash test_parity.sh            # rebuild, run every fixtures_smoke/*.gdnreq, diff vs results_smoke_python/
-```
-Tolerance 1e-3 (observed diffs ~1e-5). Diff logic is `scripts/check_gdn_c_parity.py`. **Note:** this is the prefill-parity flow; it no longer runs as-is on the decode-only branch (`gdn_eval` rejects non-decode invocations). The committed `results_smoke_python/` and the diff script remain; decode correctness is now gated by the check below.
+`gdn_eval` is a **decode-only** csim and hard-requires `--decode --decode-from-state`. The native build `#include`s `hls_stream.h`, so it needs the Vitis HLS include dir (`XILINX_HLS_INC`, default `/tools/Xilinx/Vitis_HLS/2022.1/include`). Retired prefill and standalone matmul/attention harnesses are available through Git history; the active native target is only `gdn_eval`.
 
 ### Decode correctness + TPOT (vs cached GPU golden — no GPU needed)
 ```bash
@@ -179,15 +173,16 @@ Vivado `get_cells` glob gotcha, learned twice (iter8, iter37C): `*` **spans `/`*
 ### Exporting weights, state & fixtures (Python golden reference)
 ```bash
 python scripts/export_gdn_c.py weights    --output c_impl/artifacts/gdn-1.3b-f32.gdnw
+python scripts/export_gdn_c.py decode     --output-dir c_impl/fixtures_decode
 python scripts/export_gdn_state.py        ...   # GPU prefill → c_impl/fixtures_decode/*.gdnstate (recurrent+conv state)
-python scripts/export_gdn_c.py fixtures   --tasks piqa hellaswag --output-dir c_impl/fixtures_smoke
 ```
-`export_gdn_state.py` is the decode handoff producer (it self-checks bit-exactness vs the cache-decode golden). `export_block_fixture.py` (→ `.gdnblk`) targeted the retired single-layer attention harness.
+`export_gdn_state.py` is the decode handoff producer (it self-checks
+bit-exactness versus the cached decode golden).
 
 ### Running Python golden reference
 ```bash
-python scripts/compare_gdn_c.py --fixture c_impl/fixtures_smoke/piqa.gdnreq --output results/piqa_python.json --device cuda --dtype float32
-python scripts/check_gdn_c_parity.py --python-dir c_impl/results_smoke_python --c-dir c_impl/results_smoke_c --output c_impl/results_smoke_parity.json
+python scripts/compare_gdn_c.py --decode-golden c_impl/fixtures_decode/decode.gdnreq --output c_impl/results_decode_golden/decode.decode.json
+python scripts/check_gdn_c_parity.py --decode --golden c_impl/results_decode_golden/decode.decode.json --c <candidate.json>
 python scripts/fla_lm_eval.py               # lm-eval-harness evaluation
 ```
 

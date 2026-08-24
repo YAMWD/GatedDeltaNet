@@ -24,8 +24,6 @@ try:
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 from einops import rearrange
-import torch.nn.functional as F
-
 from causal_conv1d import causal_conv1d_fn
 
 RoPECache = Tuple[torch.Tensor, torch.Tensor]
@@ -571,6 +569,3 @@ def build_rope_cache(
     if dtype in (torch.float16, torch.bfloat16, torch.int8):
         return cos.half(), sin.half()
     return cos, sin
-
-
-    

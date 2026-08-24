@@ -3,12 +3,9 @@
 
 # Copyright (c) 2023, Tri Dao.
 
-import math
-from typing import Optional, Tuple
-
 import rotary_emb
 import torch
-from einops import rearrange, repeat
+from einops import rearrange
 
 class ApplyRotaryEmb(torch.autograd.Function):
     @staticmethod
@@ -91,4 +88,3 @@ class ApplyRotaryEmb(torch.autograd.Function):
 
 
 apply_rotary_emb_func = ApplyRotaryEmb.apply
-

@@ -2,9 +2,7 @@
 # GatedDeltaNet c_impl/ — host testbench + v++ build for Alveo U55C.
 #
 # Builds three classes of artifact:
-#   1. Host-side C++ testbenches that drive the HLS source directly through
-#      its csim entry points (gdn_eval, gdn_attn_test, gdn_matmul_test).
-#      These are what test_parity.sh runs.
+#   1. The decode-only native testbench (`gdn_eval`).
 #   2. The HLS kernel for U55C: gdn_forward.xo (compile) → gdn_forward.xclbin
 #      (link). Targets are `xo` and `xclbin`; per-target output goes to
 #      build.$(TARGET)/ so sw_emu/hw_emu/hw can coexist.
@@ -132,11 +130,11 @@ all: host_tb
 
 help:
 	@echo "Targets:"
-	@echo "  host_tb     C++ host testbenches: gdn_eval gdn_attn_test gdn_matmul_test (default)"
+	@echo "  host_tb     decode-only native testbench: gdn_eval (default)"
 	@echo "  xo          v++ compile  → $(XO)"
 	@echo "  xclbin      v++ link     → $(XCLBIN)"
 	@echo "  host        XRT host    → $(HOST_BIN)"
-	@echo "  run_hw      reproduce Iter57 at 100 MHz, then run exact 8/64-token validation"
+	@echo "  run_hw      build the current candidate, then run exact 8/64-token validation"
 	@echo "  clean       remove host-tb binaries"
 	@echo "  clean_hw    remove build.\$$(TARGET), _x/, v++ logs"
 	@echo "  distclean   clean + clean_hw + remove host.exe"
@@ -162,25 +160,11 @@ help:
 # ----------------------------------------------------------------------------
 # C++ host testbenches
 # ----------------------------------------------------------------------------
-# Decode-only build: gdn_eval is the native csim of the decode-only GEMV kernel.
-# The old gdn_attn_test / gdn_matmul_test exercised the removed prefill /
-# GEMM-matmul tops (gdn_attn_forward, gdn_matmul_top) and are retired.
+# Decode-only native testbench.
 host_tb: gdn_eval
 
 gdn_eval: gdn_eval.cpp gdn_model.cpp gdn_model.h
 	$(CXX) $(CXXFLAGS) -I$(XILINX_HLS_INC) -o $@ gdn_eval.cpp gdn_model.cpp -lm
-
-gdn_attn_test: gdn_attn_test.cpp gdn_model.cpp gdn_model.h
-	$(CXX) $(CXXFLAGS) -I$(XILINX_HLS_INC) -o $@ gdn_attn_test.cpp gdn_model.cpp -lm
-
-# gdn_matmul_test exercises the systolic matmul through the gdn_matmul_top
-# HLS entry in gdn_model.cpp, comparing against the native-C naive_matmul
-# reference in gdn_matmul_test.cpp. Same translation unit as the rest of
-# the model — no separate matmul source file.
-gdn_matmul_test: gdn_matmul_test.cpp gdn_model.cpp gdn_model.h
-	$(CXX) $(CXXFLAGS) -I$(XILINX_HLS_INC) -o $@ \
-	    gdn_matmul_test.cpp gdn_model.cpp -lm
-
 
 # ----------------------------------------------------------------------------
 # v++ compile: gdn_model.cpp → $(KERNEL).xo
@@ -260,7 +244,7 @@ run_hw: $(XCLBIN) $(HOST_BIN)
 	        '$(XCLBIN)' \
 	        '$(WEIGHTS)' \
 	        '$(DECODE_FIXTURE)' \
-	        "$$output" '$(HW_DEVICE)' 1 \
+	        "$$output" '$(HW_DEVICE)' \
 	        --decode --decode-from-state '$(DECODE_STATE)' \
 	        --decode-len "$$decode_len" 2>&1 | tee "$$log"; \
 	    python3 ../scripts/check_gdn_c_parity.py \
@@ -280,7 +264,7 @@ run_hw: $(XCLBIN) $(HOST_BIN)
 # Clean
 # ----------------------------------------------------------------------------
 clean:
-	rm -f gdn_eval gdn_attn_test gdn_matmul_test
+	rm -f gdn_eval
 
 clean_hw:
 	rm -rf $(BUILD_DIR) _x v++_*.log v++_*.jou .Xil

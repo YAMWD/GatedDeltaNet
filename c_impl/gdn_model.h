@@ -12,7 +12,6 @@
  * shard builder, and the run-state all agree on one value. */
 #define GEMV_CHANNELS 32
 #define GEMV_CLUSTERS 16
-#define GEMV_CHANNELS_PER_CLUSTER 2
 
 #ifdef __cplusplus
 extern "C" {
@@ -108,26 +107,13 @@ typedef struct {
 } GDNModel;
 
 typedef struct {
-    uint32_t max_tokens;
-    float *workspace;   /* step 4 Stage B: one HBM[0] alloc (GDN_WS_FLOATS); the
-                         * 15 pointers below are views into it at GDN_WS_OFF_*. */
+    float *workspace;   /* one ABI-sized HBM[0] allocation */
     float *x;
     float *x_norm;
-    float *q;
-    float *k;
-    float *v;
-    float *a;
-    float *b;
-    float *gate;
-    float *attn;
-    float *tmp_hidden;
-    float *mlp_gate;
-    float *mlp_up;
     float *recurrent_state;
     float *head_buffer;
     float *weight_shards[GEMV_CHANNELS];  /* compact gemv weight shards (built from weight_data) */
     float *aux_weights;                   /* compact per-layer non-GEMV weights */
-    float *logits;                        /* [vocab] lm_head gemv scratch (decode argmax → x_norm[0]) */
 } GDNRunState;
 
 /* Build the GEMV_CHANNELS compact weight shards from the flat weight blob; each

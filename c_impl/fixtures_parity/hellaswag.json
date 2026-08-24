@@ -1,7 +1,0 @@
-{
-  "task": "hellaswag",
-  "kind": 1,
-  "num_examples": 2,
-  "limit": 2,
-  "path": "c_impl/fixtures_parity/hellaswag.gdnreq"
-}

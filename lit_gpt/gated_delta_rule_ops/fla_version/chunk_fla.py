@@ -2,21 +2,17 @@
 # Copyright (c) https://github.com/fla-org/flash-linear-attention/tree/main/fla/ops/gated_delta_rule
 # Licensed under the MIT license.
 
-from typing import Any, Callable, Optional, Tuple
+from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from fla.utils import contiguous
-from torch.amp import custom_bwd, custom_fwd
 try:
     from .wy_fast_fla import fwd_recompute_w_u, fwd_prepare_wy_repr, bwd_prepare_wy_repr
 except:
     from wy_fast_fla import fwd_recompute_w_u, fwd_prepare_wy_repr, bwd_prepare_wy_repr
 from einops import rearrange
-import torch.nn.functional as F 
 from fla.ops.utils import chunk_local_cumsum
 from fla.utils import tensor_cache, autocast_custom_bwd, autocast_custom_fwd, contiguous
-from fla.utils import autocast_custom_bwd, autocast_custom_fwd, contiguous
 from fla.ops.utils.exp import safe_exp
 
 
@@ -1317,5 +1313,4 @@ def recurrent_gated_delta_rule_ref(
         S = S.clone() + _k.unsqueeze(-1) * _v.unsqueeze(-2)
         o[:, :, i] = torch.einsum('bhd,bhdm->bhm', _q, S)
     return o
-
 

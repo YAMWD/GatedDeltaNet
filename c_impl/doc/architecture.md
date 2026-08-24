@@ -528,11 +528,10 @@ HLS resources.
 
 ### Previous Iter36 frequency result
 
-For comparison, the Iter36 source was built with a 130 MHz link request:
-
-```bash
-bash c_impl/build_iter36_headlocal.sh 130
-```
+For comparison, the Iter36 source was built with a 130 MHz link request. Its
+per-iteration launcher has been retired from the active tree; the exact command
+and source/config hashes remain in `optimization_log.md` and Git history.
+Current hardware builds use `make -C c_impl run_hw`.
 
 Post-route `AggressiveExplore` improved the kernel paths but did not close the
 7.692 ns requirement. At the requested 130 MHz, the post-physopt report has

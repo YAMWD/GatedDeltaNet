@@ -8,45 +8,15 @@
 #include <time.h>
 
 typedef struct {
-    uint32_t ctx_len;
-    uint32_t cont_len;
-    int32_t *ctx;
-    int32_t *cont;
-} PairReq;
-
-typedef struct {
-    uint32_t gold;
-    uint32_t num_choices;
-    PairReq *choices;
-} MCReq;
-
-typedef struct {
-    uint32_t word_count;
-    uint32_t byte_count;
-    uint32_t num_windows;
-    PairReq *windows;
-} RollingReq;
-
-typedef struct {
     uint32_t kind;
     uint32_t num_examples;
-    PairReq *ll_examples;
-    MCReq *mc_examples;
-    RollingReq *rolling_examples;
+    uint32_t first_cont_len;
 } Fixture;
 
-enum {
-    REQ_KIND_MC = 1,
-    REQ_KIND_LL = 2,
-    REQ_KIND_ROLLING = 3,
-};
+#define REQ_KIND_LL 2
 
 typedef struct {
     time_t start_time;
-    uint32_t total_examples;
-    uint32_t total_windows;
-    uint32_t completed_examples;
-    uint32_t completed_windows;
 } ProgressState;
 
 typedef struct {
@@ -79,14 +49,6 @@ static void *xmalloc(size_t bytes) {
     return ptr;
 }
 
-static void *xcalloc(size_t count, size_t size) {
-    void *ptr = calloc(count, size);
-    if (ptr == NULL) {
-        die("calloc failed");
-    }
-    return ptr;
-}
-
 static uint32_t read_u32(const uint8_t *blob, size_t size, size_t *offset) {
     uint32_t value;
     if (*offset + 4 > size) {
@@ -97,17 +59,12 @@ static uint32_t read_u32(const uint8_t *blob, size_t size, size_t *offset) {
     return value;
 }
 
-static int32_t *read_i32_array(const uint8_t *blob, size_t size, size_t *offset, uint32_t count) {
-    int32_t *out = NULL;
+static void skip_i32_array(const uint8_t *blob, size_t size, size_t *offset, uint32_t count) {
     if (*offset + (size_t)count * 4 > size) {
         die("fixture truncated");
     }
-    if (count > 0) {
-        out = (int32_t *)xmalloc((size_t)count * sizeof(int32_t));
-        memcpy(out, blob + *offset, (size_t)count * 4);
-    }
+    (void)blob;
     *offset += (size_t)count * 4;
-    return out;
 }
 
 static void load_fixture(const char *path, Fixture *fixture) {
@@ -166,93 +123,26 @@ static void load_fixture(const char *path, Fixture *fixture) {
         die("unsupported fixture version");
     }
 
-    if (fixture->kind == REQ_KIND_MC) {
-        uint32_t example_index;
-        fixture->mc_examples = (MCReq *)xcalloc(fixture->num_examples, sizeof(MCReq));
-        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
-            MCReq *req = &fixture->mc_examples[example_index];
-            uint32_t choice_index;
-            req->num_choices = read_u32(blob, file_size, &offset);
-            req->gold = read_u32(blob, file_size, &offset);
-            req->choices = (PairReq *)xcalloc(req->num_choices, sizeof(PairReq));
-            for (choice_index = 0; choice_index < req->num_choices; ++choice_index) {
-                PairReq *pair = &req->choices[choice_index];
-                pair->ctx_len = read_u32(blob, file_size, &offset);
-                pair->cont_len = read_u32(blob, file_size, &offset);
-                pair->ctx = read_i32_array(blob, file_size, &offset, pair->ctx_len);
-                pair->cont = read_i32_array(blob, file_size, &offset, pair->cont_len);
-            }
-        }
-    } else if (fixture->kind == REQ_KIND_LL) {
-        uint32_t example_index;
-        fixture->ll_examples = (PairReq *)xcalloc(fixture->num_examples, sizeof(PairReq));
-        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
-            PairReq *pair = &fixture->ll_examples[example_index];
-            pair->ctx_len = read_u32(blob, file_size, &offset);
-            pair->cont_len = read_u32(blob, file_size, &offset);
-            pair->ctx = read_i32_array(blob, file_size, &offset, pair->ctx_len);
-            pair->cont = read_i32_array(blob, file_size, &offset, pair->cont_len);
-        }
-    } else if (fixture->kind == REQ_KIND_ROLLING) {
-        uint32_t example_index;
-        fixture->rolling_examples = (RollingReq *)xcalloc(fixture->num_examples, sizeof(RollingReq));
-        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
-            RollingReq *req = &fixture->rolling_examples[example_index];
-            uint32_t window_index;
-            req->word_count = read_u32(blob, file_size, &offset);
-            req->byte_count = read_u32(blob, file_size, &offset);
-            req->num_windows = read_u32(blob, file_size, &offset);
-            req->windows = (PairReq *)xcalloc(req->num_windows, sizeof(PairReq));
-            for (window_index = 0; window_index < req->num_windows; ++window_index) {
-                PairReq *pair = &req->windows[window_index];
-                pair->ctx_len = read_u32(blob, file_size, &offset);
-                pair->cont_len = read_u32(blob, file_size, &offset);
-                pair->ctx = read_i32_array(blob, file_size, &offset, pair->ctx_len);
-                pair->cont = read_i32_array(blob, file_size, &offset, pair->cont_len);
-            }
-        }
-    } else {
+    if (fixture->kind != REQ_KIND_LL) {
         free(blob);
-        die("unsupported fixture kind");
+        die("decode-only evaluator requires an LL fixture");
     }
 
+    for (uint32_t example_index = 0;
+         example_index < fixture->num_examples; ++example_index) {
+        uint32_t ctx_len = read_u32(blob, file_size, &offset);
+        uint32_t cont_len = read_u32(blob, file_size, &offset);
+        if (example_index == 0) {
+            fixture->first_cont_len = cont_len;
+        }
+        skip_i32_array(blob, file_size, &offset, ctx_len);
+        skip_i32_array(blob, file_size, &offset, cont_len);
+    }
+    if (offset != file_size) {
+        free(blob);
+        die("unexpected trailing data in decode fixture");
+    }
     free(blob);
-}
-
-static void free_fixture(Fixture *fixture) {
-    if (fixture->kind == REQ_KIND_MC && fixture->mc_examples != NULL) {
-        uint32_t example_index;
-        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
-            MCReq *req = &fixture->mc_examples[example_index];
-            uint32_t choice_index;
-            for (choice_index = 0; choice_index < req->num_choices; ++choice_index) {
-                free(req->choices[choice_index].ctx);
-                free(req->choices[choice_index].cont);
-            }
-            free(req->choices);
-        }
-        free(fixture->mc_examples);
-    } else if (fixture->kind == REQ_KIND_LL && fixture->ll_examples != NULL) {
-        uint32_t example_index;
-        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
-            free(fixture->ll_examples[example_index].ctx);
-            free(fixture->ll_examples[example_index].cont);
-        }
-        free(fixture->ll_examples);
-    } else if (fixture->kind == REQ_KIND_ROLLING && fixture->rolling_examples != NULL) {
-        uint32_t example_index;
-        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
-            RollingReq *req = &fixture->rolling_examples[example_index];
-            uint32_t window_index;
-            for (window_index = 0; window_index < req->num_windows; ++window_index) {
-                free(req->windows[window_index].ctx);
-                free(req->windows[window_index].cont);
-            }
-            free(req->windows);
-        }
-        free(fixture->rolling_examples);
-    }
-    memset(fixture, 0, sizeof(*fixture));
 }
 
 static FILE *open_output(const char *path) {
@@ -272,43 +162,14 @@ static double elapsed_seconds(const ProgressState *progress) {
     return difftime(time(NULL), progress->start_time);
 }
 
-static void progress_start(ProgressState *progress, const Fixture *fixture) {
-    uint32_t example_index;
+static void progress_start(ProgressState *progress) {
     memset(progress, 0, sizeof(*progress));
     progress->start_time = time(NULL);
-    progress->total_examples = fixture->num_examples;
-    if (fixture->kind == REQ_KIND_ROLLING && fixture->rolling_examples != NULL) {
-        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
-            progress->total_windows += fixture->rolling_examples[example_index].num_windows;
-        }
-    }
 }
 
 static void log_progress_message(const char *message) {
     fprintf(stderr, "%s\n", message);
     fflush(stderr);
-}
-
-/* Standalone argmax over the logits for a single hidden row. Used by the
- * free-running greedy loop in --decode mode, where there is no target token
- * and no logprob/greedy bookkeeping to do. */
-static int argmax_logits(const GDNModel *model, const float *hidden, float *logits) {
-    uint32_t vocab = model->config.vocab_size;
-    uint32_t vocab_index;
-    float max_logit;
-    int max_index;
-
-    gdn_compute_logits(model, hidden, logits);
-
-    max_logit = logits[0];
-    max_index = 0;
-    for (vocab_index = 1; vocab_index < vocab; ++vocab_index) {
-        if (logits[vocab_index] > max_logit) {
-            max_logit = logits[vocab_index];
-            max_index = (int)vocab_index;
-        }
-    }
-    return max_index;
 }
 
 static double monotonic_ms(void) {
@@ -638,13 +499,12 @@ int main(int argc, char **argv) {
     logits = (float *)xmalloc((size_t)model.config.vocab_size * sizeof(float));
     log_progress_message("[progress] loading fixture");
     load_fixture(argv[2], &fixture);
-    progress_start(&progress, &fixture);
+    progress_start(&progress);
     fprintf(
         stderr,
-        "[progress] starting evaluation kind=%u examples=%u windows=%u\n",
+        "[progress] starting decode evaluation kind=%u examples=%u\n",
         fixture.kind,
-        fixture.num_examples,
-        progress.total_windows
+        fixture.num_examples
     );
     fflush(stderr);
 
@@ -658,10 +518,10 @@ int main(int argc, char **argv) {
     {
         uint32_t n = decode_len;
         if (n == 0) {
-            if (fixture.kind != REQ_KIND_LL || fixture.num_examples == 0 || fixture.ll_examples == NULL) {
+            if (fixture.kind != REQ_KIND_LL || fixture.num_examples == 0) {
                 die("decode-from-state requires an LL-kind fixture with at least 1 example");
             }
-            n = fixture.ll_examples[0].cont_len;
+            n = fixture.first_cont_len;
         }
         if (n == 0) die("decode-from-state: zero decode length");
         const char *decode_out = (argc == 4) ? argv[3] : "results_decode_c/decode.c.json";
@@ -672,7 +532,6 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr, "[progress] decode finished elapsed=%.0fs\n", elapsed_seconds(&progress));
         fflush(stderr);
-        free_fixture(&fixture);
         free(logits);
         gdn_run_state_free(&run_state);
         gdn_model_free(&model);

@@ -1,7 +1,0 @@
-{
-  "task": "wikitext",
-  "kind": 3,
-  "num_examples": 62,
-  "limit": null,
-  "path": "c_impl/fixtures_full/wikitext.gdnreq"
-}

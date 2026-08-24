@@ -1,9 +1,11 @@
-# Optimised Recurrent Attention (`gdn_recurrent_attention`)
+# Optimised Recurrent Attention
 
 **Status:** Active Iter37 decode compute block. The prefill and v1--v7
 synthesis discussions later in this document are historical.
 
-**Location:** `gdn_model.cpp` (`gdn_recurrent_attention`, static helper)
+**Location:** `gdn_model.cpp` (`gdn_recurrent_attention_islands` and its two
+frequency-island actors). The retired monolithic helper remains available in
+Git history.
 
 ## Overview
 
@@ -291,9 +293,8 @@ plus a few control-path BRAMs ⇒ 258 total). The state matrix (8 × 256 × 256 
 
 ## Parity Verification
 
-- Single-layer `gdn_attn_test`: max_abs_diff = 1.19 × 10⁻⁶, 0 failures
-  (atol = 1 × 10⁻³, rtol = 1 × 10⁻³).
-- Full-model `test_parity.sh` (v0 / v1 / v4 baselines): PASS across all
-  benchmarks (PiQA, HellaSwag, WinoGrande, ARC, BoolQ, WikiText, ...) with
-  max diffs in 1 × 10⁻⁴ to 1 × 10⁻⁶ range. v7 result pending on the same
-  fixtures.
+The active full-model gate is `scripts/decode_correctness_check.sh`. It checks
+the complete decode trajectory against the cached GPU golden; use `--fast` for
+the short smoke gate and omit it for the full check. Historical standalone
+attention and prefill-parity results remain in Git history and the optimization
+log rather than in active test harnesses.

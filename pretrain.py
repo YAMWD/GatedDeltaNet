@@ -11,8 +11,7 @@ import math
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Tuple, Union
-import math
+from typing import Optional, Tuple
 import lightning as L
 import torch
 from lightning.fabric.strategies import FSDPStrategy
@@ -23,19 +22,13 @@ sys.path.append(str(wd))
 from lit_gpt.model import GPT, Block, MBlock, Config
 from lit_gpt.packed_dataset import CombinedDataset, PackedDataset
 from lit_gpt.speed_monitor import SpeedMonitorFabric as Monitor
-from lit_gpt.speed_monitor import estimate_flops
 from lit_gpt.utils import chunked_cross_entropy, num_parameters
 from pytorch_lightning.loggers import WandbLogger
-from transformers import AutoTokenizer
 from lit_gpt import FusedCrossEntropyLoss
 import random
 import os
 import argparse
-import time
 import torch.multiprocessing as mp
-import shutil
-from distutils.dir_util import copy_tree
-import pdb
 os.environ["TRITON_CACHE_MANAGER"] = "cache:ParallelFileCacheManager"
 
 def main(args):

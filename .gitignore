@@ -8,12 +8,6 @@ c_impl/build.hw/
 c_impl/build.hw.*/
 c_impl/_decode_*_backup*/
 c_impl/GDN/
-c_impl/GDN_matmul/
-c_impl/GDN_matmul.broken.*/
-c_impl/GDN_single_attn/
-c_impl/GDN_single_attn_synth/
-c_impl/GDN_single_attn_synth.broken.*/
-c_impl/GDN_synth/
 c_impl/.ipcache/
 c_impl/.Xil/
 c_impl/.run/
@@ -41,20 +35,12 @@ c_impl/congestion_reports/
 # Host testbench / hardware binaries and intermediates
 c_impl/gdn_eval
 c_impl/gdn_eval.o
-c_impl/gdn_attn_test
-c_impl/gdn_attn_test.o
-c_impl/gdn_matmul_test
-c_impl/gdn_matmul_test.o
 c_impl/gdn_model.o
-c_impl/gdn_model_main.o
-c_impl/gdn_matmul_systolic.o
 c_impl/host.exe
 c_impl/microbench/**/*.exe
 
 # Hardware run outputs and parity artefacts produced by gdn_eval / host.exe
 c_impl/hw_*.json
-c_impl/results_smoke_c/
-c_impl/results_smoke_parity.json
 c_impl/results_decode_c/
 c_impl/results_decode_hw/
 
@@ -68,5 +54,3 @@ __pycache__/
 
 # Disaggregated decode: GPU-exported state blobs (large, regenerable)
 c_impl/fixtures_decode/*.gdnstate
-c_impl/probe_alloc
-c_impl/hw_decode*.json
