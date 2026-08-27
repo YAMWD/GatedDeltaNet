@@ -4910,3 +4910,98 @@ filled by the argmax path and would not have caught a fault in the new stream.
 
 **Verdict: RETAINED.** First design to emit full logits from hardware while
 keeping the exact 64-token trajectory. Costs +0.35% per token.
+
+## Native-BF16-product GPU quality audit (COMPLETE — QUALITY PASS)
+
+**Hypothesis and numerical contract.** This is a quality experiment for the
+prospective native `ap_float<16,8>` multiplier, not a claim about the current
+Iter65 exact-product RTL. Every HBM-backed dense operand is BF16; each scalar
+BF16 x BF16 product is rounded RNE to BF16 before any addition; the rounded
+product is widened and reduced in FP32. Dense operator outputs and all other
+transient boundaries remain BF16, recurrent arithmetic remains FP32, persistent
+recurrent state is rounded to BF16 after every token, convolution tails remain
+BF16, and the LM head emits FP32 logits. Tiny a/b projections remain outside the
+patched HBM-backed dense set and retain their existing arithmetic.
+
+The GPU emulator patches exactly 193 dense matrices: q/k/v/g/output and the
+three MLP projections in each of 24 layers, plus the LM head. Its Triton kernel
+does not materialize an M x N x K tensor. It implements four FP32 partial banks,
+explicit balanced 16-product trees, and final `(p0+p1)+(p2+p3)` association to
+match the FPGA GEMV schedule. The fused SwiGLU path is disabled only so the
+patched `down_proj.forward` cannot be bypassed; the same BF16 SwiGLU kernel is
+still used. Normalization, convolution, residual, gating, and recurrent kernels
+are otherwise unchanged from the previously evaluated all-BF16 arm.
+
+**Arithmetic preflight.** Slurm light jobs 1208 and 1210 exposed harness-only
+errors (the first `--wrap` used `/bin/sh` with `pipefail`; the second omitted the
+test's Triton import). Job 1209 found one one-ULP mismatch in 6,823 tested outputs
+because `tl.sum` did not guarantee the HLS tree association. The kernel was
+corrected to express every 8/4/2/1 tree level explicitly. A fresh A100 80-GB
+preflight, job **1211**, then passed 23 shapes and 6,823 FP32 output elements with
+zero bit mismatches against the independent product-rounded/four-bank reference.
+All 512 values in a separate check differed bitwise from ordinary exact-product
+BF16 GEMM, proving the experiment is active. Generated PTX contains BF16
+conversions and zero `mma.sync` instructions, so it cannot silently fall back to
+the already evaluated Tensor-Core Arm-A contract. The 256x2048x2048 test took
+0.5843 ms. Log:
+`c_impl/diagnostics/bf16_native_product_quality_20260827/arithmetic_gate_preflight.log`.
+
+**Evaluation plan and identities.** Run the unchanged full Table 3, Table 2
+S1/S2/S3, and 14-task Table 5 protocols against
+`checkpoint_bf16_mixed`, with the proven per-token BF16-state patch and the same
+4/16/16 batch sizes as the five existing arms. Before the full suite, require an
+unpatched-state control, a patched-state gate, all 193 expected dense modules,
+finite FP32 full logits, and a successful one-sequence model forward. Raw output
+goes to `/home/yaoz0b/gdn_precision_eval_20260827/native_bf16_product`; shared
+diagnostics go to
+`c_impl/diagnostics/bf16_native_product_quality_20260827/`.
+
+Key hashes before submission are emulator
+`ef5e90947a175594bfb785f5b692af385596a8e23c193d2f64ae4992ab906f8d`,
+arithmetic test
+`b3771dbca065e3d3558dfa064a8372d7fac94e56aa352f4caa24e4c9af5142cf`,
+model smoke test
+`447b772eb0022276d610991322addbee9ce81fd67363e924761b313d18179c1f`,
+lm-eval adapter
+`fae76908342b7f31adcdc8a34d7d212a357767d789c052d39f329758f9012b10`,
+LongBench runner
+`072a3aba98a2bdf8156abfa002356c8d2f3a9731901f7a74b22a11a407bd0340`,
+Slurm wrapper
+`bec595888643371a5fc4bf5d1ba0f69d867b27ec5d95771e78aa472d1efecd05`,
+checkpoint config
+`a9f049a3b13636fcb9f98a5c1d2a2c7c2c36a3c866f166d58ea06b4e8d9477c7`,
+and checkpoint index
+`7f2e08499fe95816ae0c341bfd85ec8f9e95070cec8c2b612aefc41e93e47ba2`.
+Acceptance is a complete, untruncated suite with valid sample counts and deltas
+reported against both FP32 and the prior all-BF16 exact-product arm. Verdict:
+**IN PROGRESS**.
+
+The full audit was submitted as Slurm light job **1213** on `acclnode01` at
+2026-08-27 11:48 UTC with one A100 80-GB, eight CPUs, and 32 GiB. The job entered
+`RUNNING`; both shared `slurm-1213.out` and `evaluation.live.log` were verified
+visible from `acclhead1`. The arithmetic, state, and model-smoke gates run before
+the full suite, so a failed contract check cannot consume the multi-hour
+evaluation allocation.
+
+**Completed result.** Job 1213 completed at 2026-08-27 21:22:14 UTC after
+09:33:29 with Slurm state `COMPLETED` and exit code 0. The wrapper exit marker is
+also zero, and its EXIT trap restored the patched FLA recurrent source to SHA256
+`752c117ade918d009b7669cb9b64b1dbda039d029e1c416163da1dca7e5b6fb1`.
+All result-count gates pass: Table 2 has 5,500 samples, Table 3 has every full
+reference task count, and Table 5 has all 3,350 examples.
+
+Against FP32, the product-rounded all-BF16 arm measures Table 2 **86.87 versus
+85.44** (+1.44), Table 3 metric-mapped accuracy **58.13 versus 58.09** (+0.03),
+WikiText PPL **16.827 versus 16.824**, LAMBADA PPL **9.693 versus 9.720**, and
+Table 5 **15.09 versus 15.13** (-0.04). Its first-line Table 5 macro is **18.88
+versus 18.82**. Against the prior exact-product all-BF16 arm, the deltas are
++0.44, -0.06, and -0.09 on Tables 2, 3, and 5 respectively. Every
+pre-registered quality threshold passes.
+
+This is not output identity: only 57.8% of LongBench answers are byte-identical
+to FP32 and 70.8% to the exact-product arm. The retained conclusion is therefore
+that native BF16 product rounding is **quality-compatible**, not that it is
+bit-compatible or better. Any FPGA implementation of this contract requires a
+new exact full-logit/trajectory golden. Full per-cell tables and the comparison
+are recorded in `c_impl/doc/fp32_bf16_quality_evaluation.md`. Verdict:
+**COMPLETE — QUALITY PASS; hardware feasibility remains unproven.**

@@ -1,11 +1,11 @@
 # FP32 and BF16-Mixed Checkpoint Quality Evaluation
 
-Status: complete as of 2026-08-23. The FP32 arm and both BF16 arms have run
+Status: complete as of 2026-08-27. The FP32 arm and both BF16 arms have run
 Tables 2, 3, and 5 at their full reference sample counts, plus a BF16
 recurrent-state follow-up, an all-BF16 arm (weights, activations and state
-together — the configuration the accelerator would implement), and one
-on-hardware WikiText measurement. Everything is GPU-measured except the section explicitly marked
-on-hardware.
+together), a native-BF16-product arm matching the prospective HLS multiplier,
+and one on-hardware WikiText measurement. Everything is GPU-measured except the
+section explicitly marked on-hardware.
 
 Two caveats that apply throughout: RULER (Table 2) is not bit-reproducible and
 carries a measured +/-0.6 run-to-run band, so differences at or below that are
@@ -649,6 +649,113 @@ directions and `route_design` refused at level 7. One layer alone is 28 URAM and
 fits easily, but leaving the other 23 in HBM keeps the traffic. The prize is
 also bounded: state traffic is 1.9% of per-token bytes, and the latency upside
 from the recurrent critical path is on the order of 10-15%.
+
+### Native BF16 product rounded before FP32 accumulation (2026-08-27)
+
+This follow-up isolates the numerical behavior offered by a compact native HLS
+BF16 multiplier. It uses the same all-BF16 operands, transient boundaries,
+convolution tails, and per-token BF16 recurrent-state persistence as the prior
+all-BF16 arm, but changes every HBM-backed dense product from an exact
+BF16-by-BF16 product represented in FP32 to:
+
+```text
+BF16 weight * BF16 activation -> RNE-rounded BF16 product -> FP32 reduction
+```
+
+The emulator patched all 193 dense modules (the eight projections in each of
+24 layers plus the LM head), retained four FP32 partial banks and the balanced
+16-product reduction trees, and emitted FP32 logits. The arithmetic preflight
+matched an independent bit-level reference at every one of 6,823 tested FP32
+outputs. Slurm job 1213 then completed the full suite on an A100 80-GB in
+09:33:29 with exit code zero. All reference counts are present: 5,500 Table 2
+samples, every Table 3 task at its full harness count, and all 3,350 Table 5
+examples.
+
+In the tables below, **Exact-product BF16** is the 2026-08-23 all-BF16 arm and
+**Native-product BF16** is the new rounded-product arm. Deltas are against the
+measured FP32 checkpoint and against the exact-product arm, not inferred from
+the paper.
+
+**Table 2 — RULER S-NIAH (accuracy %)**
+
+| Cell | Paper | FP32 | Exact-product BF16 | Native-product BF16 | Native - FP32 | Native - exact |
+|---|---:|---:|---:|---:|---:|---:|
+| S1 1K | 98.4 | 100.0 | 100.0 | 100.0 | +0.0 | +0.0 |
+| S1 2K | 88.4 | 100.0 | 100.0 | 100.0 | +0.0 | +0.0 |
+| S1 4K | 91.4 | 100.0 | 100.0 | 100.0 | +0.0 | +0.0 |
+| S1 8K | 91.8 | 97.4 | 100.0 | 100.0 | +2.6 | +0.0 |
+| S2 1K | 100.0 | 100.0 | 100.0 | 100.0 | +0.0 | +0.0 |
+| S2 2K | 99.8 | 100.0 | 100.0 | 100.0 | +0.0 | +0.0 |
+| S2 4K | 92.2 | 85.6 | 90.6 | 91.2 | +5.6 | +0.6 |
+| S2 8K | 29.6 | 40.0 | 43.4 | 44.2 | +4.2 | +0.8 |
+| S3 1K | 86.6 | 82.0 | 78.2 | 80.4 | -1.6 | +2.2 |
+| S3 2K | 84.2 | 81.6 | 83.2 | 83.2 | +1.6 | +0.0 |
+| S3 4K | 27.6 | 53.2 | 55.4 | 56.6 | +3.4 | +1.2 |
+| **Macro average** | **80.91** | **85.44** | **86.44** | **86.87** | **+1.44** | **+0.44** |
+
+**Table 3 — short-context and commonsense**
+
+| Metric | Paper | FP32 | Exact-product BF16 | Native-product BF16 | Native - FP32 | Native - exact |
+|---|---:|---:|---:|---:|---:|---:|
+| WikiText word PPL *(lower better)* | 16.42 | 16.824 | 16.841 | 16.827 | +0.003 | -0.014 |
+| LAMBADA PPL *(lower better)* | 12.17 | 9.720 | 9.687 | 9.693 | -0.028 | +0.006 |
+| LAMBADA accuracy | 46.65 | 51.81 | 51.58 | 51.80 | -0.02 | +0.21 |
+| PIQA | 72.25 | 73.78 | 73.72 | 73.88 | +0.11 | +0.16 |
+| HellaSwag | 55.76 | 60.13 | 60.16 | 60.17 | +0.04 | +0.01 |
+| WinoGrande | 57.45 | 61.88 | 62.35 | 62.27 | +0.39 | -0.08 |
+| ARC-Easy | 71.21 | 72.31 | 72.47 | 72.31 | +0.00 | -0.17 |
+| ARC-Challenge | 38.39 | 40.78 | 40.96 | 40.78 | +0.00 | -0.17 |
+| SocialIQA | 40.63 | 42.37 | 42.48 | 42.32 | -0.05 | -0.15 |
+| BoolQ | 60.24 | 61.68 | 61.74 | 61.47 | -0.21 | -0.28 |
+| **Accuracy average** | **55.32** | **58.09** | **58.18** | **58.13** | **+0.03** | **-0.06** |
+
+**Table 5 — LongBench v1, as run**
+
+| Task | Paper | FP32 | Exact-product BF16 | Native-product BF16 | Native - FP32 | Native - exact |
+|---|---:|---:|---:|---:|---:|---:|
+| narrativeqa | 14.10 | 2.51 | 2.56 | 2.55 | +0.03 | -0.02 |
+| qasper | 14.00 | 7.12 | 6.85 | 6.80 | -0.31 | -0.05 |
+| multifieldqa_en | 23.30 | 13.58 | 13.93 | 13.77 | +0.20 | -0.16 |
+| hotpotqa | 13.70 | 7.05 | 6.89 | 6.95 | -0.10 | +0.06 |
+| 2wikimqa | 14.40 | 8.87 | 9.01 | 9.16 | +0.28 | +0.15 |
+| musique | 5.80 | 3.16 | 3.34 | 3.48 | +0.32 | +0.14 |
+| gov_report | 7.50 | 8.98 | 8.85 | 8.88 | -0.10 | +0.03 |
+| qmsum | 16.40 | 18.47 | 18.02 | 18.29 | -0.18 | +0.27 |
+| multi_news | 7.90 | 12.68 | 13.14 | 12.49 | -0.20 | -0.66 |
+| trec | 30.00 | 36.50 | 36.50 | 35.50 | -1.00 | -1.00 |
+| triviaqa | 22.40 | 26.27 | 25.58 | 25.28 | -0.98 | -0.30 |
+| samsum | 23.00 | 30.15 | 30.77 | 30.86 | +0.71 | +0.10 |
+| lcc | 18.70 | 18.46 | 18.78 | 19.02 | +0.57 | +0.24 |
+| repobench-p | 22.10 | 18.06 | 18.32 | 18.26 | +0.19 | -0.06 |
+| **Macro average** | **16.60** | **15.13** | **15.18** | **15.09** | **-0.04** | **-0.09** |
+
+The known LongBench answer-length artifact remains: rescoring the six QA tasks
+at the first generated line raises the native-product macro from 15.09 to
+**18.88**, versus 18.82 for FP32 and 18.88 for exact-product BF16. The raw
+paper comparison therefore remains unsuitable for judging checkpoint quality;
+the precision comparison is paired and uses an identical harness.
+
+**Verdict: quality pass.** Native-product BF16 passes every pre-registered gate:
+Table 2 is +1.44 points versus FP32 (worst cell -1.6), Table 3 accuracy is +0.03
+with only +0.019% WikiText perplexity, and raw Table 5 is -0.04 with a worst-task
+drop of -1.00. It is statistically indistinguishable in aggregate quality from
+the exact-product arm; the apparent Table 2 improvement must not be treated as
+a model-quality gain because RULER has a measured run-to-run band.
+
+The numerical contract is nevertheless observably different. Against FP32,
+105 of 5,500 RULER answers changed (92 wrong-to-right and 13 right-to-wrong),
+and only 1,935 of 3,350 LongBench generations (57.8%) were byte-identical.
+Against exact-product BF16, 38 RULER answers changed and 2,371 LongBench
+generations (70.8%) were byte-identical. A native-product FPGA must therefore
+use a newly generated product-rounded all-BF16 logit/trajectory golden; passing
+aggregate quality does not authorize comparison against the old exact-product
+golden.
+
+Raw results are under
+`/home/yaoz0b/gdn_precision_eval_20260827/native_bf16_product/`; the Slurm log is
+`c_impl/diagnostics/bf16_native_product_quality_20260827/slurm-1213.out`.
+The committed aggregate results, artifact hashes, code map, and reproduction
+instructions are in `c_impl/results_native_bf16_product/README.md`.
 
 ### FP32 summary across the three tables
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import random
 import re
 import string
@@ -24,6 +25,11 @@ from tqdm import tqdm
 # Importing the FLA classes registers gated_deltanet with Transformers AutoModel.
 from fla.models.gated_deltanet import GatedDeltaNetConfig  # noqa: F401,E402
 from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
+
+from gdn_native_bf16_product import (  # noqa: E402
+    install_native_bf16_product_linears,
+    patch_manifest,
+)
 
 
 TABLE5_TASKS = [
@@ -94,6 +100,7 @@ def write_manifest(
     args: argparse.Namespace,
     protocol: dict[str, Any],
     model: torch.nn.Module,
+    arithmetic_manifest: dict[str, Any] | None = None,
 ) -> None:
     dtype_counts: Counter[str] = Counter()
     for parameter in model.parameters():
@@ -116,6 +123,8 @@ def write_manifest(
         ),
         "torch_version": torch.__version__,
     }
+    if arithmetic_manifest is not None:
+        manifest["native_bf16_product"] = arithmetic_manifest
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
@@ -368,7 +377,16 @@ def main() -> None:
     ).to(device)
     model.eval()
     set_recurrent_mode(model)
-    write_manifest(args.output_dir, args, protocol, model)
+    arithmetic_manifest = None
+    if os.environ.get("GDN_NATIVE_BF16_PRODUCT") == "1":
+        arithmetic_manifest = patch_manifest(
+            install_native_bf16_product_linears(model)
+        )
+        print(
+            "GDN_NATIVE_BF16_PRODUCT="
+            + json.dumps(arithmetic_manifest, sort_keys=True)
+        )
+    write_manifest(args.output_dir, args, protocol, model, arithmetic_manifest)
     for task in tasks:
         generate_task(
             model,

@@ -1,0 +1,121 @@
+{
+  "schema": "gdn-native-bf16-product-quality-v1",
+  "experiment": {
+    "date_utc": "2026-08-27",
+    "slurm_job_id": 1213,
+    "slurm_state": "COMPLETED",
+    "exit_code": 0,
+    "elapsed": "09:33:29",
+    "node": "acclnode01",
+    "gpu": "NVIDIA A100 80GB PCIe"
+  },
+  "arithmetic_contract": {
+    "dense_operands": "bfloat16",
+    "scalar_product": "bfloat16_rne",
+    "reduction": "float32_dot16_balanced_four_banks_final_01_plus_23",
+    "dense_output_boundary": "bfloat16_rne_except_lm_head",
+    "recurrent_arithmetic": "float32",
+    "persistent_recurrent_state": "bfloat16_rne_after_every_token",
+    "convolution_tail": "bfloat16",
+    "lm_head_logits": "float32",
+    "patched_dense_modules": 193
+  },
+  "comparands": {
+    "fp32": "original FP32 checkpoint and FP32 execution",
+    "exact_product_bf16": "BF16 weights, activations and persistent state; exact BF16xBF16 products entering FP32 accumulation",
+    "native_product_bf16": "same boundaries, but every scalar product is RNE-rounded to BF16 before FP32 accumulation"
+  },
+  "sample_counts": {
+    "table2_total": 5500,
+    "table2_per_cell": 500,
+    "table3": {
+      "wikitext": 62,
+      "lambada_openai": 5153,
+      "piqa": 1838,
+      "hellaswag": 10042,
+      "winogrande": 1267,
+      "arc_easy": 2376,
+      "arc_challenge": 1172,
+      "social_iqa": 1954,
+      "boolq": 3270
+    },
+    "table5_total": 3350
+  },
+  "table2_accuracy_percent": {
+    "S1_1K": {"paper": 98.4, "fp32": 100.0, "exact_product_bf16": 100.0, "native_product_bf16": 100.0},
+    "S1_2K": {"paper": 88.4, "fp32": 100.0, "exact_product_bf16": 100.0, "native_product_bf16": 100.0},
+    "S1_4K": {"paper": 91.4, "fp32": 100.0, "exact_product_bf16": 100.0, "native_product_bf16": 100.0},
+    "S1_8K": {"paper": 91.8, "fp32": 97.4, "exact_product_bf16": 100.0, "native_product_bf16": 100.0},
+    "S2_1K": {"paper": 100.0, "fp32": 100.0, "exact_product_bf16": 100.0, "native_product_bf16": 100.0},
+    "S2_2K": {"paper": 99.8, "fp32": 100.0, "exact_product_bf16": 100.0, "native_product_bf16": 100.0},
+    "S2_4K": {"paper": 92.2, "fp32": 85.6, "exact_product_bf16": 90.6, "native_product_bf16": 91.2},
+    "S2_8K": {"paper": 29.6, "fp32": 40.0, "exact_product_bf16": 43.4, "native_product_bf16": 44.2},
+    "S3_1K": {"paper": 86.6, "fp32": 82.0, "exact_product_bf16": 78.2, "native_product_bf16": 80.4},
+    "S3_2K": {"paper": 84.2, "fp32": 81.6, "exact_product_bf16": 83.2, "native_product_bf16": 83.2},
+    "S3_4K": {"paper": 27.6, "fp32": 53.2, "exact_product_bf16": 55.4, "native_product_bf16": 56.6},
+    "macro": {"paper": 80.91, "fp32": 85.44, "exact_product_bf16": 86.44, "native_product_bf16": 86.87}
+  },
+  "table3": {
+    "wikitext_word_perplexity": {"paper": 16.42, "fp32": 16.824, "exact_product_bf16": 16.841, "native_product_bf16": 16.827},
+    "lambada_perplexity": {"paper": 12.17, "fp32": 9.720, "exact_product_bf16": 9.687, "native_product_bf16": 9.693},
+    "lambada_accuracy_percent": {"paper": 46.65, "fp32": 51.81, "exact_product_bf16": 51.58, "native_product_bf16": 51.80},
+    "piqa_accuracy_percent": {"paper": 72.25, "fp32": 73.78, "exact_product_bf16": 73.72, "native_product_bf16": 73.88},
+    "hellaswag_normalized_accuracy_percent": {"paper": 55.76, "fp32": 60.13, "exact_product_bf16": 60.16, "native_product_bf16": 60.17},
+    "winogrande_accuracy_percent": {"paper": 57.45, "fp32": 61.88, "exact_product_bf16": 62.35, "native_product_bf16": 62.27},
+    "arc_easy_accuracy_percent": {"paper": 71.21, "fp32": 72.31, "exact_product_bf16": 72.47, "native_product_bf16": 72.31},
+    "arc_challenge_normalized_accuracy_percent": {"paper": 38.39, "fp32": 40.78, "exact_product_bf16": 40.96, "native_product_bf16": 40.78},
+    "social_iqa_accuracy_percent": {"paper": 40.63, "fp32": 42.37, "exact_product_bf16": 42.48, "native_product_bf16": 42.32},
+    "boolq_accuracy_percent": {"paper": 60.24, "fp32": 61.68, "exact_product_bf16": 61.74, "native_product_bf16": 61.47},
+    "metric_mapped_accuracy_average_percent": {"paper": 55.32, "fp32": 58.09, "exact_product_bf16": 58.18, "native_product_bf16": 58.13}
+  },
+  "table5_as_run": {
+    "narrativeqa": {"paper": 14.10, "fp32": 2.51, "exact_product_bf16": 2.56, "native_product_bf16": 2.55},
+    "qasper": {"paper": 14.00, "fp32": 7.12, "exact_product_bf16": 6.85, "native_product_bf16": 6.80},
+    "multifieldqa_en": {"paper": 23.30, "fp32": 13.58, "exact_product_bf16": 13.93, "native_product_bf16": 13.77},
+    "hotpotqa": {"paper": 13.70, "fp32": 7.05, "exact_product_bf16": 6.89, "native_product_bf16": 6.95},
+    "2wikimqa": {"paper": 14.40, "fp32": 8.87, "exact_product_bf16": 9.01, "native_product_bf16": 9.16},
+    "musique": {"paper": 5.80, "fp32": 3.16, "exact_product_bf16": 3.34, "native_product_bf16": 3.48},
+    "gov_report": {"paper": 7.50, "fp32": 8.98, "exact_product_bf16": 8.85, "native_product_bf16": 8.88},
+    "qmsum": {"paper": 16.40, "fp32": 18.47, "exact_product_bf16": 18.02, "native_product_bf16": 18.29},
+    "multi_news": {"paper": 7.90, "fp32": 12.68, "exact_product_bf16": 13.14, "native_product_bf16": 12.49},
+    "trec": {"paper": 30.00, "fp32": 36.50, "exact_product_bf16": 36.50, "native_product_bf16": 35.50},
+    "triviaqa": {"paper": 22.40, "fp32": 26.27, "exact_product_bf16": 25.58, "native_product_bf16": 25.28},
+    "samsum": {"paper": 23.00, "fp32": 30.15, "exact_product_bf16": 30.77, "native_product_bf16": 30.86},
+    "lcc": {"paper": 18.70, "fp32": 18.46, "exact_product_bf16": 18.78, "native_product_bf16": 19.02},
+    "repobench-p": {"paper": 22.10, "fp32": 18.06, "exact_product_bf16": 18.32, "native_product_bf16": 18.26},
+    "macro": {"paper": 16.60, "fp32": 15.13, "exact_product_bf16": 15.18, "native_product_bf16": 15.09}
+  },
+  "table5_first_line_rescore": {
+    "native_product_bf16": {
+      "narrativeqa": 14.94,
+      "qasper": 15.46,
+      "multifieldqa_en": 25.93,
+      "hotpotqa": 16.64,
+      "2wikimqa": 16.73,
+      "musique": 6.02,
+      "gov_report": 8.88,
+      "qmsum": 18.29,
+      "multi_news": 12.49,
+      "trec": 35.50,
+      "triviaqa": 25.28,
+      "samsum": 30.86,
+      "lcc": 19.02,
+      "repobench-p": 18.26,
+      "macro": 18.88
+    },
+    "macro_comparison": {"fp32": 18.82, "exact_product_bf16": 18.88, "native_product_bf16": 18.88}
+  },
+  "paired_output_analysis": {
+    "table2_native_vs_fp32": {"changed": 105, "total": 5500, "wrong_to_right": 92, "right_to_wrong": 13},
+    "table2_native_vs_exact_product_bf16": {"changed": 38, "total": 5500, "wrong_to_right": 31, "right_to_wrong": 7},
+    "table5_native_vs_fp32_byte_identical": {"identical": 1935, "total": 3350, "percent": 57.8},
+    "table5_native_vs_exact_product_bf16_byte_identical": {"identical": 2371, "total": 3350, "percent": 70.8}
+  },
+  "acceptance": {
+    "table2": {"verdict": "pass", "native_minus_fp32_macro_points": 1.44, "worst_cell_drop_points": -1.60},
+    "table3": {"verdict": "pass", "native_minus_fp32_accuracy_points": 0.03, "wikitext_perplexity_change_percent": 0.019},
+    "table5": {"verdict": "pass", "native_minus_fp32_macro_points": -0.04, "worst_task_drop_points": -1.00},
+    "overall": "pass",
+    "interpretation": "quality-compatible but not bit-compatible; regenerate the exact full-logit and trajectory golden for FPGA validation"
+  }
+}
