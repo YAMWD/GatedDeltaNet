@@ -17,9 +17,13 @@
 # behind any other allocation of the user's that holds a card, even an idle
 # one, and even when other U55Cs sit free.
 
-set -uo pipefail
+# pipefail only for now: XRT's setup.sh is not set -u clean, and sourcing it
+# with stderr discarded under set -u kills the shell with no message at all --
+# job 2503 failed in two seconds exactly this way (same lesson as hw_build
+# job 1338: source the toolchain BEFORE enabling strict shell options).
+set -o pipefail
 
-JOBS="${JOBS:-32}"
+JOBS="${JOBS:-48}"
 HLS_FREQ="${HLS_FREQ:-150}"
 LINK_FREQ="${LINK_FREQ:-100}"
 TAG="${TAG:?TAG must be set by the submitter}"
@@ -32,26 +36,32 @@ echo "  gres    : ${SLURM_JOB_GRES:-<unset>}"
 
 source /opt/xilinx/xrt/setup.sh >/dev/null 2>&1 || {
     echo "FATAL: cannot source XRT setup" >&2; exit 2; }
+set -u
 
 # Under ConstrainDevices=yes only the allocated card is visible, so the XRT
 # index is normally 0 even though the node holds several cards. Verify that
 # rather than trusting it: a wrong index fails with a bare err = -22.
+# Some nodes expose cards beyond the allocation to `xbutil examine` --
+# acclnode01 lists an unallocated U280 beside the allocated U55C (on-card
+# jobs 1354 and 2504), so counting all visible cards is the wrong guard.
+# Require exactly one U55C and select it explicitly by BDF; host.exe accepts
+# a BDF in place of an enumeration index (the qualification-proven pattern
+# from job 1355).
 examine="$(xbutil examine 2>/dev/null)"
-mapfile -t bdfs < <(printf '%s\n' "$examine" \
+mapfile -t all_bdfs < <(printf '%s\n' "$examine" \
     | grep -oE '\[[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]\]' | sort -u)
-echo "  cards visible: ${#bdfs[@]}  ${bdfs[*]:-none}"
-if [ "${#bdfs[@]}" -ne 1 ]; then
-    echo "FATAL: expected exactly 1 visible card inside this allocation," >&2
-    echo "       found ${#bdfs[@]}. Not guessing a device index." >&2
+mapfile -t u55c_bdfs < <(printf '%s\n' "$examine" \
+    | grep -i 'xilinx_u55c' \
+    | grep -oE '\[[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]\]' \
+    | tr -d '[]' | sort -u)
+echo "  cards visible: ${#all_bdfs[@]}  ${all_bdfs[*]:-none}"
+echo "  u55c cards   : ${#u55c_bdfs[@]}  ${u55c_bdfs[*]:-none}"
+if [ "${#u55c_bdfs[@]}" -ne 1 ]; then
+    echo "FATAL: expected exactly 1 U55C in this allocation, found ${#u55c_bdfs[@]}." >&2
     printf '%s\n' "$examine" | head -30 >&2
     exit 2
 fi
-if ! printf '%s\n' "$examine" | grep -qi 'u55c'; then
-    echo "FATAL: the visible card is not a U55C. Refusing to load this image." >&2
-    printf '%s\n' "$examine" | head -30 >&2
-    exit 2
-fi
-HW_DEVICE=0
+HW_DEVICE="${u55c_bdfs[0]}"
 
 # JOBS only names the build directory here -- nothing is compiled in this job,
 # which has 8 cores. It MUST match the build job's JOBS or make would look in
@@ -67,13 +77,18 @@ test -x ./host.exe || { echo "FATAL: host.exe missing" >&2; exit 2; }
 # Data knobs are forwarded explicitly rather than left to the Makefile default.
 # They matter: a kernel built for packed BF16 weights rejects the FP32 blob
 # outright (`weight payload is not BF16-exact`), and it does so only after the
-# host has read the whole 5.6 GB file. Pass WEIGHTS=artifacts/gdn-1.3b-bf16w.gdnw
-# for a BF16 image; the FP32 default is correct for the FP32 production kernel.
+# host has read the whole 5.6 GB file. This branch defaults to
+# WEIGHTS=artifacts/gdn-1.3b-bf16w.gdnw; an override is still forwarded here.
 mk_args=(JOBS="$JOBS" HLS_FREQ="$HLS_FREQ" LINK_FREQ="$LINK_FREQ" HW_DEVICE="$HW_DEVICE")
-for knob in WEIGHTS DECODE_STATE DECODE_FIXTURE DECODE_GOLDEN LOGITS_REFERENCE; do
-    if [ -n "${!knob:-}" ]; then
+for knob in WEIGHTS DECODE_STATE DECODE_FIXTURE DECODE_GOLDEN \
+            LOGITS_REFERENCE GPU_LOGITS_REFERENCE; do
+    # Forward when SET, even if empty: an explicitly empty knob must override
+    # the Makefile default. LOGITS_REFERENCE now defaults to empty because the
+    # hardware/native comparison is a diagnostic, not a gate (Iter66m); set it
+    # to a GDNLOG1 path to re-enable the comparison for arithmetic debugging.
+    if [ "${!knob+set}" = "set" ]; then
         mk_args+=("${knob}=${!knob}")
-        echo "  ${knob} = ${!knob}"
+        echo "  ${knob} = '${!knob}'"
     fi
 done
 

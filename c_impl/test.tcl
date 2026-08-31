@@ -8,7 +8,7 @@ set_part {xcu55c-fsvh2892-2L-e}
 create_clock -period 6.667 -name default
 source ./hls_gdn_forward.tcl
 # Decode-only csim requires a GPU-exported .gdnstate (gitignored/regenerable).
-# Supply current weight, state, and logit-reference paths explicitly before
-# enabling csim or cosim.
+# Supply current BF16-exact weights/state and logits-reference paths explicitly
+# before enabling csim or cosim.
 csynth_design
 exit
