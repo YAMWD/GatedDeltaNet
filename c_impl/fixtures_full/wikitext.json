@@ -1,0 +1,12 @@
+{
+  "kind": 3,
+  "dataset": "EleutherAI/wikitext_document_level wikitext-2-raw-v1 test",
+  "model_name": "/home/yaoz0b/gdn_precision_eval_20260817/checkpoint_bf16_mixed",
+  "max_seq_len": 2048,
+  "documents": 62,
+  "windows": 183,
+  "scored_tokens": 314843,
+  "words": 241335,
+  "bytes": 1290527,
+  "prefix_token_id": 2
+}
