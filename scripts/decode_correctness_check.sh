@@ -33,16 +33,19 @@ SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_PATH}/.." && pwd)"
 C_IMPL="${REPO_ROOT}/c_impl"
 
-WEIGHTS="${C_IMPL}/artifacts/gdn-1.3b-f32.gdnw"
-FIXTURE="${C_IMPL}/fixtures_decode/decode.gdnreq"
-GOLDEN="${C_IMPL}/results_decode_golden/decode.decode.json"
+# The packed-BF16 kernel rejects a non-BF16-exact blob (and only after
+# reading all 5.6 GB), so this must track the Makefile default.
+WEIGHTS="${WEIGHTS:-${C_IMPL}/artifacts/gdn-1.3b-bf16w.gdnw}"
+FIXTURE="${FIXTURE:-${C_IMPL}/fixtures_decode/decode.gdnreq}"
+GOLDEN="${GOLDEN:-${C_IMPL}/results_decode_golden/decode_native_bf16_product.decode.json}"
+LOGITS_REFERENCE="${LOGITS_REFERENCE:-}"
 CHECKER="${REPO_ROOT}/scripts/check_gdn_c_parity.py"
 # Disaggregated decode: the FPGA never prefills. State (example 0's post-prompt
 # recurrent + conv window) is produced once by the GPU (scripts/export_gdn_state.py)
 # and lives on disk (gitignored, like the weight blob). The native decode-only
 # path loads it and decodes from the exported seed token — no prefill, no
 # re-prefill — and is gated bit-exact against the same cached golden.
-STATE="${C_IMPL}/fixtures_decode/decode_ex0.gdnstate"
+STATE="${STATE:-${C_IMPL}/fixtures_decode/decode_ex0_native_bf16_product.gdnstate}"
 
 # --- parse args --------------------------------------------------------------
 MODE="full"
@@ -94,6 +97,9 @@ fail() { echo "FATAL: $*" >&2; exit 1; }
 for f in "${WEIGHTS}" "${FIXTURE}" "${GOLDEN}" "${CHECKER}" "${STATE}"; do
     [[ -f "${f}" ]] || fail "required file not found: ${f}"
 done
+if [[ -n "${LOGITS_REFERENCE}" && ! -f "${LOGITS_REFERENCE}" ]]; then
+    fail "required logit reference not found: ${LOGITS_REFERENCE}"
+fi
 command -v "${PYTHON_BIN}" >/dev/null 2>&1 || fail "python interpreter not found: ${PYTHON_BIN}"
 
 mkdir -p "$(dirname "${OUT_JSON}")"
@@ -105,6 +111,7 @@ echo "  repo root   : ${REPO_ROOT}"
 echo "  weights     : ${WEIGHTS}"
 echo "  fixture     : ${FIXTURE}"
 echo "  golden      : ${GOLDEN}  (cached, NOT regenerated)"
+echo "  logits ref  : ${LOGITS_REFERENCE:-none}"
 echo "  candidate   : ${OUT_JSON}"
 echo "  decode args : --limit ${LIMIT} --decode-len ${DECODE_LEN}"
 echo "----------------------------------------------------------------------"
@@ -121,13 +128,19 @@ echo "==> Running native decode-only from GPU state (no prefill / no re-prefill)
 echo "    cd ${C_IMPL} && ./gdn_eval <weights> <fixture> ${OUT_JSON} --decode --decode-from-state ${STATE} --decode-len ${DECODE_LEN}"
 (
     cd "${C_IMPL}"
-    ./gdn_eval \
-        "${WEIGHTS}" \
-        "${FIXTURE}" \
-        "${OUT_JSON}" \
-        --decode \
-        --decode-from-state "${STATE}" \
+    eval_args=(
+        "${WEIGHTS}"
+        "${FIXTURE}"
+        "${OUT_JSON}"
+        --decode
+        --decode-from-state "${STATE}"
         --decode-len "${DECODE_LEN}"
+    )
+    if [[ -n "${LOGITS_REFERENCE}" ]]; then
+        eval_args+=(--logits-reference "${LOGITS_REFERENCE}")
+    fi
+    ./gdn_eval \
+        "${eval_args[@]}"
 )
 
 # --- check -------------------------------------------------------------------

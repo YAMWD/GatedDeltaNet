@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
-"""Export GatedDeltaNet weights and the decode fixture for the C runtime."""
+"""Export GatedDeltaNet weights and the decode fixture for the C runtime.
+
+The packed-BF16 kernel only accepts a BF16-exact FP32-word blob, so the
+default `weights` export RNE-rounds every tensor to BF16 before widening it
+back to FP32 words (equivalent to convert_gdn_checkpoint_bf16.py followed by
+an FP32 export) and writes c_impl/artifacts/gdn-1.3b-bf16w.gdnw. Pass
+`--precision fp32` only for the retired FP32 kernel; the current loaders
+reject that blob.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import struct
 from contextlib import ExitStack
 from pathlib import Path
 
+import torch
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoTokenizer
@@ -20,6 +30,7 @@ WEIGHT_HEADER = struct.Struct("<8s10I2if")
 REQ_HEADER = struct.Struct("<8s3I")
 
 REQ_KIND_LL = 2
+REQ_KIND_ROLLING = 3
 
 DEFAULT_MODEL = "m-a-p/1.3B-100B-GatedDeltaNet-pure"
 
@@ -155,7 +166,7 @@ def tensor_names(cfg: dict) -> list[str]:
     return names
 
 
-def export_weights(model_name: str, output_path: Path) -> None:
+def export_weights(model_name: str, output_path: Path, precision: str) -> None:
     snapshot_dir = load_snapshot(model_name)
     cfg = json.loads((snapshot_dir / "config.json").read_text())
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -191,11 +202,17 @@ def export_weights(model_name: str, output_path: Path) -> None:
             tensor = reader.get_tensor(name).float().contiguous()
             if name.endswith("conv1d.weight"):
                 tensor = tensor[:, 0, :].contiguous()
+            if precision == "bf16":
+                # RNE-round to BF16, then widen back so every stored FP32
+                # word is BF16-exact — what gdn_validate_bf16_exact_weights
+                # requires of the packed-BF16 kernel's blob.
+                tensor = tensor.to(torch.bfloat16).float().contiguous()
             handle.write(tensor.numpy().tobytes(order="C"))
 
     meta = {
         "model_name": model_name,
         "output": str(output_path),
+        "precision": precision,
         "config": {
             "vocab_size": cfg["vocab_size"],
             "hidden_size": cfg["hidden_size"],
@@ -215,6 +232,123 @@ def export_weights(model_name: str, output_path: Path) -> None:
     print(f"wrote {output_path}")
 
 
+
+def build_rolling_windows(tokens: list[int], prefix_token_id: int,
+                          max_seq_len: int) -> list[tuple[list[int], list[int]]]:
+    """Replicate lm-eval's rolling windows for loglikelihood_rolling.
+
+    Mirrors lm_eval.utils.get_rolling_token_windows(context_len=1) followed by
+    make_disjoint_window, which is what the harness applies for the WikiText
+    task. With context_len=1 every block carries exactly one token of context,
+    so the FPGA's per-window score is directly comparable to the GPU arm's
+    word perplexity (16.827 for this contract).
+    """
+    if not tokens:
+        return []
+    windows: list[tuple[list[int], list[int]]] = []
+    pred_len = max_seq_len            # context_len == 1
+    first_seq_len = min(max_seq_len, len(tokens))
+    # get_rolling_token_windows first yield, then make_disjoint_window:
+    # ctx keeps only the tokens the continuation does not already cover.
+    windows.append(([prefix_token_id], tokens[:first_seq_len]))
+    predicted = first_seq_len
+    while predicted < len(tokens):
+        window_pred_len = min(len(tokens) - predicted, pred_len)
+        window_end = predicted + window_pred_len
+        raw_ctx = tokens[window_end - max_seq_len - 1: window_end - 1]
+        cont = tokens[window_end - window_pred_len: window_end]
+        ctx = raw_ctx[:len(raw_ctx) - (len(cont) - 1)]
+        if not ctx:                   # short document: fall back to the prefix
+            ctx = [prefix_token_id]
+        windows.append((ctx, cont))
+        predicted += window_pred_len
+    return windows
+
+
+def export_rolling_fixture(model_name: str, output_path: Path, max_seq_len: int,
+                           limit: int | None, min_chars: int) -> None:
+    """WikiText rolling-loglikelihood fixture (.gdnreq kind=3).
+
+    Layout, matching the host/native scorer's loader:
+        magic, version, kind, num_examples
+        per example: word_count, byte_count, num_windows
+          per window: ctx_len, cont_len, ctx[i32], cont[i32]
+    word/byte counts are the lm-eval definitions (whitespace words, UTF-8
+    bytes of the raw document) so word and byte perplexity are comparable.
+    """
+    from datasets import load_dataset
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    prefix_token_id = (tokenizer.eos_token_id
+                       if tokenizer.eos_token_id is not None
+                       else tokenizer.bos_token_id)
+    if prefix_token_id is None:
+        raise ValueError("tokenizer defines neither EOS nor BOS")
+
+    dataset = load_dataset("EleutherAI/wikitext_document_level",
+                           "wikitext-2-raw-v1", split="test")
+    # lm-eval's wikitext task SCORES the detokenized page
+    # (doc_to_target: wikitext_detokenizer) but NORMALIZES by the RAW page's
+    # word and byte counts (process_results). Tokenizing the raw page instead
+    # inflates the token count through its " @-@ " style artifacts and gave
+    # word PPL 19.89 against the harness's 16.83 -- so both halves matter.
+    from lm_eval.tasks.wikitext.preprocess_wikitext import wikitext_detokenizer
+
+    records = []
+    total_windows = total_tokens = 0
+    for row in dataset:
+        raw_text = row["page"]
+        if len(raw_text) < min_chars:
+            continue
+        text = wikitext_detokenizer({"page": raw_text})
+        tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
+        windows = build_rolling_windows(tokens, prefix_token_id, max_seq_len)
+        if not windows:
+            continue
+        records.append({
+            # lm-eval counts words/bytes on the RAW page, not the scored text.
+            "word_count": len(re.split(r"\s+", raw_text)),
+            "byte_count": len(raw_text.encode("utf-8")),
+            "windows": windows,
+        })
+        total_windows += len(windows)
+        total_tokens += sum(len(c) for _, c in windows)
+        if limit is not None and len(records) >= limit:
+            break
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("wb") as handle:
+        handle.write(REQ_HEADER.pack(REQ_MAGIC, 1, REQ_KIND_ROLLING,
+                                     len(records)))
+        for record in records:
+            write_u32(handle, record["word_count"])
+            write_u32(handle, record["byte_count"])
+            write_u32(handle, len(record["windows"]))
+            for ctx, cont in record["windows"]:
+                write_u32(handle, len(ctx))
+                write_u32(handle, len(cont))
+                write_i32_array(handle, ctx)
+                write_i32_array(handle, cont)
+
+    meta = {
+        "kind": REQ_KIND_ROLLING,
+        "dataset": "EleutherAI/wikitext_document_level wikitext-2-raw-v1 test",
+        "model_name": model_name,
+        "max_seq_len": max_seq_len,
+        "documents": len(records),
+        "windows": total_windows,
+        "scored_tokens": total_tokens,
+        "words": sum(r["word_count"] for r in records),
+        "bytes": sum(r["byte_count"] for r in records),
+        "prefix_token_id": prefix_token_id,
+    }
+    output_path.with_suffix(".json").write_text(json.dumps(meta, indent=2))
+    print(f"wrote {output_path}: {len(records)} documents, {total_windows} "
+          f"windows, {total_tokens} scored tokens "
+          f"({total_tokens * 0.02665 / 3600:.2f} h of card time at "
+          f"26.65 ms/token)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="cmd", required=True)
@@ -222,10 +356,32 @@ def main() -> None:
     weight_parser = subparsers.add_parser("weights")
     weight_parser.add_argument("--model-name", default=DEFAULT_MODEL)
     weight_parser.add_argument(
+        "--precision",
+        choices=("bf16", "fp32"),
+        default="bf16",
+        help="bf16 (default) writes the BF16-exact blob the packed kernel "
+             "requires; fp32 reproduces the retired FP32 blob",
+    )
+    weight_parser.add_argument(
         "--output",
         type=Path,
-        default=Path("c_impl/artifacts/gdn-1.3b-f32.gdnw"),
+        default=None,
+        help="defaults to c_impl/artifacts/gdn-1.3b-bf16w.gdnw (bf16) or "
+             "c_impl/artifacts/gdn-1.3b-f32.gdnw (fp32)",
     )
+
+    rolling_parser = subparsers.add_parser(
+        "wikitext",
+        help="rolling-loglikelihood WikiText fixture for on-card perplexity")
+    rolling_parser.add_argument("--model-name", default=DEFAULT_MODEL)
+    rolling_parser.add_argument("--output", type=Path,
+                                default=Path("c_impl/fixtures_full/wikitext.gdnreq"))
+    rolling_parser.add_argument("--max-seq-len", type=int, default=2048,
+                                help="model max_position_embeddings (lm-eval max_length)")
+    rolling_parser.add_argument("--limit", type=int, default=None,
+                                help="documents to keep (default: all)")
+    rolling_parser.add_argument("--min-chars", type=int, default=1,
+                                help="skip documents shorter than this")
 
     decode_parser = subparsers.add_parser("decode")
     decode_parser.add_argument("--model-name", default=DEFAULT_MODEL)
@@ -239,13 +395,23 @@ def main() -> None:
 
     args = parser.parse_args()
     if args.cmd == "weights":
-        export_weights(args.model_name, args.output)
+        output = args.output
+        if output is None:
+            output = Path("c_impl/artifacts/gdn-1.3b-bf16w.gdnw"
+                          if args.precision == "bf16"
+                          else "c_impl/artifacts/gdn-1.3b-f32.gdnw")
+        export_weights(args.model_name, output, args.precision)
         return
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     prefix_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
     if prefix_token_id is None:
         raise ValueError("Tokenizer must define BOS or EOS token for prefix_token_id.")
+    if args.cmd == "wikitext":
+        export_rolling_fixture(args.model_name, args.output, args.max_seq_len,
+                               args.limit, args.min_chars)
+        return
+
     if args.cmd == "decode":
         export_decode_fixture(tokenizer, prefix_token_id, args.decode_len, args.output_dir, args.limit)
         return

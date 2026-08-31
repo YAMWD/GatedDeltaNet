@@ -122,9 +122,16 @@ def compare_decode(golden_path: Path, c_path: Path) -> dict:
         checked_steps = int(logits_parity.get("checked_steps", 0))
         compared_values = int(logits_parity.get("compared_values", 0))
         if checked_steps > 0 and compared_values > 0:
+            exact_required = bool(
+                logits_parity.get("exact_reference_required", True)
+            )
             logits_parity_pass = bool(
                 int(logits_parity.get("cpu_tolerance_failures", 0)) == 0
-                and int(logits_parity.get("exact_reference_mismatches", 0)) == 0
+                and int(logits_parity.get("nonfinite_mismatches", 0)) == 0
+                and (
+                    not exact_required
+                    or int(logits_parity.get("exact_reference_mismatches", 0)) == 0
+                )
                 and int(logits_parity.get("argmax_mismatches", 0)) == 0
             )
 
@@ -216,7 +223,9 @@ def print_decode_report(report: dict) -> None:
         )
         print(
             f"      cpu_tol_fail={int(logits.get('cpu_tolerance_failures', 0))} "
+            f"nonfinite_mismatch={int(logits.get('nonfinite_mismatches', 0))} "
             f"exact_ref_mismatch={int(logits.get('exact_reference_mismatches', 0))} "
+            f"exact_required={bool(logits.get('exact_reference_required', True))} "
             f"argmax_mismatch={int(logits.get('argmax_mismatches', 0))} "
             f"pass={agg['logits_parity_pass']}"
         )

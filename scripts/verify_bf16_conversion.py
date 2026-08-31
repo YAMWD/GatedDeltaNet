@@ -29,7 +29,12 @@ from safetensors import safe_open
 # BF16 keeps 8 bits of significand (7 stored + 1 implicit), so round-to-nearest
 # cannot move a value by more than 2^-8. Truncation would permit up to 2^-7,
 # which is how these two rounding modes are told apart below.
+# That relative bound only holds in BF16's normal range: below 2^-126 the
+# result is subnormal or zero and the relative error legitimately reaches 1.0,
+# so those lanes are bounded by the subnormal half-step (2^-133 / 2) instead.
 BF16_ROUND_TO_NEAREST_BOUND = 2.0**-8
+BF16_MIN_NORMAL = 2.0**-126
+BF16_SUBNORMAL_HALF_STEP = 2.0**-134
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,6 +69,7 @@ def main() -> int:
 
     n_tensors = n_elements = 0
     worst_rel, worst_name = 0.0, ""
+    worst_tiny_abs, worst_tiny_name = 0.0, ""
     dtypes: dict[str, int] = {}
     changed_non_float: list[str] = []
 
@@ -79,30 +85,45 @@ def main() -> int:
                 ta, tb = a.get_tensor(key), b.get_tensor(key)
                 n_tensors += 1
                 n_elements += ta.numel()
-                dtypes[str(tb.dtype)] = dtypes.get(str(tb.dtype), 0) + 1
                 if ta.shape != tb.shape:
                     check(f"{key} shape", False, f"{ta.shape} vs {tb.shape}")
                     continue
                 if not ta.is_floating_point():
+                    # Non-float tensors are deliberately left uncast, so they
+                    # must not count toward the all-bfloat16 dtype check.
                     if not torch.equal(ta, tb):
                         changed_non_float.append(key)
                     continue
+                dtypes[str(tb.dtype)] = dtypes.get(str(tb.dtype), 0) + 1
                 x, y = ta.float(), tb.float()
-                rel = ((y - x).abs() / x.abs().clamp_min(1e-30)).max().item()
+                diff = (y - x).abs()
+                in_normal = x.abs() >= BF16_MIN_NORMAL
+                rel = torch.where(
+                    in_normal, diff / x.abs().clamp_min(1e-30),
+                    torch.zeros_like(diff)).max().item()
                 if rel > worst_rel:
                     worst_rel, worst_name = rel, key
+                tiny_abs = torch.where(
+                    in_normal, torch.zeros_like(diff), diff).max().item()
+                if tiny_abs > worst_tiny_abs:
+                    worst_tiny_abs, worst_tiny_name = tiny_abs, key
 
     print(f"\ntensors compared      : {n_tensors}")
     print(f"elements compared     : {n_elements:,}")
     print(f"output dtypes         : {dtypes}")
     print(f"worst relative change : {worst_rel:.4e} "
-          f"(round-to-nearest bound {BF16_ROUND_TO_NEAREST_BOUND:.4e}) at {worst_name}\n")
+          f"(round-to-nearest bound {BF16_ROUND_TO_NEAREST_BOUND:.4e}) at {worst_name}")
+    print(f"worst subnormal-range absolute change : {worst_tiny_abs:.4e} "
+          f"(half-step bound {BF16_SUBNORMAL_HALF_STEP:.4e})"
+          f"{(' at ' + worst_tiny_name) if worst_tiny_name else ''}\n")
 
     check("all float tensors are bfloat16", set(dtypes) <= {"torch.bfloat16"}, str(dtypes))
     check("non-float tensors unchanged", not changed_non_float,
           f"{len(changed_non_float)} changed")
     check("rounding is round-to-nearest, not truncation",
           worst_rel <= BF16_ROUND_TO_NEAREST_BOUND, f"{worst_rel:.4e}")
+    check("subnormal-range values stay within the RNE half-step",
+          worst_tiny_abs <= BF16_SUBNORMAL_HALF_STEP, f"{worst_tiny_abs:.4e}")
     if args.expect_tensors is not None:
         check(f"tensor count is {args.expect_tensors}",
               n_tensors == args.expect_tensors, f"got {n_tensors}")

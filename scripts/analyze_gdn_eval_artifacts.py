@@ -113,6 +113,10 @@ def pair_table2(arm_a: Path, arm_b: Path) -> None:
             up, down, unchanged = up + u, down + d, unchanged + s
             print(f"{label:6s}{length:8d}{u:12d}{d:10d}{u - d:+6d}{u + d + s:7d}")
     total = up + down + unchanged
+    if total == 0:
+        raise SystemExit(
+            "pair-table2: no overlapping samples found -- were both arms run "
+            "with --log_samples, and do the two roots point at the same tasks?")
     print(f"\nwrong->right {up}, right->wrong {down}, unchanged {unchanged}")
     print(f"changed {up + down} of {total} samples = {100 * (up + down) / total:.2f}%")
     if up + down:
@@ -136,9 +140,16 @@ def pair_table5_preds(arm_a: Path, arm_b: Path) -> None:
         identical += same
         if same / len(a) < worst[0]:
             worst = (same / len(a), task)
+    if total == 0:
+        raise SystemExit(
+            "pair-table5-preds: no comparable predictions -- every task was "
+            "missing or length-mismatched between the two arms")
     print(f"{identical}/{total} generated answers byte-identical "
           f"= {100 * identical / total:.1f}%")
-    print(f"worst task: {worst[1]} at {100 * worst[0]:.1f}%")
+    if worst[1]:
+        print(f"worst task: {worst[1]} at {100 * worst[0]:.1f}%")
+    else:
+        print("worst task: none (every compared task fully identical)")
 
 
 def main() -> None:
