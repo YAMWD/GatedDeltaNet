@@ -8514,3 +8514,97 @@ routed with zero overlaps, timing-closed at WNS +0.003 / WHS +0.009 ns,
 on-card exact 64-token trajectory, on-card CUDA vector gate over 2,016,000
 logits, on-card WikiText-2 perplexity within 0.0077% of GPU over 314,843
 tokens, and 512-token drift shown bounded.
+
+### Iter67 — restore the on-chip argmax and repair the recurrent-read II (IN PROGRESS)
+
+*2026-08-31. Evidence so far: native fast and full 32-step gates only. No
+csynth, cosim, or hardware. Two of the three items below are unverifiable in
+csim by construction, so this is not a retained result.*
+
+**1. On-chip argmax restored, fused rather than reinstated.** Iter63 removed
+the greedy pick on the argument that the host already has the logits, so the
+silicon was redundant. That reasoning was about area, not time, and the entry
+itself recorded "resource and cycle effects are unmeasured". What it moved onto
+the host is a **128 KB PCIe read-back per token**, paid by every generation
+step to recover four bytes of information.
+
+The restoration does not reinstate Iter61's separate 2,016-iteration sweep of
+the reorder buffer. The two logit-emission loops in `gemv32_store` already
+visit every logit exactly once in natural vocabulary order, so the argmax is
+fused into them: sixteen independent lane accumulators (one compare per lane in
+the loop-carried path, no tree), then a cross-lane merge. Cost is a 16-wide
+compare per emitted beat and **no extra cycles**. Global vocabulary index is
+`emitted_beat * 16 + lane`, where `emitted_beat = pair * 125 + p` for the
+even-channel loop and `pair * 125 + 62 + p` for the stitched one -- 2 x 1000
+rows is exactly 125 whole Beat512 lines, so the emitted stream is contiguous.
+
+`out[0]` lane 0 carries the token id and the top level copies it to
+`GDN_WS_OFF_X_NORM`; no AXI port is added inside `gemv32_store`, which is the
+constraint Iter58b and Iter59 violated. `host.cpp` gains a `want_logits`
+argument: a plain generation step reads the 64-byte token line only, while any
+reference comparison, logit dump, or teacher-forced scoring still pulls the
+full vector. When the logits are present anyway the host re-derives the pick
+and cross-checks the hardware for free.
+
+`gdn_eval.cpp` now **fails** if the kernel's on-chip pick disagrees with its
+independent host scan. Both read the identical FP32 vector, so a disagreement
+is a defect in the fused argmax -- lane indexing, the tie rule, or the merge --
+and csim is the only place this datapath can be caught before an eight-hour
+link.
+
+Gates: fast 6/6 and full 32/32 both PASS, `exact_traj_match=True`,
+`first_divergence=-1`, 992,000 logits with `exact_ref_mismatch=0`,
+`argmax_mismatch=0`, and the new assertion silent on every step. The trajectory
+is unchanged, as it must be -- the rule is identical on both sides.
+
+**2. `recur_island_read` II=2 -> II=1, without touching the arithmetic.** The
+loop requested `II=1` and achieved 2 in every csynth report on disk since
+2026-08-19, costing 1,024 cycles per head -- 196,608 per token, **7.7%**. The
+cause was never diagnosed here; it is stated verbatim in the o16 build log:
+
+```
+[HLS 200-880] The II Violation in module
+'gdn_recurrent_attention_island_0_Pipeline_recur_island_read'
+(loop 'recur_island_read'): Unable to enforce a carried dependence constraint
+(II = 1, distance = 4, offset = 1) between 'store' operation
+('partial_hi_addr_write_ln1971') of variable 'add2' on array 'partial_hi'
+and 'load' operation ('partial_hi_load') on array 'partial_hi'.
+```
+
+`local_base` is `(block & 3) * 16`, so each accumulator is revisited every
+fourth iteration: distance 4. II=1 therefore needs an adder latency of at most
+4, and this file's binding is 5. The fix names each sum and binds it to
+`latency=4`. **The arithmetic is untouched** -- same expression, same operand
+order, same sequential row-major accumulation -- so the trajectory stays
+bit-exact, which the full gate confirms.
+
+The obvious alternative, splitting the accumulators into parity banks to reach
+distance 8, was rejected: it reassociates the sum, retires the exact golden,
+and would require regenerating every reference and repeating the quality work
+for a lever worth 7.7%.
+
+**This is the item csim cannot check.** A `bind_op` has no effect in C -- the
+same blind spot Iter66j recorded for the DAZ/FTZ adder audit. The passing
+native gate proves only that the arithmetic did not change. Whether II=1 is
+actually achieved, and at what timing cost a latency-4 adder carries, is
+unknown until csynth.
+
+**3. Recorded, not fixed: the depthwise-convolution window II violations.** The
+same probe log names three more, on `in_window_4` and `in_window_8` at II=1, 2
+and 3, all "due to limited memory ports" in
+`iter39_head_conv_restore_*` and `iter39_head_conv_shift_*`. `in_window[4][256]`
+is already partitioned `dim=1 complete` plus `dim=2 cyclic factor=GDN_CONV_LANES`,
+so HLS's own suggestion -- partition further -- is partly applied; the shift
+loop reads and writes the same dim-1 plane in one iteration, which points at
+port count rather than banking. Complete dim-2 partitioning would build 256:1
+muxes on a runtime `col` index and is probably worse. The block is 272
+cycles per head-kind, so the whole conv actor is on the order of 6% of the
+token and this is a fraction of that. Left alone deliberately: it needs the
+same csynth loop, and guessing at a fix csim cannot score is what Iter63 step
+2b already cost this project once.
+
+Verdict: **IN PROGRESS.** Item 1 is validated as far as csim can validate it.
+Items 2 and 3 need one integrated csynth at 150 MHz under 2024.2, which should
+report `recur_island_read` at II=1, the estimated clock against the current
+4.867 ns, and the resource delta from the fused argmax. No hardware build until
+that passes.

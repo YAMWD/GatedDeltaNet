@@ -1980,10 +1980,38 @@ recur_island_head: for (uint32_t head_index = 0;
 #pragma HLS unroll
                 GDNStatePair state_value =
                     state_pair[row][local_base + lane];
-                retrieval_lo[local_base + lane] += state_value.lo * kj;
-                retrieval_hi[local_base + lane] += state_value.hi * kj;
-                partial_lo[local_base + lane] += state_value.lo * qj;
-                partial_hi[local_base + lane] += state_value.hi * qj;
+                const uint32_t col = local_base + lane;
+                /* Iter67: this loop ran at II=2, not the requested II=1, in
+                 * every csynth report on disk. HLS names the reason exactly:
+                 *
+                 *   [HLS 200-880] Unable to enforce a carried dependence
+                 *   constraint (II = 1, distance = 4, offset = 1) ... on
+                 *   array 'partial_hi'
+                 *
+                 * `local_base` is (block & 3) * 16, so each accumulator is
+                 * revisited every fourth iteration. II=1 therefore needs an
+                 * adder latency of at most 4, and this file's default binding
+                 * is 5 (see the fulldsp latency=5 accumulator in the GEMV
+                 * cluster). Naming each sum and binding it to latency 4 buys
+                 * II=1 without touching the arithmetic: the expression, its
+                 * operand order, and the sequential row-major accumulation are
+                 * all unchanged, so the trajectory stays bit-exact. Splitting
+                 * the accumulators into parity banks would also give II=1, at
+                 * distance 8, but it reassociates the sum and would retire the
+                 * exact golden -- do not substitute it without regenerating
+                 * the references and repeating the quality work. */
+                float acc_r_lo = retrieval_lo[col] + state_value.lo * kj;
+                float acc_r_hi = retrieval_hi[col] + state_value.hi * kj;
+                float acc_p_lo = partial_lo[col] + state_value.lo * qj;
+                float acc_p_hi = partial_hi[col] + state_value.hi * qj;
+#pragma HLS bind_op variable=acc_r_lo op=fadd impl=fabric latency=4
+#pragma HLS bind_op variable=acc_r_hi op=fadd impl=fabric latency=4
+#pragma HLS bind_op variable=acc_p_lo op=fadd impl=fabric latency=4
+#pragma HLS bind_op variable=acc_p_hi op=fadd impl=fabric latency=4
+                retrieval_lo[col] = acc_r_lo;
+                retrieval_hi[col] = acc_r_hi;
+                partial_lo[col] = acc_p_lo;
+                partial_hi[col] = acc_p_hi;
             }
         }
 
@@ -2842,11 +2870,16 @@ int gdn_forward(
                  a, b, a_log_storage, dt_bias_storage, layer_index);
     }
 
-        /* Iter63: the x_norm[0] token handoff is retired with the on-chip
-         * argmax. gemv_out_storage[0] lane 0 now holds a logit, not a token
-         * id, so copying it out would hand the host a value that looks like a
-         * token and is not one. The host derives the token from the logit
-         * vector drained below. */
+    /* Iter67: the on-chip argmax is back, so hand the host a token id again.
+     * gemv_out_storage[0] lane 0 holds it; one 512-bit line to the workspace
+     * token slot lets a generation loop read 4 bytes instead of pulling the
+     * whole 128 KB logit vector across PCIe every step. The logit drain below
+     * is unchanged and still serves teacher-forced scoring, which needs the
+     * full vector and is not latency-bound. */
+    {
+        Beat512 *token_out = workspace + GDN_WS_OFF_X_NORM / 16;
+        token_out[0] = gemv_out_storage[0];
+    }
 
     /* Drain the LM-head logit queue to HBM. This is the only new AXI traffic
      * in Iter61 and it lives here, at the top level, next to the token write
@@ -3527,6 +3560,30 @@ gemv32_store_fill: for (uint32_t i = 0; i < total_opacks; ++i) {
 #ifndef __SYNTHESIS__
         uint32_t debug_index = 0;
 #endif
+        /* Iter67: the greedy pick is fused back into the emission loops rather
+         * than restored as Iter61's separate pass. The stream below already
+         * visits every logit exactly once in natural vocabulary order, so the
+         * argmax costs a 16-wide compare per beat and no extra cycles at all
+         * -- Iter63 removed a second 2,016-iteration sweep of the reorder
+         * buffer, and nothing here reinstates it.
+         *
+         * Sixteen independent lane accumulators keep the loop-carried
+         * dependency to one compare per lane instead of a tree, which is what
+         * let Iter61 hold II=1 in this block. Indices increase monotonically
+         * within a lane, so strict '>' keeps the lowest index on ties; the
+         * merge then applies the same rule across lanes. This is exactly the
+         * host's maximum-value / lowest-index rule, so the trajectory is
+         * unchanged and the native gate stays bit-exact. */
+        float lane_best[16];
+        uint32_t lane_best_index[16];
+#pragma HLS array_partition variable=lane_best complete dim=1
+#pragma HLS array_partition variable=lane_best_index complete dim=1
+    gemv32_argmax_init: for (uint32_t lane = 0; lane < 16; ++lane) {
+#pragma HLS unroll
+            lane_best[lane] = -3.402823466e38f;
+            lane_best_index[lane] = 0;
+        }
+
         gemv32_logits_channel_pair: for (uint32_t pair = 0;
                                              pair < GEMV_CHANNELS / 2;
                                              ++pair) {
@@ -3550,6 +3607,19 @@ gemv32_store_fill: for (uint32_t i = 0; i < total_opacks; ++i) {
                 }
                 debug_index += 16;
 #endif
+                /* Emitted beat number is pair*125 + p: each pair contributes
+                 * 62 even-channel beats plus 63 stitched ones, and 2 x 1000
+                 * rows is exactly 125 whole Beat512 lines. Global vocabulary
+                 * index is therefore emitted_beat*16 + lane. */
+                const uint32_t even_base = (pair * 125u + p) * 16u;
+            gemv32_argmax_even: for (uint32_t lane = 0; lane < 16; ++lane) {
+#pragma HLS unroll
+                    const float candidate = get_fp32_lane(line, lane);
+                    if (candidate > lane_best[lane]) {
+                        lane_best[lane] = candidate;
+                        lane_best_index[lane] = even_base + lane;
+                    }
+                }
                 logits_stream.write(line);
             }
 
@@ -3578,6 +3648,15 @@ gemv32_store_fill: for (uint32_t i = 0; i < total_opacks; ++i) {
                 }
                 debug_index += 16;
 #endif
+                const uint32_t odd_base = (pair * 125u + 62u + p) * 16u;
+            gemv32_argmax_odd: for (uint32_t lane = 0; lane < 16; ++lane) {
+#pragma HLS unroll
+                    const float candidate = get_fp32_lane(line, lane);
+                    if (candidate > lane_best[lane]) {
+                        lane_best[lane] = candidate;
+                        lane_best_index[lane] = odd_base + lane;
+                    }
+                }
                 logits_stream.write(line);
                 if (p + 1 < ((GDN_VOCAB / GEMV_CHANNELS) + 15) / 16) {
                     carry = source.range(511, 256);
@@ -3585,13 +3664,24 @@ gemv32_store_fill: for (uint32_t i = 0; i < total_opacks; ++i) {
             }
         }
 
-        /* Iter63: the on-chip argmax is retired. The host already receives the
-         * full FP32 logit vector (Iter61), so the greedy pick costs nothing
-         * there, and this scan was a second II=1 pass over the whole reorder
-         * buffer plus a 16-wide compare tree, inside a block the island
-         * pblocks distribute across all three SLRs. The host reproduces the
-         * exact rule this implemented -- maximum value, lowest vocabulary
-         * index on ties -- with a strict-'>' first-wins scan. */
+        /* Cross-lane merge: lower index wins a tie, matching the host rule. */
+        float best = lane_best[0];
+        uint32_t best_index = lane_best_index[0];
+    gemv32_argmax_merge: for (uint32_t lane = 1; lane < 16; ++lane) {
+            const float candidate = lane_best[lane];
+            const uint32_t candidate_index = lane_best_index[lane];
+            if (candidate > best ||
+                (candidate == best && candidate_index < best_index)) {
+                best = candidate;
+                best_index = candidate_index;
+            }
+        }
+        /* Lane 0 of out[0] carries the token id. The LM-head branch writes
+         * nothing else to `out`, and the top level copies this one lane to the
+         * workspace token slot -- no AXI port is added inside this block,
+         * which is the constraint Iter58b and Iter59 violated. */
+        out[0] = 0;
+        set_fp32_lane(out[0], 0, (float)best_index);
         return;
     }
 

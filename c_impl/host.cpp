@@ -647,7 +647,11 @@ public:
         }
     }
 
-    double run_forward(int32_t token) {
+    /* want_logits=false skips the 128 KB logit read-back and takes the token
+     * id the kernel now writes to the workspace slot. A generation loop needs
+     * only that; teacher-forced scoring and every reference comparison need
+     * the full vector and pass true. */
+    double run_forward(int32_t token, bool want_logits = true) {
         if (token < 0 || static_cast<uint32_t>(token) >= vocab_) {
             throw std::runtime_error("token id out of range for hardware run");
         }
@@ -680,10 +684,25 @@ public:
 
         // The LM head streams its full logit vector to the workspace logits
         // region; pull it back for scoring and host-side greedy selection.
-        const size_t lg_off = GDN_WS_OFF_LOGITS * sizeof(float);
-        const size_t lg_bytes = static_cast<size_t>(GDN_WSF_LOGITS) * sizeof(float);
-        sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_FROM_DEVICE, lg_bytes, lg_off);
-        workspace_bo_.read(logits_host_.data(), lg_bytes, lg_off);
+        /* One 512-bit line: lane 0 is the kernel's greedy pick. Always cheap. */
+        const size_t tk_off = GDN_WS_OFF_X_NORM * sizeof(float);
+        float token_line[16];
+        sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_FROM_DEVICE,
+                        sizeof(token_line), tk_off);
+        workspace_bo_.read(token_line, sizeof(token_line), tk_off);
+        device_token_ = static_cast<int32_t>(token_line[0]);
+
+        if (want_logits) {
+            const size_t lg_off = GDN_WS_OFF_LOGITS * sizeof(float);
+            const size_t lg_bytes =
+                static_cast<size_t>(GDN_WSF_LOGITS) * sizeof(float);
+            sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_FROM_DEVICE,
+                            lg_bytes, lg_off);
+            workspace_bo_.read(logits_host_.data(), lg_bytes, lg_off);
+            logits_valid_ = true;
+        } else {
+            logits_valid_ = false;
+        }
 
         return seconds;
     }
@@ -785,6 +804,10 @@ public:
 
     // Full pre-argmax logit vector the kernel streamed out this step.
     const float *device_logits() const { return logits_host_.data(); }
+    bool logits_valid() const { return logits_valid_; }
+    /* The kernel's on-chip greedy pick: maximum value, lowest vocabulary index
+     * on ties -- the same rule the host scan implements. */
+    int32_t device_token() const { return device_token_; }
 
     double average_kernel_seconds() const {
         return kernel_runs_ == 0 ? 0.0 : total_kernel_seconds_ / static_cast<double>(kernel_runs_);
@@ -823,6 +846,8 @@ private:
     xrt::bo workspace_bo_;
     std::vector<xrt::bo> weight_bos_;
     std::vector<float> logits_host_;
+    int32_t device_token_ = -1;
+    bool logits_valid_ = false;
     double total_kernel_seconds_ = 0.0;
     uint64_t kernel_runs_ = 0;
 };
@@ -1101,19 +1126,39 @@ static std::vector<DecodeExample> run_decode_hw(
         std::fwrite(magic, 1, sizeof(magic), logits_dump);
         std::fwrite(header, sizeof(uint32_t), 3, logits_dump);
     }
+    uint64_t onchip_argmax_mismatches = 0;
     for (uint32_t step = 1; step < n; ++step) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        double ksec = runner.run_forward(result.gen_traj[step - 1]);
-        /* Iter63: the kernel emits the full FP32 logit vector and no longer
-         * argmaxes on chip. Pick the token here with the same rule the retired
-         * hardware scan implemented -- maximum value, lowest vocabulary index
-         * on ties -- which a strict-'>' first-wins loop gives exactly. */
+        /* Iter67: the kernel picks the token on chip again, so a plain
+         * generation step needs only the 4-byte token slot. Pull the 128 KB
+         * logit vector back over PCIe only when something actually consumes
+         * it -- a reference comparison or a dump. */
+        const bool want_logits = !logits_reference_path.empty() ||
+                                 !gpu_logits_reference_path.empty() ||
+                                 logits_dump != nullptr;
+        double ksec = runner.run_forward(result.gen_traj[step - 1], want_logits);
         const float *device_logits = runner.device_logits();
-        int next = 0;
-        for (uint32_t vocab_index = 1;
-             vocab_index < model.config.vocab_size; ++vocab_index) {
-            if (device_logits[vocab_index] > device_logits[next]) {
-                next = static_cast<int>(vocab_index);
+        int next = runner.device_token();
+        if (want_logits) {
+            /* We already paid for the logits, so re-derive the pick on the
+             * host and cross-check the hardware against it for free. Same rule
+             * both sides: maximum value, lowest vocabulary index on ties,
+             * which a strict-'>' first-wins scan gives exactly. A disagreement
+             * here is a real defect, not a rounding difference -- both are
+             * reading the identical FP32 vector. */
+            int host_pick = 0;
+            for (uint32_t vocab_index = 1;
+                 vocab_index < model.config.vocab_size; ++vocab_index) {
+                if (device_logits[vocab_index] > device_logits[host_pick]) {
+                    host_pick = static_cast<int>(vocab_index);
+                }
+            }
+            if (host_pick != next) {
+                ++onchip_argmax_mismatches;
+                std::cerr << "[warn] on-chip argmax " << next
+                          << " != host scan " << host_pick
+                          << " at step " << step << "\n";
+                next = host_pick;
             }
         }
         /* Stop the wall clock here. Everything above is work a production
