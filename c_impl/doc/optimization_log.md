@@ -8608,3 +8608,71 @@ Items 2 and 3 need one integrated csynth at 150 MHz under 2024.2, which should
 report `recur_island_read` at II=1, the estimated clock against the current
 4.867 ns, and the resource delta from the fused argmax. No hardware build until
 that passes.
+
+### Iter67 measured results — argmax RETAINED, two II fixes REJECTED
+
+*Probes 2985 and 2986, integrated csynth at 150 MHz under Vitis 2024.2.
+Baseline throughout is Iter66e (probe 2485): top 6,659,621 cycles, BRAM18
+1,995 / DSP 3,325 / FF 1,002,888 / LUT 895,268 / URAM 80, estimated 205.47 MHz,
+`recur_island_read` 2,055 cycles at II=2, recurrent islands 43,427 cycles/layer
+and 132,071 LUT, `gdn_depthwise_conv_silu_head_kind` 272 cycles.*
+
+**On-chip argmax: RETAINED (probe 2985).** Fusing the greedy pick into the two
+existing emission loops cost **+70 cycles** (+0.001%) and **zero** BRAM, DSP or
+URAM. Both emission loops held II=1 (depth 3); `gemv32_argmax_merge` is 15
+trips at II=1, 17 cycles, once per token. The estimated clock was unchanged at
+205.47 MHz. The price is **+30,612 LUT (+3.4%, 68% -> 71%)** and +13,829 FF,
+which lands in `gemv32_store` and therefore across all three SLRs -- the number
+to watch against SLR0's 96.53% CLB occupancy, and the reason this must be
+judged at place-and-route rather than on the cycle count.
+
+**II fix attempt 1, latency-4 fabric adders: REJECTED (probe 2985).** Naming
+each accumulator sum and binding it to `impl=fabric latency=4` did **not**
+reach II=1: `recur_island_read` stayed at interval 2, 2,056 cycles, depth
+falling only 11 -> 10. It cost **+20,448 LUT** in the recurrent islands
+(132,071 -> 152,519) for nothing. The premise was wrong: the loop-carried path
+is not the adder alone but *accumulator read + add + write*, and the
+accumulators are `cyclic factor=16` over 64 elements, so each bank is a
+four-element memory whose access latency sits inside the recurrence.
+
+**II fix attempt 2, complete partitioning: REJECTED as a clear regression
+(probe 2986).** Making those four accumulators registers to remove the memory
+latency made it **worse**: interval 2 -> **4**, `recur_island_read` 2,055 ->
+**4,104** cycles, and the recurrent islands 43,427 -> **57,491 cycles/layer**
+-- +14,064 per layer, +337K per token, about **13% slower**. The index
+`local_base + lane` is dynamic in `local_base`, so complete partitioning builds
+a 64-way crossbar that costs more than the memory latency it removes. Do not
+retry this.
+
+**Convolution window banking: POSITIVE, retained (probe 2986).**
+`in_window[4][256]` was partitioned `dim=2 cyclic factor=GDN_CONV_LANES` with
+`GDN_CONV_LANES` = 4, while `iter39_head_conv_shift` and `..._restore` unroll
+**16** lanes. Bank index is `col % 4 == lane % 4`, so four lanes collide on
+every bank and demand four reads and four writes per cycle from a two-port
+memory -- the measured cause of the three escalating "limited memory ports"
+violations on `in_window_4` and `in_window_8`. Banking to 16 to match the
+unroll took the block from **272 to 193 cycles, -29%**. HLS still prints
+violations for the residual, so there is more here, but the block is
+measurably faster and the change is pure storage: no arithmetic, no reordering.
+
+**Iter67c, five-phase schedule: IN PROGRESS (probe 2992).** Per external
+review, the routability-first fix is to lengthen the distance rather than
+shorten the adder. Iterating five phases per row while four carry work makes
+each accumulator's revisit distance 5 and inserts one bubble per row. The
+arithmetic is untouched, so it stays bit-exact -- unlike parity partial sums,
+which would reach II=1 at distance 8 by reassociating the sum and would retire
+the golden. Predicted 1,290 cycles per head against 2,056, about 147K cycles
+or 1.47 ms per token, with the `bind_op` dropped so the +20,448 LUT is
+recovered.
+
+**The bound that decides it.** II=2 at distance 4 means `4 x 2 = 8 >= feedback
+> 4`, so the feedback path is 5 to 8 cycles -- five phases wins only if it is
+exactly 5. `GDN_RECURRENT_READ_PHASES` is the single knob. The value decays
+fast: 1.47 ms at five phases, 1.0 ms at six, nothing by eight. This is worth
+one or two more probes, not five; past that the honest conclusion is that II=1
+here requires reassociation and the 7.7% must be weighed against regenerating
+every reference and repeating the quality work.
+
+Native gates after the Iter67c edit: fast 6/6 and full 32/32 PASS,
+`exact_traj_match=True`, `first_divergence=-1`, 992,000 logits,
+`exact_ref_mismatch=0`, `argmax_mismatch=0`.
