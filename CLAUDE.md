@@ -39,7 +39,7 @@ Checkpoint: `m-a-p/1.3B-100B-GatedDeltaNet-pure` (HuggingFace) — consumed by `
 |---|---|
 | Shipping image | **Iter66e**, all-BF16, Vitis 2024.2, XCLBIN `98b38cc7…` |
 | TPOT | **26.654 ms/token** wall, **25.625 ms** kernel (job 2507) = 2.5625M cycles @ 100 MHz |
-| Routed timing | WNS +0.003 / WHS +0.009 ns, **zero** failing endpoints of 2,277,369, zero overlaps |
+| Routed timing | zero overlaps, zero failing endpoints of 2,277,369. **Per clock**: kernel **+0.195 ns**, fixed 250 MHz DMA **+0.003 ns**, HBM 450 MHz +0.079. The design-wide +0.003 is the *shell's* margin, not the kernel's |
 | Correctness | exact 64-token trajectory; CUDA vector gate over 2,016,000 logits — NRMSE 0.00466, min cosine 0.99995, top-5 exact, zero argmax mismatches |
 | Long-run drift | bounded to 512 tokens; hardware tracks the GPU for 447 tokens (job 2529) |
 | Per-token weight bytes | 2.597 GB → 1,268,224 beat-cycles/port = **49.5%** port occupancy |
@@ -119,6 +119,8 @@ Phase times: `xo` ~30–60 min, `host` seconds. The 32-port `xclbin` link is **l
 **`make run_hw` is the production build-and-run recipe, and `bash run_hw_sbatch.sh` is how it reaches the cluster** (two chained Slurm jobs — see *Cluster environment* below; a card and 32 cores cannot be held by one job). It resolves the relocatable physical configuration, builds HLS at 150 MHz, links the demonstrated 100 MHz image, then runs exact 8-token and 64-token on-card gates. Do not add iteration-specific Make targets or launcher scripts; preserve historical commands in `optimization_log.md` instead.
 
 **Kernel frequency:** `HLS_FREQ` defaults to **150 MHz** and `LINK_FREQ`/`FREQ` to **100 MHz**. The U55C platform defaults to 300 MHz, which this kernel cannot meet, so never omit the link override. A requested frequency is not an achieved frequency: verify `DATA_CLK` in the XCLBIN and report the per-clock WNS. The fixed 250 MHz `dma_ip_axi_aclk_1` is a separate timing gate even when the scalable kernel clock closes.
+
+**Always read WNS *per clock*, not design-wide — the two differ by 65x here.** Iter66e's design-wide WNS is +0.003 ns, and it is easy to read that as "the kernel barely closed." It did not: `clk_kernel_00_unbuffered_net` has **+0.195 ns** over 1,580,815 endpoints, and the +0.003 belongs to the fixed 250 MHz `dma_ip_axi_aclk_1`, which raising the kernel clock does not directly load. Vivado's own `report_qor_suggestions` on the routed checkpoint says it has no suggestions because the design "is assessed to easily meet timing." **Frequency is therefore an open lever again**, which it was not while the design was bandwidth-bound: port occupancy is frequency-invariant at 49.5%, so a faster clock is a clean multiplier on the token rather than a march toward an HBM wall.
 
 **`HW_CFG_TEMPLATE` now defaults to `hw_iter66e_frp_unpair_f100.cfg`** — the shipping physical configuration — so a bare `bash run_hw_sbatch.sh <tag>` reproduces the routed image. `hw_f150_physical_islands.cfg` is retained as the pre-Iter66 recipe for A/B comparison only.
 

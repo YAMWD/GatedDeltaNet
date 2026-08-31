@@ -706,8 +706,11 @@ Final implementation result:
 | Requested / encoded kernel clock | **100 / 100 MHz** |
 | Failed / unrouted nets | 0 / 0 |
 | Node overlaps | **0** |
-| Setup WNS / TNS | **+0.003 ns / 0.000**, 0 failing of 2,277,369 endpoints |
+| Setup WNS / TNS (design-wide) | **+0.003 ns / 0.000**, 0 failing of 2,277,369 endpoints |
 | Hold WHS / THS | **+0.009 ns / 0.000**, 0 failing |
+| Setup WNS, **kernel clock** | **+0.195 ns** over 1,580,815 endpoints |
+| Setup WNS, fixed 250 MHz DMA | +0.003 ns over 307,211 endpoints |
+| Setup WNS, fixed 450 MHz HBM | +0.079 ns over 270,010 endpoints |
 | Automatic clock scaling | **none** |
 | `route_design` wall time | **1:30:56** (every prior attempt ground 5+ h and failed) |
 | Total build | 8:07:32 on `harrier`, job 2502 |
@@ -715,6 +718,20 @@ Final implementation result:
 Raw post-route setup was WNS -0.017 / TNS -0.132; post-route
 `AggressiveExplore` recovered it to the values above. Both the kernel and the
 fixed 250 MHz DMA clock domains are clean.
+
+**Read the per-clock rows, not the design-wide one — this design's headroom is
+where it is not obvious.** The design-wide +0.003 ns belongs to the *fixed*
+250 MHz `dma_ip_axi_aclk_1`, a shell clock the kernel frequency does not
+directly load. The scalable kernel clock has **+0.195 ns**, a 9.805 ns
+critical path, and `report_qor_suggestions` on the routed checkpoint returns
+nothing because the design "is assessed to easily meet timing." Frequency is
+consequently an open lever for the first time since the design became
+compute-bound: port occupancy is frequency-invariant at 49.5%, so a faster
+clock scales the token directly instead of walking into an HBM wall. Treat the
+2% implied by 9.805 ns as a floor rather than a ceiling — the tools stopped
+optimizing the kernel path once the 100 MHz constraint was met, and the last
+frequency attempt (Iter36, 130 MHz auto-scaled to 115.7) predates both frp and
+the removal of the clock-enable cones.
 
 Routed whole-device usage and its per-SLR distribution:
 
