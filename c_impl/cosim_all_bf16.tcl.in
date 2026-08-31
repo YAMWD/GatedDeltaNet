@@ -1,0 +1,11 @@
+open_project hls_cosim_all_bf16
+set_top gdn_forward
+add_files gdn_model.cpp -cflags "-I."
+add_files -tb packed_bf16_one_layer_test.cpp -cflags "-I."
+open_solution "solution" -flow_target vitis
+set_part {xcu55c-fsvh2892-2L-e}
+create_clock -period @CLOCK_NS@ -name default
+source ./hls_gdn_forward.tcl
+csynth_design
+cosim_design -rtl verilog -trace_level none
+exit

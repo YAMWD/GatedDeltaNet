@@ -54,3 +54,29 @@ __pycache__/
 
 # Disaggregated decode: GPU-exported state blobs (large, regenerable)
 c_impl/fixtures_decode/*.gdnstate
+
+# ---------------------------------------------------------------------------
+# Iter66 additions
+# ---------------------------------------------------------------------------
+# Per-iteration evidence: Vivado/Vitis reports, live logs, routed checkpoints.
+# 32 GB and growing. The numbers that matter are transcribed into
+# c_impl/doc/optimization_log.md; the trees themselves are local evidence.
+c_impl/diagnostics/
+
+# HLS cosim and standalone-qualification work trees
+c_impl/hls_cosim_packed_bf16/
+c_impl/GDN_packed_cluster/
+c_impl/native_bf16_qual/
+
+# Logit reference vectors (~7.8 MB each). Regenerable, and the recipes are
+# committed: scripts/export_all_bf16_reference.slurm produces the GPU
+# reference, scripts/run_all_bf16_native_reference.slurm the native one.
+c_impl/artifacts/*.gdnlog
+
+# Slurm stdout that landed outside diagnostics/
+c_impl/slurm-*.out
+
+# Standalone arithmetic/layout probe binaries
+c_impl/all_bf16_layout_test
+c_impl/packed_bf16_test
+c_impl/gdn_eval_nofma
