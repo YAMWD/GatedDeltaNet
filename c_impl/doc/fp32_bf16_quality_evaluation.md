@@ -1,6 +1,18 @@
 # FP32 and BF16-Mixed Checkpoint Quality Evaluation
 
-Status: complete as of 2026-08-27. The FP32 arm and both BF16 arms have run
+Status: **complete** as of 2026-08-27, and its conclusion is now **implemented
+in shipping hardware** — Iter66e is all-BF16 with a native `ap_float<16,8>`
+product, measured at 26.654 ms/token on card. This document is no longer a
+pending question about whether BF16 is acceptable; it is the evidence base for
+a contract the kernel already runs. The on-card sequel, **Iter66o, is also complete
+and passing**: teacher-forced WikiText-2 rolling perplexity through the
+kernel's own exported logits gives FPGA word PPL **16.774840** against GPU
+**16.776124** on identical windows — **-0.0077%** against a 5% gate, over 62
+documents / 183 windows / 314,843 scored tokens with full workload-identity
+verification (card job 2822, GPU reference job 2821). The earlier 2-document
+smoke read -0.058%; the full run is 7.6x tighter.
+
+Original status line: complete as of 2026-08-27. The FP32 arm and both BF16 arms have run
 Tables 2, 3, and 5 at their full reference sample counts, plus a BF16
 recurrent-state follow-up, an all-BF16 arm (weights, activations and state
 together), a native-BF16-product arm matching the prospective HLS multiplier,

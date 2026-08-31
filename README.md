@@ -53,7 +53,9 @@ Run the short exact correctness gate, or omit `--fast` for the full gate:
 bash scripts/decode_correctness_check.sh --fast
 ```
 
-Run integrated HLS synthesis with Vitis HLS 2022.2:
+Run integrated HLS synthesis with Vitis HLS **2024.2** (pinned as
+`VITIS_VERSION` in `c_impl/Makefile`; the native BF16 multiplier requires its
+`ap_float`):
 
 ```bash
 cd c_impl
@@ -78,7 +80,9 @@ diagnostic reports are generated artifacts and are intentionally not committed.
 
 ## Documentation
 
-- `c_impl/doc/architecture.md` — current top-level architecture and ABI.
+- `c_impl/doc/README.md` — **start here**; says which document is current.
+- `c_impl/doc/architecture.md` — current top-level architecture and ABI
+  (Iter66e: all-BF16, 26.654 ms/token on card).
 - `c_impl/doc/decode_disaggregated_gemv.md` — 32-port GEMV engine.
 - `c_impl/doc/recurrent_attention.md` — recurrent-state implementation.
 - `c_impl/doc/cycle_optimization_roadmap.md` — measured cycle roadmap.

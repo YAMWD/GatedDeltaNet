@@ -1,17 +1,27 @@
 # Optimised Recurrent Attention
 
-**Status:** Active Iter37 decode compute block. The prefill and v1--v7
-synthesis discussions later in this document are historical.
+**Status:** Active decode compute block, current as of **Iter66e**
+(2026-08-30). The prefill and v1--v7 synthesis discussions later in this
+document are historical.
+
+**This block is now the second-largest consumer of the token and the largest
+one that did not shrink when the weights went BF16.** At 43,427 cycles per
+layer x 24 layers = **1.042M cycles, it is 40.7% of the measured 2.5625M-cycle
+token.** While weights were FP32 it was ~25%; halving the weight bytes did not
+touch it, so its share grew. Any further optimisation campaign should cost
+levers against this number, not against the block's share of HBM bytes.
 
 **Location:** `gdn_model.cpp` (`gdn_recurrent_attention_islands` and its two
-frequency-island actors). The retired monolithic helper remains available in
-Git history.
+island actors). The retired monolithic `gdn_recurrent_attention` helper is
+available through Git history.
 
 ## Overview
 
 This module implements the gated delta rule recurrence. Each of the eight
-heads maintains a persistent 256 x 256 FP32 state matrix. Iter37 combines four
-features:
+heads maintains a persistent 256 x 256 state matrix, **stored BF16 on the
+device since Iter64** (24 MiB across 24 layers, previously 48 MiB FP32) and
+widened to FP32 inside the island for the arithmetic. Iter37 established four
+features that remain:
 
 1. one head-local 256 x 256 URAM buffer rather than an all-head layer buffer;
 2. algebraic fusion that reduces four state traversals to a retrieval pass and
@@ -19,10 +29,51 @@ features:
 3. four external state stripes appended to weight ports 28--31; and
 4. 32-column recurrent arithmetic supplied by two state ports at a time.
 
-The external `.gdnstate` format remains contiguous
-`[layer][head][K][V]`. The host scatters Pack16 words into four 12 MiB tails
-when it uploads the state; the kernel updates that striped representation in
-place across decode calls.
+The external `.gdnstate` format remains a contiguous
+`[layer][head][K][V]` FP32-word tensor whose values must be BF16-exact. The
+host packs them 32 per Beat512 and scatters into four **6 MiB** tails at
+upload; the kernel updates that striped representation in place across decode
+calls. The public file format is unchanged by the BF16 move — only the device
+representation is.
+
+## Measured per-head schedule (Iter66e csynth)
+
+The `recur_island_head` loop runs 8 heads at **5,428 cycles per iteration**,
+43,424 per island; the two islands run concurrently so the wrapper is 43,427.
+The sub-pipelines are serial within a head:
+
+| Loop | Cycles | Trips | II | What it is |
+|---|---:|---:|---:|---|
+| `recur_island_load_state` | **1,027** | 1,024 | 1 | fill local scratch from the HBM-fed queue |
+| `recur_island_load_qk` | 262 | 256 | 1 | |
+| `recur_island_load_v` | 258 | 256 | 1 | |
+| `recur_island_norm_qk` | 262 | 256 | 1 | |
+| `recur_island_alpha_product` | 262 | 256 | 1 | |
+| `recur_island_read` | **2,055** | 1,024 | **2** | the retrieval/partial compute pass |
+| `recur_island_delta` | 30 | 128 | 1 | 16 columns/cycle/island |
+| `recur_island_update` | **1,035** | 1,024 | 1 | write the updated state back out |
+| others (`load_qkv`, `init`, `output_half`) | 26 | | | |
+
+Two things follow directly, and both are cheap to test:
+
+**State movement is 2,062 of 5,428 cycles per head — 38% of the block, and
+395,904 cycles or 15.4% of the whole token** (`load_state` + `update`, x 8
+heads x 24 layers). That is the true size of the on-chip-residency prize. Note
+it is *not* the 1.9%-of-bytes figure that the earlier documents quoted: bytes
+were the right metric only while the design was bandwidth-bound, and it no
+longer is (ports are busy 49.5% of the token).
+
+**`recur_island_read` requests `#pragma HLS pipeline II=1` and achieves II=2**,
+in every `csynth.rpt` on disk from 2026-08-19 onward. Iter38C documented this
+failure mode — the merged four-port read requested two accesses per URAM bank
+per cycle — and Iter38D was recorded as having fixed it with `GDNStatePair`.
+The current source (`gdn_model.cpp`, `recur_island_read`) reads one
+`GDNStatePair` per lane but updates four accumulator arrays
+(`retrieval_lo/hi`, `partial_lo/hi`) under a 16-lane unroll, so the accumulator
+port count is the more likely driver than `state_pair`. **If II=1 is
+recoverable it is 1,024 cycles per head, 196,608 per token, 7.7%** — for a
+source-only change with no new resource. This has not been attempted and is the
+cheapest open lever in the block.
 
 ## Gated Delta Rule Algorithm
 
@@ -293,8 +344,6 @@ plus a few control-path BRAMs ⇒ 258 total). The state matrix (8 × 256 × 256 
 
 ## Parity Verification
 
-The active full-model gate is `scripts/decode_correctness_check.sh`. It checks
-the complete decode trajectory against the cached GPU golden; use `--fast` for
-the short smoke gate and omit it for the full check. Historical standalone
-attention and prefill-parity results remain in Git history and the optimization
-log rather than in active test harnesses.
+The retired single-layer and prefill parity results remain recorded in
+`optimization_log.md`. Current changes are gated by the decode-only native
+trajectory and full-logit checks in `scripts/decode_correctness_check.sh`.

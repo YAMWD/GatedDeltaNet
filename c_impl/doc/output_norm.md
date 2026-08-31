@@ -1,6 +1,8 @@
 # Output Norm + Gate (`gdn_output_norm_and_gate`)
 
-**Status:** Active decode compute block. Synthesis tables below are historical.
+**Status:** Active decode compute block, current at **Iter66e** and
+structurally unchanged. Synthesis tables below are historical and predate the
+BF16 work.
 
 **Location:** `gdn_model.cpp` (`gdn_output_norm_and_gate`, static helper)
 

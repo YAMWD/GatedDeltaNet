@@ -1,23 +1,66 @@
-# Cycle-First Optimization Roadmap After Iter57
+# Cycle-First Optimization Roadmap After Iter66e
 
-**Status:** Iter57 preserves the completed recurrent-head portion of Stage 4
-and adds the timing-friendly physical decomposition needed to close a true
-100 MHz image: two concurrent 16-column recurrent islands, registered GEMV
-collector boundaries, and two-head state queues. It is routed, timing-closed,
-and exact on card. Output-projection head-chunk accumulation and chunk-streamed
-MLP remain open.
+**Current cycle reference (rebased 2026-08-31):** **Iter66e**, all-BF16,
+**2.5625M cycles/token = 25.625 ms kernel / 26.654 ms wall** at a true 100 MHz,
+WNS +0.003 / WHS +0.009 ns, zero overlaps, exact 64-token trajectory. This
+supersedes Iter57's 4.202354M / 42.023540 ms as the number every remaining
+stage is costed against.
 
-**Current cycle reference:** Iter57 preserves the 32-port/16-cluster FP32 GEMV
-topology and measures **4.202354M cycles/token / 42.023540 ms/token** with exact
-64-token parity at a true 100 MHz. Kernel/DMA WNS are +0.060/+0.003 ns. This is
-a 2.48% cycle and latency reduction from Iter39C. Iter54c remains a historical
-lower-cycle result at 4.112395M, but its 100 MHz request auto-scaled to 94.1 MHz
-and is not the production timing reference.
+**Status of the original stages.** Iter57 completed the recurrent-head portion
+of Stage 4 and the physical decomposition. Iter66e then delivered the "Beyond
+Exact FP32" direction (§13) that this roadmap had listed as speculative:
+packed-BF16 weights, a native `ap_float<16,8>` multiplier, BF16 recurrent
+state, full-window URAM state queues, and free-running cluster pipelines. That
+one step was worth **1.582x** — more than every remaining listed stage
+combined. Output-projection head-chunk accumulation and chunk-streamed MLP
+remain open and remain percent-level.
 
-**Primary objective:** minimize exact single-token decode cycles first. Perform
-only the 100 MHz implementation checkpoints required to verify real cycles and
-routability while the architecture is evolving. Begin deliberate frequency
-recovery only after the minimum-cycle exact-FP32 architecture is stable.
+## 0. The one thing that changed how levers must be costed
+
+**The design is no longer HBM-bandwidth-bound, so a lever's share of bytes no
+longer predicts its share of time.** At 2.597 GB of BF16 weights per token,
+32 ports x 64 B x 100 MHz gives **1,268,224 beat-cycles per port against a
+measured 2,562,500 — 49.5% port occupancy**. The standalone microbenchmark
+sustains 98.353% of clock-rate ceiling on this exact port structure, so the
+idle half is scheduling, not memory.
+
+Two consequences, both already paid for:
+
+- **BF16 delivered 1.582x, not 2x.** The prediction of "13--21 ms" in earlier
+  documents assumed a bandwidth-bound design. Record the miss; do not repeat
+  the reasoning.
+- **The recurrent block became the second target without changing.** It is
+  43,427 cycles/layer x 24 = **1.042M cycles, 40.7% of the token** — about 25%
+  when weights were FP32. Halving the weights raised its share.
+
+Rank remaining levers by measured share of the token:
+
+| Lever | Measured basis | Upper bound | Physical risk |
+|---|---|---:|---|
+| Sub-byte weights (INT4) | weight beats 1,268,224 -> ~317,056/port | **37%** (-> ~16.1 ms) | new datapath, retires the current quality baseline |
+| Recurrent state fully on chip | `load_state`+`update`, 395,904 cyc | 15.4% (realistically 8--12%) | **blocked** — see below |
+| `recur_island_read` II=2 -> II=1 | 1,024 cyc/head x 192 | **7.7%** | none — source only |
+| Partial state residency, SLR2-local | 9 of 24 layers x 15.4% | 5.8% | low — no new cross-SLR path |
+| Head-chunked output projection | roadmap Stage 4 remainder | percent-level | moderate |
+| Chunk-streamed GU/SwiGLU/MLP-down | roadmap Stage 5 | percent-level | moderate |
+
+**Full on-chip recurrent state is blocked and should not be opened.** 24 MiB of
+BF16 state is 683 URAM by raw capacity and only 80 of 960 are in use, so it
+looks free device-wide. It is not: URAM is **320 per SLR**, the recurrent
+islands are pblock-pinned to SLR2, and SLR2 has **272 free = 9 layers**. The
+other 15 would cross on 512-bit paths while SLR1<->SLR0 SLL sits at **89.57%**
+and SLR0/SLR1 CLB at **96.53% / 94.68%**. Feasibility is unproven as well as
+tight: this design's partitioned access has cost ~1.68x raw
+(96 URAM/layer against 57 for the FP32 version), which puts full residency near
+1,152 URAM against 960 available. Iter59 measured a weaker version — ~600 URAM
+moved on chip — and congestion worsened in all four directions with
+`route_design` refusing at level 7. **Do the two cheap substitutes first**: the
+II=2 fix (7.7%, source-only) and SLR2-local partial residency (5.8%).
+
+**Primary objective:** minimize single-token decode cycles. Perform only the
+100 MHz implementation checkpoints required to verify real cycles and
+routability while the architecture is evolving. Note that "exact FP32" is no
+longer the contract — see `architecture.md` § *Arithmetic contract*.
 
 ## 1. Measured Baseline
 
@@ -25,12 +68,27 @@ Iter38 stripes the 48 MiB recurrent state over tails appended to weight ports
 28--31 and advances all four ports concurrently. Compact 64-bit low/high state
 pairs let the same 32 URAM banks serve both halves without a second address.
 
-| Metric | Iter36 | Iter37 | Iter38 | Iter39C | Iter54c | Iter57 |
-|---|---:|---:|---:|---:|---:|---:|
-| Clock used on card | 100 MHz | 100 MHz | 100 MHz | 100 MHz | 94.1 MHz | **100 MHz** |
-| Mean cycles/token | 5.958M | 5.145M | 4.708M | 4.309M | **4.112M** | 4.202M |
-| Mean latency | 59.578 ms | 51.451 ms | 47.079 ms | 43.093 ms | 43.702 ms | **42.024 ms** |
-| Recurrent HLS cycles/layer | 76.7K | 43.9--44.1K | 27.3--27.5K | 27.3--27.5K | streamed | two streamed islands |
+| Metric | Iter36 | Iter37 | Iter38 | Iter39C | Iter54c | Iter57 | **Iter66e** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Clock used on card | 100 MHz | 100 MHz | 100 MHz | 100 MHz | 94.1 MHz | 100 MHz | **100 MHz** |
+| Mean cycles/token | 5.958M | 5.145M | 4.708M | 4.309M | 4.112M | 4.202M | **2.5625M** |
+| Mean latency (kernel) | 59.578 ms | 51.451 ms | 47.079 ms | 43.093 ms | 43.702 ms | 42.024 ms | **25.625 ms** |
+| Weight bytes/token | 5.195 GB | 5.195 GB | 5.195 GB | 5.195 GB | 5.195 GB | 5.195 GB | **2.597 GB** |
+| Port occupancy | 92% | 79% | 73% | 67% | 64% | 65% | **49.5%** |
+| Recurrent HLS cycles/layer | 76.7K | 43.9--44.1K | 27.3--27.5K (see note) | " | streamed | two streamed islands | **43,427 (measured)** |
+
+Port occupancy is derived, not measured directly: weight beats per port divided
+by measured cycles. It is the clearest single indicator that the bottleneck
+moved — the design gave back half its memory pressure and did not get twice as
+fast.
+
+**Note on the recurrent row.** The 27.3--27.5K figures are carried forward from
+the Iter38D entry and **cannot be reproduced from any report on disk**: every
+`csynth.rpt` from 2026-08-19 onward, including pre-BF16 builds, reports
+`gdn_recurrent_attention_islands` at 43,235--43,427 cycles/layer. Either the
+Iter57 two-island split restored the cost or the two figures count different
+scopes. Unresolved; needs one instrumented csynth. It matters because this
+block is 40.7% of the token.
 
 The dimension-correct Iter37 schedule is:
 
@@ -407,15 +465,31 @@ For exact FP32, stop cycle work when one of these holds:
 - routing/resource cost forces a larger loss elsewhere than the projected
   saving.
 
-The realistic endpoint is **3.2--3.5M cycles** with four state ports and the
-stretch endpoint is **3.0--3.3M cycles** with eight. At a recovered 115 MHz,
-those ranges correspond to approximately 26.1--30.4 ms/token.
+**These endpoints were overtaken and are kept as a record of the estimate.**
+The realistic endpoint was projected at **3.2--3.5M cycles** with four state
+ports, stretch **3.0--3.3M**, corresponding to ~26.1--30.4 ms/token at a
+recovered 115 MHz. Iter66e reaches **2.5625M cycles / 25.625 ms at 100 MHz**,
+below the stretch endpoint and without any frequency recovery — because it
+changed the accuracy contract rather than staying inside exact FP32. The
+lesson to carry: the floor those bullets described was a floor *of the
+contract*, not of the machine.
+
+Rebased stop conditions for the current, non-exact-FP32 contract: stop when the
+next safe lever projects less than 0.05M cycles/token (2% of the token), when a
+gain requires a quality regression beyond the pre-registered WikiText gate, or
+when routing cost forces a larger loss elsewhere than the projected saving.
 
 ## 12. Rejected or Deprioritized Directions
 
 - **Direct AXI reads inside GEMV clusters:** previously worsened local
   congestion; retain MM2S/FIFO decoupling.
-- **All recurrent state on chip:** the persistent 48 MiB state does not fit.
+- **All recurrent state on chip:** re-costed at Iter66e and still rejected, but
+  for a different reason than "does not fit". BF16 halved the state to 24 MiB /
+  683 URAM against 880 free, so device capacity is no longer the blocker;
+  **per-SLR capacity is** (320 each, recurrent islands pinned to SLR2 with 272
+  free = 9 layers), together with SLR1<->SLR0 SLL at 89.57% and SLR0/SLR1 CLB at
+  96.53%/94.68%. Prize is 8--15%; Iter59's weaker version made congestion worse
+  in all four directions. Prefer the II=2 fix and SLR2-local partial residency.
 - **Eight time-multiplexed GEMV clusters:** routability fallback only; it raises
   GEMV cycles.
 - **Repeated-call cleanup with source loops:** maintainability only unless the
@@ -428,19 +502,31 @@ those ranges correspond to approximately 26.1--30.4 ms/token.
   limited and already physically dense.
 - **Frequency-first work:** useful only after the cycle topology is final.
 
-## 13. Beyond Exact FP32
+## 13. Beyond Exact FP32 — **partly DONE at Iter66e**
 
-The dense FP32 weight floor prevents a material reduction below roughly 3M
-cycles. Further improvement requires a separate accuracy contract:
+This section correctly identified that the dense FP32 weight floor prevented
+material reduction below roughly 3M cycles and that further improvement
+required a separate accuracy contract. Iter66e took the first two items:
 
-- BF16/FP16 or calibrated INT8 weights;
-- quantized recurrent state;
-- structured sparsity or low-rank projections;
-- speculative multi-token decoding; or
-- additional independent hardware bandwidth.
+- **BF16 weights — DONE.** Packed 32/beat, 2.597 GB/token. Measured 1.582x.
+- **Quantized recurrent state — DONE.** BF16, 24 MiB, 0.02 Table-3 accuracy
+  points measured on GPU before adoption.
+- **Calibrated INT8 / sub-byte weights — OPEN, and now the largest remaining
+  lever at up to 37%.** INT4 would take weight beats from 1,268,224 to
+  ~317,056 per port. Non-power-of-two group sizes with dequantisation in the
+  datapath are the shape worth pursuing, because it is something tensor cores
+  cannot natively execute — the differentiation argument, not just the speed
+  one.
+- **Structured sparsity or low-rank projections — OPEN, unevaluated.**
+- **Speculative multi-token decoding — OPEN.** Note this changes the O(1)
+  per-token claim that motivates the whole partition; evaluate carefully.
+- **Additional independent hardware bandwidth — closed.** All 32 masters and
+  all 32 HBM banks are already committed; the shell's 32-master limit is hard.
 
-These follow the exact-FP32 streaming baseline rather than replacing its
-correctness contract.
+The accuracy contract that replaced exact FP32 is documented in
+`architecture.md` § *Arithmetic contract and what "correct" means*, and the
+quality evidence behind it in `fp32_bf16_quality_evaluation.md`. Any further
+format change must repeat that quality work, not assume it transfers.
 
 ## 14. Iteration Discipline
 

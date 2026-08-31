@@ -1,11 +1,21 @@
 # Disaggregated Decode-Only Accelerator (GEMV datapath)
 
-**Status:** Historical GEMV scaling and optimization record. The current
-production design is the integrated Iter57 32-port/16-cluster,
-activation-resident, timing-island recurrent-state kernel documented in
-[architecture.md](architecture.md).
+**Status:** Historical GEMV scaling and optimization record — **how the design
+got here, not what it is now.** The current production design is the integrated
+**Iter66e** 32-port/16-cluster kernel with packed-BF16 weights, a native
+`ap_float<16,8>` multiplier, free-running cluster pipelines, BF16 recurrent
+state and full-window URAM state queues, documented in
+[architecture.md](architecture.md). Numbers in this document below this header
+describe earlier images and must not be quoted as current.
 The standalone 32-port microbenchmark remains documented separately in
 [`../microbench/gemv_tile/README.md`](../microbench/gemv_tile/README.md).
+
+The current **Iter66e** image measures **26.654 ms/token wall / 25.625 ms
+kernel (2.5625M cycles)** at a true 100 MHz with zero overlaps and
+WNS +0.003 / WHS +0.009 ns. The GEMV datapath this document traces is otherwise
+structurally unchanged from Iter57; what changed is the data format and the
+pipeline control style, not the topology. For reference, the Iter57 image it
+descends from:
 
 The Iter57 U55C image routes with zero failed/unrouted nets and zero overlaps,
 closes the kernel/DMA clocks at +0.060/+0.003 ns WNS, and passes exact 64-token

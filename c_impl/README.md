@@ -18,6 +18,23 @@ In particular:
 Historical source and build recipes are available through Git history rather
 than being retained as inactive files in the production directory.
 
+## Building the hardware from a clean clone
+
+Four inputs are gitignored because they are large and regenerable. Produce
+them first; everything else in the chain is committed.
+
+```bash
+python scripts/export_gdn_c.py weights            # 5.87 GB BF16-exact .gdnw
+sbatch scripts/export_all_bf16_reference.slurm    # GPU logits + .gdnstate handoff
+sbatch scripts/run_all_bf16_native_reference.slurm  # optional: native diagnostic
+cd c_impl && bash run_hw_sbatch.sh <tag>          # build + on-card, two chained jobs
+```
+
+`GPU_LOGITS_REFERENCE` is a required on-card gate input; `LOGITS_REFERENCE`
+is not, and defaults to empty. The root `CLAUDE.md` carries the full
+committed-file manifest under *Reproducing a hardware build from a clean
+clone*.
+
 ## Active source and build files
 
 | File | Purpose |
