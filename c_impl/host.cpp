@@ -1116,6 +1116,17 @@ static std::vector<DecodeExample> run_decode_hw(
                 next = static_cast<int>(vocab_index);
             }
         }
+        /* Stop the wall clock here. Everything above is work a production
+         * decode loop must do -- write the embedding, run the kernel, read the
+         * logits back, pick the token. Everything below is gate work that only
+         * exists because a reference was supplied, and it was previously
+         * inside this window: the two compare_logits_step calls each sweep all
+         * 32,000 values, so a gated run reported a per-token wall time that a
+         * real deployment would never pay. */
+        auto t1 = std::chrono::high_resolution_clock::now();
+        result.per_step_tpot_ms[step] =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        result.kernel_ms[step] = ksec * 1000.0;
         if (!logits_reference_path.empty() && logits_parity != nullptr) {
             const float *reference = logits_reference.values.data() +
                 static_cast<size_t>(step - 1) * model.config.vocab_size;
@@ -1134,10 +1145,6 @@ static std::vector<DecodeExample> run_decode_hw(
                                 false,
                                 gpu_logits_parity);
         }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        result.per_step_tpot_ms[step] =
-            std::chrono::duration<double, std::milli>(t1 - t0).count();
-        result.kernel_ms[step] = ksec * 1000.0;
         result.gen_traj[step] = next;
         result.tf_argmax[step] = next;
         if (logits_dump != nullptr) {

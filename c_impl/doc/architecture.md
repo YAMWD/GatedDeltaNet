@@ -796,8 +796,16 @@ Excluding the seed entry, 63 measured kernel calls (job 2507) produced:
 | Speedup over eight-port baseline, 121.4 ms | **4.55x** |
 | Margin vs stock-GPU 35 ms reference | **24% faster** |
 
-Host loop overhead was measured directly here for the first time and is the
-wall-minus-kernel difference; it had previously been an unquantified lever.
+Host loop overhead was measured directly here for the first time as the
+wall-minus-kernel difference. **That 1.029 ms figure is an overestimate and
+the wall column is not a production number**: the timed window contained the
+two `compare_logits_step` calls, each sweeping all 32,000 logits against a
+reference, so a gated run charged itself for work a deployment never does.
+`host.cpp` now stops the clock after the host argmax and runs the comparisons
+outside it. The kernel column is unaffected -- it only ever spanned
+`run.wait()` -- so 25.625 ms and the 2.5625M-cycle figure stand. The next
+on-card run will report a lower wall time that must not be compared against
+26.654.
 
 **Quality gates.** The trajectory is exact over 64 tokens. The independent CUDA
 vector gate over all 2,016,000 logits reports global NRMSE **0.00466**,

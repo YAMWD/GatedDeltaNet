@@ -38,7 +38,7 @@ Checkpoint: `m-a-p/1.3B-100B-GatedDeltaNet-pure` (HuggingFace) — consumed by `
 | | |
 |---|---|
 | Shipping image | **Iter66e**, all-BF16, Vitis 2024.2, XCLBIN `98b38cc7…` |
-| TPOT | **26.654 ms/token** wall, **25.625 ms** kernel (job 2507) = 2.5625M cycles @ 100 MHz |
+| TPOT | **25.625 ms/token** kernel (job 2507) = 2.5625M cycles @ 100 MHz. Wall was 26.654, but that window wrongly contained the 32,000-value logit gate — fixed in `host.cpp`, so the next run's wall figure will be lower and is not comparable to 26.654 |
 | Routed timing | zero overlaps, zero failing endpoints of 2,277,369. **Per clock**: kernel **+0.195 ns**, fixed 250 MHz DMA **+0.003 ns**, HBM 450 MHz +0.079. The design-wide +0.003 is the *shell's* margin, not the kernel's |
 | Correctness | exact 64-token trajectory; CUDA vector gate over 2,016,000 logits — NRMSE 0.00466, min cosine 0.99995, top-5 exact, zero argmax mismatches |
 | Long-run drift | bounded to 512 tokens; hardware tracks the GPU for 447 tokens (job 2529) |
