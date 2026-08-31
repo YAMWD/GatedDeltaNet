@@ -1,0 +1,34 @@
+tag:
+  - gdn_table2
+task: gdn_niah_single_1
+dataset_path: ""
+dataset_name: ""
+output_type: generate_until
+test_split: test
+custom_dataset: !function ruler_table2_utils.niah_single_1
+doc_to_text: "{{input}}"
+doc_to_target: "{{outputs}}"
+gen_prefix: "{{gen_prefix}}"
+target_delimiter: " "
+process_results: !function ruler_table2_utils.process_results
+metric_list:
+  - metric: "1024"
+    aggregation: !function ruler_table2_utils.aggregate_metrics
+    higher_is_better: true
+  - metric: "2048"
+    aggregation: !function ruler_table2_utils.aggregate_metrics
+    higher_is_better: true
+  - metric: "4096"
+    aggregation: !function ruler_table2_utils.aggregate_metrics
+    higher_is_better: true
+  - metric: "8192"
+    aggregation: !function ruler_table2_utils.aggregate_metrics
+    higher_is_better: true
+generation_kwargs:
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 128
+  until: []
+repeats: 1
+metadata:
+  version: 1.0

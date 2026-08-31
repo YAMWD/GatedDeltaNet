@@ -11,6 +11,21 @@ FPGA's TPOT. The trustworthy signal is the **slope vs context** (flat vs
 growing), not the absolute per-token number — see "Why GDN looks slow on GPU"
 below for why the GPU understates GDN and why that argues *for* the FPGA.
 
+**Two updates to how this document should be read (2026-08-31).**
+
+1. **The accelerator now beats the stock-GPU number outright.** Iter66e
+   measures **26.654 ms/token** on card against the ~35 ms stock reference
+   here — 24% faster. That was not true when this document was written.
+2. **Do not lean on that margin as the headline claim.** A side experiment on
+   branch `worktree-gpu-decode-opt` showed the 35 ms is dominated by dispatch,
+   not arithmetic — 1,981 kernel launches per token, 58% of wall time in gaps,
+   4.1% of peak bandwidth — and capturing the per-token step as a single CUDA
+   graph reached **4.20 ms/token**, verified token-identical to eager. A
+   hand-optimised GPU therefore goes far below anything this accelerator
+   currently reaches. The durable claims remain the ones this document is
+   actually about: **flat O(1) latency, constant memory with no KV cache, and
+   performance per watt and per dollar** — not raw speed.
+
 Harness: [`scripts/bench_tpot.py`](../../scripts/bench_tpot.py). Raw data:
 [`report/tpot/`](../../report/tpot/) (`tpot_results.{json,csv}`, two PNGs).
 

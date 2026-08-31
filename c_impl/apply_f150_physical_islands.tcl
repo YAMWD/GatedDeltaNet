@@ -1,13 +1,19 @@
-# Iter56 surgical 150 MHz floorplan.
+# Surgical 150 MHz floorplan, corrected after the Iter66a route failure.
 #
 # Iter55d proved that hard-containing all sixteen clusters, their BRAM FIFOs,
 # local collectors, auxiliary actors, and recurrence in a 6/7/3 partition was
 # over-constrained: post-place SLR0--SLR1 connectivity reached 95.83%, outer
 # SLR BRAM exceeded 92%, and individual SLL columns reached 179% demand.
-# Preserve only the placements with prior routing evidence:
+# Iter66a combined the native-BF16 product path with the rejected Iter65d
+# topology.  It reached route verification with only 3,989 overlaps, but its
+# free cluster 10 again landed mainly in the 99.50%-occupied SLR0.  Restore the
+# topology that produced the substantially better exact-product Iter65b route:
 #
 #   * the complete recurrent wrapper may use all of SLR2;
-#   * clusters 8 and 10 stay in SLR1, with cluster 10's local input FIFOs;
+#   * cluster 8 stays in SLR1;
+#   * cluster 10 plus its two weight FIFOs and activation-ripple FIFO stay in
+#     SLR1;
+#   * cluster 9 and the remaining cluster-9/10 result transports remain free;
 #   * the three explicit collector-boundary relays and final collector meet in
 #     SLR1, with the relay registers marked for dedicated SLL placement;
 #   * every other cluster, FIFO, local collector, and auxiliary actor is free.
@@ -90,13 +96,24 @@ set cluster8 [f150_one \
 f150_make_pblock pb_iter56_cluster8_slr1 $slr1_range \
     [list $cluster8] SLR1
 
-set cluster10_cone [list \
-    [f150_one "*/grp_gdn_gemv_fu_*/gemv32_cluster2_10_U0" "cluster 10"] \
-    [f150_one "*/grp_gdn_gemv_fu_*/ws_20_U" "ws20 FIFO"] \
-    [f150_one "*/grp_gdn_gemv_fu_*/ws_21_U" "ws21 FIFO"] \
-    [f150_one "*/grp_gdn_gemv_fu_*/xr_10_U" "xr10 FIFO"]]
-f150_make_pblock pb_iter56_cluster10_slr1 $slr1_range \
-    $cluster10_cone SLR1
+set cluster10 [f150_one \
+    "*/grp_gdn_gemv_fu_*/gemv32_cluster2_10_U0" "cluster 10"]
+set ws20 [f150_one "*/grp_gdn_gemv_fu_*/ws_20_U" "cluster-10 weight FIFO 20"]
+set ws21 [f150_one "*/grp_gdn_gemv_fu_*/ws_21_U" "cluster-10 weight FIFO 21"]
+set xr10 [f150_one "*/grp_gdn_gemv_fu_*/xr_10_U" "cluster-10 activation FIFO"]
+f150_make_pblock pb_iter66b_cluster10_slr1 $slr1_range \
+    [list $cluster10 $ws20 $ws21 $xr10] SLR1
+
+# Resolve every deliberately free root exactly once.  This catches hierarchy
+# drift without imposing the BRAM-column and whole-cluster SLR2 constraints
+# that left 554 primitives unplaced in Iter65c.
+set relaxed_roots [list \
+    [f150_one "*/grp_gdn_gemv_fu_*/gemv32_cluster2_9_U0" "free cluster 9"] \
+    [f150_one "*/grp_gdn_gemv_fu_*/ws_18_U" "free ws18 FIFO"] \
+    [f150_one "*/grp_gdn_gemv_fu_*/ws_19_U" "free ws19 FIFO"] \
+    [f150_one "*/grp_gdn_gemv_fu_*/xr_9_U" "free xr9 FIFO"] \
+    [f150_one "*/grp_gdn_gemv_fu_*/ys_9_U" "free ys9 FIFO"] \
+    [f150_one "*/grp_gdn_gemv_fu_*/ys_10_U" "free ys10 FIFO"]]
 
 # The three relay actors are explicit sequential boundaries added in Iter56.
 # Put their receiving registers and the final collector in SLR1. The local
@@ -134,4 +151,4 @@ if {[llength $reset_net] != 1} {
 set_property MAX_FANOUT_MODE CLOCK_REGION $reset_net
 set_property FORCE_MAX_FANOUT 32 $reset_net
 
-puts "GDN_ITER56_DONE collector_cut=4/6/6 recurrent=full_slr2 clusters=8,10_slr1 relay_regs=$relay_registers reset_fanout=32 broad_pblocks=0"
+puts "GDN_ITER66B_DONE collector_cut=4/6/6 recurrent=full_slr2 cluster8=slr1 cluster9=free cluster10_local_cone=slr1 transport_roots_free=[llength $relaxed_roots] relay_regs=$relay_registers reset_fanout=32 narrow_pblocks=0"

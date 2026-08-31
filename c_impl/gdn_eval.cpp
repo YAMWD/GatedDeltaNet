@@ -8,45 +8,15 @@
 #include <time.h>
 
 typedef struct {
-    uint32_t ctx_len;
-    uint32_t cont_len;
-    int32_t *ctx;
-    int32_t *cont;
-} PairReq;
-
-typedef struct {
-    uint32_t gold;
-    uint32_t num_choices;
-    PairReq *choices;
-} MCReq;
-
-typedef struct {
-    uint32_t word_count;
-    uint32_t byte_count;
-    uint32_t num_windows;
-    PairReq *windows;
-} RollingReq;
-
-typedef struct {
     uint32_t kind;
     uint32_t num_examples;
-    PairReq *ll_examples;
-    MCReq *mc_examples;
-    RollingReq *rolling_examples;
+    uint32_t first_cont_len;
 } Fixture;
 
-enum {
-    REQ_KIND_MC = 1,
-    REQ_KIND_LL = 2,
-    REQ_KIND_ROLLING = 3,
-};
+#define REQ_KIND_LL 2
 
 typedef struct {
     time_t start_time;
-    uint32_t total_examples;
-    uint32_t total_windows;
-    uint32_t completed_examples;
-    uint32_t completed_windows;
 } ProgressState;
 
 typedef struct {
@@ -66,6 +36,13 @@ typedef struct {
     uint32_t decode_steps;
 } LogitsDumpHeader;
 
+typedef struct {
+    char magic[8];
+    uint32_t version;
+    uint32_t hidden_size;
+    uint32_t decode_steps;
+} HiddenDumpHeader;
+
 static void die(const char *message) {
     fprintf(stderr, "%s\n", message);
     exit(1);
@@ -75,14 +52,6 @@ static void *xmalloc(size_t bytes) {
     void *ptr = malloc(bytes);
     if (ptr == NULL) {
         die("malloc failed");
-    }
-    return ptr;
-}
-
-static void *xcalloc(size_t count, size_t size) {
-    void *ptr = calloc(count, size);
-    if (ptr == NULL) {
-        die("calloc failed");
     }
     return ptr;
 }
@@ -97,17 +66,12 @@ static uint32_t read_u32(const uint8_t *blob, size_t size, size_t *offset) {
     return value;
 }
 
-static int32_t *read_i32_array(const uint8_t *blob, size_t size, size_t *offset, uint32_t count) {
-    int32_t *out = NULL;
+static void skip_i32_array(const uint8_t *blob, size_t size, size_t *offset, uint32_t count) {
     if (*offset + (size_t)count * 4 > size) {
         die("fixture truncated");
     }
-    if (count > 0) {
-        out = (int32_t *)xmalloc((size_t)count * sizeof(int32_t));
-        memcpy(out, blob + *offset, (size_t)count * 4);
-    }
+    (void)blob;
     *offset += (size_t)count * 4;
-    return out;
 }
 
 static void load_fixture(const char *path, Fixture *fixture) {
@@ -166,93 +130,26 @@ static void load_fixture(const char *path, Fixture *fixture) {
         die("unsupported fixture version");
     }
 
-    if (fixture->kind == REQ_KIND_MC) {
-        uint32_t example_index;
-        fixture->mc_examples = (MCReq *)xcalloc(fixture->num_examples, sizeof(MCReq));
-        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
-            MCReq *req = &fixture->mc_examples[example_index];
-            uint32_t choice_index;
-            req->num_choices = read_u32(blob, file_size, &offset);
-            req->gold = read_u32(blob, file_size, &offset);
-            req->choices = (PairReq *)xcalloc(req->num_choices, sizeof(PairReq));
-            for (choice_index = 0; choice_index < req->num_choices; ++choice_index) {
-                PairReq *pair = &req->choices[choice_index];
-                pair->ctx_len = read_u32(blob, file_size, &offset);
-                pair->cont_len = read_u32(blob, file_size, &offset);
-                pair->ctx = read_i32_array(blob, file_size, &offset, pair->ctx_len);
-                pair->cont = read_i32_array(blob, file_size, &offset, pair->cont_len);
-            }
-        }
-    } else if (fixture->kind == REQ_KIND_LL) {
-        uint32_t example_index;
-        fixture->ll_examples = (PairReq *)xcalloc(fixture->num_examples, sizeof(PairReq));
-        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
-            PairReq *pair = &fixture->ll_examples[example_index];
-            pair->ctx_len = read_u32(blob, file_size, &offset);
-            pair->cont_len = read_u32(blob, file_size, &offset);
-            pair->ctx = read_i32_array(blob, file_size, &offset, pair->ctx_len);
-            pair->cont = read_i32_array(blob, file_size, &offset, pair->cont_len);
-        }
-    } else if (fixture->kind == REQ_KIND_ROLLING) {
-        uint32_t example_index;
-        fixture->rolling_examples = (RollingReq *)xcalloc(fixture->num_examples, sizeof(RollingReq));
-        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
-            RollingReq *req = &fixture->rolling_examples[example_index];
-            uint32_t window_index;
-            req->word_count = read_u32(blob, file_size, &offset);
-            req->byte_count = read_u32(blob, file_size, &offset);
-            req->num_windows = read_u32(blob, file_size, &offset);
-            req->windows = (PairReq *)xcalloc(req->num_windows, sizeof(PairReq));
-            for (window_index = 0; window_index < req->num_windows; ++window_index) {
-                PairReq *pair = &req->windows[window_index];
-                pair->ctx_len = read_u32(blob, file_size, &offset);
-                pair->cont_len = read_u32(blob, file_size, &offset);
-                pair->ctx = read_i32_array(blob, file_size, &offset, pair->ctx_len);
-                pair->cont = read_i32_array(blob, file_size, &offset, pair->cont_len);
-            }
-        }
-    } else {
+    if (fixture->kind != REQ_KIND_LL) {
         free(blob);
-        die("unsupported fixture kind");
+        die("decode-only evaluator requires an LL fixture");
     }
 
+    for (uint32_t example_index = 0;
+         example_index < fixture->num_examples; ++example_index) {
+        uint32_t ctx_len = read_u32(blob, file_size, &offset);
+        uint32_t cont_len = read_u32(blob, file_size, &offset);
+        if (example_index == 0) {
+            fixture->first_cont_len = cont_len;
+        }
+        skip_i32_array(blob, file_size, &offset, ctx_len);
+        skip_i32_array(blob, file_size, &offset, cont_len);
+    }
+    if (offset != file_size) {
+        free(blob);
+        die("unexpected trailing data in decode fixture");
+    }
     free(blob);
-}
-
-static void free_fixture(Fixture *fixture) {
-    if (fixture->kind == REQ_KIND_MC && fixture->mc_examples != NULL) {
-        uint32_t example_index;
-        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
-            MCReq *req = &fixture->mc_examples[example_index];
-            uint32_t choice_index;
-            for (choice_index = 0; choice_index < req->num_choices; ++choice_index) {
-                free(req->choices[choice_index].ctx);
-                free(req->choices[choice_index].cont);
-            }
-            free(req->choices);
-        }
-        free(fixture->mc_examples);
-    } else if (fixture->kind == REQ_KIND_LL && fixture->ll_examples != NULL) {
-        uint32_t example_index;
-        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
-            free(fixture->ll_examples[example_index].ctx);
-            free(fixture->ll_examples[example_index].cont);
-        }
-        free(fixture->ll_examples);
-    } else if (fixture->kind == REQ_KIND_ROLLING && fixture->rolling_examples != NULL) {
-        uint32_t example_index;
-        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
-            RollingReq *req = &fixture->rolling_examples[example_index];
-            uint32_t window_index;
-            for (window_index = 0; window_index < req->num_windows; ++window_index) {
-                free(req->windows[window_index].ctx);
-                free(req->windows[window_index].cont);
-            }
-            free(req->windows);
-        }
-        free(fixture->rolling_examples);
-    }
-    memset(fixture, 0, sizeof(*fixture));
 }
 
 static FILE *open_output(const char *path) {
@@ -272,43 +169,14 @@ static double elapsed_seconds(const ProgressState *progress) {
     return difftime(time(NULL), progress->start_time);
 }
 
-static void progress_start(ProgressState *progress, const Fixture *fixture) {
-    uint32_t example_index;
+static void progress_start(ProgressState *progress) {
     memset(progress, 0, sizeof(*progress));
     progress->start_time = time(NULL);
-    progress->total_examples = fixture->num_examples;
-    if (fixture->kind == REQ_KIND_ROLLING && fixture->rolling_examples != NULL) {
-        for (example_index = 0; example_index < fixture->num_examples; ++example_index) {
-            progress->total_windows += fixture->rolling_examples[example_index].num_windows;
-        }
-    }
 }
 
 static void log_progress_message(const char *message) {
     fprintf(stderr, "%s\n", message);
     fflush(stderr);
-}
-
-/* Standalone argmax over the logits for a single hidden row. Used by the
- * free-running greedy loop in --decode mode, where there is no target token
- * and no logprob/greedy bookkeeping to do. */
-static int argmax_logits(const GDNModel *model, const float *hidden, float *logits) {
-    uint32_t vocab = model->config.vocab_size;
-    uint32_t vocab_index;
-    float max_logit;
-    int max_index;
-
-    gdn_compute_logits(model, hidden, logits);
-
-    max_logit = logits[0];
-    max_index = 0;
-    for (vocab_index = 1; vocab_index < vocab; ++vocab_index) {
-        if (logits[vocab_index] > max_logit) {
-            max_logit = logits[vocab_index];
-            max_index = (int)vocab_index;
-        }
-    }
-    return max_index;
 }
 
 static double monotonic_ms(void) {
@@ -362,21 +230,31 @@ static void load_gdnstate(const char *path, const GDNModel *model,
     if (fread(run_state->recurrent_state, sizeof(float), rec_count, f) != rec_count)
         die(".gdnstate: truncated recurrent section");
     {
-        float *state_stripes[GDN_RECURRENT_STATE_PORTS];
-        const size_t shard_floats = gdn_weight_shard_floats(c);
+        Beat512 *state_stripes[GDN_RECURRENT_STATE_PORTS];
+        const size_t shard_beats = gdn_weight_shard_beats(c);
         for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
             state_stripes[p] =
                 run_state->weight_shards[GDN_RECURRENT_STATE_FIRST_PORT + p] +
-                shard_floats;
+                shard_beats;
         }
-        gdn_scatter_recurrent_state(state_stripes,
-                                    run_state->recurrent_state, rec_count);
+        if (gdn_scatter_recurrent_state(state_stripes,
+                                        run_state->recurrent_state,
+                                        rec_count) != 0)
+            die(".gdnstate: recurrent values are not BF16-exact");
     }
-    /* Section B: conv tails -> run_state->head_buffer (layers x 3 x (W-1) x hidden). */
+    /* Section B remains FP32 words on disk but must contain BF16-exact values.
+     * Pack each layer/kind stripe into the first half of its unchanged workspace
+     * reservation. */
     size_t conv_count = (size_t)hdr->num_layers * 3u *
                         (hdr->conv_size - 1u) * hdr->hidden;
-    if (fread(run_state->head_buffer, sizeof(float), conv_count, f) != conv_count)
+    float *conv_tails = (float *)xmalloc(conv_count * sizeof(float));
+    if (fread(conv_tails, sizeof(float), conv_count, f) != conv_count)
         die(".gdnstate: truncated conv section");
+    if (gdn_pack_conv_tails_bf16(
+            reinterpret_cast<Beat512 *>(run_state->head_buffer),
+            conv_tails, conv_count) != 0)
+        die(".gdnstate: convolution-tail values are not BF16-exact");
+    free(conv_tails);
     fclose(f);
 
     fprintf(stderr,
@@ -391,7 +269,8 @@ static void load_gdnstate(const char *path, const GDNModel *model,
 static int run_decode_from_state(
     const GDNModel *model, GDNRunState *run_state, float *logits,
     const char *state_path, uint32_t decode_len, const char *output_path,
-    const char *logits_dump_path, const char *logits_reference_path
+    const char *logits_dump_path, const char *logits_reference_path,
+    const char *hidden_dump_path, const char *state_dump_path
 ) {
     GDNStateHeader hdr;
     load_gdnstate(state_path, model, run_state, &hdr);
@@ -406,6 +285,7 @@ static int run_decode_from_state(
     float *saved_logits = NULL;
     FILE *logits_dump = NULL;
     FILE *logits_reference = NULL;
+    FILE *hidden_dump = NULL;
     LogitsParity logits_parity;
     memset(&logits_parity, 0, sizeof(logits_parity));
 
@@ -433,9 +313,18 @@ static int run_decode_from_state(
         saved_logits = (float *)xmalloc(
             (size_t)model->config.vocab_size * sizeof(float));
     }
-
+    if (hidden_dump_path != NULL) {
+        HiddenDumpHeader hidden_header = {{'G','D','N','H','I','D','1','\0'}, 1,
+                                          model->config.hidden_size, n - 1};
+        hidden_dump = fopen(hidden_dump_path, "wb");
+        if (hidden_dump == NULL ||
+            fwrite(&hidden_header, sizeof(hidden_header), 1, hidden_dump) != 1) {
+            die("decode-from-state: cannot create hidden-state dump");
+        }
+    }
 #ifndef __SYNTHESIS__
     gdn_set_native_debug_buffers(final_hidden, logits);
+    gdn_reset_mixed_mul_stats();
 #endif
 
     /* traj[0] = the GPU-exported seed (argmax of the prompt's last position);
@@ -449,13 +338,21 @@ static int run_decode_from_state(
         int32_t prev = traj[step - 1];
         if (gdn_decode_step_host(model, run_state, &prev) != 0)
             die("decode-from-state: single-token step failed");
-        /* lm_head + greedy argmax now run on-chip (gdn_forward) and write the
-         * next token id into x_norm[0] — read it directly instead of recomputing
-         * host-side, so native matches the kernel exactly. */
-        traj[step] = (int32_t)run_state->x_norm[0];
+        if (hidden_dump != NULL &&
+            fwrite(final_hidden, sizeof(float), model->config.hidden_size,
+                   hidden_dump) != model->config.hidden_size) {
+            die("decode-from-state: failed while writing hidden-state dump");
+        }
+        /* Iter63: the kernel emits the full FP32 logit vector and no longer
+         * argmaxes on chip, so the token is picked here. The rule is the one
+         * the retired hardware scan implemented -- maximum value, lowest
+         * vocabulary index on ties -- which a strict-'>' first-wins loop gives
+         * exactly. traj[step] is assigned after the scan below. */
         gdn_compute_logits(model, final_hidden, reference_logits);
         uint32_t captured_argmax = 0;
+        uint32_t reference_argmax = 0;
         float captured_best = logits[0];
+        float reference_best = reference_logits[0];
         for (uint32_t vocab_index = 0;
              vocab_index < model->config.vocab_size; ++vocab_index) {
             float captured = logits[vocab_index];
@@ -467,18 +364,31 @@ static int run_decode_from_state(
                 logits_parity.max_abs_error = abs_error;
             if (rel_error > logits_parity.max_rel_error)
                 logits_parity.max_rel_error = rel_error;
-            if (!isfinite(captured) || !isfinite(reference) ||
-                abs_error > 1e-3 + 1e-4 * fabs((double)reference)) {
+            /* Bit-identical values pass even when non-finite, matching the
+             * on-card host.cpp gate; differing non-finite values still fail
+             * explicitly (a NaN abs_error never exceeds the tolerance). */
+            if (memcmp(&captured, &reference, sizeof(float)) != 0 &&
+                (!isfinite(captured) || !isfinite(reference) ||
+                 abs_error > 1e-3 + 1e-4 * fabs((double)reference))) {
                 logits_parity.cpu_tolerance_failures++;
             }
             if (vocab_index != 0 && captured > captured_best) {
                 captured_best = captured;
                 captured_argmax = vocab_index;
             }
+            if (vocab_index != 0 && reference > reference_best) {
+                reference_best = reference;
+                reference_argmax = vocab_index;
+            }
         }
+        traj[step] = (int32_t)captured_argmax;
         logits_parity.checked_steps++;
         logits_parity.compared_values += model->config.vocab_size;
-        if ((int32_t)captured_argmax != traj[step])
+        /* The kernel's logits versus the independent scalar LM head. This used
+         * to compare the host pick against the on-chip pick; with the on-chip
+         * argmax retired it compares against the reference path instead, which
+         * is a stronger check rather than a vacuous one. */
+        if (captured_argmax != reference_argmax)
             logits_parity.argmax_mismatches++;
 
         if (logits_reference != NULL) {
@@ -503,6 +413,17 @@ static int run_decode_from_state(
     }
 #ifndef __SYNTHESIS__
     gdn_set_native_debug_buffers(NULL, NULL);
+    {
+        GDNMixedMulStats stats = gdn_get_mixed_mul_stats();
+        fprintf(stderr,
+                "[mixed_mul] calls=%llu special_inputs=%llu "
+                "flushed_inputs=%llu flushed_outputs=%llu overflows=%llu\n",
+                (unsigned long long)stats.calls,
+                (unsigned long long)stats.special_inputs,
+                (unsigned long long)stats.flushed_inputs,
+                (unsigned long long)stats.flushed_outputs,
+                (unsigned long long)stats.overflows);
+    }
 #endif
 
     fprintf(stderr,
@@ -515,6 +436,38 @@ static int run_decode_from_state(
             (unsigned long long)logits_parity.exact_reference_mismatches,
             logits_parity.argmax_mismatches);
     fflush(stderr);
+
+    /* Iter66g probe: persistent state after the decode loop, in the same
+     * GDNSDMP1 format host.cpp emits, so native and hardware post-step state
+     * diff bit-for-bit. Stripes live at the shard tails exactly as on HBM. */
+    if (state_dump_path != NULL) {
+        FILE *sd = fopen(state_dump_path, "wb");
+        if (sd == NULL) die("decode-from-state: cannot create state dump");
+        const char magic[8] = {'G', 'D', 'N', 'S', 'D', 'M', 'P', '1'};
+        const uint32_t dump_header[4] = {
+            GDN_RECURRENT_STATE_STRIPE_BF16_BEATS,
+            GDN_RECURRENT_STATE_PORTS,
+            (uint32_t)(GDN_WSF_HEADBUF / 16u), 0};
+        fwrite(magic, 1, sizeof(magic), sd);
+        fwrite(dump_header, sizeof(uint32_t), 4, sd);
+        const size_t shard_beats = gdn_weight_shard_beats(&model->config);
+        for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
+            const Beat512 *stripe =
+                run_state->weight_shards[GDN_RECURRENT_STATE_FIRST_PORT + p] +
+                shard_beats;
+            if (fwrite(stripe, sizeof(Beat512),
+                       GDN_RECURRENT_STATE_STRIPE_BF16_BEATS, sd) !=
+                GDN_RECURRENT_STATE_STRIPE_BF16_BEATS)
+                die("decode-from-state: state dump write failed");
+        }
+        const Beat512 *conv_region =
+            reinterpret_cast<const Beat512 *>(run_state->head_buffer);
+        if (fwrite(conv_region, sizeof(Beat512), GDN_WSF_HEADBUF / 16u, sd) !=
+            GDN_WSF_HEADBUF / 16u)
+            die("decode-from-state: conv dump write failed");
+        fclose(sd);
+        fprintf(stderr, "[state_dump] wrote %s\n", state_dump_path);
+    }
 
     FILE *out = open_output(output_path);
     fprintf(out, "{\"kind\": 2, \"decode_len\": %u, \"num_examples\": 1,\n", n);
@@ -546,9 +499,30 @@ static int run_decode_from_state(
     free(saved_logits);
     if (logits_dump != NULL) fclose(logits_dump);
     if (logits_reference != NULL) fclose(logits_reference);
+    if (hidden_dump != NULL) fclose(hidden_dump);
     return (logits_parity.cpu_tolerance_failures == 0 &&
             logits_parity.exact_reference_mismatches == 0 &&
             logits_parity.argmax_mismatches == 0) ? 0 : -1;
+}
+
+#if defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
+
+/* Iter66g probe: run the native model with the FPU flushing subnormals the
+ * way the hardware's AMD FPO cores do (DAZ bit 6, FTZ bit 15 of MXCSR). If
+ * this makes the native post-step state dump bit-identical to hardware, the
+ * step-2 divergence is fully explained by subnormal flushing in the FP32
+ * recurrence arithmetic, and the fix is a reference-contract alignment, not
+ * a hardware change. */
+static void gdn_enable_ftz_daz(void) {
+#if defined(__x86_64__)
+    _mm_setcsr(_mm_getcsr() | 0x8040u);
+    fprintf(stderr, "[fpu] FTZ+DAZ enabled (MXCSR=0x%08x)\n", _mm_getcsr());
+#else
+    fprintf(stderr, "[fpu] FTZ+DAZ requested but unsupported on this arch\n");
+    exit(1);
+#endif
 }
 
 int main(int argc, char **argv) {
@@ -562,6 +536,8 @@ int main(int argc, char **argv) {
     uint32_t decode_len = 0;   /* 0 => use the fixture's golden cont_len */
     const char *logits_dump_path = NULL;
     const char *logits_reference_path = NULL;
+    const char *hidden_dump_path = NULL;
+    const char *state_dump_path = NULL;
     const char *positional[3];
     int positional_count = 0;
     int arg_index;
@@ -586,9 +562,17 @@ int main(int argc, char **argv) {
         } else if (strcmp(arg, "--logits-dump") == 0) {
             if (arg_index + 1 >= argc) die("--logits-dump requires a path");
             logits_dump_path = argv[++arg_index];
+        } else if (strcmp(arg, "--dump-state") == 0) {
+            if (arg_index + 1 >= argc) die("--dump-state requires a path");
+            state_dump_path = argv[++arg_index];
+        } else if (strcmp(arg, "--ftz") == 0) {
+            gdn_enable_ftz_daz();
         } else if (strcmp(arg, "--logits-reference") == 0) {
             if (arg_index + 1 >= argc) die("--logits-reference requires a path");
             logits_reference_path = argv[++arg_index];
+        } else if (strcmp(arg, "--hidden-dump") == 0) {
+            if (arg_index + 1 >= argc) die("--hidden-dump requires a path");
+            hidden_dump_path = argv[++arg_index];
         } else if (positional_count < 3) {
             positional[positional_count++] = arg;
         } else {
@@ -601,7 +585,8 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "usage (decode-only): %s <weights.gdnw> <fixture.gdnreq> [output.json]"
                 " --decode --decode-from-state <state.gdnstate> [--decode-len N]"
-                " [--logits-dump file] [--logits-reference file]\n",
+                " [--logits-dump file] [--logits-reference file]"
+                " [--hidden-dump file]\n",
                 argv[0]);
         return 1;
     }
@@ -638,13 +623,12 @@ int main(int argc, char **argv) {
     logits = (float *)xmalloc((size_t)model.config.vocab_size * sizeof(float));
     log_progress_message("[progress] loading fixture");
     load_fixture(argv[2], &fixture);
-    progress_start(&progress, &fixture);
+    progress_start(&progress);
     fprintf(
         stderr,
-        "[progress] starting evaluation kind=%u examples=%u windows=%u\n",
+        "[progress] starting decode evaluation kind=%u examples=%u\n",
         fixture.kind,
-        fixture.num_examples,
-        progress.total_windows
+        fixture.num_examples
     );
     fflush(stderr);
 
@@ -658,21 +642,25 @@ int main(int argc, char **argv) {
     {
         uint32_t n = decode_len;
         if (n == 0) {
-            if (fixture.kind != REQ_KIND_LL || fixture.num_examples == 0 || fixture.ll_examples == NULL) {
+            if (fixture.kind != REQ_KIND_LL || fixture.num_examples == 0) {
                 die("decode-from-state requires an LL-kind fixture with at least 1 example");
             }
-            n = fixture.ll_examples[0].cont_len;
+            n = fixture.first_cont_len;
         }
+        /* n may exceed the golden continuation: decode-from-state is
+         * free-running, so a longer run is well defined and is compared
+         * against a native reference of the same length (Iter66n
+         * long-horizon drift study) rather than the fixture golden. */
         if (n == 0) die("decode-from-state: zero decode length");
         const char *decode_out = (argc == 4) ? argv[3] : "results_decode_c/decode.c.json";
         if (run_decode_from_state(&model, &run_state, logits, state_path, n,
                                   decode_out, logits_dump_path,
-                                  logits_reference_path) != 0) {
+                                  logits_reference_path,
+                                  hidden_dump_path, state_dump_path) != 0) {
             die("decode-from-state: full-logits parity failed");
         }
         fprintf(stderr, "[progress] decode finished elapsed=%.0fs\n", elapsed_seconds(&progress));
         fflush(stderr);
-        free_fixture(&fixture);
         free(logits);
         gdn_run_state_free(&run_state);
         gdn_model_free(&model);

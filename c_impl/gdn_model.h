@@ -4,6 +4,16 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+#include "ap_int.h"
+
+using Beat512 = ap_uint<512>;
+using Fp32Bits = ap_uint<32>;
+using Bf16Bits = ap_uint<16>;
+
+static_assert(sizeof(Beat512) == 64, "Beat512 must occupy one 512-bit beat");
+#endif
+
 /* Parallel HBM weight readers for the decode GEMV (output-stripe split). Each
  * gemv projection's output rows split into GEMV_CHANNELS disjoint shards, read by
  * GEMV_CHANNELS m_axi masters in parallel — the Stage-2 scaling lever. It must
@@ -12,7 +22,6 @@
  * shard builder, and the run-state all agree on one value. */
 #define GEMV_CHANNELS 32
 #define GEMV_CLUSTERS 16
-#define GEMV_CHANNELS_PER_CLUSTER 2
 
 #ifdef __cplusplus
 extern "C" {
@@ -65,9 +74,10 @@ typedef struct {
 #define GDN_WS_OFF_LOGITS     (GDN_WS_OFF_HEAD_BUF  + GDN_WSF_HEADBUF)
 #define GDN_WS_FLOATS         (GDN_WS_OFF_LOGITS    + GDN_WSF_LOGITS)
 
-/* Iter37 recurrent-state layout. The external .gdnstate file remains one
- * contiguous [layer][head][K][V] FP32 tensor. At upload time its aligned
- * Pack16 words are striped round-robin over the tails of weight shards 28..31.
+/* Recurrent-state device layout. The external .gdnstate file remains one
+ * contiguous [layer][head][K][V] FP32-word tensor whose values are required
+ * to be BF16-exact. At upload time those values are packed 32 per Beat512 and
+ * striped over the tails of weight shards 28..31.
  * The four corresponding AXI masters are idle while recurrent attention runs,
  * so the kernel gains independent state bandwidth without adding an m_axi
  * interface or changing the public state-file format. */
@@ -75,7 +85,23 @@ typedef struct {
 #define GDN_RECURRENT_STATE_FIRST_PORT 28
 #define GDN_RECURRENT_STATE_STRIPE_FLOATS \
     (GDN_WSF_STATE / GDN_RECURRENT_STATE_PORTS)
-#define GDN_COMPILED_WEIGHT_SHARD_FLOATS 43728896u
+#define GDN_RECURRENT_STATE_STRIPE_BF16_BEATS \
+    (GDN_RECURRENT_STATE_STRIPE_FLOATS / 32u)
+#define GDN_COMPILED_WEIGHT_SHARD_BEATS 1366528u
+#define GDN_COMPILED_WEIGHT_SHARD_BYTES \
+    ((size_t)GDN_COMPILED_WEIGHT_SHARD_BEATS * sizeof(Beat512))
+
+/* The workspace ABI reserves the original FP32-sized convolution-tail region.
+ * Each layer/kind stripe now stores its BF16 payload in the first half of that
+ * reservation; the second half remains unused so every GDN_WS_OFF_* value is
+ * unchanged. */
+#define GDN_CONV_TAIL_STRIPES (24u * 3u)
+#define GDN_CONV_TAIL_FLOATS_PER_STRIPE \
+    (GDN_WSF_HEADBUF / GDN_CONV_TAIL_STRIPES)
+#define GDN_CONV_TAIL_RESERVED_BEATS_PER_STRIPE \
+    (GDN_CONV_TAIL_FLOATS_PER_STRIPE / 16u)
+#define GDN_CONV_TAIL_BF16_BEATS_PER_STRIPE \
+    (GDN_CONV_TAIL_FLOATS_PER_STRIPE / 32u)
 
 typedef struct {
     const float *attn_norm;
@@ -108,43 +134,58 @@ typedef struct {
 } GDNModel;
 
 typedef struct {
-    uint32_t max_tokens;
-    float *workspace;   /* step 4 Stage B: one HBM[0] alloc (GDN_WS_FLOATS); the
-                         * 15 pointers below are views into it at GDN_WS_OFF_*. */
+    Beat512 *workspace; /* one 64-byte-aligned raw-beat allocation */
     float *x;
-    float *x_norm;
-    float *q;
-    float *k;
-    float *v;
-    float *a;
-    float *b;
-    float *gate;
-    float *attn;
-    float *tmp_hidden;
-    float *mlp_gate;
-    float *mlp_up;
     float *recurrent_state;
     float *head_buffer;
-    float *weight_shards[GEMV_CHANNELS];  /* compact gemv weight shards (built from weight_data) */
+    Beat512 *weight_shards[GEMV_CHANNELS]; /* packed-BF16 GEMV shards */
     float *aux_weights;                   /* compact per-layer non-GEMV weights */
-    float *logits;                        /* [vocab] lm_head gemv scratch (decode argmax → x_norm[0]) */
 } GDNRunState;
 
-/* Build the GEMV_CHANNELS compact weight shards from the flat weight blob; each
- * of the GEMV_CHANNELS shard buffers (shards[0..GEMV_CHANNELS-1]) is
- * gdn_weight_shard_floats(config) floats. Host-only. */
-size_t gdn_weight_shard_floats(const GDNWeightHeader *config);
+typedef struct {
+    uint64_t calls;
+    uint64_t special_inputs;
+    uint64_t flushed_inputs;
+    uint64_t flushed_outputs;
+    uint64_t overflows;
+} GDNMixedMulStats;
+
+/* Build the GEMV_CHANNELS compact packed-BF16 shards from the flat FP32-word
+ * blob. Every source weight must already be BF16-exact. Host-only. */
+size_t gdn_weight_shard_beats(const GDNWeightHeader *config);
+size_t gdn_weight_shard_bytes(const GDNWeightHeader *config);
+int gdn_validate_bf16_exact_weights(const float *weight_data,
+                                    const GDNWeightHeader *config);
 void gdn_build_weight_shards(const float *weight_data, const GDNWeightHeader *config,
-                             float *const shards[]);
+                             Beat512 *const shards[]);
 int gdn_validate_weight_shards(const float *weight_data,
                                const GDNWeightHeader *config,
-                               float *const shards[]);
+                               Beat512 *const shards[]);
 size_t gdn_aux_weight_floats(const GDNWeightHeader *config);
 void gdn_build_aux_weights(const float *weight_data, const GDNWeightHeader *config,
                            float *aux_weights);
-void gdn_scatter_recurrent_state(float *const state_stripes[],
-                                 const float *recurrent_state,
-                                 size_t recurrent_state_floats);
+int gdn_scatter_recurrent_state(Beat512 *const state_stripes[],
+                                const float *recurrent_state,
+                                size_t recurrent_state_floats);
+int gdn_pack_conv_tails_bf16(Beat512 *workspace_head_buffer,
+                             const float *conv_tails,
+                             size_t conv_tail_floats);
+
+/* Iter66 native-BF16 contract: multiply two BF16 operands, RNE-round the
+ * product to BF16 with AMD FPO DAZ/FTZ semantics, then widen by wiring for the
+ * existing FP32 accumulation tree. */
+float gdn_native_bf16_mul_to_fp32(Bf16Bits weight, Bf16Bits activation);
+
+#ifndef __SYNTHESIS__
+void gdn_reset_mixed_mul_stats(void);
+GDNMixedMulStats gdn_get_mixed_mul_stats(void);
+uint16_t gdn_test_fp32_to_bf16_rne_bits(uint32_t bits);
+uint32_t gdn_test_bf16_to_fp32_bits(uint16_t bits);
+void gdn_test_set_fp32_lane_bits(Beat512 *beat, uint32_t lane, uint32_t bits);
+uint32_t gdn_test_get_fp32_lane_bits(const Beat512 *beat, uint32_t lane);
+void gdn_test_set_bf16_lane_bits(Beat512 *beat, uint32_t lane, uint16_t bits);
+uint16_t gdn_test_get_bf16_lane_bits(const Beat512 *beat, uint32_t lane);
+#endif
 
 int gdn_model_load(GDNModel *model, const char *path);
 void gdn_model_free(GDNModel *model);
@@ -159,39 +200,39 @@ void gdn_run_state_free(GDNRunState *state);
  * there is no prefill / no GEMM / no mode flag. */
 int gdn_forward(
     const float *aux_weights,
-    float *workspace,   /* step 4 Stage B: 15 activation/state buffers at GDN_WS_OFF_* */
-    const float *weight_data_mm0,
-    const float *weight_data_mm1,
-    const float *weight_data_mm2,
-    const float *weight_data_mm3,
-    const float *weight_data_mm4,
-    const float *weight_data_mm5,
-    const float *weight_data_mm6,
-    const float *weight_data_mm7,
-    const float *weight_data_mm8,
-    const float *weight_data_mm9,
-    const float *weight_data_mm10,
-    const float *weight_data_mm11,
-    const float *weight_data_mm12,
-    const float *weight_data_mm13,
-    const float *weight_data_mm14,
-    const float *weight_data_mm15,
-    const float *weight_data_mm16,
-    const float *weight_data_mm17,
-    const float *weight_data_mm18,
-    const float *weight_data_mm19,
-    const float *weight_data_mm20,
-    const float *weight_data_mm21,
-    const float *weight_data_mm22,
-    const float *weight_data_mm23,
-    const float *weight_data_mm24,
-    const float *weight_data_mm25,
-    const float *weight_data_mm26,
-    const float *weight_data_mm27,
-    float *weight_data_mm28,
-    float *weight_data_mm29,
-    float *weight_data_mm30,
-    float *weight_data_mm31
+    Beat512 *workspace,
+    const Beat512 *weight_data_mm0,
+    const Beat512 *weight_data_mm1,
+    const Beat512 *weight_data_mm2,
+    const Beat512 *weight_data_mm3,
+    const Beat512 *weight_data_mm4,
+    const Beat512 *weight_data_mm5,
+    const Beat512 *weight_data_mm6,
+    const Beat512 *weight_data_mm7,
+    const Beat512 *weight_data_mm8,
+    const Beat512 *weight_data_mm9,
+    const Beat512 *weight_data_mm10,
+    const Beat512 *weight_data_mm11,
+    const Beat512 *weight_data_mm12,
+    const Beat512 *weight_data_mm13,
+    const Beat512 *weight_data_mm14,
+    const Beat512 *weight_data_mm15,
+    const Beat512 *weight_data_mm16,
+    const Beat512 *weight_data_mm17,
+    const Beat512 *weight_data_mm18,
+    const Beat512 *weight_data_mm19,
+    const Beat512 *weight_data_mm20,
+    const Beat512 *weight_data_mm21,
+    const Beat512 *weight_data_mm22,
+    const Beat512 *weight_data_mm23,
+    const Beat512 *weight_data_mm24,
+    const Beat512 *weight_data_mm25,
+    const Beat512 *weight_data_mm26,
+    const Beat512 *weight_data_mm27,
+    Beat512 *weight_data_mm28,
+    Beat512 *weight_data_mm29,
+    Beat512 *weight_data_mm30,
+    Beat512 *weight_data_mm31
 );
 
 /* Single-token decode step (the only host entry): gdn_forward with num_tokens=1

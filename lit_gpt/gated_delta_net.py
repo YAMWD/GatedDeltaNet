@@ -18,7 +18,6 @@ from einops import rearrange, repeat
 
 from fla.modules import FusedRMSNormSwishGate, RMSNorm, ShortConvolution
 from fla.modules.activations import ACT2FN
-from fla.ops.simple_gla import chunk_simple_gla
 from .gated_delta_rule_ops import chunk_gated_delta_rule
 import math 
 

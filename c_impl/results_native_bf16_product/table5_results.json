@@ -1,0 +1,51 @@
+{
+  "macro_average": 15.0918,
+  "sample_counts": {
+    "2wikimqa": 200,
+    "gov_report": 200,
+    "hotpotqa": 200,
+    "lcc": 500,
+    "multi_news": 200,
+    "multifieldqa_en": 150,
+    "musique": 200,
+    "narrativeqa": 200,
+    "qasper": 200,
+    "qmsum": 200,
+    "repobench-p": 500,
+    "samsum": 200,
+    "trec": 200,
+    "triviaqa": 200
+  },
+  "scores": {
+    "2wikimqa": 9.16,
+    "gov_report": 8.88,
+    "hotpotqa": 6.95,
+    "lcc": 19.02,
+    "multi_news": 12.49,
+    "multifieldqa_en": 13.77,
+    "musique": 3.48,
+    "narrativeqa": 2.55,
+    "qasper": 6.8,
+    "qmsum": 18.29,
+    "repobench-p": 18.26,
+    "samsum": 30.86,
+    "trec": 35.5,
+    "triviaqa": 25.28
+  },
+  "scores_unrounded": {
+    "2wikimqa": 9.15560022757189,
+    "gov_report": 8.876722181810587,
+    "hotpotqa": 6.952179159757339,
+    "lcc": 19.02200000000002,
+    "multi_news": 12.48662727860333,
+    "multifieldqa_en": 13.772335409410577,
+    "musique": 3.4757111199425115,
+    "narrativeqa": 2.546816049347964,
+    "qasper": 6.80380903170987,
+    "qmsum": 18.290420206419007,
+    "repobench-p": 18.25599999999999,
+    "samsum": 30.864375635456557,
+    "trec": 35.5,
+    "triviaqa": 25.283296680623028
+  }
+}

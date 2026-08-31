@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Export GatedDeltaNet weights and pretokenized eval fixtures for the C runtime."""
+"""Export GatedDeltaNet weights and the decode fixture for the C runtime.
+
+The packed-BF16 kernel only accepts a BF16-exact FP32-word blob, so the
+default `weights` export RNE-rounds every tensor to BF16 before widening it
+back to FP32 words (equivalent to convert_gdn_checkpoint_bf16.py followed by
+an FP32 export) and writes c_impl/artifacts/gdn-1.3b-bf16w.gdnw. Pass
+`--precision fp32` only for the retired FP32 kernel; the current loaders
+reject that blob.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +18,7 @@ import struct
 from contextlib import ExitStack
 from pathlib import Path
 
-from datasets import load_dataset
+import torch
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoTokenizer
@@ -21,22 +29,10 @@ REQ_MAGIC = b"GDNREQ1\0"
 WEIGHT_HEADER = struct.Struct("<8s10I2if")
 REQ_HEADER = struct.Struct("<8s3I")
 
-REQ_KIND_MC = 1
 REQ_KIND_LL = 2
 REQ_KIND_ROLLING = 3
 
 DEFAULT_MODEL = "m-a-p/1.3B-100B-GatedDeltaNet-pure"
-ALL_TASKS = [
-    "lambada_openai",
-    "piqa",
-    "hellaswag",
-    "winogrande",
-    "arc_easy",
-    "arc_challenge",
-    "social_iqa",
-    "boolq",
-    "wikitext",
-]
 
 
 def write_u32(handle, value: int) -> None:
@@ -49,226 +45,17 @@ def write_i32_array(handle, values: list[int]) -> None:
 
 
 def load_snapshot(model_name: str) -> Path:
+    # Accept a local directory as well as a Hub repo id, so a converted
+    # checkpoint (e.g. the BF16 cast) can be exported without publishing it.
+    candidate = Path(model_name)
+    if candidate.is_dir() and (candidate / "config.json").exists():
+        return candidate
     return Path(snapshot_download(model_name, local_files_only=True))
 
 
 def tok_encode_default(tokenizer, text: str) -> list[int]:
     # Match lm-eval HFLM.tok_encode(..., add_special_tokens=None).
     return tokenizer.encode(text)
-
-
-def encode_pair(tokenizer, prefix_token_id: int, context: str, continuation: str) -> tuple[list[int], list[int]]:
-    if context == "":
-        continuation_enc = tokenizer.encode(continuation, add_special_tokens=False)
-        if continuation_enc and prefix_token_id != continuation_enc[0]:
-            return [prefix_token_id], continuation_enc
-        return continuation_enc[:1], continuation_enc[1:]
-
-    n_spaces = len(context) - len(context.rstrip())
-    if n_spaces > 0:
-        continuation = context[-n_spaces:] + continuation
-        context = context[:-n_spaces]
-
-    whole_enc = tok_encode_default(tokenizer, context + continuation)
-    context_enc = tok_encode_default(tokenizer, context)
-    continuation_enc = whole_enc[len(context_enc) :]
-    return context_enc, continuation_enc
-
-
-def get_rolling_token_windows(
-    token_list: list[int], prefix_token: int, max_seq_len: int, context_len: int
-):
-    assert 1 <= context_len <= max_seq_len
-    if not token_list:
-        return
-    pred_len = max_seq_len - context_len + 1
-    predicted = 0
-
-    first_seq_len = min(max_seq_len, len(token_list))
-    yield [prefix_token] + token_list[: first_seq_len - 1], token_list[:first_seq_len]
-    predicted += first_seq_len
-
-    while predicted < len(token_list):
-        window_pred_len = min(len(token_list) - predicted, pred_len)
-        window_end = predicted + window_pred_len
-        yield (
-            token_list[window_end - max_seq_len - 1 : window_end - 1],
-            token_list[window_end - window_pred_len : window_end],
-        )
-        predicted += window_pred_len
-
-
-def make_disjoint_window(pair: tuple[list[int], list[int]]) -> tuple[list[int], list[int]]:
-    context, continuation = pair
-    return context[: len(context) - (len(continuation) - 1)], continuation
-
-
-def hellaswag_preprocess(text: str) -> str:
-    text = text.strip()
-    text = text.replace(" [title]", ". ")
-    text = re.sub(r"\[.*?\]", "", text)
-    text = text.replace("  ", " ")
-    return text
-
-
-def wikitext_detokenizer(doc: dict) -> str:
-    string = doc["page"]
-    string = string.replace("s '", "s'")
-    string = re.sub(r"/' [0-9]/", r"/'[0-9]/", string)
-    string = string.replace(" @-@ ", "-")
-    string = string.replace(" @,@ ", ",")
-    string = string.replace(" @.@ ", ".")
-    string = string.replace(" : ", ": ")
-    string = string.replace(" ; ", "; ")
-    string = string.replace(" . ", ". ")
-    string = string.replace(" ! ", "! ")
-    string = string.replace(" ? ", "? ")
-    string = string.replace(" , ", ", ")
-    string = re.sub(r"\(\s*([^\)]*?)\s*\)", r"(\1)", string)
-    string = re.sub(r"\[\s*([^\]]*?)\s*\]", r"[\1]", string)
-    string = re.sub(r"{\s*([^}]*?)\s*}", r"{\1}", string)
-    string = re.sub(r'"\s*([^"]*?)\s*"', r'"\1"', string)
-    string = re.sub(r"'\s*([^']*?)\s*'", r"'\1'", string)
-    string = string.replace("= = = =", "====")
-    string = string.replace("= = =", "===")
-    string = string.replace("= =", "==")
-    string = string.replace(" " + chr(176) + " ", chr(176))
-    string = string.replace(" \n", "\n")
-    string = string.replace("\n ", "\n")
-    string = string.replace(" N ", " 1 ")
-    string = string.replace(" 's", "'s")
-    return string
-
-
-def build_mc_records(task: str, tokenizer, prefix_token_id: int, limit: int | None):
-    records = []
-    if task == "piqa":
-        dataset = load_dataset("baber/piqa", split="validation")
-        for doc in dataset.select(range(limit)) if limit is not None else dataset:
-            context = f"Question: {doc['goal']}\nAnswer:"
-            choices = [doc["sol1"], doc["sol2"]]
-            gold = int(doc["label"])
-            records.append(
-                {
-                    "gold": gold,
-                    "choices": [
-                        encode_pair(tokenizer, prefix_token_id, context, " " + choice)
-                        for choice in choices
-                    ],
-                }
-            )
-    elif task == "hellaswag":
-        dataset = load_dataset("Rowan/hellaswag", split="validation")
-        iterator = dataset.select(range(limit)) if limit is not None else dataset
-        for doc in iterator:
-            ctx = doc["ctx_a"] + " " + doc["ctx_b"].capitalize()
-            query = hellaswag_preprocess(doc["activity_label"] + ": " + ctx)
-            choices = [hellaswag_preprocess(ending) for ending in doc["endings"]]
-            gold = int(doc["label"])
-            records.append(
-                {
-                    "gold": gold,
-                    "choices": [
-                        encode_pair(tokenizer, prefix_token_id, query, " " + choice)
-                        for choice in choices
-                    ],
-                }
-            )
-    elif task == "winogrande":
-        dataset = load_dataset("allenai/winogrande", "winogrande_xl", split="validation")
-        iterator = dataset.select(range(limit)) if limit is not None else dataset
-        answer_to_num = {"1": 0, "2": 1}
-        for doc in iterator:
-            idx = doc["sentence"].index("_")
-            suffix = doc["sentence"][idx + 1 :].strip()
-            prefixes = [doc["sentence"][:idx] + doc["option1"], doc["sentence"][:idx] + doc["option2"]]
-            gold = answer_to_num[doc["answer"]]
-            records.append(
-                {
-                    "gold": gold,
-                    "choices": [
-                        encode_pair(tokenizer, prefix_token_id, prefix, " " + suffix)
-                        for prefix in prefixes
-                    ],
-                }
-            )
-    elif task == "arc_easy":
-        dataset = load_dataset("allenai/ai2_arc", "ARC-Easy", split="test")
-        iterator = dataset.select(range(limit)) if limit is not None else dataset
-        for doc in iterator:
-            context = f"Question: {doc['question']}\nAnswer:"
-            gold = doc["choices"]["label"].index(doc["answerKey"])
-            records.append(
-                {
-                    "gold": gold,
-                    "choices": [
-                        encode_pair(tokenizer, prefix_token_id, context, " " + choice)
-                        for choice in doc["choices"]["text"]
-                    ],
-                }
-            )
-    elif task == "arc_challenge":
-        dataset = load_dataset("allenai/ai2_arc", "ARC-Challenge", split="test")
-        iterator = dataset.select(range(limit)) if limit is not None else dataset
-        for doc in iterator:
-            context = f"Question: {doc['question']}\nAnswer:"
-            gold = doc["choices"]["label"].index(doc["answerKey"])
-            records.append(
-                {
-                    "gold": gold,
-                    "choices": [
-                        encode_pair(tokenizer, prefix_token_id, context, " " + choice)
-                        for choice in doc["choices"]["text"]
-                    ],
-                }
-            )
-    elif task == "social_iqa":
-        dataset = load_dataset("allenai/social_i_qa", split="validation")
-        iterator = dataset.select(range(limit)) if limit is not None else dataset
-        for doc in iterator:
-            context = f"Q: {doc['context']} {doc['question']}\nA:"
-            gold = int(doc["label"]) - 1
-            choices = [doc["answerA"], doc["answerB"], doc["answerC"]]
-            records.append(
-                {
-                    "gold": gold,
-                    "choices": [
-                        encode_pair(tokenizer, prefix_token_id, context, " " + choice)
-                        for choice in choices
-                    ],
-                }
-            )
-    elif task == "boolq":
-        dataset = load_dataset("aps/super_glue", "boolq", split="validation")
-        iterator = dataset.select(range(limit)) if limit is not None else dataset
-        for doc in iterator:
-            context = f"{doc['passage']}\nQuestion: {doc['question']}?\nAnswer:"
-            choices = ["no", "yes"]
-            gold = int(doc["label"])
-            records.append(
-                {
-                    "gold": gold,
-                    "choices": [
-                        encode_pair(tokenizer, prefix_token_id, context, " " + choice)
-                        for choice in choices
-                    ],
-                }
-            )
-    else:
-        raise ValueError(f"Unsupported multiple-choice task: {task}")
-    return records
-
-
-def build_ll_records(tokenizer, prefix_token_id: int, limit: int | None):
-    dataset = load_dataset("EleutherAI/lambada_openai", "default", split="test")
-    iterator = dataset.select(range(limit)) if limit is not None else dataset
-    records = []
-    for doc in iterator:
-        parts = doc["text"].split(" ")
-        context = " ".join(parts[:-1])
-        continuation = " " + parts[-1]
-        records.append(encode_pair(tokenizer, prefix_token_id, context, continuation))
-    return records
 
 
 # Curated natural-English prompts for the decode benchmark. Kept short so the
@@ -316,32 +103,6 @@ def build_decode_records(tokenizer, prefix_token_id: int, decode_len: int, limit
     return records
 
 
-def build_wikitext_records(tokenizer, prefix_token_id: int, max_seq_len: int, limit: int | None):
-    dataset = load_dataset("EleutherAI/wikitext_document_level", "wikitext-2-raw-v1", split="test")
-    iterator = dataset.select(range(limit)) if limit is not None else dataset
-    records = []
-    for doc in iterator:
-        text = wikitext_detokenizer(doc)
-        token_list = tok_encode_default(tokenizer, text)
-        windows = [
-            make_disjoint_window(window)
-            for window in get_rolling_token_windows(
-                token_list=token_list,
-                prefix_token=prefix_token_id,
-                max_seq_len=max_seq_len,
-                context_len=1,
-            )
-        ]
-        records.append(
-            {
-                "word_count": len(re.split(r"\s+", doc["page"])),
-                "byte_count": len(doc["page"].encode("utf-8")),
-                "windows": windows,
-            }
-        )
-    return records
-
-
 def export_decode_fixture(tokenizer, prefix_token_id: int, decode_len: int, output_dir: Path, limit: int | None) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / "decode.gdnreq"
@@ -369,61 +130,6 @@ def export_decode_fixture(tokenizer, prefix_token_id: int, decode_len: int, outp
         "limit": limit,
         "path": str(out_path),
         "note": "cont[] is a placeholder; run compare_gdn_c.py --decode-golden to fill the golden trajectory",
-    }
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    print(f"wrote {out_path}")
-
-
-def export_task_fixture(task: str, tokenizer, prefix_token_id: int, max_seq_len: int, output_dir: Path, limit: int | None) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f"{task}.gdnreq"
-    manifest_path = output_dir / f"{task}.json"
-    if task in {"piqa", "hellaswag", "winogrande", "arc_easy", "arc_challenge", "social_iqa", "boolq"}:
-        kind = REQ_KIND_MC
-        records = build_mc_records(task, tokenizer, prefix_token_id, limit)
-    elif task == "lambada_openai":
-        kind = REQ_KIND_LL
-        records = build_ll_records(tokenizer, prefix_token_id, limit)
-    elif task == "wikitext":
-        kind = REQ_KIND_ROLLING
-        records = build_wikitext_records(tokenizer, prefix_token_id, max_seq_len, limit)
-    else:
-        raise ValueError(f"Unsupported task {task}")
-
-    with out_path.open("wb") as handle:
-        handle.write(REQ_HEADER.pack(REQ_MAGIC, 1, kind, len(records)))
-        if kind == REQ_KIND_MC:
-            for rec in records:
-                write_u32(handle, len(rec["choices"]))
-                write_u32(handle, rec["gold"])
-                for context_ids, continuation_ids in rec["choices"]:
-                    write_u32(handle, len(context_ids))
-                    write_u32(handle, len(continuation_ids))
-                    write_i32_array(handle, context_ids)
-                    write_i32_array(handle, continuation_ids)
-        elif kind == REQ_KIND_LL:
-            for context_ids, continuation_ids in records:
-                write_u32(handle, len(context_ids))
-                write_u32(handle, len(continuation_ids))
-                write_i32_array(handle, context_ids)
-                write_i32_array(handle, continuation_ids)
-        else:
-            for rec in records:
-                write_u32(handle, rec["word_count"])
-                write_u32(handle, rec["byte_count"])
-                write_u32(handle, len(rec["windows"]))
-                for context_ids, continuation_ids in rec["windows"]:
-                    write_u32(handle, len(context_ids))
-                    write_u32(handle, len(continuation_ids))
-                    write_i32_array(handle, context_ids)
-                    write_i32_array(handle, continuation_ids)
-
-    manifest = {
-        "task": task,
-        "kind": kind,
-        "num_examples": len(records),
-        "limit": limit,
-        "path": str(out_path),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2))
     print(f"wrote {out_path}")
@@ -460,7 +166,7 @@ def tensor_names(cfg: dict) -> list[str]:
     return names
 
 
-def export_weights(model_name: str, output_path: Path) -> None:
+def export_weights(model_name: str, output_path: Path, precision: str) -> None:
     snapshot_dir = load_snapshot(model_name)
     cfg = json.loads((snapshot_dir / "config.json").read_text())
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -496,11 +202,17 @@ def export_weights(model_name: str, output_path: Path) -> None:
             tensor = reader.get_tensor(name).float().contiguous()
             if name.endswith("conv1d.weight"):
                 tensor = tensor[:, 0, :].contiguous()
+            if precision == "bf16":
+                # RNE-round to BF16, then widen back so every stored FP32
+                # word is BF16-exact — what gdn_validate_bf16_exact_weights
+                # requires of the packed-BF16 kernel's blob.
+                tensor = tensor.to(torch.bfloat16).float().contiguous()
             handle.write(tensor.numpy().tobytes(order="C"))
 
     meta = {
         "model_name": model_name,
         "output": str(output_path),
+        "precision": precision,
         "config": {
             "vocab_size": cfg["vocab_size"],
             "hidden_size": cfg["hidden_size"],
@@ -520,6 +232,123 @@ def export_weights(model_name: str, output_path: Path) -> None:
     print(f"wrote {output_path}")
 
 
+
+def build_rolling_windows(tokens: list[int], prefix_token_id: int,
+                          max_seq_len: int) -> list[tuple[list[int], list[int]]]:
+    """Replicate lm-eval's rolling windows for loglikelihood_rolling.
+
+    Mirrors lm_eval.utils.get_rolling_token_windows(context_len=1) followed by
+    make_disjoint_window, which is what the harness applies for the WikiText
+    task. With context_len=1 every block carries exactly one token of context,
+    so the FPGA's per-window score is directly comparable to the GPU arm's
+    word perplexity (16.827 for this contract).
+    """
+    if not tokens:
+        return []
+    windows: list[tuple[list[int], list[int]]] = []
+    pred_len = max_seq_len            # context_len == 1
+    first_seq_len = min(max_seq_len, len(tokens))
+    # get_rolling_token_windows first yield, then make_disjoint_window:
+    # ctx keeps only the tokens the continuation does not already cover.
+    windows.append(([prefix_token_id], tokens[:first_seq_len]))
+    predicted = first_seq_len
+    while predicted < len(tokens):
+        window_pred_len = min(len(tokens) - predicted, pred_len)
+        window_end = predicted + window_pred_len
+        raw_ctx = tokens[window_end - max_seq_len - 1: window_end - 1]
+        cont = tokens[window_end - window_pred_len: window_end]
+        ctx = raw_ctx[:len(raw_ctx) - (len(cont) - 1)]
+        if not ctx:                   # short document: fall back to the prefix
+            ctx = [prefix_token_id]
+        windows.append((ctx, cont))
+        predicted += window_pred_len
+    return windows
+
+
+def export_rolling_fixture(model_name: str, output_path: Path, max_seq_len: int,
+                           limit: int | None, min_chars: int) -> None:
+    """WikiText rolling-loglikelihood fixture (.gdnreq kind=3).
+
+    Layout, matching the host/native scorer's loader:
+        magic, version, kind, num_examples
+        per example: word_count, byte_count, num_windows
+          per window: ctx_len, cont_len, ctx[i32], cont[i32]
+    word/byte counts are the lm-eval definitions (whitespace words, UTF-8
+    bytes of the raw document) so word and byte perplexity are comparable.
+    """
+    from datasets import load_dataset
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    prefix_token_id = (tokenizer.eos_token_id
+                       if tokenizer.eos_token_id is not None
+                       else tokenizer.bos_token_id)
+    if prefix_token_id is None:
+        raise ValueError("tokenizer defines neither EOS nor BOS")
+
+    dataset = load_dataset("EleutherAI/wikitext_document_level",
+                           "wikitext-2-raw-v1", split="test")
+    # lm-eval's wikitext task SCORES the detokenized page
+    # (doc_to_target: wikitext_detokenizer) but NORMALIZES by the RAW page's
+    # word and byte counts (process_results). Tokenizing the raw page instead
+    # inflates the token count through its " @-@ " style artifacts and gave
+    # word PPL 19.89 against the harness's 16.83 -- so both halves matter.
+    from lm_eval.tasks.wikitext.preprocess_wikitext import wikitext_detokenizer
+
+    records = []
+    total_windows = total_tokens = 0
+    for row in dataset:
+        raw_text = row["page"]
+        if len(raw_text) < min_chars:
+            continue
+        text = wikitext_detokenizer({"page": raw_text})
+        tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
+        windows = build_rolling_windows(tokens, prefix_token_id, max_seq_len)
+        if not windows:
+            continue
+        records.append({
+            # lm-eval counts words/bytes on the RAW page, not the scored text.
+            "word_count": len(re.split(r"\s+", raw_text)),
+            "byte_count": len(raw_text.encode("utf-8")),
+            "windows": windows,
+        })
+        total_windows += len(windows)
+        total_tokens += sum(len(c) for _, c in windows)
+        if limit is not None and len(records) >= limit:
+            break
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("wb") as handle:
+        handle.write(REQ_HEADER.pack(REQ_MAGIC, 1, REQ_KIND_ROLLING,
+                                     len(records)))
+        for record in records:
+            write_u32(handle, record["word_count"])
+            write_u32(handle, record["byte_count"])
+            write_u32(handle, len(record["windows"]))
+            for ctx, cont in record["windows"]:
+                write_u32(handle, len(ctx))
+                write_u32(handle, len(cont))
+                write_i32_array(handle, ctx)
+                write_i32_array(handle, cont)
+
+    meta = {
+        "kind": REQ_KIND_ROLLING,
+        "dataset": "EleutherAI/wikitext_document_level wikitext-2-raw-v1 test",
+        "model_name": model_name,
+        "max_seq_len": max_seq_len,
+        "documents": len(records),
+        "windows": total_windows,
+        "scored_tokens": total_tokens,
+        "words": sum(r["word_count"] for r in records),
+        "bytes": sum(r["byte_count"] for r in records),
+        "prefix_token_id": prefix_token_id,
+    }
+    output_path.with_suffix(".json").write_text(json.dumps(meta, indent=2))
+    print(f"wrote {output_path}: {len(records)} documents, {total_windows} "
+          f"windows, {total_tokens} scored tokens "
+          f"({total_tokens * 0.02665 / 3600:.2f} h of card time at "
+          f"26.65 ms/token)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="cmd", required=True)
@@ -527,20 +356,32 @@ def main() -> None:
     weight_parser = subparsers.add_parser("weights")
     weight_parser.add_argument("--model-name", default=DEFAULT_MODEL)
     weight_parser.add_argument(
+        "--precision",
+        choices=("bf16", "fp32"),
+        default="bf16",
+        help="bf16 (default) writes the BF16-exact blob the packed kernel "
+             "requires; fp32 reproduces the retired FP32 blob",
+    )
+    weight_parser.add_argument(
         "--output",
         type=Path,
-        default=Path("c_impl/artifacts/gdn-1.3b-f32.gdnw"),
+        default=None,
+        help="defaults to c_impl/artifacts/gdn-1.3b-bf16w.gdnw (bf16) or "
+             "c_impl/artifacts/gdn-1.3b-f32.gdnw (fp32)",
     )
 
-    fixture_parser = subparsers.add_parser("fixtures")
-    fixture_parser.add_argument("--model-name", default=DEFAULT_MODEL)
-    fixture_parser.add_argument("--tasks", nargs="+", default=ALL_TASKS)
-    fixture_parser.add_argument("--limit", type=int, default=None)
-    fixture_parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("c_impl/fixtures"),
-    )
+    rolling_parser = subparsers.add_parser(
+        "wikitext",
+        help="rolling-loglikelihood WikiText fixture for on-card perplexity")
+    rolling_parser.add_argument("--model-name", default=DEFAULT_MODEL)
+    rolling_parser.add_argument("--output", type=Path,
+                                default=Path("c_impl/fixtures_full/wikitext.gdnreq"))
+    rolling_parser.add_argument("--max-seq-len", type=int, default=2048,
+                                help="model max_position_embeddings (lm-eval max_length)")
+    rolling_parser.add_argument("--limit", type=int, default=None,
+                                help="documents to keep (default: all)")
+    rolling_parser.add_argument("--min-chars", type=int, default=1,
+                                help="skip documents shorter than this")
 
     decode_parser = subparsers.add_parser("decode")
     decode_parser.add_argument("--model-name", default=DEFAULT_MODEL)
@@ -554,20 +395,27 @@ def main() -> None:
 
     args = parser.parse_args()
     if args.cmd == "weights":
-        export_weights(args.model_name, args.output)
+        output = args.output
+        if output is None:
+            output = Path("c_impl/artifacts/gdn-1.3b-bf16w.gdnw"
+                          if args.precision == "bf16"
+                          else "c_impl/artifacts/gdn-1.3b-f32.gdnw")
+        export_weights(args.model_name, output, args.precision)
         return
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     prefix_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
     if prefix_token_id is None:
         raise ValueError("Tokenizer must define BOS or EOS token for prefix_token_id.")
+    if args.cmd == "wikitext":
+        export_rolling_fixture(args.model_name, args.output, args.max_seq_len,
+                               args.limit, args.min_chars)
+        return
+
     if args.cmd == "decode":
         export_decode_fixture(tokenizer, prefix_token_id, args.decode_len, args.output_dir, args.limit)
         return
 
-    max_seq_len = 2048
-    for task in args.tasks:
-        export_task_fixture(task, tokenizer, prefix_token_id, max_seq_len, args.output_dir, args.limit)
 
 
 if __name__ == "__main__":

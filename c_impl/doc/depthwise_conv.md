@@ -1,7 +1,15 @@
 # Depthwise 1D Convolution + SiLU
 
-**Status:** Iter39C production decode block. Synthesis tables in the lower
-historical section are from the retired prefill top.
+**Status:** Active decode block, structurally unchanged since Iter39C and
+current at **Iter66e**. Its convolution tails are now packed **BF16** (32 per
+Beat512) inside the reserved FP32-sized workspace region, so `GDN_WS_OFF_*`
+offsets are unchanged; see `GDN_CONV_TAIL_BF16_BEATS_PER_STRIPE` in
+`gdn_model.h`. The tails were measured **bit-identical** between hardware and
+native in the Iter66 state-dump audit, which is what localized that divergence
+to the recurrent path — this block contains no transcendental.
+
+Synthesis tables in the lower historical section are from the retired prefill
+top and are not current.
 
 **Location:** `gdn_model.cpp` (`gdn_depthwise_conv_silu_head_kind`)
 

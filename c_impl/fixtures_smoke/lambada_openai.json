@@ -1,7 +1,0 @@
-{
-  "task": "lambada_openai",
-  "kind": 2,
-  "num_examples": 1,
-  "limit": 1,
-  "path": "c_impl/fixtures_smoke/lambada_openai.gdnreq"
-}
