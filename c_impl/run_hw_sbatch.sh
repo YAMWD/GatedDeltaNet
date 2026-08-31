@@ -105,8 +105,14 @@ if [ -n "$held" ]; then
     printf '        %s\n' "$held"
 fi
 
+# The complete build chain, frozen into the submission snapshot so a run is
+# reproducible from its own record. Every Tcl link is here: the config names
+# apply_f150 / apply_iter66e_unpair / check_f150 / report_final_qor, and
+# apply_iter66e_unpair sources apply_iter54_dma_timing, which chains the
+# iter35 and iter23 DMA fanout repairs.
 snapshot_files=(
     Makefile gdn_model.cpp gdn_model.h host.cpp hls_gdn_forward.tcl
+    hw_iter66e_frp_unpair_f100.cfg apply_iter66e_unpair.tcl
     hw_f150_physical_islands.cfg apply_f150_physical_islands.tcl
     apply_iter54_dma_timing.tcl apply_iter35_dma_w15_fifoaddr_fanout.tcl
     apply_iter23_dma_fanout.tcl check_f150_physical_islands.tcl
@@ -119,7 +125,7 @@ if [ -n "${EXTRA_SNAPSHOT_FILES:-}" ]; then
         snapshot_files+=("${extra}")
     done
 fi
-echo "cfg tmpl   : ${HW_CFG_TEMPLATE:-hw_f150_physical_islands.cfg (default)}"
+echo "cfg tmpl   : ${HW_CFG_TEMPLATE:-hw_iter66e_frp_unpair_f100.cfg (default)}"
 for snapshot_file in "${snapshot_files[@]}"; do
     test -s "${snapshot_file}" || {
         echo "FATAL: source/config file missing: ${snapshot_file}" >&2

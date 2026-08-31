@@ -78,7 +78,10 @@ HLS_PRE_TCL    := $(abspath ./hls_gdn_forward.tcl)
 BUILD_DIR      := build.$(TARGET).gdn32.h$(HLS_FREQ).f$(LINK_FREQ).o$(JOBS)
 XO             := $(BUILD_DIR)/$(KERNEL).xo
 XCLBIN         := $(BUILD_DIR)/$(KERNEL).xclbin
-HW_CFG_TEMPLATE ?= hw_f150_physical_islands.cfg
+# The shipping physical configuration is Iter66e: the base island floorplan
+# plus the SLR0 LUT un-pairing hook. hw_f150_physical_islands.cfg remains the
+# pre-Iter66 recipe and is kept for A/B comparison.
+HW_CFG_TEMPLATE ?= hw_iter66e_frp_unpair_f100.cfg
 RESOLVED_HW_CFG := $(BUILD_DIR)/resolved_hw.cfg
 HW_CFG          ?= $(RESOLVED_HW_CFG)
 
