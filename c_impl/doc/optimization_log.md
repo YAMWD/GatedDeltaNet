@@ -8676,3 +8676,39 @@ every reference and repeating the quality work.
 Native gates after the Iter67c edit: fast 6/6 and full 32/32 PASS,
 `exact_traj_match=True`, `first_divergence=-1`, 992,000 logits,
 `exact_ref_mismatch=0`, `argmax_mismatch=0`.
+
+### Iter67c five-phase schedule — POSITIVE (probe 2992)
+
+The distance fix works, and at the predicted size. `recur_island_read` is now
+the flattened `recur_island_read_row_recur_island_read`: **1,287 cycles at
+II=1** over 1,280 trips, against 2,055 at II=2. That is **-768 cycles per
+head, 147,456 per token, 1.47 ms at 100 MHz** -- exactly the external review's
+estimate. The recurrent islands fall **43,427 -> 37,283 cycles per layer,
+-14.1%**.
+
+Note the trap in the raw log: `vitis_hls.log` still prints
+`Final II = 2, loop 'recur_island_read'` from an intermediate scheduling
+attempt. The authoritative csynth table reports the flattened loop at II=1.
+Read the table, not the log line.
+
+Retained together in this candidate:
+
+| change | effect |
+|---|---|
+| on-chip argmax fused into the emission loops | +70 cycles, +30,612 LUT, 4-byte token read-back replaces 128 KB |
+| five-phase recurrent read | -147,456 cycles (-1.47 ms) |
+| convolution window banked 16 to match its unroll | conv block 272 -> 193 cycles (-29%) |
+
+Whole-kernel: LUT 895,268 (68%) -> **920,867 (70%)**, estimated clock unchanged
+at 205.47 MHz, BRAM/DSP/URAM unchanged at 1,995 / 3,325 / 80. The static
+`layer_loop` total is unchanged at 6,590,496 because it is dominated by the
+worst-case GEMV path; that number has never predicted this design's measured
+cycles (6.66M static against 2.56M measured) and is not used here.
+
+Predicted kernel TPOT is about **24.2 ms** against Iter66e's measured 25.625,
+before any host-side gain from the 4-byte token path. Hardware build launched
+to measure it. The risk this build tests is not cycles but placement: +25,599
+LUT lands partly in `gemv32_store`, which the island pblocks distribute across
+all three SLRs, and SLR0 sits at 96.53% CLB in the Iter66e route that only
+reached zero overlaps after frp plus LUT un-pairing. Verdict: **csynth
+POSITIVE; on-card pending.**

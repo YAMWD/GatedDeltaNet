@@ -1400,7 +1400,15 @@ static void gdn_depthwise_conv_silu_head_kind(
 #pragma HLS array_partition variable=w_loc dim=1 cyclic factor=GDN_CONV_LANES
     float in_window[GDN_CONV][GDN_HEAD_DIM];
 #pragma HLS array_partition variable=in_window dim=1 complete
-#pragma HLS array_partition variable=in_window dim=2 cyclic factor=GDN_CONV_LANES
+/* Iter67b: banked 16 ways, not GDN_CONV_LANES (4). The shift and restore
+ * loops unroll 16 lanes, and with 4 banks the bank index is col % 4 == lane %
+ * 4, so four lanes collide on every bank and demand 4 reads + 4 writes per
+ * cycle from a 2-port memory. That is the measured cause of the three
+ * escalating II violations HLS reports on in_window_4 and in_window_8
+ * ("limited memory ports", II = 1, then 2, then 3). Matching the banking to
+ * the unroll width gives one access per bank per cycle. GDN_CONV_LANES stays
+ * 4 for w_loc, whose access pattern is different. */
+#pragma HLS array_partition variable=in_window dim=2 cyclic factor=16
 
     const uint32_t head_packs = GDN_HEAD_DIM / 32;
     const uint32_t hidden_packs = GDN_HIDDEN / 32;
@@ -1694,6 +1702,12 @@ static void gdn_load_recurrent_scalars(
  * 4 to 2.
  * ----------------------------------------------------------------------- */
 #define GDN_RECURRENT_ISLAND_LANES 16
+/* Phases per row in the recurrent read pass. Four carry work; the extra one
+ * is a scheduling bubble that lengthens each accumulator's revisit distance to
+ * match the read+add+write feedback path, which is what buys II=1. Raise this
+ * only if csynth still reports II>1 -- it is the single knob, and every extra
+ * phase costs 256 cycles per head. */
+#define GDN_RECURRENT_READ_PHASES 5
 #define GDN_RECURRENT_ISLAND_COLS  (GDN_DV / 4)
 
 static void gdn_recurrent_duplicate_qkv(
@@ -1945,6 +1959,11 @@ recur_island_head: for (uint32_t head_index = 0;
         float delta_hi[GDN_RECURRENT_ISLAND_COLS];
         float output_lo[GDN_RECURRENT_ISLAND_COLS];
         float output_hi[GDN_RECURRENT_ISLAND_COLS];
+/* Cyclic, NOT complete. Probe 2986 measured complete partitioning as a clear
+ * regression: the dynamic `local_base + lane` index forces a 64-way crossbar,
+ * and read_pass II went 2 -> 4 with the island growing 43,427 -> 57,491
+ * cycles per layer. The crossbar costs more than the memory latency it
+ * removes. */
 #pragma HLS array_partition variable=retrieval_lo cyclic factor=GDN_RECURRENT_ISLAND_LANES
 #pragma HLS array_partition variable=retrieval_hi cyclic factor=GDN_RECURRENT_ISLAND_LANES
 #pragma HLS array_partition variable=partial_lo cyclic factor=GDN_RECURRENT_ISLAND_LANES
@@ -1965,13 +1984,40 @@ recur_island_head: for (uint32_t head_index = 0;
             partial_hi[i] = 0.0f;
         }
 
-    recur_island_read: for (uint32_t block = 0;
-                            block < GDN_DK * 4; ++block) {
-#pragma HLS loop_tripcount min=1024 max=1024
+    /* Iter67c: a five-phase schedule, not a faster adder.
+     *
+     * The accumulator feedback path (read + FP32 add + write) is longer than
+     * four cycles, so at distance 4 the scheduler can only reach II=2. Two
+     * ways to close that gap were measured and rejected:
+     *
+     *   - binding the adds to a latency-4 fabric core (probe 2985): still
+     *     II=2, and +20,448 LUT in the recurrent islands for nothing;
+     *   - partitioning the accumulators into registers (probe 2986): II got
+     *     *worse*, 2 -> 4, because the dynamic index becomes a crossbar.
+     *
+     * Instead, lengthen the distance to match the feedback. Iterating five
+     * phases per row while only four carry work inserts one bubble per row and
+     * makes each accumulator's revisit distance 5. The arithmetic is
+     * untouched -- same expression, same operand order, same sequential
+     * row-major accumulation -- so this stays bit-exact, unlike parity partial
+     * sums, which would reach II=1 by reassociating the sum and would retire
+     * the golden.
+     *
+     * Cost/benefit at II=1: 256 x 5 = 1,280 trips replacing 1,024 trips at
+     * II=2, so ~1,290 cycles per head against 2,056 -- about 147K cycles or
+     * 1.47 ms per token, for no extra arithmetic and no forced adder cone.
+     * If the feedback turns out to exceed five, the phase count is the single
+     * knob to raise; the value falls to ~1.0 ms at six phases and vanishes by
+     * eight, which is the point at which this trade stops being worth it. */
+    recur_island_read_row: for (uint32_t row = 0; row < GDN_DK; ++row) {
+#pragma HLS loop_tripcount min=256 max=256
+        recur_island_read: for (uint32_t phase = 0;
+                                phase < GDN_RECURRENT_READ_PHASES; ++phase) {
+#pragma HLS loop_tripcount min=5 max=5
 #pragma HLS pipeline II=1
-            const uint32_t row = block >> 2;
+            if (phase < 4) {
             const uint32_t local_base =
-                (block & 3) * GDN_RECURRENT_ISLAND_LANES;
+                phase * GDN_RECURRENT_ISLAND_LANES;
             const float kj = k_loc[row];
             const float qj = q_loc[row];
         recur_island_read_lane: for (uint32_t lane = 0;
@@ -1981,38 +2027,17 @@ recur_island_head: for (uint32_t head_index = 0;
                 GDNStatePair state_value =
                     state_pair[row][local_base + lane];
                 const uint32_t col = local_base + lane;
-                /* Iter67: this loop ran at II=2, not the requested II=1, in
-                 * every csynth report on disk. HLS names the reason exactly:
-                 *
-                 *   [HLS 200-880] Unable to enforce a carried dependence
-                 *   constraint (II = 1, distance = 4, offset = 1) ... on
-                 *   array 'partial_hi'
-                 *
-                 * `local_base` is (block & 3) * 16, so each accumulator is
-                 * revisited every fourth iteration. II=1 therefore needs an
-                 * adder latency of at most 4, and this file's default binding
-                 * is 5 (see the fulldsp latency=5 accumulator in the GEMV
-                 * cluster). Naming each sum and binding it to latency 4 buys
-                 * II=1 without touching the arithmetic: the expression, its
-                 * operand order, and the sequential row-major accumulation are
-                 * all unchanged, so the trajectory stays bit-exact. Splitting
-                 * the accumulators into parity banks would also give II=1, at
-                 * distance 8, but it reassociates the sum and would retire the
-                 * exact golden -- do not substitute it without regenerating
-                 * the references and repeating the quality work. */
                 float acc_r_lo = retrieval_lo[col] + state_value.lo * kj;
                 float acc_r_hi = retrieval_hi[col] + state_value.hi * kj;
                 float acc_p_lo = partial_lo[col] + state_value.lo * qj;
                 float acc_p_hi = partial_hi[col] + state_value.hi * qj;
-#pragma HLS bind_op variable=acc_r_lo op=fadd impl=fabric latency=4
-#pragma HLS bind_op variable=acc_r_hi op=fadd impl=fabric latency=4
-#pragma HLS bind_op variable=acc_p_lo op=fadd impl=fabric latency=4
-#pragma HLS bind_op variable=acc_p_hi op=fadd impl=fabric latency=4
                 retrieval_lo[col] = acc_r_lo;
                 retrieval_hi[col] = acc_r_hi;
                 partial_lo[col] = acc_p_lo;
                 partial_hi[col] = acc_p_hi;
             }
+            }
+        }
         }
 
     /* Process 16 columns per island per cycle. Across both concurrently
