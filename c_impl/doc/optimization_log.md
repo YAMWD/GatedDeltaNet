@@ -8819,3 +8819,42 @@ so job 3101 silently overwrote job 2994's `oncard_decode64.json` and its parity
 logs. Both runs are recoverable only from their Slurm logs. Any future
 comparison of two images at the same frequency will lose the earlier result the
 same way.
+
+### Iter67c production-TPOT phase breakdown — MEASUREMENT ONLY (job 3119)
+
+The production timer was partitioned without changing the kernel or XCLBIN:
+host embedding-row BO write, 8 KiB embedding H2D sync, XRT run construction /
+argument setup / start, kernel wait, and 64-byte token D2H sync/read. Optional
+full-logit transfer and validation remain outside every production phase. The
+five component intervals exactly reconstruct TPOT (median residual 0 ns at the
+reported precision).
+
+Slurm U55C job **3119** ran on `acclnode01`, completed in 20 seconds, and used
+the retained Iter67c XCLBIN
+`fb4fc63f76bc1ee485665f21102596270930d6d39643b8eb5ae7d4f899d289ab`.
+Host source SHA-256 was
+`8bc562e6cc9ee01d871eca5e1042a9967f77e50d11e24a3929a6148e0d80f25a`.
+Across 63 real decode calls, excluding the seed:
+
+| Production phase | Median | Mean | Min | Max |
+|---|---:|---:|---:|---:|
+| complete token-ID-to-token-ID TPOT | **24.221158 ms** | 24.215531 ms | 24.158499 ms | 24.281041 ms |
+| embedding host lookup / BO write | 0.001052 ms | 0.001063 ms | 0.000761 ms | 0.001953 ms |
+| embedding H2D sync | 0.051728 ms | 0.051272 ms | 0.040276 ms | 0.060194 ms |
+| XRT launch setup/start | 0.014999 ms | 0.015569 ms | 0.007204 ms | 0.097345 ms |
+| kernel wait | **24.096601 ms** | 24.091784 ms | 24.058870 ms | 24.103383 ms |
+| selected-token D2H/read | 0.055264 ms | 0.055842 ms | 0.042811 ms | 0.074983 ms |
+
+The paired per-step median `TPOT - kernel` is **0.123966 ms** (0.512% of
+TPOT). The combined embedding ingress is **0.052780 ms** median, only 0.218% of
+TPOT and 42.6% of the host-side gap. Moving the embedding table to board HBM
+therefore has a hard measured standalone opportunity of roughly 53 us before
+paying for the replacement HBM lookup; it is not a high-ROI next kernel change.
+
+The 64-token trajectory remained exact (`first_divergence=-1`, 100% top-1).
+Jobs 3116--3118 were wrapper-only launch failures before compilation or card
+access: the vendor XRT setup script was sourced under shell `nounset`. Job 3119
+disabled `errexit`/`nounset` only around that script and restored both
+immediately afterward. Verdict: **host observability measurement retained by
+explicit request; no bitstream or architecture change**. Raw JSON and Slurm
+evidence are under `diagnostics/iter67c_tpot_breakdown/`.
