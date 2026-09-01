@@ -8712,3 +8712,48 @@ LUT lands partly in `gemv32_store`, which the island pblocks distribute across
 all three SLRs, and SLR0 sits at 96.53% CLB in the Iter66e route that only
 reached zero overlaps after frp plus LUT un-pairing. Verdict: **csynth
 POSITIVE; on-card pending.**
+
+### Iter67c hardware result — RETAINED. 24.099 ms/token on card.
+
+Build **2993** on `harrier`, 12:08:59; on-card **2994**. XCLBIN
+`fb4fc63f76bc1ee485665f21102596270930d6d39643b8eb5ae7d4f899d289ab`.
+
+| | Iter66e | Iter67c |
+|---|---:|---:|
+| kernel TPOT, median of 63 | 25.625 ms | **24.099 ms** |
+| effective cycles | 2.5625M | **2.4099M** |
+| routed nets | all | 1,749,053 / 1,749,053, **0 routing errors** |
+| setup WNS / failing | +0.003 / 0 | **+0.003 / 0** of 2,329,520 |
+| hold WHS / failing | +0.009 / 0 | **+0.007 / 0** of 2,326,865 |
+| achieved kernel clock | 100 MHz | **100 MHz**, no auto-scaling |
+
+**-1.526 ms, -6.0%**, and 5.04x over the 121.4 ms eight-port baseline. Measured
+-152,600 cycles against a predicted -147,456 from the five-phase read plus the
+convolution rebanking; the two agree to 3.5%.
+
+Gates: exact 64-token trajectory, `first_divergence=-1`, `argmax_mismatch=0`,
+GPU vector gate over 2,016,000 logits at global NRMSE 0.00466, worst-step
+0.0119, min cosine 0.99995, min top-5 overlap 5.
+
+**Placement redistributed rather than choking**, which is why +25,599 LUT still
+routed: SLR0 CLB went 96.53% -> **99.29%** while SLR1 fell 94.68% -> 87.51% and
+SLR2 rose 76.09% -> 81.97%; the SLR1<->SLR0 SLL crossing eased 89.57% ->
+84.76%. SLR0 at 99.29% is the tightest this design has ever routed and is the
+number to watch before adding anything further.
+
+**A reading trap worth recording.** Grepping the build log mid-flight returns
+*intermediate* router values -- this build showed 15 node overlaps, 1,349,859
+unrouted nets and WHS -0.401 with 26,380 failing hold endpoints while
+rip-up-and-reroute was still running. All of it was resolved by post-route
+phys-opt. Only `gdn_final_qor/route_status.rpt` and
+`gdn_final_qor/timing_summary.rpt` are verdicts. Likewise the routing duration
+is not a predictor: this build spent 3.5+ hours in rip-up, which matches the
+*failed* Iter66a-d pattern rather than Iter66e's 1:30:56, and still closed
+cleanly.
+
+**Still unmeasured: the argmax's own TPOT benefit.** This run passed a GPU
+reference, so `want_logits` was true and the host still pulled the full 128 KB
+logit vector every step; the 4-byte token path never executed. The 0.588 ms
+host overhead here is also not comparable to Iter66e's 1.029 ms, because the
+logit gate was moved out of the timed window in between. Measuring the fast
+path needs one short reference-free card run.

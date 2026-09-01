@@ -37,14 +37,14 @@ Checkpoint: `m-a-p/1.3B-100B-GatedDeltaNet-pure` (HuggingFace) — consumed by `
 
 | | |
 |---|---|
-| Shipping image | **Iter66e**, all-BF16, Vitis 2024.2, XCLBIN `98b38cc7…` |
-| TPOT | **25.625 ms/token** kernel (job 2507) = 2.5625M cycles @ 100 MHz. Wall was 26.654, but that window wrongly contained the 32,000-value logit gate — fixed in `host.cpp`, so the next run's wall figure will be lower and is not comparable to 26.654 |
-| Routed timing | zero overlaps, zero failing endpoints of 2,277,369. **Per clock**: kernel **+0.195 ns**, fixed 250 MHz DMA **+0.003 ns**, HBM 450 MHz +0.079. The design-wide +0.003 is the *shell's* margin, not the kernel's |
+| Shipping image | **Iter67c**, all-BF16 + on-chip argmax + II=1 recurrent read, Vitis 2024.2, XCLBIN `fb4fc63f…` |
+| TPOT | **24.099 ms/token** kernel median, n=63 (job 2994) = 2.4099M cycles @ 100 MHz, achieved clock verified 100 MHz. Wall 24.687 with 0.588 ms host overhead — **not comparable** to Iter66e's 26.654/1.029, because the logit gate was moved out of the timed window in between |
+| Routed timing | 1,749,053/1,749,053 nets routed, 0 routing errors. Setup WNS +0.003 (0 failing of 2,329,520), hold WHS +0.007 (0 failing). Read WNS **per clock**: the design-wide figure is the fixed 250 MHz DMA's margin, not the kernel's |
 | Correctness | exact 64-token trajectory; CUDA vector gate over 2,016,000 logits — NRMSE 0.00466, min cosine 0.99995, top-5 exact, zero argmax mismatches |
 | Long-run drift | bounded to 512 tokens; hardware tracks the GPU for 447 tokens (job 2529) |
 | Per-token weight bytes | 2.597 GB → 1,268,224 beat-cycles/port = **49.5%** port occupancy |
 | Resources (csynth) | BRAM18 1,995 (49%) · DSP 3,325 (36%) · FF 1.00M (38%) · LUT 895K (68%) · **URAM 80 (8%)** |
-| Routed per-SLR CLB | 96.53% / 94.68% / 76.09% · SLR1↔SLR0 SLL **89.57%** |
+| Routed per-SLR CLB | **99.29%** / 87.51% / 81.97% · SLR1↔SLR0 SLL 84.76% (Iter66e was 96.53/94.68/76.09, SLL 89.57%) |
 | Task quality | Iter66o WikiText-2 on card, **complete** (job 2822): word PPL **16.774840** vs GPU **16.776124** on identical windows = **−0.0077%**, gate 5% |
 | Committed | Yes — Iter66e is the committed design and the `run_hw` default as of 2026-08-31 |
 
