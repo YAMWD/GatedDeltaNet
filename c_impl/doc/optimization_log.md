@@ -8751,9 +8751,71 @@ is not a predictor: this build spent 3.5+ hours in rip-up, which matches the
 *failed* Iter66a-d pattern rather than Iter66e's 1:30:56, and still closed
 cleanly.
 
-**Still unmeasured: the argmax's own TPOT benefit.** This run passed a GPU
-reference, so `want_logits` was true and the host still pulled the full 128 KB
-logit vector every step; the 4-byte token path never executed. The 0.588 ms
-host overhead here is also not comparable to Iter66e's 1.029 ms, because the
-logit gate was moved out of the timed window in between. Measuring the fast
-path needs one short reference-free card run.
+### Iter67c production-TPOT audit — RETAINED host measurement fix (job 3101)
+
+The first Iter67c run still timed the optional 128 KB full-logit read-back and
+host argmax cross-check whenever the independent-GPU reference was enabled.
+That is validation overhead, not the deployed greedy loop. The host timer now
+starts before the host embedding lookup/upload and stops immediately after the
+FPGA-selected token line returns. Full-logit transfer, the host argmax
+cross-check, and both reference scans still execute afterward and therefore
+retain the complete quality gate without contributing to TPOT. This is a
+host-only reporting change; the XCLBIN remains
+`fb4fc63f76bc1ee485665f21102596270930d6d39643b8eb5ae7d4f899d289ab`.
+
+Slurm U55C job **3101** rebuilt only `host.exe` and reran the 8/64-token gates
+on `acclnode01`. Across the 63 real kernel invocations (excluding the seed):
+
+| Metric | Median | Mean | Min | Max |
+|---|---:|---:|---:|---:|
+| production token-to-token TPOT | **24.208 ms** | **24.219 ms** | 24.134 ms | 24.422 ms |
+| kernel execution | **24.099 ms** | **24.092 ms** | 24.052 ms | 24.112 ms |
+| host/XRT/PCIe production overhead | **0.109 ms** | **0.126 ms** | -- | -- |
+
+The production boundary includes the host-resident embedding-row lookup, its
+8 KiB upload, XRT launch/wait, the complete FPGA kernel including fused
+argmax, and one 64-byte selected-token read-back. The GPU-reference gate still
+compared all 2,016,000 logits with zero tolerance failures and zero argmax
+mismatches; the 64-token trajectory remained exact with first divergence -1.
+
+The reporting script also stopped averaging the seed's zero-duration
+placeholder into TPOT/kernel means. Its previous printed Iter67c mean values
+23.717/23.840 ms were therefore underestimates; the medians were unaffected.
+Host source SHA-256
+`1344b536920a2dd88a0fcc973d3979370368ac3777ae13d5e43dbdccc2ffff4e`;
+reporter SHA-256
+`154a6bc84886d45e0092b971dfa4947a07036189f0eb63f9df0fb87560c7ff36`.
+Verdict: **RETAINED** as the production TPOT definition. No kernel, route,
+timing, or arithmetic result changed.
+
+**Reporting bug found while auditing job 3101: the seed token's zero was being
+averaged in.** `_summarize_ms` in `scripts/check_gdn_c_parity.py` took the mean
+over the raw `kernel_ms` / `per_step_tpot_ms` arrays, whose index 0 is the seed
+token -- a step the decode loop never runs a kernel for, recorded as `0.0`.
+Every mean this script has printed was therefore understated by one part in N:
+1.6% on a 64-token run and **12.5% on the 8-token smoke**, which was reporting
+21.06 ms against a true 24.06. Medians were never affected, because with the
+single zero sorted to the front the middle values are still real samples. The
+Makefile's `jq` summary already filtered with `select(. > 0)`, so any figure
+taken from `performance_summary.json` -- including the whole historical ladder
+-- is sound; only this script's mean was wrong, and it surfaced now because
+`jq` is absent on `acclnode01` and the parity report was the only summary
+produced. Fixed by filtering non-positive entries.
+
+**One claim retracted.** An intermediate reading of this campaign attributed
+the difference between job 2994's 0.586 ms host overhead and job 3101's
+0.109 ms to run-to-run variance from cold DMA buffers. That was wrong. The two
+jobs ran different host timers: 2994 measured through the 128 KB logit
+read-back and host argmax cross-check, 3101 stopped after the 64-byte token
+line. The 0.477 ms difference is deterministic and is the measured cost of the
+logit path -- which is exactly the saving the restored on-chip argmax delivers.
+Kernel time was identical at 24.099 ms median across both runs, which is the
+reproducibility evidence that made the discrepancy traceable to the timer
+rather than the hardware.
+
+**Operational hazard, unfixed:** the on-card output directory
+`diagnostics/run_hw_h150_f100/on_card/` is keyed by frequency, not by run tag,
+so job 3101 silently overwrote job 2994's `oncard_decode64.json` and its parity
+logs. Both runs are recoverable only from their Slurm logs. Any future
+comparison of two images at the same frequency will lose the earlier result the
+same way.

@@ -1,26 +1,27 @@
-# Cycle-First Optimization Roadmap After Iter66e
+# Cycle-First Optimization Roadmap After Iter67c
 
-**Current cycle reference (rebased 2026-08-31):** **Iter66e**, all-BF16,
-**2.5625M cycles/token = 25.625 ms kernel / 26.654 ms wall** at a true 100 MHz,
-WNS +0.003 / WHS +0.009 ns, zero overlaps, exact 64-token trajectory. This
-supersedes Iter57's 4.202354M / 42.023540 ms as the number every remaining
-stage is costed against.
+**Current cycle reference (rebased 2026-09-01):** **Iter67c**, all-BF16,
+**2.4099M cycles/token = 24.099 ms kernel median / 24.208 ms production TPOT**
+at a true 100 MHz, WNS +0.003 / WHS +0.007 ns design-wide, zero routing errors,
+and an exact 64-token trajectory. This supersedes Iter66e's 2.5625M / 25.625 ms
+as the number every remaining stage is costed against.
 
 **Status of the original stages.** Iter57 completed the recurrent-head portion
 of Stage 4 and the physical decomposition. Iter66e then delivered the "Beyond
 Exact FP32" direction (§13) that this roadmap had listed as speculative:
 packed-BF16 weights, a native `ap_float<16,8>` multiplier, BF16 recurrent
-state, full-window URAM state queues, and free-running cluster pipelines. That
-one step was worth **1.582x** — more than every remaining listed stage
-combined. Output-projection head-chunk accumulation and chunk-streamed MLP
-remain open and remain percent-level.
+state, full-window URAM state queues, and free-running cluster pipelines.
+Iter67c then completed the recurrent-read II lever: its five-phase schedule
+reduced the measured token by another 152,600 cycles without reassociation.
+Output-projection head-chunk accumulation and chunk-streamed MLP remain open
+and remain percent-level.
 
 ## 0. The one thing that changed how levers must be costed
 
 **The design is no longer HBM-bandwidth-bound, so a lever's share of bytes no
 longer predicts its share of time.** At 2.597 GB of BF16 weights per token,
 32 ports x 64 B x 100 MHz gives **1,268,224 beat-cycles per port against a
-measured 2,562,500 — 49.5% port occupancy**. The standalone microbenchmark
+measured 2,409,900 — 52.6% port occupancy**. The standalone microbenchmark
 sustains 98.353% of clock-rate ceiling on this exact port structure, so the
 idle half is scheduling, not memory.
 
@@ -29,18 +30,17 @@ Two consequences, both already paid for:
 - **BF16 delivered 1.582x, not 2x.** The prediction of "13--21 ms" in earlier
   documents assumed a bandwidth-bound design. Record the miss; do not repeat
   the reasoning.
-- **The recurrent block became the second target without changing.** It is
-  43,427 cycles/layer x 24 = **1.042M cycles, 40.7% of the token** — about 25%
-  when weights were FP32. Halving the weights raised its share.
+- **The recurrent block remains the second target after its II fix.** The
+  five-phase schedule removed 6,144 cycles/layer, leaving approximately
+  37,283 cycles/layer x 24 = **0.895M cycles, 37.1% of the token**.
 
 Rank remaining levers by measured share of the token:
 
 | Lever | Measured basis | Upper bound | Physical risk |
 |---|---|---:|---|
 | Sub-byte weights (INT4) | weight beats 1,268,224 -> ~317,056/port | **37%** (-> ~16.1 ms) | new datapath, retires the current quality baseline |
-| Recurrent state fully on chip | `load_state`+`update`, 395,904 cyc | 15.4% (realistically 8--12%) | **blocked** — see below |
-| `recur_island_read` II=2 -> II=1 | 1,024 cyc/head x 192 | **7.7%** | none — source only |
-| Partial state residency, SLR2-local | 9 of 24 layers x 15.4% | 5.8% | low — no new cross-SLR path |
+| Recurrent state fully on chip | `load_state`+`update`, 395,904 cyc | 16.4% (realistically 8--12%) | **blocked** — see below |
+| Partial state residency, SLR2-local | 9 of 24 layers x 16.4% | 6.2% | low — no new cross-SLR path |
 | Head-chunked output projection | roadmap Stage 4 remainder | percent-level | moderate |
 | Chunk-streamed GU/SwiGLU/MLP-down | roadmap Stage 5 | percent-level | moderate |
 
@@ -54,8 +54,8 @@ tight: this design's partitioned access has cost ~1.68x raw
 (96 URAM/layer against 57 for the FP32 version), which puts full residency near
 1,152 URAM against 960 available. Iter59 measured a weaker version — ~600 URAM
 moved on chip — and congestion worsened in all four directions with
-`route_design` refusing at level 7. **Do the two cheap substitutes first**: the
-II=2 fix (7.7%, source-only) and SLR2-local partial residency (5.8%).
+`route_design` refusing at level 7. The II=2 substitute is complete in Iter67c;
+SLR2-local partial residency remains the bounded state-residency test.
 
 **Primary objective:** minimize single-token decode cycles. Perform only the
 100 MHz implementation checkpoints required to verify real cycles and
@@ -68,14 +68,14 @@ Iter38 stripes the 48 MiB recurrent state over tails appended to weight ports
 28--31 and advances all four ports concurrently. Compact 64-bit low/high state
 pairs let the same 32 URAM banks serve both halves without a second address.
 
-| Metric | Iter36 | Iter37 | Iter38 | Iter39C | Iter54c | Iter57 | **Iter66e** |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Clock used on card | 100 MHz | 100 MHz | 100 MHz | 100 MHz | 94.1 MHz | 100 MHz | **100 MHz** |
-| Mean cycles/token | 5.958M | 5.145M | 4.708M | 4.309M | 4.112M | 4.202M | **2.5625M** |
-| Mean latency (kernel) | 59.578 ms | 51.451 ms | 47.079 ms | 43.093 ms | 43.702 ms | 42.024 ms | **25.625 ms** |
-| Weight bytes/token | 5.195 GB | 5.195 GB | 5.195 GB | 5.195 GB | 5.195 GB | 5.195 GB | **2.597 GB** |
-| Port occupancy | 92% | 79% | 73% | 67% | 64% | 65% | **49.5%** |
-| Recurrent HLS cycles/layer | 76.7K | 43.9--44.1K | 27.3--27.5K (see note) | " | streamed | two streamed islands | **43,427 (measured)** |
+| Metric | Iter36 | Iter37 | Iter38 | Iter39C | Iter54c | Iter57 | Iter66e | **Iter67c** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Clock used on card | 100 MHz | 100 MHz | 100 MHz | 100 MHz | 94.1 MHz | 100 MHz | 100 MHz | **100 MHz** |
+| Cycles/token | 5.958M | 5.145M | 4.708M | 4.309M | 4.112M | 4.202M | 2.5625M | **2.4099M** |
+| Latency (kernel) | 59.578 ms | 51.451 ms | 47.079 ms | 43.093 ms | 43.702 ms | 42.024 ms | 25.625 ms | **24.099 ms** |
+| Weight bytes/token | 5.195 GB | 5.195 GB | 5.195 GB | 5.195 GB | 5.195 GB | 5.195 GB | 2.597 GB | **2.597 GB** |
+| Port occupancy | 92% | 79% | 73% | 67% | 64% | 65% | 49.5% | **52.6%** |
+| Recurrent HLS cycles/layer | 76.7K | 43.9--44.1K | 27.3--27.5K (see note) | " | streamed | two streamed islands | 43,427 | **~37,283** |
 
 Port occupancy is derived, not measured directly: weight beats per port divided
 by measured cycles. It is the clearest single indicator that the bottleneck
@@ -129,6 +129,14 @@ measured count rises by 0.090M versus Iter54c, but it closes the requested
 Iter39C reference, it still saves 0.107M measured cycles. Treat this as a
 timing-friendly milestone with a modest cycle win, not as completion of the
 remaining cycle-streaming roadmap.
+
+Iter66e halves dense-weight traffic with the accepted all-BF16 contract and
+reaches 2.5625M measured cycles. Iter67c removes another 152,600 cycles: its
+five-phase recurrent read reaches II=1 without changing FP32 association, and
+16-bank convolution storage removes the measured window conflict. The fused
+argmax restores token-only egress but adds no separate logit pass. It routes at
+100 MHz with SLR0 at 99.29% CLB, so remaining levers must reduce or redistribute
+logic rather than assume usable SLR0 headroom.
 
 ## 2. Hard Floors and Target Outcome
 

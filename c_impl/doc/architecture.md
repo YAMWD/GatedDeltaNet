@@ -1,19 +1,21 @@
 # GatedDeltaNet Decode Accelerator Architecture
 
-**Status:** Current production architecture (**Iter66e**), routed,
-timing-closed, and validated on an Alveo U55C on 2026-08-30. It is
+**Status:** Current production architecture (**Iter67c**), routed,
+timing-closed, and validated on an Alveo U55C on 2026-09-01. It is
 HLS-synthesized at 150 MHz under **Vitis 2024.2** and links at the requested
 **100 MHz** without automatic clock scaling. The 64-token run measures
-**26.654 ms/token wall / 25.625 ms kernel = 2.5625M cycles**, with an exact
-token trajectory and a clean scale-aware quality gate over 2,016,000 logits.
+**24.208 ms/token production TPOT / 24.099 ms kernel = 2.4099M cycles** by
+median over 63 generated tokens, with an exact token trajectory and a clean
+scale-aware quality gate over 2,016,000 logits.
 
-Iter66e is the first all-BF16 image and the first of that family to route at
-all: the route-verification overlap ladder across the campaign reads 224,566 →
-20,793 → 3,989 → 16 → 5 → 3 → **0**. Evidence: build job 2502 (`harrier`,
-8:07:32; `route_design` legal in 1:30:56), on-card job 2507. XCLBIN SHA-256
-`98b38cc7ae3fa1974ef64780e34da83c0ba91fa00b463f710d23548b9f8bed32` from
+Iter66e was the first all-BF16 image to route. Iter67c retains that datapath,
+fuses strict argmax into natural-order logit emission, changes the recurrent
+read schedule from four to five phases to reach II=1, and banks the convolution
+window to match its 16-lane access. Evidence: build job 2993 (`harrier`,
+12:08:59), on-card job 2994, and production-TPOT audit job 3101. XCLBIN SHA-256
+`fb4fc63f76bc1ee485665f21102596270930d6d39643b8eb5ae7d4f899d289ab` from
 `gdn_model.cpp`
-`69db425550e8c92a111180833d7fca38771122f3baaa31b7f8a4cda074132be8`.
+`2bc240e6a5cf24b23bd83aa3ad518552bd475e72c8ac5c54a6cdf8bc991ad020`.
 
 **Read § *Arithmetic contract and what "correct" means* before treating any
 hardware/native mismatch as a defect.** With BF16 the end-to-end bit-exact
@@ -36,6 +38,8 @@ token per `gdn_forward` invocation. The successful design combines:
   28--31, behind full-window 4,096-deep 512-bit URAM queues;
 - two concurrent 16-column, head-local recurrent islands with HBM retrieval and
   update fused into the two required attention passes;
+- a five-phase recurrent read schedule that maintains enough accumulator
+  recurrence distance for II=1 without changing FP32 association;
 - concurrent transfer from all four state ports into packed low/high URAM
   pairs;
 - head-serial/all-port Q/K/V/gate (`QKVG`) and pair-interleaved MLP gate/up
@@ -56,12 +60,12 @@ token per `gdn_forward` invocation. The successful design combines:
 - on-chip LM-head argmax, plus (Iter61) the full GDN_VOCAB logit vector
   streamed out to the workspace for benchmark scoring.
 
-The architecture routes with zero failed nets, zero unrouted nets, and zero
-node overlaps and preserves exact 64-token parity. Post-route physical
-optimization closes the 100 MHz kernel clock at **+0.060 ns WNS** and the fixed
-250 MHz DMA clock at **+0.003 ns WNS**. Iter57 is 2.48% faster and uses 2.48%
-fewer cycles than Iter39C; it is 2.889x faster than the 121.4 ms eight-port
-baseline.
+The architecture routes all 1,749,053 routable nets with zero routing errors
+and preserves the exact 64-token trajectory. Post-route physical optimization
+closes the 100 MHz kernel clock at **+0.153 ns WNS / +0.007 ns WHS** and the
+fixed 250 MHz DMA clock at **+0.003 ns WNS / +0.009 ns WHS**. Iter67c uses
+5.95% fewer measured kernel cycles than Iter66e and is 5.04x faster than the
+121.4 ms eight-port baseline by kernel median.
 
 ## Fixed Model Shape
 
@@ -78,10 +82,10 @@ baseline.
 | Vocabulary | 32,000 |
 | Tokens per invocation | 1 |
 
-The recurrent state is `24 x 8 x 256 x 256` FP32 values, or 48 MiB. The
-convolution state is three prior rows for Q, K, and V in every layer, or about
-1.69 MiB. These two state classes persist in HBM across kernel calls; transient
-activations do not.
+Recurrent arithmetic remains FP32, while its persistent
+`24 x 8 x 256 x 256` state is stored as BF16, or 24 MiB. The three prior Q/K/V
+convolution rows per layer are also stored as BF16, about 0.84 MiB. These two
+state classes persist in HBM across kernel calls; transient activations do not.
 
 ## System Overview
 
@@ -775,7 +779,33 @@ on-card-validated 115.7 MHz result, not a 130 MHz closure result.
 
 ## Correctness and On-Card Performance
 
-### Iter66e (current)
+### Iter67c (current)
+
+Iter67c retains Iter66e's all-BF16 physical architecture and changes three
+bounded datapaths: argmax is fused into the existing logit-emission traversal,
+`recur_island_read` uses a five-phase schedule to reach II=1 without FP32
+reassociation, and the convolution window has 16 banks. Build 2993 routed and
+closed timing at 100 MHz; on-card jobs 2994 and 3101 passed the exact trajectory
+and independent-GPU full-logit gates.
+
+Job 3101 defines production TPOT at the token-ID-to-token-ID system boundary.
+Its timer includes the host-resident embedding lookup and 8 KiB upload, XRT
+launch/wait, the full kernel including fused argmax, and one 64-byte token-line
+read-back. It stops before optional full-logit transfer and all reference
+scans. Across 63 generated tokens:
+
+| Metric | Median | Mean |
+|---|---:|---:|
+| Production TPOT | **24.208 ms/token** | **24.219 ms/token** |
+| Kernel execution | **24.099 ms/token** | **24.092 ms/token** |
+| Production host/XRT/PCIe overhead | **0.109 ms/token** | **0.126 ms/token** |
+| Effective kernel cycles at 100 MHz | **2.4099M** | **2.4092M** |
+
+The full-logit gate remains enabled after the production timer: global NRMSE
+0.00466, worst-step NRMSE 0.0119, minimum cosine 0.99995, exact top-5, zero
+argmax mismatches, exact 64-token trajectory, and first divergence -1.
+
+### Iter66e (predecessor)
 
 The Iter66e image passed, in order: native C++ build; fast exact decode 6/6;
 full native exact decode 32/32 with all 992,000 logits bit-identical to the

@@ -650,11 +650,19 @@ public:
     /* want_logits=false skips the 128 KB logit read-back and takes the token
      * id the kernel now writes to the workspace slot. A generation loop needs
      * only that; teacher-forced scoring and every reference comparison need
-     * the full vector and pass true. */
-    double run_forward(int32_t token, bool want_logits = true) {
+     * the full vector and pass true.
+     *
+     * generation_seconds, when requested, measures the production token-ID to
+     * token-ID boundary: embedding lookup/upload, kernel launch/execution, and
+     * selected-token read-back.  Stop that clock before the optional full-logit
+     * transfer so enabling a correctness reference cannot inflate TPOT. */
+    double run_forward(int32_t token, bool want_logits = true,
+                       double *generation_seconds = nullptr) {
         if (token < 0 || static_cast<uint32_t>(token) >= vocab_) {
             throw std::runtime_error("token id out of range for hardware run");
         }
+        const auto generation_start =
+            std::chrono::high_resolution_clock::now();
         size_t x_bytes = static_cast<size_t>(hidden_) * sizeof(float);
         const float *embedding = embeddings_ + static_cast<size_t>(token) * hidden_;
         const size_t x_off = GDN_WS_OFF_X * sizeof(float);
@@ -691,6 +699,13 @@ public:
                         sizeof(token_line), tk_off);
         workspace_bo_.read(token_line, sizeof(token_line), tk_off);
         device_token_ = static_cast<int32_t>(token_line[0]);
+
+        const auto generation_end =
+            std::chrono::high_resolution_clock::now();
+        if (generation_seconds != nullptr) {
+            *generation_seconds = std::chrono::duration<double>(
+                generation_end - generation_start).count();
+        }
 
         if (want_logits) {
             const size_t lg_off = GDN_WS_OFF_LOGITS * sizeof(float);
@@ -1128,7 +1143,6 @@ static std::vector<DecodeExample> run_decode_hw(
     }
     uint64_t onchip_argmax_mismatches = 0;
     for (uint32_t step = 1; step < n; ++step) {
-        auto t0 = std::chrono::high_resolution_clock::now();
         /* Iter67: the kernel picks the token on chip again, so a plain
          * generation step needs only the 4-byte token slot. Pull the 128 KB
          * logit vector back over PCIe only when something actually consumes
@@ -1136,7 +1150,9 @@ static std::vector<DecodeExample> run_decode_hw(
         const bool want_logits = !logits_reference_path.empty() ||
                                  !gpu_logits_reference_path.empty() ||
                                  logits_dump != nullptr;
-        double ksec = runner.run_forward(result.gen_traj[step - 1], want_logits);
+        double generation_seconds = 0.0;
+        double ksec = runner.run_forward(result.gen_traj[step - 1], want_logits,
+                                         &generation_seconds);
         const float *device_logits = runner.device_logits();
         int next = runner.device_token();
         if (want_logits) {
@@ -1161,16 +1177,11 @@ static std::vector<DecodeExample> run_decode_hw(
                 next = host_pick;
             }
         }
-        /* Stop the wall clock here. Everything above is work a production
-         * decode loop must do -- write the embedding, run the kernel, read the
-         * logits back, pick the token. Everything below is gate work that only
-         * exists because a reference was supplied, and it was previously
-         * inside this window: the two compare_logits_step calls each sweep all
-         * 32,000 values, so a gated run reported a per-token wall time that a
-         * real deployment would never pay. */
-        auto t1 = std::chrono::high_resolution_clock::now();
-        result.per_step_tpot_ms[step] =
-            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        /* generation_seconds stopped inside run_forward immediately after the
+         * selected-token read-back. The optional 128 KB logit transfer above,
+         * this host cross-check, and the reference comparisons below are all
+         * validation work and deliberately excluded from production TPOT. */
+        result.per_step_tpot_ms[step] = generation_seconds * 1000.0;
         result.kernel_ms[step] = ksec * 1000.0;
         if (!logits_reference_path.empty() && logits_parity != nullptr) {
             const float *reference = logits_reference.values.data() +
