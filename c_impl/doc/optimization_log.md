@@ -8514,3 +8514,347 @@ routed with zero overlaps, timing-closed at WNS +0.003 / WHS +0.009 ns,
 on-card exact 64-token trajectory, on-card CUDA vector gate over 2,016,000
 logits, on-card WikiText-2 perplexity within 0.0077% of GPU over 314,843
 tokens, and 512-token drift shown bounded.
+
+### Iter67 — restore the on-chip argmax and repair the recurrent-read II (IN PROGRESS)
+
+*2026-08-31. Evidence so far: native fast and full 32-step gates only. No
+csynth, cosim, or hardware. Two of the three items below are unverifiable in
+csim by construction, so this is not a retained result.*
+
+**1. On-chip argmax restored, fused rather than reinstated.** Iter63 removed
+the greedy pick on the argument that the host already has the logits, so the
+silicon was redundant. That reasoning was about area, not time, and the entry
+itself recorded "resource and cycle effects are unmeasured". What it moved onto
+the host is a **128 KB PCIe read-back per token**, paid by every generation
+step to recover four bytes of information.
+
+The restoration does not reinstate Iter61's separate 2,016-iteration sweep of
+the reorder buffer. The two logit-emission loops in `gemv32_store` already
+visit every logit exactly once in natural vocabulary order, so the argmax is
+fused into them: sixteen independent lane accumulators (one compare per lane in
+the loop-carried path, no tree), then a cross-lane merge. Cost is a 16-wide
+compare per emitted beat and **no extra cycles**. Global vocabulary index is
+`emitted_beat * 16 + lane`, where `emitted_beat = pair * 125 + p` for the
+even-channel loop and `pair * 125 + 62 + p` for the stitched one -- 2 x 1000
+rows is exactly 125 whole Beat512 lines, so the emitted stream is contiguous.
+
+`out[0]` lane 0 carries the token id and the top level copies it to
+`GDN_WS_OFF_X_NORM`; no AXI port is added inside `gemv32_store`, which is the
+constraint Iter58b and Iter59 violated. `host.cpp` gains a `want_logits`
+argument: a plain generation step reads the 64-byte token line only, while any
+reference comparison, logit dump, or teacher-forced scoring still pulls the
+full vector. When the logits are present anyway the host re-derives the pick
+and cross-checks the hardware for free.
+
+`gdn_eval.cpp` now **fails** if the kernel's on-chip pick disagrees with its
+independent host scan. Both read the identical FP32 vector, so a disagreement
+is a defect in the fused argmax -- lane indexing, the tie rule, or the merge --
+and csim is the only place this datapath can be caught before an eight-hour
+link.
+
+Gates: fast 6/6 and full 32/32 both PASS, `exact_traj_match=True`,
+`first_divergence=-1`, 992,000 logits with `exact_ref_mismatch=0`,
+`argmax_mismatch=0`, and the new assertion silent on every step. The trajectory
+is unchanged, as it must be -- the rule is identical on both sides.
+
+**2. `recur_island_read` II=2 -> II=1, without touching the arithmetic.** The
+loop requested `II=1` and achieved 2 in every csynth report on disk since
+2026-08-19, costing 1,024 cycles per head -- 196,608 per token, **7.7%**. The
+cause was never diagnosed here; it is stated verbatim in the o16 build log:
+
+```
+[HLS 200-880] The II Violation in module
+'gdn_recurrent_attention_island_0_Pipeline_recur_island_read'
+(loop 'recur_island_read'): Unable to enforce a carried dependence constraint
+(II = 1, distance = 4, offset = 1) between 'store' operation
+('partial_hi_addr_write_ln1971') of variable 'add2' on array 'partial_hi'
+and 'load' operation ('partial_hi_load') on array 'partial_hi'.
+```
+
+`local_base` is `(block & 3) * 16`, so each accumulator is revisited every
+fourth iteration: distance 4. II=1 therefore needs an adder latency of at most
+4, and this file's binding is 5. The fix names each sum and binds it to
+`latency=4`. **The arithmetic is untouched** -- same expression, same operand
+order, same sequential row-major accumulation -- so the trajectory stays
+bit-exact, which the full gate confirms.
+
+The obvious alternative, splitting the accumulators into parity banks to reach
+distance 8, was rejected: it reassociates the sum, retires the exact golden,
+and would require regenerating every reference and repeating the quality work
+for a lever worth 7.7%.
+
+**This is the item csim cannot check.** A `bind_op` has no effect in C -- the
+same blind spot Iter66j recorded for the DAZ/FTZ adder audit. The passing
+native gate proves only that the arithmetic did not change. Whether II=1 is
+actually achieved, and at what timing cost a latency-4 adder carries, is
+unknown until csynth.
+
+**3. Recorded, not fixed: the depthwise-convolution window II violations.** The
+same probe log names three more, on `in_window_4` and `in_window_8` at II=1, 2
+and 3, all "due to limited memory ports" in
+`iter39_head_conv_restore_*` and `iter39_head_conv_shift_*`. `in_window[4][256]`
+is already partitioned `dim=1 complete` plus `dim=2 cyclic factor=GDN_CONV_LANES`,
+so HLS's own suggestion -- partition further -- is partly applied; the shift
+loop reads and writes the same dim-1 plane in one iteration, which points at
+port count rather than banking. Complete dim-2 partitioning would build 256:1
+muxes on a runtime `col` index and is probably worse. The block is 272
+cycles per head-kind, so the whole conv actor is on the order of 6% of the
+token and this is a fraction of that. Left alone deliberately: it needs the
+same csynth loop, and guessing at a fix csim cannot score is what Iter63 step
+2b already cost this project once.
+
+Verdict: **IN PROGRESS.** Item 1 is validated as far as csim can validate it.
+Items 2 and 3 need one integrated csynth at 150 MHz under 2024.2, which should
+report `recur_island_read` at II=1, the estimated clock against the current
+4.867 ns, and the resource delta from the fused argmax. No hardware build until
+that passes.
+
+### Iter67 measured results — argmax RETAINED, two II fixes REJECTED
+
+*Probes 2985 and 2986, integrated csynth at 150 MHz under Vitis 2024.2.
+Baseline throughout is Iter66e (probe 2485): top 6,659,621 cycles, BRAM18
+1,995 / DSP 3,325 / FF 1,002,888 / LUT 895,268 / URAM 80, estimated 205.47 MHz,
+`recur_island_read` 2,055 cycles at II=2, recurrent islands 43,427 cycles/layer
+and 132,071 LUT, `gdn_depthwise_conv_silu_head_kind` 272 cycles.*
+
+**On-chip argmax: RETAINED (probe 2985).** Fusing the greedy pick into the two
+existing emission loops cost **+70 cycles** (+0.001%) and **zero** BRAM, DSP or
+URAM. Both emission loops held II=1 (depth 3); `gemv32_argmax_merge` is 15
+trips at II=1, 17 cycles, once per token. The estimated clock was unchanged at
+205.47 MHz. The price is **+30,612 LUT (+3.4%, 68% -> 71%)** and +13,829 FF,
+which lands in `gemv32_store` and therefore across all three SLRs -- the number
+to watch against SLR0's 96.53% CLB occupancy, and the reason this must be
+judged at place-and-route rather than on the cycle count.
+
+**II fix attempt 1, latency-4 fabric adders: REJECTED (probe 2985).** Naming
+each accumulator sum and binding it to `impl=fabric latency=4` did **not**
+reach II=1: `recur_island_read` stayed at interval 2, 2,056 cycles, depth
+falling only 11 -> 10. It cost **+20,448 LUT** in the recurrent islands
+(132,071 -> 152,519) for nothing. The premise was wrong: the loop-carried path
+is not the adder alone but *accumulator read + add + write*, and the
+accumulators are `cyclic factor=16` over 64 elements, so each bank is a
+four-element memory whose access latency sits inside the recurrence.
+
+**II fix attempt 2, complete partitioning: REJECTED as a clear regression
+(probe 2986).** Making those four accumulators registers to remove the memory
+latency made it **worse**: interval 2 -> **4**, `recur_island_read` 2,055 ->
+**4,104** cycles, and the recurrent islands 43,427 -> **57,491 cycles/layer**
+-- +14,064 per layer, +337K per token, about **13% slower**. The index
+`local_base + lane` is dynamic in `local_base`, so complete partitioning builds
+a 64-way crossbar that costs more than the memory latency it removes. Do not
+retry this.
+
+**Convolution window banking: POSITIVE, retained (probe 2986).**
+`in_window[4][256]` was partitioned `dim=2 cyclic factor=GDN_CONV_LANES` with
+`GDN_CONV_LANES` = 4, while `iter39_head_conv_shift` and `..._restore` unroll
+**16** lanes. Bank index is `col % 4 == lane % 4`, so four lanes collide on
+every bank and demand four reads and four writes per cycle from a two-port
+memory -- the measured cause of the three escalating "limited memory ports"
+violations on `in_window_4` and `in_window_8`. Banking to 16 to match the
+unroll took the block from **272 to 193 cycles, -29%**. HLS still prints
+violations for the residual, so there is more here, but the block is
+measurably faster and the change is pure storage: no arithmetic, no reordering.
+
+**Iter67c, five-phase schedule: IN PROGRESS (probe 2992).** Per external
+review, the routability-first fix is to lengthen the distance rather than
+shorten the adder. Iterating five phases per row while four carry work makes
+each accumulator's revisit distance 5 and inserts one bubble per row. The
+arithmetic is untouched, so it stays bit-exact -- unlike parity partial sums,
+which would reach II=1 at distance 8 by reassociating the sum and would retire
+the golden. Predicted 1,290 cycles per head against 2,056, about 147K cycles
+or 1.47 ms per token, with the `bind_op` dropped so the +20,448 LUT is
+recovered.
+
+**The bound that decides it.** II=2 at distance 4 means `4 x 2 = 8 >= feedback
+> 4`, so the feedback path is 5 to 8 cycles -- five phases wins only if it is
+exactly 5. `GDN_RECURRENT_READ_PHASES` is the single knob. The value decays
+fast: 1.47 ms at five phases, 1.0 ms at six, nothing by eight. This is worth
+one or two more probes, not five; past that the honest conclusion is that II=1
+here requires reassociation and the 7.7% must be weighed against regenerating
+every reference and repeating the quality work.
+
+Native gates after the Iter67c edit: fast 6/6 and full 32/32 PASS,
+`exact_traj_match=True`, `first_divergence=-1`, 992,000 logits,
+`exact_ref_mismatch=0`, `argmax_mismatch=0`.
+
+### Iter67c five-phase schedule — POSITIVE (probe 2992)
+
+The distance fix works, and at the predicted size. `recur_island_read` is now
+the flattened `recur_island_read_row_recur_island_read`: **1,287 cycles at
+II=1** over 1,280 trips, against 2,055 at II=2. That is **-768 cycles per
+head, 147,456 per token, 1.47 ms at 100 MHz** -- exactly the external review's
+estimate. The recurrent islands fall **43,427 -> 37,283 cycles per layer,
+-14.1%**.
+
+Note the trap in the raw log: `vitis_hls.log` still prints
+`Final II = 2, loop 'recur_island_read'` from an intermediate scheduling
+attempt. The authoritative csynth table reports the flattened loop at II=1.
+Read the table, not the log line.
+
+Retained together in this candidate:
+
+| change | effect |
+|---|---|
+| on-chip argmax fused into the emission loops | +70 cycles, +30,612 LUT, 4-byte token read-back replaces 128 KB |
+| five-phase recurrent read | -147,456 cycles (-1.47 ms) |
+| convolution window banked 16 to match its unroll | conv block 272 -> 193 cycles (-29%) |
+
+Whole-kernel: LUT 895,268 (68%) -> **920,867 (70%)**, estimated clock unchanged
+at 205.47 MHz, BRAM/DSP/URAM unchanged at 1,995 / 3,325 / 80. The static
+`layer_loop` total is unchanged at 6,590,496 because it is dominated by the
+worst-case GEMV path; that number has never predicted this design's measured
+cycles (6.66M static against 2.56M measured) and is not used here.
+
+Predicted kernel TPOT is about **24.2 ms** against Iter66e's measured 25.625,
+before any host-side gain from the 4-byte token path. Hardware build launched
+to measure it. The risk this build tests is not cycles but placement: +25,599
+LUT lands partly in `gemv32_store`, which the island pblocks distribute across
+all three SLRs, and SLR0 sits at 96.53% CLB in the Iter66e route that only
+reached zero overlaps after frp plus LUT un-pairing. Verdict: **csynth
+POSITIVE; on-card pending.**
+
+### Iter67c hardware result — RETAINED. 24.099 ms/token on card.
+
+Build **2993** on `harrier`, 12:08:59; on-card **2994**. XCLBIN
+`fb4fc63f76bc1ee485665f21102596270930d6d39643b8eb5ae7d4f899d289ab`.
+
+| | Iter66e | Iter67c |
+|---|---:|---:|
+| kernel TPOT, median of 63 | 25.625 ms | **24.099 ms** |
+| effective cycles | 2.5625M | **2.4099M** |
+| routed nets | all | 1,749,053 / 1,749,053, **0 routing errors** |
+| setup WNS / failing | +0.003 / 0 | **+0.003 / 0** of 2,329,520 |
+| hold WHS / failing | +0.009 / 0 | **+0.007 / 0** of 2,326,865 |
+| achieved kernel clock | 100 MHz | **100 MHz**, no auto-scaling |
+
+**-1.526 ms, -6.0%**, and 5.04x over the 121.4 ms eight-port baseline. Measured
+-152,600 cycles against a predicted -147,456 from the five-phase read plus the
+convolution rebanking; the two agree to 3.5%.
+
+Gates: exact 64-token trajectory, `first_divergence=-1`, `argmax_mismatch=0`,
+GPU vector gate over 2,016,000 logits at global NRMSE 0.00466, worst-step
+0.0119, min cosine 0.99995, min top-5 overlap 5.
+
+**Placement redistributed rather than choking**, which is why +25,599 LUT still
+routed: SLR0 CLB went 96.53% -> **99.29%** while SLR1 fell 94.68% -> 87.51% and
+SLR2 rose 76.09% -> 81.97%; the SLR1<->SLR0 SLL crossing eased 89.57% ->
+84.76%. SLR0 at 99.29% is the tightest this design has ever routed and is the
+number to watch before adding anything further.
+
+**A reading trap worth recording.** Grepping the build log mid-flight returns
+*intermediate* router values -- this build showed 15 node overlaps, 1,349,859
+unrouted nets and WHS -0.401 with 26,380 failing hold endpoints while
+rip-up-and-reroute was still running. All of it was resolved by post-route
+phys-opt. Only `gdn_final_qor/route_status.rpt` and
+`gdn_final_qor/timing_summary.rpt` are verdicts. Likewise the routing duration
+is not a predictor: this build spent 3.5+ hours in rip-up, which matches the
+*failed* Iter66a-d pattern rather than Iter66e's 1:30:56, and still closed
+cleanly.
+
+### Iter67c production-TPOT audit — RETAINED host measurement fix (job 3101)
+
+The first Iter67c run still timed the optional 128 KB full-logit read-back and
+host argmax cross-check whenever the independent-GPU reference was enabled.
+That is validation overhead, not the deployed greedy loop. The host timer now
+starts before the host embedding lookup/upload and stops immediately after the
+FPGA-selected token line returns. Full-logit transfer, the host argmax
+cross-check, and both reference scans still execute afterward and therefore
+retain the complete quality gate without contributing to TPOT. This is a
+host-only reporting change; the XCLBIN remains
+`fb4fc63f76bc1ee485665f21102596270930d6d39643b8eb5ae7d4f899d289ab`.
+
+Slurm U55C job **3101** rebuilt only `host.exe` and reran the 8/64-token gates
+on `acclnode01`. Across the 63 real kernel invocations (excluding the seed):
+
+| Metric | Median | Mean | Min | Max |
+|---|---:|---:|---:|---:|
+| production token-to-token TPOT | **24.208 ms** | **24.219 ms** | 24.134 ms | 24.422 ms |
+| kernel execution | **24.099 ms** | **24.092 ms** | 24.052 ms | 24.112 ms |
+| host/XRT/PCIe production overhead | **0.109 ms** | **0.126 ms** | -- | -- |
+
+The production boundary includes the host-resident embedding-row lookup, its
+8 KiB upload, XRT launch/wait, the complete FPGA kernel including fused
+argmax, and one 64-byte selected-token read-back. The GPU-reference gate still
+compared all 2,016,000 logits with zero tolerance failures and zero argmax
+mismatches; the 64-token trajectory remained exact with first divergence -1.
+
+The reporting script also stopped averaging the seed's zero-duration
+placeholder into TPOT/kernel means. Its previous printed Iter67c mean values
+23.717/23.840 ms were therefore underestimates; the medians were unaffected.
+Host source SHA-256
+`1344b536920a2dd88a0fcc973d3979370368ac3777ae13d5e43dbdccc2ffff4e`;
+reporter SHA-256
+`154a6bc84886d45e0092b971dfa4947a07036189f0eb63f9df0fb87560c7ff36`.
+Verdict: **RETAINED** as the production TPOT definition. No kernel, route,
+timing, or arithmetic result changed.
+
+**Reporting bug found while auditing job 3101: the seed token's zero was being
+averaged in.** `_summarize_ms` in `scripts/check_gdn_c_parity.py` took the mean
+over the raw `kernel_ms` / `per_step_tpot_ms` arrays, whose index 0 is the seed
+token -- a step the decode loop never runs a kernel for, recorded as `0.0`.
+Every mean this script has printed was therefore understated by one part in N:
+1.6% on a 64-token run and **12.5% on the 8-token smoke**, which was reporting
+21.06 ms against a true 24.06. Medians were never affected, because with the
+single zero sorted to the front the middle values are still real samples. The
+Makefile's `jq` summary already filtered with `select(. > 0)`, so any figure
+taken from `performance_summary.json` -- including the whole historical ladder
+-- is sound; only this script's mean was wrong, and it surfaced now because
+`jq` is absent on `acclnode01` and the parity report was the only summary
+produced. Fixed by filtering non-positive entries.
+
+**One claim retracted.** An intermediate reading of this campaign attributed
+the difference between job 2994's 0.586 ms host overhead and job 3101's
+0.109 ms to run-to-run variance from cold DMA buffers. That was wrong. The two
+jobs ran different host timers: 2994 measured through the 128 KB logit
+read-back and host argmax cross-check, 3101 stopped after the 64-byte token
+line. The 0.477 ms difference is deterministic and is the measured cost of the
+logit path -- which is exactly the saving the restored on-chip argmax delivers.
+Kernel time was identical at 24.099 ms median across both runs, which is the
+reproducibility evidence that made the discrepancy traceable to the timer
+rather than the hardware.
+
+**Operational hazard, unfixed:** the on-card output directory
+`diagnostics/run_hw_h150_f100/on_card/` is keyed by frequency, not by run tag,
+so job 3101 silently overwrote job 2994's `oncard_decode64.json` and its parity
+logs. Both runs are recoverable only from their Slurm logs. Any future
+comparison of two images at the same frequency will lose the earlier result the
+same way.
+
+### Iter67c production-TPOT phase breakdown — MEASUREMENT ONLY (job 3119)
+
+The production timer was partitioned without changing the kernel or XCLBIN:
+host embedding-row BO write, 8 KiB embedding H2D sync, XRT run construction /
+argument setup / start, kernel wait, and 64-byte token D2H sync/read. Optional
+full-logit transfer and validation remain outside every production phase. The
+five component intervals exactly reconstruct TPOT (median residual 0 ns at the
+reported precision).
+
+Slurm U55C job **3119** ran on `acclnode01`, completed in 20 seconds, and used
+the retained Iter67c XCLBIN
+`fb4fc63f76bc1ee485665f21102596270930d6d39643b8eb5ae7d4f899d289ab`.
+Host source SHA-256 was
+`8bc562e6cc9ee01d871eca5e1042a9967f77e50d11e24a3929a6148e0d80f25a`.
+Across 63 real decode calls, excluding the seed:
+
+| Production phase | Median | Mean | Min | Max |
+|---|---:|---:|---:|---:|
+| complete token-ID-to-token-ID TPOT | **24.221158 ms** | 24.215531 ms | 24.158499 ms | 24.281041 ms |
+| embedding host lookup / BO write | 0.001052 ms | 0.001063 ms | 0.000761 ms | 0.001953 ms |
+| embedding H2D sync | 0.051728 ms | 0.051272 ms | 0.040276 ms | 0.060194 ms |
+| XRT launch setup/start | 0.014999 ms | 0.015569 ms | 0.007204 ms | 0.097345 ms |
+| kernel wait | **24.096601 ms** | 24.091784 ms | 24.058870 ms | 24.103383 ms |
+| selected-token D2H/read | 0.055264 ms | 0.055842 ms | 0.042811 ms | 0.074983 ms |
+
+The paired per-step median `TPOT - kernel` is **0.123966 ms** (0.512% of
+TPOT). The combined embedding ingress is **0.052780 ms** median, only 0.218% of
+TPOT and 42.6% of the host-side gap. Moving the embedding table to board HBM
+therefore has a hard measured standalone opportunity of roughly 53 us before
+paying for the replacement HBM lookup; it is not a high-ROI next kernel change.
+
+The 64-token trajectory remained exact (`first_divergence=-1`, 100% top-1).
+Jobs 3116--3118 were wrapper-only launch failures before compilation or card
+access: the vendor XRT setup script was sourced under shell `nounset`. Job 3119
+disabled `errexit`/`nounset` only around that script and restored both
+immediately afterward. Verdict: **host observability measurement retained by
+explicit request; no bitstream or architecture change**. Raw JSON and Slurm
+evidence are under `diagnostics/iter67c_tpot_breakdown/`.

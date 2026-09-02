@@ -554,6 +554,15 @@ static xrt::kernel open_gdn_kernel(xrt::device &device, const xrt::uuid &uuid) {
     }
 }
 
+struct ForwardTiming {
+    double tpot_seconds = 0.0;
+    double embedding_write_seconds = 0.0;
+    double embedding_h2d_seconds = 0.0;
+    double launch_seconds = 0.0;
+    double kernel_seconds = 0.0;
+    double token_d2h_seconds = 0.0;
+};
+
 class HwRunner {
 public:
     HwRunner(xrt::device &device, const xrt::uuid &uuid, const ModelData &model)
@@ -647,15 +656,32 @@ public:
         }
     }
 
-    double run_forward(int32_t token) {
+    /* want_logits=false skips the 128 KB logit read-back and takes the token
+     * id the kernel now writes to the workspace slot. A generation loop needs
+     * only that; teacher-forced scoring and every reference comparison need
+     * the full vector and pass true.
+     *
+     * timing, when requested, partitions the production token-ID-to-token-ID
+     * boundary into embedding BO write, embedding H2D sync, XRT launch setup,
+     * kernel wait, and selected-token D2H/read. Stop all of those clocks before
+     * the optional full-logit transfer so correctness checking cannot inflate
+     * production TPOT. */
+    double run_forward(int32_t token, bool want_logits = true,
+                       ForwardTiming *timing = nullptr) {
         if (token < 0 || static_cast<uint32_t>(token) >= vocab_) {
             throw std::runtime_error("token id out of range for hardware run");
         }
+        const auto generation_start =
+            std::chrono::high_resolution_clock::now();
         size_t x_bytes = static_cast<size_t>(hidden_) * sizeof(float);
         const float *embedding = embeddings_ + static_cast<size_t>(token) * hidden_;
         const size_t x_off = GDN_WS_OFF_X * sizeof(float);
         workspace_bo_.write(embedding, x_bytes, x_off);
+        const auto embedding_write_end =
+            std::chrono::high_resolution_clock::now();
         sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_TO_DEVICE, x_bytes, x_off);
+        const auto embedding_h2d_end =
+            std::chrono::high_resolution_clock::now();
 
         // Kernel-call construction sets the AXI-Lite argument registers and writes
         // ap_start (host-side PCIe overhead, ~100-200 µs, scales with arg
@@ -670,20 +696,52 @@ public:
             run.set_arg(2 + c, weight_bos_[c]);
         }
         run.start();
-        auto start = std::chrono::high_resolution_clock::now();
+        const auto launch_end = std::chrono::high_resolution_clock::now();
         run.wait();
-        auto end = std::chrono::high_resolution_clock::now();
+        const auto kernel_end = std::chrono::high_resolution_clock::now();
 
-        double seconds = std::chrono::duration<double>(end - start).count();
+        double seconds = std::chrono::duration<double>(
+            kernel_end - launch_end).count();
         total_kernel_seconds_ += seconds;
         kernel_runs_ += 1;
 
         // The LM head streams its full logit vector to the workspace logits
         // region; pull it back for scoring and host-side greedy selection.
-        const size_t lg_off = GDN_WS_OFF_LOGITS * sizeof(float);
-        const size_t lg_bytes = static_cast<size_t>(GDN_WSF_LOGITS) * sizeof(float);
-        sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_FROM_DEVICE, lg_bytes, lg_off);
-        workspace_bo_.read(logits_host_.data(), lg_bytes, lg_off);
+        /* One 512-bit line: lane 0 is the kernel's greedy pick. Always cheap. */
+        const size_t tk_off = GDN_WS_OFF_X_NORM * sizeof(float);
+        float token_line[16];
+        sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_FROM_DEVICE,
+                        sizeof(token_line), tk_off);
+        workspace_bo_.read(token_line, sizeof(token_line), tk_off);
+        device_token_ = static_cast<int32_t>(token_line[0]);
+
+        const auto generation_end =
+            std::chrono::high_resolution_clock::now();
+        if (timing != nullptr) {
+            timing->tpot_seconds = std::chrono::duration<double>(
+                generation_end - generation_start).count();
+            timing->embedding_write_seconds = std::chrono::duration<double>(
+                embedding_write_end - generation_start).count();
+            timing->embedding_h2d_seconds = std::chrono::duration<double>(
+                embedding_h2d_end - embedding_write_end).count();
+            timing->launch_seconds = std::chrono::duration<double>(
+                launch_end - embedding_h2d_end).count();
+            timing->kernel_seconds = seconds;
+            timing->token_d2h_seconds = std::chrono::duration<double>(
+                generation_end - kernel_end).count();
+        }
+
+        if (want_logits) {
+            const size_t lg_off = GDN_WS_OFF_LOGITS * sizeof(float);
+            const size_t lg_bytes =
+                static_cast<size_t>(GDN_WSF_LOGITS) * sizeof(float);
+            sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_FROM_DEVICE,
+                            lg_bytes, lg_off);
+            workspace_bo_.read(logits_host_.data(), lg_bytes, lg_off);
+            logits_valid_ = true;
+        } else {
+            logits_valid_ = false;
+        }
 
         return seconds;
     }
@@ -785,6 +843,10 @@ public:
 
     // Full pre-argmax logit vector the kernel streamed out this step.
     const float *device_logits() const { return logits_host_.data(); }
+    bool logits_valid() const { return logits_valid_; }
+    /* The kernel's on-chip greedy pick: maximum value, lowest vocabulary index
+     * on ties -- the same rule the host scan implements. */
+    int32_t device_token() const { return device_token_; }
 
     double average_kernel_seconds() const {
         return kernel_runs_ == 0 ? 0.0 : total_kernel_seconds_ / static_cast<double>(kernel_runs_);
@@ -823,6 +885,8 @@ private:
     xrt::bo workspace_bo_;
     std::vector<xrt::bo> weight_bos_;
     std::vector<float> logits_host_;
+    int32_t device_token_ = -1;
+    bool logits_valid_ = false;
     double total_kernel_seconds_ = 0.0;
     uint64_t kernel_runs_ = 0;
 };
@@ -834,7 +898,11 @@ struct DecodeExample {
     std::vector<int32_t> gen_traj;           // free-running greedy trajectory (N)
     std::vector<int32_t> tf_argmax;          // teacher-forced per-position argmax (N)
     std::vector<double> per_step_tpot_ms;    // wall ms per greedy step (N)
+    std::vector<double> embedding_write_ms;  // host row lookup + BO write (N)
+    std::vector<double> embedding_h2d_ms;    // 8 KiB BO sync to device (N)
+    std::vector<double> launch_ms;           // run construction/args/start (N)
     std::vector<double> kernel_ms;           // on-card kernel ms per greedy step (N)
+    std::vector<double> token_d2h_ms;        // token-line sync + BO read (N)
 };
 
 static void compare_logits_step(
@@ -983,10 +1051,10 @@ static void compare_logits_step(
 // The fixture provides the golden continuation length (and example indices).
 // The device starts from the exported seed token and performs one single-token
 // decode step per call, updating persistent recurrent/conv state in device memory.
-//   - gen_traj / per_step_tpot_ms / kernel_ms: free-running greedy O(1) decode.
+//   - gen_traj / per_step_tpot_ms / phase timings: free-running greedy O(1) decode.
 //     Persistent recurrent and convolution state advances in device memory on
-//     every call. Per-step wall time surrounds run_forward; kernel_ms is the
-//     on-card kernel time returned by run_forward (seconds * 1000).
+//     every call. TPOT covers the complete token-ID-to-token-ID boundary; the
+//     component arrays split that same interval without including validation.
 //
 // N = min(cont_len, decode_len) (decode_len == 0 means use cont_len);
 // E = min(num_examples, limit) (limit == 0 means all).
@@ -1077,7 +1145,11 @@ static std::vector<DecodeExample> run_decode_hw(
     result.gen_traj.resize(n);
     result.tf_argmax.resize(n);
     result.per_step_tpot_ms.resize(n);
+    result.embedding_write_ms.resize(n);
+    result.embedding_h2d_ms.resize(n);
+    result.launch_ms.resize(n);
     result.kernel_ms.resize(n);
+    result.token_d2h_ms.resize(n);
 
     // traj[0] = the GPU-exported seed (argmax of the prompt's last position);
     // every later token is one O(1) decode step against the persistent state.
@@ -1086,7 +1158,11 @@ static std::vector<DecodeExample> run_decode_hw(
     result.gen_traj[0] = seed;
     result.tf_argmax[0] = seed;
     result.per_step_tpot_ms[0] = 0.0;
+    result.embedding_write_ms[0] = 0.0;
+    result.embedding_h2d_ms[0] = 0.0;
+    result.launch_ms[0] = 0.0;
     result.kernel_ms[0] = 0.0;
+    result.token_d2h_ms[0] = 0.0;
     std::cerr << "[progress] decode-from-state seed=" << seed << " N=" << n << "\n";
 
     /* GDNLOG1 dump, byte-compatible with gdn_eval --logits-dump. */
@@ -1101,21 +1177,54 @@ static std::vector<DecodeExample> run_decode_hw(
         std::fwrite(magic, 1, sizeof(magic), logits_dump);
         std::fwrite(header, sizeof(uint32_t), 3, logits_dump);
     }
+    uint64_t onchip_argmax_mismatches = 0;
     for (uint32_t step = 1; step < n; ++step) {
-        auto t0 = std::chrono::high_resolution_clock::now();
-        double ksec = runner.run_forward(result.gen_traj[step - 1]);
-        /* Iter63: the kernel emits the full FP32 logit vector and no longer
-         * argmaxes on chip. Pick the token here with the same rule the retired
-         * hardware scan implemented -- maximum value, lowest vocabulary index
-         * on ties -- which a strict-'>' first-wins loop gives exactly. */
+        /* Iter67: the kernel picks the token on chip again, so a plain
+         * generation step needs only the 4-byte token slot. Pull the 128 KB
+         * logit vector back over PCIe only when something actually consumes
+         * it -- a reference comparison or a dump. */
+        const bool want_logits = !logits_reference_path.empty() ||
+                                 !gpu_logits_reference_path.empty() ||
+                                 logits_dump != nullptr;
+        ForwardTiming timing;
+        double ksec = runner.run_forward(result.gen_traj[step - 1], want_logits,
+                                         &timing);
         const float *device_logits = runner.device_logits();
-        int next = 0;
-        for (uint32_t vocab_index = 1;
-             vocab_index < model.config.vocab_size; ++vocab_index) {
-            if (device_logits[vocab_index] > device_logits[next]) {
-                next = static_cast<int>(vocab_index);
+        int next = runner.device_token();
+        if (want_logits) {
+            /* We already paid for the logits, so re-derive the pick on the
+             * host and cross-check the hardware against it for free. Same rule
+             * both sides: maximum value, lowest vocabulary index on ties,
+             * which a strict-'>' first-wins scan gives exactly. A disagreement
+             * here is a real defect, not a rounding difference -- both are
+             * reading the identical FP32 vector. */
+            int host_pick = 0;
+            for (uint32_t vocab_index = 1;
+                 vocab_index < model.config.vocab_size; ++vocab_index) {
+                if (device_logits[vocab_index] > device_logits[host_pick]) {
+                    host_pick = static_cast<int>(vocab_index);
+                }
+            }
+            if (host_pick != next) {
+                ++onchip_argmax_mismatches;
+                std::cerr << "[warn] on-chip argmax " << next
+                          << " != host scan " << host_pick
+                          << " at step " << step << "\n";
+                next = host_pick;
             }
         }
+        /* timing stopped inside run_forward immediately after the
+         * selected-token read-back. The optional 128 KB logit transfer above,
+         * this host cross-check, and the reference comparisons below are all
+         * validation work and deliberately excluded from production TPOT. */
+        result.per_step_tpot_ms[step] = timing.tpot_seconds * 1000.0;
+        result.embedding_write_ms[step] =
+            timing.embedding_write_seconds * 1000.0;
+        result.embedding_h2d_ms[step] =
+            timing.embedding_h2d_seconds * 1000.0;
+        result.launch_ms[step] = timing.launch_seconds * 1000.0;
+        result.kernel_ms[step] = ksec * 1000.0;
+        result.token_d2h_ms[step] = timing.token_d2h_seconds * 1000.0;
         if (!logits_reference_path.empty() && logits_parity != nullptr) {
             const float *reference = logits_reference.values.data() +
                 static_cast<size_t>(step - 1) * model.config.vocab_size;
@@ -1134,10 +1243,6 @@ static std::vector<DecodeExample> run_decode_hw(
                                 false,
                                 gpu_logits_parity);
         }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        result.per_step_tpot_ms[step] =
-            std::chrono::duration<double, std::milli>(t1 - t0).count();
-        result.kernel_ms[step] = ksec * 1000.0;
         result.gen_traj[step] = next;
         result.tf_argmax[step] = next;
         if (logits_dump != nullptr) {
@@ -1203,7 +1308,7 @@ static std::vector<DecodeExample> run_decode_hw(
 }
 
 // Writes the on-card decode JSON. Schema is the native gdn_eval decode schema
-// plus a per-step kernel_ms series.
+// plus per-step production-phase timing series.
 static void write_decode_json(
     const std::string &output_path,
     uint32_t decode_len,
@@ -1237,9 +1342,25 @@ static void write_decode_json(
         for (uint32_t j = 0; j < n; ++j) {
             file << (j ? ", " : "") << result.per_step_tpot_ms[j];
         }
+        file << "],\n   \"embedding_write_ms\": [";
+        for (uint32_t j = 0; j < n; ++j) {
+            file << (j ? ", " : "") << result.embedding_write_ms[j];
+        }
+        file << "],\n   \"embedding_h2d_ms\": [";
+        for (uint32_t j = 0; j < n; ++j) {
+            file << (j ? ", " : "") << result.embedding_h2d_ms[j];
+        }
+        file << "],\n   \"launch_ms\": [";
+        for (uint32_t j = 0; j < n; ++j) {
+            file << (j ? ", " : "") << result.launch_ms[j];
+        }
         file << "],\n   \"kernel_ms\": [";
         for (uint32_t j = 0; j < n; ++j) {
             file << (j ? ", " : "") << result.kernel_ms[j];
+        }
+        file << "],\n   \"token_d2h_ms\": [";
+        for (uint32_t j = 0; j < n; ++j) {
+            file << (j ? ", " : "") << result.token_d2h_ms[j];
         }
         file << "]}";
     }

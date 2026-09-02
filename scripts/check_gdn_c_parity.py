@@ -11,8 +11,18 @@ from pathlib import Path
 
 
 def _summarize_ms(values: list[float]) -> dict[str, float] | None:
-    """median/mean of a flat list of per-step millisecond timings."""
-    vals = [float(v) for v in values]
+    """median/mean of a flat list of per-step millisecond timings.
+
+    Drop non-positive entries. Index 0 is the seed token, which the decode
+    loop never runs a kernel for and records as 0.0; averaging it in
+    understated every mean this script has ever printed by one part in N.
+    That is 1.6% over a 64-token run and 12.5% over an 8-token one -- the
+    8-token gate was reporting 21.06 ms against a true 24.06. The median was
+    never affected, and the Makefile's jq summary already filtered with
+    `select(. > 0)`, so figures taken from performance_summary.json are sound;
+    only this script's mean was wrong.
+    """
+    vals = [float(v) for v in values if float(v) > 0.0]
     if not vals:
         return None
     return {"median_ms": statistics.median(vals), "mean_ms": statistics.mean(vals)}
@@ -100,8 +110,15 @@ def compare_decode(golden_path: Path, c_path: Path) -> dict:
         top1_total += n
 
         tpot = [float(v) for v in c_ex.get("per_step_tpot_ms", [])][:n]
+        # Decode-from-state stores the seed at position zero without invoking
+        # the model.  Its matching zero-duration placeholder is useful for
+        # trajectory alignment but is not a TPOT sample.
+        if tpot and tpot[0] == 0.0:
+            tpot = tpot[1:]
         tpot_all.extend(tpot)
         kernel = [float(v) for v in c_ex.get("kernel_ms", [])][:n]
+        if kernel and kernel[0] == 0.0:
+            kernel = kernel[1:]
         kernel_all.extend(kernel)
 
         per_example.append(

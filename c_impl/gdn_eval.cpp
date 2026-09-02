@@ -343,11 +343,13 @@ static int run_decode_from_state(
                    hidden_dump) != model->config.hidden_size) {
             die("decode-from-state: failed while writing hidden-state dump");
         }
-        /* Iter63: the kernel emits the full FP32 logit vector and no longer
-         * argmaxes on chip, so the token is picked here. The rule is the one
-         * the retired hardware scan implemented -- maximum value, lowest
-         * vocabulary index on ties -- which a strict-'>' first-wins loop gives
-         * exactly. traj[step] is assigned after the scan below. */
+        /* Iter67: the kernel picks the token on chip again. This testbench
+         * still derives it independently from the captured logits -- maximum
+         * value, lowest vocabulary index on ties, a strict-'>' first-wins scan
+         * -- because that is the stronger check, and then verifies the
+         * kernel's own pick against it below. csim is the only place this new
+         * datapath can be validated before an eight-hour link, so a mismatch
+         * here must fail the run rather than be reported and ignored. */
         gdn_compute_logits(model, final_hidden, reference_logits);
         uint32_t captured_argmax = 0;
         uint32_t reference_argmax = 0;
@@ -382,6 +384,24 @@ static int run_decode_from_state(
             }
         }
         traj[step] = (int32_t)captured_argmax;
+
+        /* Verify the kernel's on-chip greedy pick against the scan above. Both
+         * read the identical FP32 vector, so any disagreement is a defect in
+         * the fused argmax -- lane indexing, the tie rule, or the merge -- not
+         * a rounding difference. */
+        {
+            const float *token_line =
+                reinterpret_cast<const float *>(run_state->workspace) +
+                GDN_WS_OFF_X_NORM;
+            uint32_t onchip = (uint32_t)token_line[0];
+            if (onchip != captured_argmax) {
+                fprintf(stderr,
+                        "on-chip argmax %u != host scan %u at step %u\n",
+                        onchip, captured_argmax, step);
+                die("decode-from-state: on-chip argmax disagrees with the "
+                    "independent host scan");
+            }
+        }
         logits_parity.checked_steps++;
         logits_parity.compared_values += model->config.vocab_size;
         /* The kernel's logits versus the independent scalar LM head. This used
