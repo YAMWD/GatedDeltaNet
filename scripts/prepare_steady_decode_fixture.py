@@ -74,8 +74,13 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     prompt_path = args.output_dir / "prompt_4096.tokens"
     teacher_path = args.output_dir / "teacher_4096.tokens"
+    fpga_stream_path = args.output_dir / "fpga_stream_4097.tokens"
     write_tokens(prompt_path, prompt)
     write_tokens(teacher_path, teacher)
+    # The handoff state represents prompt[:-1].  The FPGA must therefore
+    # consume prompt[-1] before the teacher stream, just as the GPU benchmark
+    # does internally.
+    write_tokens(fpga_stream_path, [prompt[-1], *teacher])
     manifest = {
         "schema": "gdn-steady-fixture-v1",
         "source_fixture": str(args.fixture.resolve()),
@@ -85,6 +90,8 @@ def main() -> None:
         "teacher_length": len(teacher),
         "prompt_sha256": sha256(prompt_path),
         "teacher_sha256": sha256(teacher_path),
+        "fpga_stream_length": len(teacher) + 1,
+        "fpga_stream_sha256": sha256(fpga_stream_path),
     }
     (args.output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
@@ -94,4 +101,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
