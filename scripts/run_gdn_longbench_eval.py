@@ -30,6 +30,10 @@ from gdn_native_bf16_product import (  # noqa: E402
     install_native_bf16_product_linears,
     patch_manifest,
 )
+from fpga_eval_client import (  # noqa: E402
+    FastStateHandoffProducer,
+    FpgaFileQueue,
+)
 
 
 TABLE5_TASKS = [
@@ -67,6 +71,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-only", action="store_true")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--fpga-queue", type=Path)
+    parser.add_argument("--fpga-results", type=Path)
+    parser.add_argument("--fpga-request-prefix", default="longbench")
+    parser.add_argument("--fpga-result-timeout", type=float, default=7200.0)
     return parser.parse_args()
 
 
@@ -125,6 +133,15 @@ def write_manifest(
     }
     if arithmetic_manifest is not None:
         manifest["native_bf16_product"] = arithmetic_manifest
+    if args.fpga_queue is not None:
+        manifest.update({
+            "execution": "gpu_prefill_fpga_decode",
+            "fpga_queue": str(args.fpga_queue.resolve()),
+            "fpga_results": str(args.fpga_results.resolve()),
+            "fpga_request_prefix": args.fpga_request_prefix,
+        })
+    else:
+        manifest["execution"] = "gpu"
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
@@ -255,6 +272,136 @@ def generate_task(
         progress.close()
 
 
+def generate_task_fpga(
+    tokenizer: Any,
+    dataset_name: str,
+    task_config: dict[str, Any],
+    protocol: dict[str, Any],
+    output_path: Path,
+    limit: int | None,
+    resume: bool,
+    overwrite: bool,
+    queue: FpgaFileQueue,
+    request_prefix: str,
+) -> None:
+    """Generate one LongBench task with GPU prefill and FPGA-only outputs."""
+
+    if output_path.exists() and overwrite:
+        output_path.unlink()
+    existing = read_completed(output_path)
+    if existing and not resume:
+        raise FileExistsError(
+            f"{output_path} already has {len(existing)} rows; "
+            "use --resume or --overwrite"
+        )
+    dataset = load_dataset(
+        "THUDM/LongBench",
+        dataset_name,
+        split="test",
+        revision=protocol["dataset_revision"],
+        trust_remote_code=True,
+    )
+    total = min(len(dataset), limit) if limit is not None else len(dataset)
+    if len(existing) > total:
+        raise ValueError(f"{output_path} has more rows than the selected dataset")
+    for index, row in enumerate(existing):
+        expected = str(dataset[index]["_id"])
+        if str(row.get("_id")) != expected:
+            raise ValueError(
+                f"Resume mismatch at {dataset_name}[{index}]: "
+                f"{row.get('_id')} != {expected}"
+            )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if existing else "w"
+    pending: list[tuple[int, Any, Any, float, int]] = []
+
+    def drain(
+        handle: Any,
+        index: int,
+        row: Any,
+        started: float,
+        prompt_tokens: int,
+        out: Any,
+    ) -> None:
+        result = queue.wait(handle)
+        tokens = [int(value) for value in result["tokens"]]
+        prediction = tokenizer.decode(tokens, skip_special_tokens=True)
+        record = {
+            "_id": str(row["_id"]),
+            "index": index,
+            "pred": prediction,
+            "answers": row["answers"],
+            "all_classes": row["all_classes"],
+            "length": row["length"],
+            "prompt_tokens": prompt_tokens,
+            "generated_tokens": len(tokens),
+            "request_elapsed_seconds": time.perf_counter() - started,
+            "fpga_request_id": handle.request_id,
+            "fpga_kernel_seconds": float(result["kernel_seconds"]),
+            "fpga_production_seconds": float(result["production_seconds"]),
+        }
+        out.write(json.dumps(record, ensure_ascii=False) + "\n")
+        out.flush()
+
+    with output_path.open(mode, encoding="utf-8") as handle_out:
+        progress = tqdm(total=total, initial=len(existing), desc=dataset_name)
+        for index in range(len(existing), total):
+            while len(pending) >= 2:
+                (old_index, old_row, old_handle, old_started,
+                 old_prompt_tokens) = pending.pop(0)
+                drain(
+                    old_handle, old_index, old_row, old_started,
+                    old_prompt_tokens, handle_out,
+                )
+                progress.update(1)
+
+            row = dataset[index]
+            prompt = task_config["prompt"].format(**row)
+            prompt = middle_truncate(
+                tokenizer, prompt, int(protocol["max_input_tokens"])
+            )
+            context_tokens = tokenizer.encode(prompt)
+            max_input = int(protocol["max_input_tokens"])
+            context_tokens = context_tokens[-max_input:]
+            if not context_tokens:
+                raise RuntimeError(f"empty prompt for {dataset_name}[{index}]")
+            stop_sequences: list[list[int]] = []
+            if tokenizer.eos_token_id is not None:
+                stop_sequences.append([int(tokenizer.eos_token_id)])
+            if task_config.get("newline_eos"):
+                newline = tokenizer.encode("\n", add_special_tokens=False)
+                if newline and newline not in stop_sequences:
+                    stop_sequences.append([int(value) for value in newline])
+            started = time.perf_counter()
+            request_handle = queue.submit_generate(
+                prefix=f"{request_prefix}-{dataset_name}",
+                context_tokens=context_tokens,
+                max_new_tokens=int(task_config["max_new_tokens"]),
+                stop_sequences=stop_sequences,
+                metadata={
+                    "caller": "longbench_v1",
+                    "task": dataset_name,
+                    "sample_id": str(row["_id"]),
+                    "sample_index": index,
+                    "dataset_revision": protocol["dataset_revision"],
+                },
+            )
+            pending.append(
+                (index, row, request_handle, started, len(context_tokens))
+            )
+
+        while pending:
+            (old_index, old_row, old_handle, old_started,
+             old_prompt_tokens) = pending.pop(0)
+            drain(
+                old_handle, old_index, old_row, old_started,
+                old_prompt_tokens, handle_out,
+            )
+            progress.update(1)
+        progress.close()
+
+
 def normalize_answer(text: str) -> str:
     text = text.lower()
     text = "".join(character for character in text if character not in string.punctuation)
@@ -352,6 +499,13 @@ def score_outputs(
 
 def main() -> None:
     args = parse_args()
+    if (args.fpga_queue is None) != (args.fpga_results is None):
+        raise ValueError("--fpga-queue and --fpga-results must be used together")
+    fpga_mode = args.fpga_queue is not None
+    if fpga_mode and args.dtype != "bfloat16":
+        raise ValueError("FPGA evaluation requires --dtype bfloat16")
+    if fpga_mode and args.batch_size != 1:
+        raise ValueError("FPGA LongBench evaluation requires --batch-size 1")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     protocol = json.loads(args.config.read_text())
     tasks = [task for task in args.tasks.split(",") if task]
@@ -378,7 +532,7 @@ def main() -> None:
     model.eval()
     set_recurrent_mode(model)
     arithmetic_manifest = None
-    if os.environ.get("GDN_NATIVE_BF16_PRODUCT") == "1":
+    if fpga_mode or os.environ.get("GDN_NATIVE_BF16_PRODUCT") == "1":
         arithmetic_manifest = patch_manifest(
             install_native_bf16_product_linears(model)
         )
@@ -387,20 +541,46 @@ def main() -> None:
             + json.dumps(arithmetic_manifest, sort_keys=True)
         )
     write_manifest(args.output_dir, args, protocol, model, arithmetic_manifest)
-    for task in tasks:
-        generate_task(
-            model,
-            tokenizer,
-            task,
-            protocol["tasks"][task],
-            protocol,
-            args.output_dir / "pred" / f"{task}.jsonl",
-            args.limit,
-            args.resume,
-            args.overwrite,
-            device,
-            args.batch_size,
+    fpga_queue = None
+    if fpga_mode:
+        fpga_queue = FpgaFileQueue(
+            args.fpga_queue,
+            args.fpga_results,
+            FastStateHandoffProducer(model, device),
+            result_timeout_seconds=args.fpga_result_timeout,
         )
+    try:
+        for task in tasks:
+            if fpga_queue is None:
+                generate_task(
+                    model,
+                    tokenizer,
+                    task,
+                    protocol["tasks"][task],
+                    protocol,
+                    args.output_dir / "pred" / f"{task}.jsonl",
+                    args.limit,
+                    args.resume,
+                    args.overwrite,
+                    device,
+                    args.batch_size,
+                )
+            else:
+                generate_task_fpga(
+                    tokenizer,
+                    task,
+                    protocol["tasks"][task],
+                    protocol,
+                    args.output_dir / "pred" / f"{task}.jsonl",
+                    args.limit,
+                    args.resume,
+                    args.overwrite,
+                    fpga_queue,
+                    args.fpga_request_prefix,
+                )
+    finally:
+        if fpga_queue is not None:
+            fpga_queue.finish()
     print(json.dumps(score_outputs(args.output_dir, tasks, protocol), indent=2))
 
 
