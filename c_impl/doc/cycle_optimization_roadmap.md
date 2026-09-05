@@ -6,6 +6,14 @@ at a true 100 MHz, WNS +0.003 / WHS +0.007 ns design-wide, zero routing errors,
 and an exact 64-token trajectory. This supersedes Iter66e's 2.5625M / 25.625 ms
 as the number every remaining stage is costed against.
 
+**Current priority (2026-09-05):** the Iter68 frequency-locality redesign is
+closed as stopped/inconclusive and 250 MHz is no longer a target (see
+[frequency_250mhz_roadmap.md](frequency_250mhz_roadmap.md) for its record and
+`optimization_log.md` for the verdict). The open frequency lever is the
+retained Iter67c netlist relinked at an honest 125 MHz constraint (Iter70a,
+in flight); 150 MHz on this netlist is blocked by SLL column congestion, not
+logic. Iter67c remains the retained architecture.
+
 **Status of the original stages.** Iter57 completed the recurrent-head portion
 of Stage 4 and the physical decomposition. Iter66e then delivered the "Beyond
 Exact FP32" direction (§13) that this roadmap had listed as speculative:
@@ -18,12 +26,20 @@ and remain percent-level.
 
 ## 0. The one thing that changed how levers must be costed
 
-**The design is no longer HBM-bandwidth-bound, so a lever's share of bytes no
-longer predicts its share of time.** At 2.597 GB of BF16 weights per token,
+**At the retained 100 MHz, the design is no longer HBM-bandwidth-bound, so a
+lever's share of bytes does not predict its current share of time.** At 2.597
+GB of BF16 weights per token,
 32 ports x 64 B x 100 MHz gives **1,268,224 beat-cycles per port against a
 measured 2,409,900 — 52.6% port occupancy**. The standalone microbenchmark
 sustains 98.353% of clock-rate ceiling on this exact port structure, so the
 idle half is scheduling, not memory.
+
+This conclusion is clock-scoped. A pseudo-channel peaks at 14.4 GB/s, while a
+512-bit port requests 12.8 GB/s at 200 MHz and 16.0 GB/s at 250 MHz. The design
+therefore approaches the HBM wall near 200 MHz and cannot sustain one Beat per
+cycle at 250 MHz. See
+[frequency_250mhz_roadmap.md](frequency_250mhz_roadmap.md) for the HBM-aware
+latency floor and measurement gate.
 
 Two consequences, both already paid for:
 

@@ -729,13 +729,14 @@ where it is not obvious.** The design-wide +0.003 ns belongs to the *fixed*
 directly load. The scalable kernel clock has **+0.195 ns**, a 9.805 ns
 critical path, and `report_qor_suggestions` on the routed checkpoint returns
 nothing because the design "is assessed to easily meet timing." Frequency is
-consequently an open lever for the first time since the design became
-compute-bound: port occupancy is frequency-invariant at 49.5%, so a faster
-clock scales the token directly instead of walking into an HBM wall. Treat the
-2% implied by 9.805 ns as a floor rather than a ceiling — the tools stopped
-optimizing the kernel path once the 100 MHz constraint was met, and the last
-frequency attempt (Iter36, 130 MHz auto-scaled to 115.7) predates both frp and
-the removal of the clock-enable cones.
+consequently an open lever from 100 MHz toward roughly 200 MHz, but port
+occupancy is not invariant through 250 MHz. One HBM pseudo-channel peaks at
+14.4 GB/s: a 512-bit kernel port requests 12.8 GB/s at 200 MHz and 16.0 GB/s at
+250 MHz. The latter cannot sustain one Beat per cycle. Treat the 2% implied by
+9.805 ns as a floor rather than a ceiling for the old physical netlist, while
+treating the per-channel HBM rate as a separate upper-frequency performance
+limit. The full floor model is in
+[frequency_250mhz_roadmap.md](frequency_250mhz_roadmap.md).
 
 Routed whole-device usage and its per-SLR distribution:
 

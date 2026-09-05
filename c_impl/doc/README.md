@@ -1,36 +1,42 @@
 # Accelerator Documentation
 
-**Current architecture:** the FPGA is a decode-only accelerator. **Iter66e**
+**Current architecture:** the FPGA is a decode-only accelerator. **Iter67c**
 forwards one token at a time with 32 HBM weight readers, 16 two-port GEMV
 clusters running free-running pipelines, a native `ap_float<16,8>` BF16
 multiplier feeding FP32 reduction trees, packed-BF16 weights, transient
 activations resident in local BRAM, four-port packed **BF16** recurrent state
 behind full-window 4,096-deep URAM queues, two concurrent 16-column recurrent
-islands, registered GEMV collector boundaries, head-streamed Q/K/V convolution
-and recurrence, an on-chip LM-head argmax, and a streamed full-vocabulary logit
-export. Prefill runs on the GPU and supplies persistent recurrent and
-convolution state.
+islands, a five-phase II=1 recurrent read schedule, registered GEMV collector
+boundaries, head-streamed Q/K/V convolution and recurrence, an on-chip strict
+LM-head argmax, and a streamed full-vocabulary logit export. Prefill runs on
+the GPU and supplies persistent recurrent and convolution state.
 
-The integrated Iter66e image routes with zero overlaps, zero unrouted nets and
-zero failing timing endpoints of 2,277,369 (WNS +0.003 ns, WHS +0.009 ns) at a
-true 100 MHz, and measures **26.654 ms/token wall / 25.625 ms kernel
-(2.5625M cycles)** with an exact 64-token trajectory. It is **1.582x** faster
-than Iter61 and **4.55x** faster than the 121.4 ms eight-port baseline.
+The integrated Iter67c image routes with zero overlaps and zero unrouted nets
+at a true 100 MHz. Post-route DATA-clock WNS is +0.153 ns; the design-wide
+minimum is the fixed 250 MHz DMA clock at +0.003 ns. It measures
+**24.221158 ms/token production TPOT / 24.099 ms kernel (2.4099M cycles)** with
+an exact 64-token trajectory, or **5.04x** the 121.4 ms eight-port baseline by
+kernel median.
 
 Toolchain: **Vitis 2024.2** (the native BF16 multiplier requires its
-`ap_float`). Evidence: build job 2502, on-card job 2507.
+`ap_float`). Evidence: build job 2993, on-card job 2994, and production-timer
+jobs 3101/3119.
 
 ## Current References
 
-- [architecture.md](architecture.md): authoritative Iter66e top-level data
+- [architecture.md](architecture.md): authoritative Iter67c top-level data
   flow, arithmetic contract, activation residency, 32-port GEMV topology,
   interfaces, state handling, HBM map, physical design, and measured result.
 - [recurrent_attention.md](recurrent_attention.md): the recurrent block — now
   the largest identifiable cycle consumer at 40.7% of the token — its BF16
   state transport, per-head schedule, and measured per-loop cycles.
 - [cycle_optimization_roadmap.md](cycle_optimization_roadmap.md): remaining
-  cycle targets, rebased on the Iter66e measurement, with the levers ranked by
+  cycle targets, rebased on the Iter67c measurement, with the levers ranked by
   measured share of the token rather than by share of bytes.
+- [frequency_250mhz_roadmap.md](frequency_250mhz_roadmap.md): the record of
+  the Iter68 frequency-locality redesign (closed 2026-09-05 as
+  stopped/inconclusive; 250 MHz is no longer a target) and the HBM-aware
+  frequency floor model. Historical, not the retained production specification.
 - [fp32_bf16_quality_evaluation.md](fp32_bf16_quality_evaluation.md): the
   GPU-side precision study that cleared BF16, **complete**, plus the on-card
   WikiText-2 sequel — also complete: FPGA word perplexity 16.774840 against
@@ -66,9 +72,12 @@ state lanes sitting on an RNE tie — 129 of 12,582,912, each by one BF16 ULP.
 The accepted on-card gate is the scale-aware CUDA vector gate. See
 `architecture.md` § *Arithmetic contract and what "correct" means*.
 
-**Bytes are no longer the binding metric.** At 2.597 GB of weights per token
-the 32 ports are busy 49.5% of the time, so a lever that removes bytes no
-longer buys proportional time. Rank levers by measured share of the *token*.
+**At the retained 100 MHz, bytes are not the binding metric.** At 2.597 GB of
+weights per token the 32 ports are busy 49.5% of the time, so a lever that
+removes bytes does not buy proportional time at that clock. This changes near
+200 MHz: each HBM pseudo-channel peaks at 14.4 GB/s and a 512-bit/250-MHz port
+would request 16.0 GB/s. Use the HBM-aware frequency roadmap before projecting
+a higher-clock result.
 
 The earlier standalone 32-port microbenchmark, its build commands, bandwidth,
 and post-route results are documented in
