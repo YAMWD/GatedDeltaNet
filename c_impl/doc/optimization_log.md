@@ -8858,3 +8858,2324 @@ disabled `errexit`/`nounset` only around that script and restored both
 immediately afterward. Verdict: **host observability measurement retained by
 explicit request; no bitstream or architecture change**. Raw JSON and Slurm
 evidence are under `diagnostics/iter67c_tpot_breakdown/`.
+
+### Iter68 frequency-locality campaign — IN PROGRESS (2026-09-01); CLOSED 2026-09-05 as stopped/inconclusive, see the Iter68 verdict entry
+
+**Objective.** Preserve Iter67c's all-BF16 arithmetic contract, 32 HBM ports,
+16 two-port clusters, single XRT-visible kernel, host ABI, full FP32 logits,
+and strict argmax while making the physical design local enough to attempt
+exact 150, 200, and 250 MHz DATA clocks.  The planned structural changes are
+a bounded command-driven token/GEMV service graph, 3/6/7 SLR-local GEMV
+islands, explicitly elastic registered SLR boundaries, and high-frequency
+retiming of recurrent feedback and argmax only where measured timing requires
+it.  Automatic clock scaling does not count as a result.
+
+**Immutable reference.** Git `caf5125434b7`; retained hardware artifact
+`diagnostics/iter67c_argmax_ii_hw/`; kernel median 24.099 ms and 2.4099M
+effective cycles at an exact 100 MHz; production median 24.221158 ms; route
+legal with DATA WNS positive and DMA WNS +0.003 ns.  Routed per-SLR occupied
+CLB sites were 99.29% / 87.51% / 81.97%; SLR0<->SLR1 and SLR1<->SLR2 SLL use
+were 84.76% and 56.91%.  The retained timing report identifies the global top
+FSM and per-call `gdn_gemv ap_start` control cones as dominant long-wire path
+families, and the routed image used zero dedicated SLL TX/RX registers.
+
+**Milestone gates.** HLS/link targets and maximum effective cycles are
+250/150 MHz and 2.53M, 300/200 MHz and 2.68M, then 333/250 MHz and 2.84M.
+Production TPOT targets are <=17.0, <=13.5, and <=11.5 ms respectively.  Each
+candidate requires native trajectory/full-logit gates, integrated csynth, a
+97-command schedule audit, randomized-backpressure one-layer/eight-head
+cosim, exact requested clock with no automatic scaling, legal route, clean
+DATA/DMA/HBM setup and hold, and an eight/64-token hardware run.  Negative,
+neutral, auto-scaled, stopped, or inconclusive variants will be recorded here,
+reverted, and not committed.
+
+**Day-1 evidence plan.** The retained bundle contains `post_place.dcp` but no
+post-route DCP.  Frequency feasibility will therefore be captured in two
+clearly labelled forms: (1) analytical slack projection from the final routed
+path delays at virtual 150/200/250 MHz, and (2) a post-place checkpoint clock
+census.  Isolated cluster/recurrent scheduling probes will run at HLS
+250/300/333 MHz through Slurm before the Iter68 source snapshot is linked.
+
+**Iter68A command/island/service source checkpoint (native gates passed; HLS
+pending).** The source now uses one 64-bit command format for all 97 fixed
+projection calls, with an independent schedule calculator validating the final
+per-shard boundary at 1,366,528 BF16 Beats.  The prior 4/6/6 collection tree and
+single 16-cluster activation ripple were changed to three independent 3/6/7
+island-local ripples and 6/12/14 result streams.  SLR0 and SLR2 results pass
+through two non-inlined elastic relay stages before the SLR1 final collector.
+For synthesis only, `gdn_forward` now starts three bounded actors once per
+token: a no-AXI token sequencer, the sole HBM0 service, and the GEMV service.
+The unchanged sequential implementation remains the native/csim arithmetic
+reference; this separation is intentional because ordinary C simulation cannot
+execute the cyclic top-level dataflow graph concurrently.
+
+The 64-bit command-only checkpoint passed job **3140** (six-token trajectory,
+160,000 full logits, `first_divergence=-1`, zero exact-reference/argmax
+mismatches).  The 3/6/7 island checkpoint passed job **3141** with the same
+gate.  After connecting the synthesis service graph and making the auxiliary
+port explicitly 512-bit, native compile job **3153** completed and fast gate
+job **3154** again passed all 160,000 logits and the exact trajectory.  Job
+**3138** was a wrapper-only `/bin/sh`/`pipefail` launch failure; corrected job
+**3139** completed.  Job **3156** was a diagnostics-only GNU C++ syntax probe
+under `__SYNTHESIS__`; it is inconclusive because AMD's 2024.2 arbitrary-width
+headers require HLS compiler builtins unavailable to GNU C++, so the actual HLS
+front end remains the synthesis gate.  No hardware, cycle, resource, timing, or
+retention claim is made at this checkpoint.
+
+The synthesis branch was subsequently completed as a persistent graph rather
+than accepting the provisional per-command `gdn_gemv` restart.  Each MM2S,
+two-port cluster, activation drain, local collector, final collector, QKVG
+store, and recurrent actor now loops over the entire 97-command schedule and
+reads its dimensions from a local command FIFO.  Three island-local command
+distributors bound control fanout to the 3/6/7 wrappers.  Activation and result
+crossings use two explicit relay actors for SLR0 and SLR2; Q/K/V plus recurrent
+context use two relays into SLR2 and attention uses two actors on the return
+path.  HBM0 requests/read responses/write data and full logits likewise cross
+two fixed-count stages between the SLR1 sequencer and SLR0 port service.  This
+removes any syntactic call from the synthesized path to the legacy per-command
+`gdn_gemv` graph.
+
+Native compile jobs **3168** and **3169** completed after the persistent graph
+and HBM0 boundary integration.  Fast full-logit job **3173** passed: exact
+six-token trajectory, `first_divergence=-1`, 160,000 logits checked, zero
+tolerance failures, zero exact-reference mismatches, and zero argmax
+mismatches.  Jobs **3170--3172** were diagnostics-only attempts to invoke the
+vendor synthesis clang directly; the standalone driver lacks the HLS builtin
+setup even after its shared libraries are supplied, so these are wrapper/tool
+invocation failures and not source evidence.  The immutable HLS250 snapshot is
+`diagnostics/iter68_persistent_services/source_snapshot.tar`, SHA-256
+`ee55a02924dbe12d22dbcad49898f310505410be4517f17a31b374e66a5931c2`;
+kernel source SHA-256 is
+`230daf0c9ecf31bc87c24d3d1751919cc4532d4030a42c1b7f348dda03ebb5aa`.
+HLS250 submission **3174** failed in one second before tool invocation because
+the vendor `settings64.sh` referenced an unset `PYTHONPATH` under shell
+`nounset`; the launcher now disables `nounset` only while sourcing that vendor
+script.  Corrected job **3175** was submitted from the same immutable snapshot
+with 48 CPUs/192 GiB on the `build` partition.
+
+**Iter68A HLS250 result (diagnostic success; not yet a link candidate).** Job
+**3175** completed successfully in 1:06:13 and produced
+`build.hw.gdn32.h250.f150.o48/gdn_forward.xo`.  Integrated csynth targeted
+4.000 ns and estimated 3.477 ns (**287.60 MHz**).  The generated hierarchy has
+one `gdn_gemv_service_persistent`, exactly 16 persistent two-port clusters in
+the requested 3/6/7 islands, 27 ordinary persistent MM2S actors plus four
+state-owning MM2S actors (port 0 remains owned by `gdn_port0_service`), and no
+per-operation GEMV clone.  Every reported dense-weight MM2S loop, island
+command distributor, `gemv32_four_dots`, and cluster weight-stream loop
+retained II=1.  The eight-context cluster path has depth 50 and the four-dot
+operator depth 31 at this target.
+
+The top HLS estimates are 2,173 BRAM18, 3,394 DSP, 1,276,415 FF, 958,306 LUT,
+and 72 URAM.  Against the retained Iter67c HLS report (1,995 / 3,453 /
+1,022,339 / 920,793 / 80), this is +178 BRAM18 (+8.9%), -59 DSP (-1.7%),
++254,076 FF (+24.9%), +37,513 LUT (+4.1%), and -8 URAM.  Most of the increase
+is inside the persistent GEMV service: 1,103,815 FF and 800,249 LUT versus the
+old shared `gdn_gemv` instance's 874,591 FF and 769,108 LUT.  The provisional
+crossing relays themselves are small, so the FF growth must be decomposed
+before physical implementation rather than attributed only to the relays.
+
+The report gives a broad dataflow latency range of 6,147,786--11,085,718
+cycles.  This is not accepted as an effective-cycle prediction: the old
+variable-tripcount/dataflow report was also a poor predictor of Iter67c's
+2.4099M measured cycles, and the new bound includes conservative persistent
+producer/consumer backpressure.  Consequently the <=2.53M F150 cycle gate is
+still unresolved and requires the production-faithful multi-command RTL
+cosim.  Non-GEMV misses were also reported in the sequencer: BF16 embedding
+packing II=2, RMSNorm square reductions II=3, and the shared tiny-weight BRAM
+load/store paths at II=16/8 due to limited ports.  These do not break the
+required weight-reader/cluster II=1 gate, but they must be included in the
+cosim cycle result.
+
+Verdict: **diagnostic HLS success, Iter68A still in progress and unretained**.
+Do not link this XO: the cycle gate is unresolved, FF growth needs hierarchy
+analysis, native execution does not cover the synthesis-only graph, and the
+provisional HLS copy relays still need production RTL skid-buffer boundaries.
+No commit is permitted from this result alone.
+
+### Iter68B — sequencer II repair and a 150/200/250 MHz csynth sweep — IN PROGRESS (2026-09-01); campaign CLOSED 2026-09-05
+
+**Hypothesis.** Every non-GEMV II miss job 3175 reported lives in the SLR1
+token sequencer and is a data-movement artefact of the Iter68A service split,
+not arithmetic. Fixing them at the source (no pragmas that relax targets)
+removes about 1.07M cycles/token of Iter68A regression plus roughly 5% of
+Iter67c's own token that the same reports show was already being spent on
+one-float-per-cycle weight staging, while keeping every FP32 operation in the
+same order so the native bit-exact gate must still pass.
+
+**What the HLS250 reports actually said (job 3175 evidence).**
+
+| Site | Reported | Cost per token | Cause |
+|---|---|---|---|
+| `gdn_read_fp32_vector` → `float tiny_weights[16384]` | store II=16 | 16,386 × 2 × 24 | one 512-bit beat unpacked into a 2-port FP32 RAM |
+| `gvt_mm2s` reading `tiny_weights` back | load II=8 | 8,194 × 2 × 24 | same array, 16 lanes / 2 ports |
+| `rms_load_w` | II=1 but 1 float/cycle | 2,050 × 49 ≈ 100K | weight staged as scalars (Iter67c: 2,122 × 49) |
+| `onorm_sq_half` | Final II=3 (target 2) | 8 flushes/layer | FP32 accumulate latency 3 at 4.0 ns |
+| `onorm_load_w`, per-head `onorm_*` flushes | 258 + 2,732/layer | ≈ 66K | 1 float/cycle + pipeline restart per head and per word |
+| `token_load_embedding` | II=2 (target 1) | 0 (128 cycles either way) | two stream reads per iteration |
+| `rmsnorm_sq_half` | Final II=3 (target 2) | 128 × 49 ≈ 6.3K | serial FP32 accumulate; not exactly fixable |
+
+**Source changes** (`gdn_model.cpp` `db7aa5f8d87784f4b1c55a2abebc7fbcd4cac3927659364af0bf9c8d36861082`,
+`gdn_model.h` unchanged `fe9ea867…`, Makefile/pre-TCL unchanged from job 3175;
+snapshot `diagnostics/iter68b_sequencer_ii/source_snapshot.tar`
+`7f58b072089a0b539fb61ff08ad53cb1801115f1c57fe44a84d24db9625def21`):
+
+1. **Tiny a/b GEMV fed from the HBM0 response stream.** New
+   `gdn_gemv_tiny_from_stream` hands `port0_read_response` straight to
+   `gdn_gemv_tiny_compute`; the 16,384-float staging array and its
+   `gdn_read_fp32_vector` fills are gone. Beat order on the stream is
+   unchanged (norm 128, scalars 1, a 1,024, b 1,024, conv 1,536, o-norm 16,
+   mlp-norm 128, then conv tails 576).
+2. **Norm weights stay as beats.** `gdn_rmsnorm_rows_bf16` and
+   `gdn_output_norm_and_gate` take `const Beat512 *` and unpack 16 FP32 lanes
+   per cycle (`rms_load_w` 2,050 → 128 cycles; `onorm_load_w` 258 → 16). The
+   sequencer parks them in `norm_weight_beats`/`mlp_norm_weight_beats`
+   (128 × 512-bit, URAM) and `output_norm_weight_beats` (16 × 512-bit,
+   LUTRAM). The native reference passes `aux_weights + offset / 16`; a
+   `static_assert` pins every aux component to whole beats.
+3. **Output norm rewritten as three flat pipelines per token.** Sum of
+   squares interleaves the eight heads (iteration `it` = head `it % 8`, chunk
+   `it / 8`) through a rotating 8-register accumulator file, so the recurrence
+   distance is 8 and the loop is II=1 at any adder latency; per-head chunk
+   order (lower then upper 16-lane half, `ip` ascending) is unchanged. The
+   gate pass is one 512-iteration II=1 loop over (head, word, 4-lane group)
+   slicing each word into constant-position 64-bit quarters; same expression
+   order `attn * scale * w`, `normalized * g * sigmoid(g)`, single RNE.
+4. **Embedding load one beat per iteration** (128 × II=1 instead of 64 × II=2).
+5. `gdn_read_fp32_vector` deleted; `gdn_read_beats` added.
+
+**Not fixed, by decision:** `rmsnorm_sq_half` stays II=2 at 150 MHz and II=3
+at 250 MHz. The decode RMSNorm has a single 2,048-value row and one
+accumulator, so its II is the FP32 adder latency; an exact II=1 needs a
+one-cycle adder, and reassociating into several partial sums changes the
+rounding and would fail the bit-exact gate. Cost ≈ 128 cycles/call × 49 =
+6.3K cycles/token (0.26% at 2.4M), so it is left alone rather than papered
+over with a relaxed target.
+
+**Native validation (this working tree, before submission).**
+`make -C c_impl` clean; `scripts/decode_correctness_check.sh --fast`: exact
+6-token trajectory, 160,000 logits, `exact_ref_mismatch=0`; full check: exact
+32-token trajectory, 992,000 logits, `max_abs 5.72e-06` against the FP32 CPU
+reference, `exact_ref_mismatch=0`, `argmax_mismatch=0`, `first_divergence=-1`.
+Evidence strength: native-only. The synthesis-only sequencer path is
+type-checked by the native build but only *executed* by cosim, as in Iter68A.
+
+**Sweep launched.** Three launchers in `diagnostics/iter68b_sequencer_ii/`
+(`hls150/200/250.slurm`) extract the same snapshot to node-local `/tmp`, run
+`make xo TARGET=hw HLS_FREQ={150,200,250} LINK_FREQ=150 JOBS=48
+VITIS_VERSION=2024.2`, rsync `build.hw.gdn32.h{150,200,250}.f150.o48/` back,
+and this time keep every per-module `syn/report/*.rpt` under
+`reports_compile/gdn_forward/module_reports/` (job 3175's copy step wrote to a
+directory it never created, which is why only the top-level report survived).
+`build` partition, 48 CPU / 192 GiB / 4 h each, no `--qos`. Jobs **3176**
+(150), **3177** (200), **3178** (250), submitted 2026-09-01 ~23:30. 3176 and
+3177 started at once on `harrier`; 3178 pends on `QOSMaxCpuPerUserLimit` —
+the `build` QoS caps a user at 96 CPUs and this account has no `build4`
+(`sacctmgr show assoc`: `build,light,vnc`), so the third job starts when a
+sibling finishes. Job 3175's Iter68A build directory was moved intact to
+`diagnostics/iter68_persistent_services/build.hw.gdn32.h250.f150.o48.job3175`
+before the 250 MHz job could overwrite that name.
+
+**Expected, to be checked against the reports, not assumed:** the sequencer
+latency should fall from 1,400,237 by ≈1.07M (tiny staging) + ≈94K (norm
+loads) + ≈45K (output norm) per token; `onorm_sq` should read II=1 at all
+three targets; `token_load_embedding` II=1; `rmsnorm_sq_half` still II=3 at
+250. Cycle claims for the token remain unresolved until the multi-command RTL
+cosim — the dataflow latency range in these reports is not accepted as a
+prediction (see Iter68A).
+
+**RTL cosim of the persistent graph — prepared and queued while the sweep
+runs (2026-09-02 00:08–00:30 UTC).** The native build never executes the
+Iter68 service graph (`gdn_forward`'s `#else` branch is the sequential
+reference), so the one-layer/all-eight-head cosim is the only pre-hardware
+execution of `gdn_token_sequencer` ↔ `gdn_port0_service` ↔
+`gdn_gemv_service_persistent`. Four changes make it a real gate instead of a
+liveness-only run:
+
+1. **`gdn_forward_reference` split out** (`gdn_model.cpp` →
+   `f6f95c9a2ec661037a351b168349cc25b09317c3af43036ae0977d05dd373f16`,
+   `gdn_model.h` → `2e68306c73a92dfff8a8664e30da16425821cc042c49cdd2d26619aeb6fa45e6`).
+   The former native body of `gdn_forward` moved verbatim into a function
+   with the same 34-argument signature, declared under `#ifndef __SYNTHESIS__`
+   in the header; `gdn_forward`'s native branch now just calls it. Proof the
+   synthesized design is untouched: `g++ -E -P -D__SYNTHESIS__ -std=c++14
+   -I/tools/Xilinx/Vitis/2024.2/include` on the job-3176/3177/3178 snapshot
+   (`db7aa5f8…`) and on the new file gives **3,218,060 bytes each, `diff`
+   = 0 lines**, 0 occurrences of `gdn_forward_reference`. So the csynth
+   verdicts of the sweep apply to the cosim source as-is. Native fast gate
+   after the refactor: PASS, `exact_ref_mismatch=0`.
+2. **Testbench rewritten** (`packed_bf16_one_layer_test.cpp`
+   `15a0e2d81492d034f37b88e0ec86ce45ab8deae29edfc56735e30f259f37fbbe`).
+   The old bench ran one token on constant data and checked only that the
+   call returned. The new one fills aux, all 32 shards, the recurrent state
+   (`gdn_scatter_recurrent_state`) and the conv tails
+   (`gdn_pack_conv_tails_bf16`) with deterministic BF16-exact splitmix
+   values in per-tensor ranges (weights ±[2^-7,2^-5), state ±[2^-5,2^-2),
+   tails ±[2^-3,1), norms [0.5,2), A_log [0.25,1), dt_bias −[1,4),
+   embeddings ±[2^-6,2^-4)), keeps a reference copy of the workspace and of
+   shards 28–31 (the only ones the kernel writes), and runs **two
+   back-to-back tokens** — the second token re-arms every persistent actor
+   with a different embedding, which one transaction cannot test. After
+   each token it compares RTL against `gdn_forward_reference`: both return
+   codes 0; **32,000 logits** within `rms(ref)/128` per element and finite;
+   **token id** (read as the FP32 value the fused argmax writes into lane 0
+   of `GDN_WS_OFF_X_NORM/16`) equal to the argmax of the DUT's own logits
+   *and* to the reference token (a near-tie within tolerance downgrades to
+   WARN); **524,288 BF16 state lanes** within `max(|ref|/64, 2^-12)` and at
+   least one lane changed; **conv tails bit-exact** over `3 × 192` beats.
+   Tolerances exist only because the FPO `exp`/`log1p` cores may legally
+   differ from glibc in the last bit (Iter66m: 21.4% of decay operands, ±1
+   BF16 ULP on 129 of 12.6M lanes); a misrouted beat, a stale actor or a
+   wrong command produces O(1) errors that fail every check. Native run of
+   the bench on the generated one-layer sources: PASS — logits rms
+   1.0114/1.0260, tokens 10208/7593, top-2 gaps 8.83e-02/7.32e-01,
+   520,377 and 521,137 of 524,288 state lanes changed, every comparison
+   exact (C DUT ≡ reference, as it must be).
+3. **Harness guards follow the Iter68 source** (`packed_bf16_cosim_check.sh`
+   `4003785dc5ebfbfafb8e4fbe44a4f401158fdabc95d95ff6ec310c871af0942e`).
+   Fail-closed `require_count` for every layer-derived literal: aux
+   `depth=100000`→3985 (the old `depth=2000000` float pointer is gone),
+   `GDN_GEMV_COMMANDS 97`→5, `loop_tripcount min=97 max=97` ×16→5,
+   `min=24 max=24` ×4→1 (two more sites than Iter66e:
+   `attention_boundary_command`/`attention_sink_command`), and the port-0
+   `static_assert`s 173→12 requests, 106,648→4,689 response beats,
+   13,825→577 write beats; shard depths 1,366,528→118,272 and
+   1,464,832→122,368 as before. Prepare-only run clean.
+4. **`cosim_design -O @COSIM_EXTRA@ -rtl verilog -trace_level none`**
+   (`cosim_all_bf16.tcl.in` `5349a7cd…`); the harness takes an optional
+   third argument for the extra switch. Options confirmed against
+   `vitis_hls -eval 'help cosim_design'` (2024.2).
+
+**Three cosim jobs submitted 2026-09-02 00:28 UTC** from the submit-time
+snapshot `diagnostics/iter68b_sequencer_ii/cosim_snapshot.tar`
+(`58252982d2ec5f80c346494432a161d349cfee36e3a096cbce99c7a33c9b01e9`; the
+launchers extract it to node-local `/tmp`, run the *staged* harness, copy
+`cosim.out`, the one-layer csynth and cosim reports and the xsim transcript
+to `cosim_<variant>.results/`, then delete the node-local scratch):
+
+| Job | Variant | `cosim_design` extra | Purpose | `--time` |
+|---|---|---|---|---|
+| **3179** | `plain` | — | the gate: 2-token correctness vs reference, liveness, representative cycles/transaction | 16 h |
+| **3180** | `stall` | `-random_stall` | liveness under random back-pressure on every top-level port (HBM0 multiplexing vs 32 readers); cycles not representative | 24 h |
+| **3181** | `dfprof` | `-enable_dataflow_profiling` | per-channel FIFO occupancy and stall/starve profile of the persistent graph; informational, not a gate | 16 h |
+
+Sizing is from measured jobs, not the old 48-CPU/192 GiB template: the
+Iter66e cosim (job 2500) had **MaxRSS 27.8 GB and TotalCPU 3:04 over 2:40
+elapsed** (single-threaded; xsim itself peaked at 4.2 GB), and the Iter68A
+csynth (job 3175) had **MaxRSS 7.3 GB and TotalCPU 1:06:16 over 1:06:13**.
+So each cosim asks 12 CPUs / 60 GiB; with 3178 (48 / 192 GiB) that is 84
+of the 96-CPU and 372 of the 384 GiB `build` QoS caps, so all four run at
+once when 3176/3177 finish. The same numbers say the csynth launchers were
+over-provisioned 6× in CPU — the 48-CPU request is *why* 3178 pends; future
+csynth jobs should ask ≈8 CPUs / 32 GiB. Runtime expectation from job 2500:
+one Iter66e one-layer token = 1,171,397,000 ps = 175,700 cycles simulated in
+1 h 55 min (25.4 cycles/s), so two Iter68 tokens ≈ 4 h of xsim plus ≈45 min
+csynth/IP generation for `plain`; `stall` longer. Watchers armed on the
+three `cosim_<variant>.exit` markers. If the sweep reports force a source
+change, these jobs are cancelled and resubmitted from a new snapshot (they
+pend behind 3176/3177 anyway).
+
+**Sweep result (jobs 3176/3177/3178, all COMPLETED; evidence strength:
+csynth).** 3176 (HLS150) 1:03:13, 3177 (HLS200) 1:04:04, 3178 (HLS250)
+1:04:43, all on `harrier`, Vitis 2024.2, `gdn_model.cpp db7aa5f8…` — the
+cosim refactor (`f6f95c9a…`) preprocesses to the identical synthesized text,
+see above. Reports under
+`build.hw.gdn32.h{150,200,250}.f150.o48/reports_compile/gdn_forward/module_reports/`
+(615 / 615 / 615 per-module `*_csynth.rpt`; the compile logs
+have **zero `200-885` II-violation messages** at all three targets).
+
+| HLS target | est. clock | top BRAM18 / DSP / FF / LUT / URAM | Δ vs Iter67c HLS150 (1,995 / 3,453 / 1,022,339 / 920,793 / 80) | sequencer latency | pipelined loops at target II |
+|---|---|---|---|---|---|
+| 150 MHz (6.67 ns) | 4.867 ns (205 MHz) | 2,086 / 3,476 / 1,056,526 / 947,535 / 88 | +91 / +23 / +34,187 (+3.3%) / +26,742 (+2.9%) / +8 | 287,593 | 176 of 177 |
+| 200 MHz (5.00 ns) | 3.650 ns (274 MHz) | 2,086 / 3,346 / 1,097,937 / 964,115 / 88 | +91 / −107 / +75,598 (+7.4%) / +43,322 (+4.7%) / +8 | 290,068 | 175 of 177 |
+| 250 MHz (4.00 ns) | 3.477 ns (288 MHz) | 2,086 / 3,410 / 1,279,131 / 949,715 / 88 | +91 / −43 / +256,792 (+25.1%) / +28,922 (+3.1%) / +8 | 293,876 | 175 of 177 |
+
+**Per-fix verdict (report evidence, module reports named):**
+
+| Fix | Iter68A (job 3175, HLS250) | Iter68B | Verdict |
+|---|---|---|---|
+| tiny-weight staging (`gdn_read_fp32_vector` store II=16, `gvt_mm2s` load II=8) | 24,580 cycles/layer of II-16/8 traffic | both loops gone; `gdn_gemv_tiny_from_stream` consumes `port0_read_response` beats at II=1 | retained |
+| `rms_load_w` 1 float/cycle | 2,050 cycles/call | `gdn_rmsnorm_rows_bf16` reads 128 beats, II=1 (report `gdn_rmsnorm_rows_bf16_Pipeline_rms_load_w`) | retained |
+| `onorm_load_w` 258, per-head `onorm_*` flush ≈2,732/layer | — | `gdn_output_norm_and_gate_Pipeline_onorm_load_w` 16 × II=1; `onorm_sq` **II=1, 128 iterations** (was II=3 on `onorm_sq_half`); `onorm_gate` 512 × II=1 | retained; `onorm_sq` II=1 confirmed at 150/200/250 |
+| `token_load_embedding` II=2 | 64 × II=2 | 128 × II=1 | retained (cycle-neutral, by design) |
+| `rmsnorm_sq_half` | II=3 (target 2) | **II=3 (target 2) at 150, 200 and 250 MHz alike**; `rmsnorm_scale_half` II=2 at target 2 | tolerated, pre-existing |
+
+**Correction to the paragraph above ("stays II=2 at 150 MHz and II=3 at
+250 MHz"):** the reports say `rmsnorm_sq_rmsnorm_sq_half` is **II=3 at every
+target**, including 150 MHz (`gdn_rmsnorm_rows_bf16_Pipeline_rmsnorm_sq_rmsnorm_sq_half_csynth.rpt`:
+achieved 3, target 2, trip 128, iteration latency 73/90/122). The
+Iter66/Iter67c HLS150 report shows the same II=3, so it is pre-existing and
+not a regression of this iteration; cost 128 × 3 − 128 × 2 = 128 cycles per
+call × 49 calls = 6.3K cycles/token (0.26%), unchanged. The 150 MHz II=2
+claim was an inference from the adder latency, not a report fact — struck.
+
+**New at HLS ≥ 200 only:** `gemv32_store_Pipeline_gemv32_argmax_merge`
+achieves **II=2 against target 1** (15 iterations, once per token = 15 extra
+cycles/token). The loop is the serial cross-lane `best`/`best_index` merge
+(`candidate > best || (candidate == best && candidate_index < best_index)`),
+whose FP32 compare-and-select recurrence does not fit one 5.0 ns cycle. Not
+worth fixing (a tree merge changes the tie order and the host rule is
+lower-index-wins); tolerated by name and bound in the XO gate.
+
+Every other pipelined loop is at its target: 27 ordinary `gemv32_mm2s_N`
+loops II=1, the four `gemv32_state_owner_{prefetch (trip 512), weight (trip
+2048), weight_only}` loop sets II=1, the shared `gemv32_cluster2_Pipeline_gemv32_cl_weight_stream`
+II=1 wrapped by exactly 16 `gdn_persistent_cluster_N_s`, `gemv32_four_dots`
+II=1 with 64 `floatingpoint_mul_16ns_16ns_16ns` and zero `fmul_32` per
+cluster, both `recur_island_read_row` loops II=1, all 7 `port0_*` loops and
+all 21 `gdn_token_sequencer_Pipeline_*` loops II=1.
+
+**Sequencer latency actually observed vs the prediction above.** 1,400,237
+(Iter68A, HLS250) → **287,593** (HLS150) / 290,068 (HLS200) / 293,876
+(HLS250): −1.11M cycles against the ≈1.21M estimated. The 0.1M gap is not
+attributed: job 3175 kept only the top-level report, so no per-loop Iter68A
+breakdown exists to compare against. The Iter68B sequencer spends 11,938
+cycles per `token_layer` iteration (HLS150), the largest pieces being
+`gdn_gemv_tiny_from_stream` 2,087, `token_forward_conv_weights` 1,538,
+`gdn_swiglu` 1,435, two `gdn_rmsnorm_rows_bf16` calls at 743, the two
+conv-tail forward/write loops at 578, `gdn_output_norm_and_gate` 773 and the
+`gate_up` receive/unpack pair at 354 + 357; the `token_receive_*` loops are
+counted at 66 cycles each, i.e. the report assumes the GEMV result is
+already waiting. The sequencer is therefore ≈12% of Iter67c's 2.41M measured
+token *if* it never waits, which is a lower bound on the token, not a cycle
+claim. The top-level dataflow range (6,145,192–11,085,371 at HLS150) is
+still not accepted as a prediction either — cosim decides that (jobs
+3179–3181, below).
+
+**FF decomposition — the Iter68A open question is answered.** Job 3175's
++254,076 FF (HLS250) was mostly the 250 MHz target, not the service split.
+Like-for-like at HLS150 the split costs **+34,187 FF (+3.3%)**, attributed
+by summing each module's own cost (Total − Instance, with IP-core and
+`m_axi` rows taken from the parent's instance table, weighted by instance
+count so the groups add up to the top total exactly — script kept as
+`diagnostics/iter68b_sequencer_ii/ff_decomp.py`):
+
+| Group | Iter67c HLS150 FF / LUT | Iter68B HLS150 FF / LUT | Δ FF | Iter68B HLS200 Δ FF vs Iter67c |
+|---|---|---|---|---|
+| GEMV glue (service + 3 island services: FIFOs, control) | 89,188 / 49,936 | 115,312 / 62,232 | **+26,124** | +26,124 |
+| sequencer + port0 service + frontend (new actors) | — | 16,579 / 28,104 | **+16,579** | +18,374 |
+| top-level `gdn_forward` (relay/command FIFOs) | 13,642 / 15,534 | 18,619 / 9,880 | +4,977 | +4,977 |
+| eight fixed boundary relays | 38 / 286 | 518 / 3,167 | +480 | +480 |
+| 16 clusters (incl. 960 `fadd` + 1,024 BF16 `mul` cores) | 589,136 / 508,071 | 589,376 / 508,592 | +240 | +19,600 (mul cores gain 47 FF each at 5 ns; `fadd` drops 231→205) |
+| layer blocks (norm/conv/tiny/swiglu/reduce) | 74,154 / 97,041 | 64,157 / 72,399 | −9,997 (tiny staging RAM gone: BRAM 82→44) | +1,106 |
+| 32 readers (27 mm2s + 4 state owners + load) | 32,162 / 15,714 | 30,363 / 31,143 | −1,799 (LUT +15.4K: state-owner muxing) | −1,571 |
+| recurrent (2 islands + service) | 124,992 / 129,018 | 123,395 / 128,027 | −1,597 | +5,930 (LUT +26.7K: `fadd_32ns_32ns_32_4_no_dsp` ×130, DSP −128) |
+| collect/store | 12,350 / 29,520 | 11,530 / 28,318 | −820 | +578 |
+| 32 `m_axi` adapters + `control_s_axi` | 86,677 / 75,673 | 86,677 / 75,673 | 0 | 0 |
+
+So the structural cost of Iter68B is ≈47K FF of FIFO/control in the service
+hierarchy and the two new actors, offset by 12K removed elsewhere; the
+clusters and readers — the parts that were physically hard to place — are
+unchanged at HLS150. Going from HLS150 to HLS200 adds another 41K FF, 19.6K
+of it in the clusters (the BF16 multiplier core grows from a 1-stage to a
+3-stage `floatingpoint_mul_16ns_16ns_16ns_32ns_16_3_0`) and 5.9K in the
+recurrent islands. HLS250 adds a further **181K FF over HLS200** (1,279,131 total, +25.1%
+vs Iter67c — within 2.7K of Iter68A's 1,276,415, which confirms the Iter68A
+growth was the 4.0 ns target, not the split): 146.7K of it in the clusters,
+because the 1,290 FP32 adders become 7-stage `fadd_32ns_32ns_32_7_full_dsp`
+cores at 318 FF each (205 at HLS200, 231 at HLS150), plus +29.1K in the
+layer blocks (`log_generic_float` 1,571 → 6,402 FF each, conv compute
+4,290 → 12,529), +19.8K in the recurrent islands, +6.2K in the sequencer.
+LUT is flat across the sweep (947.5K / 964.1K / 949.7K). The HLS250
+estimate is limited at 3.477 ns by `recur_island_read_row` in both
+recurrent islands (next: `gemv32_store` 3.360 ns); at HLS200 the whole
+design estimates 3.650 ns.
+
+**Architecture gate: `check_iter68_xo.py`** (`0a8d880955f75e7ff7a9176f7ce9f2ff17da6c471418605a04b489be8588484b`,
+new; the Iter66 `check_native_bf16_xo.py` stays the default). It is the
+fail-closed XO gate for the persistent-service hierarchy: HLS version
+2024.2, the estimated clock must fit the **link** period (`--link-mhz`,
+defaulting to the `.fNNN.` token of the build directory — an HLS250 XO that
+misses 4.0 ns is still a valid 150 MHz XO, so an HLS-target miss is a note,
+not a failure), resources under the device, masters exactly 0–31, the top
+dataflow = 1 sequencer + 1 port0 service + 1 persistent service + 8 fixed
+relays, the service = frontend + islands 0/1/2 + final collector + recurrent
+service + store service + 4 activation / 4 result / 2 recurrent relays +
+attention relay and sink, island layouts exactly 3/6/7 (clusters 0–2 / 3–8 /
+9–15, ports 1–5 / 6–17 / 18–27, state ports 28–31 in island 2), a
+whole-design sweep of every pipelined loop against its target II with
+exactly two named, bounded tolerances (`rmsnorm_sq_half` ≤ 3,
+`gemv32_argmax_merge` ≤ 2), the weight-path structural counts listed above,
+16 persistent cluster reports, `four_dots` II=1 / 64 BF16 multipliers / 0
+FP32 multipliers, and the four `state{0..3}_U` FIFOs at depth 4,096 × 512
+bits with ≥ 32 URAM in the service FIFO summary. Top latency is kept as
+text because the persistent services make the average `undef`. Results:
+HLS150 **PASS** (177 pipelined loops, 176 at target, 1 tolerated), HLS200
+**PASS** (175 at target, 2 tolerated), HLS250 **PASS** (175 at target, the same 2 tolerated; estimate 3.477 ns fits both the 4.0 ns HLS target and the 6.67 ns link period). Wired in through
+a new `XO_GATE_SCRIPT` knob: `slurm/hw_build.slurm`
+(`58b2d39cf254f829eab7c4b3ae7a7076ba176df24ee3a974d358834a2c8a4976`) runs
+`${XO_GATE_SCRIPT:-check_native_bf16_xo.py}` from the staged snapshot, and
+`run_hw_sbatch.sh` (`e7fce2f32f9cee9f39a1a5a14b55d17adae8cfd65ea16a26f41d095b3b67dbb6`)
+forwards and echoes it. No Make target was added.
+
+**Physical recipe for the link — written, statically checked, not yet run
+under Vivado.** Roadmap §7.1 as decided in the campaign header: soft
+placement hints, no new hard pblocks, a topology decision point after
+placement.
+
+| File | SHA-256 | Role |
+|---|---|---|
+| `hw_iter68b_islands_f150.cfg` | `bbeffe8566122b964f0260d25df6b7c4c916a0f2e1cd1c6352c31afe676102e9` | `[connectivity]` byte-identical to `hw_iter66e_frp_unpair_f100.cfg` (34 `sp=` + `nk=`, verified by diff); `[vivado]`: `-directive Default` synth, `OPT_DESIGN.PRE` → `apply_iter68_islands.tcl`, `PLACE_DESIGN.PRE` → `apply_iter66e_unpair.tcl` (unchanged; it sources the Iter54/35/23 DMA-timing chain), `PLACE_DESIGN.POST` → `check_iter68_islands.tcl`, place `SSI_SpreadLogic_high -verbose`, pre/post-route `AggressiveExplore`, route `AlternateCLBRouting`, `report_final_qor.tcl` after post-route phys-opt |
+| `iter68_islands_map.tcl` | `e65c15dac05e70ed090fed1013994ee7447895ecb926be3b2834d1b491ce3327` | the netlist map: 10 actors, 19 two-stage relays, 4 state FIFOs → SLR0/1/2 (sequencer, frontend, final collector, store service, attention sink SLR1; port0 service + island0 SLR0; island1 SLR1; island2 + recurrent service + state FIFOs SLR2), plus 67 report-only roots (clusters, ports, collectors, recurrent islands, relays) |
+| `apply_iter68_islands.tcl` | `307a88f3a47b9899f64b0c382d3cd27eb70bfaa855a39107cb3d1e1187bf6bd3` | `OPT_DESIGN.PRE`: exact-name lookup of every mapped cell (fails closed on drift), `USER_SLR_ASSIGNMENT` on the 33 actor/relay/FIFO roots, `USER_SLL_REG TRUE` on the sequential leaves of every relay (report-only Laguna outcome), reset net `MAX_FANOUT_MODE CLOCK_REGION` + `FORCE_MAX_FANOUT 32`; prints `GDN_ITER68_DONE topology=3/6/7 …` |
+| `check_iter68_islands.tcl` | `217c1756a7ba3b8946b24fd0e222d64e455b7a960b6d20bad8e9131aee32749f` | `PLACE_DESIGN.POST`: structural gate (every mapped cell still resolves to one object), per-actor SLR distribution of all 67 roots via one placed-cell list per SLR and `filter` per root (the Iter66b per-leaf LOC walk would take hours on 1.5M leaves), `report_utilization -slr` parsed into a `GDN_ITER68_SLR` line (lower/upper SLL %, the four directional SLL counts, direct SLR0↔SLR2, Laguna regs, per-SLR CLB/BRAM/URAM/DSP), advisories (lower SLL > 85, upper > 65, direct > 6,000, CLB > 95, BRAM > 90, `USER_SLL_REG` or Laguna = 0), post-place DCP + `utilization_slr` / `timing_summary` / `congestion` reports to `diagnostics/`, then the topology gate |
+
+**Topology gate threshold: fatal only above 92% SLR1↔SLR0 SLL; 85% is an
+advisory.** The roadmap wrote 85%. The retained evidence: nine routed builds
+sit at 84.67–89.45% post-place (Iter54c 88.87, Iter65b 86.84, Iter66b 87.24,
+Iter66d 88.52, Iter66e 89.45 → routed 89.57, Iter67c 84.67, …) and **no
+build has ever failed on SLL** — the Iter65/66a–d route failures were SLR0
+CLB pin and wire conflicts. Stopping a 150 MHz link at 85% would have
+stopped Iter66e. 92% is the first figure with no precedent; between 85 and
+92 the route is the decisive evidence (the Iter56 calibration lesson). If
+the gate stops, the choice (regenerate a 4/6/6 cut vs route anyway) is a
+user decision, not an auto-proceed step.
+
+**Validation of the recipe so far (static; no Vivado run yet):** all four
+Tcl files parse (`info complete`); `check_iter68_islands.tcl` was executed
+under `tclsh` against stub `get_cells`/`filter`/`report_utilization` procs
+fed by the real Iter67c `utilization_slr.rpt` and its 11-line
+`actor_slr_distribution.rpt` — 100 actor lines, the SLR line parsed to the
+known values (lower 84.67, upper 56.76, 12,536 / 6,973 / 6,774 / 6,303,
+direct 850 / 2,977, Laguna 0, CLB 99.29 / 87.51 / 81.96, BRAM 84.15 / 66.89
+/ 53.27, URAM 0 / 10 / 15, DSP 83.26 / 53.58 / 48.34), two advisories
+(SLR0 CLB 99.29, Laguna 0), verdict PROCEED. What the stub cannot prove:
+whether `get_cells -of_objects <slr>` returns the placed leaves of an SLR in
+this Vivado (a fallback via `get_sites -of_objects [get_clock_regions
+-of_objects <slr>]` is coded), whether `filter … "NAME =~ $root/*"` equals
+the per-leaf LOC walk, and what both cost on a 1.5M-leaf design. A
+scratch-only dry run that sources the hook with `::gdn_iter68_dry_run` set
+and opens the retained Iter67c `post_place.dcp` (640,380,485 bytes) is
+prepared and will run on `build` (8 CPU / 64 GiB / 3 h) as soon as the QoS
+memory cap allows; it compares the 11 ground-truth
+`GDN_ITER66B_ACTOR` lines leaf-for-leaf and must print `mismatches=0`.
+Iter68B's own hierarchy names (`grp_*_fu_NNN`) can only be confirmed on the
+Iter68B netlist, which is why the apply hook fails closed on the first
+unresolved name instead of guessing.
+
+**Which XO goes into the 150 MHz link: the HLS200 one
+(`build.hw.gdn32.h200.f150.o48/gdn_forward.xo`).** Reasoning, so it is not
+re-derived: (a) the HLS150 XO is scheduled to its own budget (6.67 − 1.80 ns
+uncertainty = 4.87 ns; estimate 4.867 ns), leaving Vivado 1.8 ns of the 6.67
+ns period for placement and routing of a design whose SLR0 was 99.29% CLB
+last time — the HLS200 XO's 3.650 ns estimate leaves 3.0 ns; (b) the HLS250
+XO buys 0.17 ns of estimate for +181K FF (+16.5%), which is the resource
+class whose pin pressure caused every Iter65/66 route failure; (c) the HLS200
+XO's estimate already fits a 200 MHz period, so if 150 MHz closes, the same
+XO can be re-linked at 200 MHz with the link frequency as the *only* changed
+variable. The HLS250 XO is kept for the 250 MHz step. Cycle counts are the
+same to within 0.02% across the three (dataflow best case 6,145,192 /
+6,146,247 / 6,147,785), so the choice does not trade cycles.
+
+**Sequencing from here (auto-proceed):** the link is launched only after
+cosim `plain` (job 3179) passes the 2-token RTL-vs-reference gate — the
+graph has never executed outside C. The check-hook dry run against the
+Iter67c checkpoint was submitted as job **3182** (`build`, 8 CPU / 64 GiB /
+3 h) the moment 3178 released its 48 CPU / 192 GiB; its output decides
+whether `iter68_slr_placed_cells`/`iter68_root_distribution` need a fix
+before the hook runs inside a real place_design. Neither result changes the
+XO. Exact link command, to be run from `c_impl/` on `acclhead1`:
+
+```
+HW_CFG_TEMPLATE=hw_iter68b_islands_f150.cfg \
+EXTRA_SNAPSHOT_FILES="hw_iter68b_islands_f150.cfg iter68_islands_map.tcl apply_iter68_islands.tcl check_iter68_islands.tcl check_iter68_xo.py" \
+XO_GATE_SCRIPT=check_iter68_xo.py HLS_FREQ=200 LINK_FREQ=150 JOBS=48 \
+BUILD_TIME=2-00:00:00 bash run_hw_sbatch.sh iter68b_islands_h200_f150
+```
+
+**Dry-run job 3182 never ran; 3184 is the real one.** 3182 failed in 1 s
+(exit 1, no output) because its working directory and `--output` path were
+the session scratchpad under `/tmp` on `acclhead1` — node-local, absent on
+`harrier`. Resubmitted from `diagnostics/iter68b_sequencer_ii/dryrun/`
+(NFS): 3183 failed in 0 s on `set -u` + `settings64.sh`'s unbound
+`PYTHONPATH`; 3184 (`build`, 8 CPU / 64 GiB, `harrier`, started
+2026-09-02T01:43Z) is running `open_checkpoint` on the Iter67c
+`post_place.dcp`. Lesson for the launcher template: source the Xilinx
+settings *before* `set -u`, and never point a job at the scratchpad.
+
+**Fourth cosim, `h200` (job 3185, submitted 2026-09-02T01:47Z, 12 CPU /
+60 GiB, same `cosim_snapshot.tar`):** the `plain` gate re-run with
+`create_clock -period 5.0`, because the XO chosen for the link is the
+**HLS200** one and the three 6.667 ns cosims exercise the HLS150 schedule
+(different arithmetic-core depths — 3-stage BF16 multiplier, 4-stage
+`fadd` — and the II=2 `argmax_merge`). The link stays gated on `plain`
+(3179) as recorded; `h200` finishes during the link's first hours and a
+FAIL there cancels the link. QoS after the four cosims + dry run: 56 of 96
+CPUs, 304 of 384 GiB. The link job asks 48 CPU / 192 GiB
+(`hw_build.slurm` defaults), so it fits only once `plain` has exited and the
+dry run is over (then 36 CPU / 180 GiB are held) — the same moment the gate
+allows it to start.
+
+**RTL-cosim verdict — FAILED, hardware link blocked.** The production-faithful
+one-layer/five-command, two-token C precheck passed exact logits, recurrent
+state, and convolution tails, but Slurm job **3179** failed RTL cosimulation
+after 1:25:36 with zero of two top transactions complete. Job **3181**, with
+dataflow profiling enabled, reproduced the failure; randomized-stall job 3180
+and the redundant HLS200 cosim job 3185 were cancelled after the deterministic
+failure was established. The generated detector reports one 14-process cycle
+at 60,692,580 ps. Every named FIFO dependency is empty; none is full. Two
+members (`gdn_result_boundary_relay_0` and `gdn_gemv_frontend`) have no FIFO
+blocker, while the synthesized persistent-service report contains generated
+`ap_sync_*`, child `*_ap_start`, `ap_ready`, and `ap_continue` logic. HLS also
+emitted `HLS 200-656` for the island command distributors and recurrent
+duplicate/merge actors: auto-rewind pipelines under `ap_ctrl_none` or disabled
+start propagation can deadlock. Verdict: **reject Iter68B for hardware**. FIFO
+depth is not the cause and is not changed; an all-empty control cycle cannot be
+repaired by additional buffering.
+
+### Iter68C — restore bounded actor start propagation (2026-09-02)
+
+**Hypothesis.** Iter68B suppressed start propagation at every level of the new
+persistent graph, but Vitis HLS still generated parent/child ready/continue
+synchronization. That combination closes a task-control cycle before the first
+QKVG result can reach recurrence. Restore ordinary HLS start propagation only
+for the new top token graph, the nested persistent service, its three 3/6/7
+islands, and the two-way recurrent-island dataflow. Retain the persistent
+97-command schedule, all stream depths, arithmetic, 32 ports, 16 clusters, and
+the external ABI unchanged.
+
+**Planned gates.** Run the native fast exact gate, then submit integrated
+csynth and the production-faithful one-layer/five-command, two-token RTL cosim
+as independent Slurm `build` jobs from the same immutable source identity. The
+cosim gate requires two completed transactions, exact logits/state/tails, and
+no deadlock. Csynth records loop II, resource deltas, estimated clock, remaining
+`HLS 200-656` warnings, and generated control hierarchy. No hardware link is
+allowed from this candidate until cosim passes and the post-synthesis control
+fanout cost has been measured.
+
+**Launch-sentry correction.** Initial parallel jobs 3193 (csynth) and 3194
+(cosim) were stopped after roughly two minutes, before useful synthesis work,
+because restoring canonical dataflow exposed four `HLS 214-113` warnings at
+the recurrent-service call and a resulting `HLS 200-471` form-check summary.
+The call passed `weight_data_mm{28..31} + state_offset` expressions directly.
+The four identical offsets are now named pointer aliases before the dataflow
+calls and passed as arguments; this is a source-form correction only and does
+not alter addresses, traffic, arithmetic, or task counts. The five warnings
+from the disabled legacy per-command `gdn_gemv` region remain out of scope for
+the persistent synthesized path.
+
+**Parallel rerun launched.** Immutable snapshot
+`diagnostics/iter68c_startprop/source_snapshot.tar` has SHA-256
+`9b966834b42dd7506b099836289e6b018745997dd7a763e531debde7a9b52cde`;
+the corrected `gdn_model.cpp` hash is
+`45958e634164fed5311683c10d20cb5832fafcf023ea111b8ae96133c2583c6a`.
+Slurm job **3195** runs the integrated HLS200 csynth/XO structural gate, and
+job **3196** concurrently runs the matching 5.0 ns, one-layer/five-command,
+two-token cosim. Both allocated `acclnode03`. During the two-minute launch
+sentry both passed environment/source staging and entered HLS synthesis with
+no error. The only `HLS 200-471` form warnings now refer to the disabled legacy
+per-command `gdn_gemv` implementation (lines 5424--5432); the four warnings in
+the live persistent graph are gone. Results remain pending.
+
+**Final verdict — REJECTED (2026-09-02).** Integrated csynth job **3195**
+completed in 1:05:15 with exit 0: every loop constraint was satisfied,
+estimated period was 3.650 ns (273.97 MHz), and `check_iter68_xo.py` printed
+`XO_GATE_PASS` for a 150 MHz link. RTL-cosim job **3196** failed in 1:27:42
+with exit 1. Its preliminary C execution was exact for both tokens (zero logit,
+state, convolution-tail, or argmax mismatch), but the actual Verilog simulation
+deadlocked at its first transaction. The detector reports the same 14-process,
+all-empty cycle as Iter68B: token sequencer waiting for attention, recurrence
+waiting for context, store waiting for collected results, result relays waiting
+for island output, and activation relays waiting for the frontend; result relay
+0 and the frontend again have no FIFO blocker. Normal start propagation also
+generated `start_for_*` FIFOs, yet did not break the cycle, while `HLS 200-656`
+remained on auto-rewind boundary/distributor actors. Therefore the cause is not
+FIFO capacity and not solved by the pragma change: the bounded HLS actors still
+participate in a cyclic task-level start/ready protocol. No hardware link is
+authorized. The next candidate must remove that protocol structurally (for
+example true `ap_ctrl_none` RTL skid-buffer crossings and/or non-auto-rewind
+command actors), then repeat RTL cosim before linking.
+
+### Iter68D — disable automatic rewind for bounded service actors (2026-09-02)
+
+**Diagnosis and hypothesis.** Iter68C's generated reports make the remaining
+control mechanism explicit: `gdn_island_command_distributor<5,3,0>` is reported
+as `loop auto-rewind stp`, and HLS emits `HLS 200-656` for that process plus the
+two first-stage fixed boundary relays on the cyclic port-0 paths. Vitis 2024.2
+enables automatic loop rewind by default. These actors already contain the
+complete bounded per-token schedule, so overlapping the end of one kernel call
+with the start of the next is neither required nor legal for this stateful
+decode kernel. Iter68D restores Iter68B's `disable_start_propagation` source
+structure and removes Iter68C's pointer aliases, then adds only
+`config_compile -enable_auto_rewind=false` to the shared production HLS Tcl.
+The II=1 pipeline pragmas, 97-command schedule, stream depths, arithmetic,
+ports, clusters, and ABI are unchanged. Expected evidence: no process in the
+live persistent hierarchy is reported as `loop auto-rewind`, no `HLS 200-656`
+for that hierarchy, and the two-token RTL cosim completes. A failure blocks the
+hardware link and triggers the more invasive flat-graph/RTL-skid-buffer repair.
+
+**Cosim launched.** Immutable snapshot
+`diagnostics/iter68d_no_auto_rewind/source_snapshot.tar` has SHA-256
+`9c5df1b9c6af235bcd3746db237c00204a59304282e1c0f06331e08925dff5f7`;
+the kernel source is the Iter68B identity
+`f6f95c9a2ec661037a351b168349cc25b09317c3af43036ae0977d05dd373f16`
+and the HLS Tcl identity is
+`7a297510b96b22f450ebcd0d0ab51f702e2a6b39c1b0a5f2a6dc1b46894b5407`.
+Slurm job **3197** runs the matching HLS200 one-layer/five-command, two-token
+RTL cosim on `acclnode03`. The two-minute sentry confirmed that Vitis accepted
+`config_compile -enable_auto_rewind=false`, source staging succeeded, and HLS
+entered synthesis without an error. Result pending.
+
+**Final verdict — REJECTED (2026-09-02).** Job **3197** exited 1 after
+58:46. HLS synthesis completed, but its estimated frequency fell from
+Iter68C's 273.97 MHz to **247.89 MHz**. RTL simulation then detected the same
+14-process, all-empty dependence cycle at 47,715,000 ns with zero of two top
+transactions complete. The sequencer was waiting for the first attention
+result, while store, recurrence, result relays, and activation relays formed
+the same return path. `gdn_gemv_frontend` and the first island-0 result relay
+again had no FIFO blocker, identifying task-level parent/child control rather
+than FIFO capacity. Disabling automatic rewind therefore neither repaired
+liveness nor preserved timing; the setting is reverted before the next
+candidate. No hardware link was launched.
+
+### Iter68E — flatten the cyclic persistent-service wrapper (2026-09-02)
+
+**Diagnosis and hypothesis.** Iter68B/C/D changed three independent HLS
+control policies but produced an invariant deadlock graph. The common
+structure is the nested `gdn_gemv_service_persistent` dataflow wrapper: its
+parent task boundary encloses the complete command → island → store →
+recurrence → attention feedback path, while the token sequencer that injects
+the first command and consumes attention is in the parent dataflow region.
+The empty-FIFO report's two processes without FIFO blockers are the points at
+which generated `ap_start`/`ap_continue` synchronization closes that cycle.
+
+Iter68E inlines only this wrapper into the top-level dataflow and removes its
+nested `dataflow` pragma. This makes frontend, crossing relays, the three
+islands, final store, recurrence, and attention sink peers of the sequencer.
+The 3/6/7 island functions remain non-inlined nested feed-forward graphs, so
+their physical hierarchy and SLR-local structure are preserved. Stream depths,
+97-command ordering, arithmetic, ports, clusters, and the ABI do not change.
+Named state-tail pointer aliases avoid non-canonical pointer expressions at the
+new flat dataflow boundary. The rejected global auto-rewind override is removed
+to restore the production default and Iter68C's higher timing estimate.
+
+**Gate.** Run the native fast exact gate, then the same production-faithful
+one-layer/five-command, two-token RTL cosim. The required result is two
+completed transactions with exact logits/state/tails and no deadlock. A
+hardware link remains blocked until this gate passes.
+
+**Native gate and immutable candidate.** Slurm job **3198** completed in
+1:25 with exit 0. The six-token trajectory was exact (`first_divergence=-1`),
+all 160,000 checked logits passed, and both exact-reference and argmax mismatch
+counts were zero. The Iter68E cosim snapshot is
+`diagnostics/iter68e_flat_service/source_snapshot.tar`, SHA-256
+`b24daf45fb0197fd1aba3d74e934a9bdea0bffe5b060b3a61c64aa25aa941119`;
+the kernel source SHA-256 is
+`196d8d78cc8cfa8cc7d63d66932f1c46313da21ac50692864db5895e00b7dd59`.
+The production HLS Tcl returned to its pre-Iter68D identity
+`a76930f3332baac50bf7540b58f9242a2efcd235154215b26e95e8da5a057633`.
+
+**Cosim launched.** Slurm job **3199** runs the matching 5.0 ns,
+one-layer/five-command, two-token RTL cosim on `acclnode03`. Its launch sentry
+confirmed exact source staging, Vitis 2024.2 startup, successful pragma/form
+checking, and entry into HLS code transformation with no error. Result pending.
+
+**Final verdict — REJECTED (2026-09-02).** Job **3199** (`acclnode03`) exited
+1 after 1:22:10. Preliminary C execution was exact for both tokens; the Verilog
+simulation stopped with `DEADLOCK DETECTED at 45715000` and 0/2 transactions.
+Flattening the wrapper changed the printed cycle from 14 to 13 processes (the
+wrapper itself is gone) and nothing else: sequencer → attention sink →
+attention relay 0 → recurrent service → recurrent relays 1, 0 → store service
+→ final collector → result relays 1_3, 0_3 → activation relays 1, 0 → frontend
+→ sequencer, every named FIFO EMPTY, and again two processes — result relay
+0_3 (edge to activation relay 1) and the frontend (edge to the sequencer) —
+with no FIFO blocker printed. No hardware link was launched.
+
+**Unit correction for every Iter68 deadlock time (applies to 68B–68E
+above).** The detector's banner labels its `$time` "ns", but xsim runs at
+`Time resolution is 1 ps` and the same runs print `$finish called at time :
+60692580 ps` (68B) / `45810 ns` (68E). The banner values are therefore
+**picoseconds**: 68B 60.559 µs at 6.667 ns = **9,083 cycles**; 68C 45.695 µs
+at 5 ns = **9,139**; 68D 47.715 µs = **9,543**; 68E 45.715 µs = **9,143**.
+All four stop ≈9.1–9.5k cycles into the first call — inside layer-0 QKVG
+(16,384 weight beats per port), not "60 ms simulated". xsim ran at ≈9
+cycles/s (16:50 wall for 9,143 cycles), so a full one-layer two-token cosim is
+a 10–12 h simulation plus ≈1 h csynth/xelab.
+
+**What the four identical reports do and do not establish.** They prove a
+deterministic stop at the same point under three different control policies
+(start propagation on/off, auto-rewind on/off, wrapper nested/flat), so the
+stop is not a FIFO-capacity or pragma-policy accident. They do *not* prove the
+printed cycle is the cause: (a) no island process and no island FIFO appears in
+it although all three islands were mid-GEMV, (b) it closes through two edges
+the report unit cannot name — in the retained 2022.x detector RTL those are
+the `input_sync_blk`/`output_sync_blk` classes (`ap_sync_reg_*_ap_ready` /
+`ap_done_reg` group waits), which print no reason — and (c) the 2024.2
+detector/RTL sources were deleted by every Iter68 job (`rm -rf` of the work
+dir, copy-back filtered to reports), so the classification cannot be read
+back. Whether islands were genuinely stalled or the detector mis-classified a
+sync wait is therefore *not tool-exposed from these artifacts; it needs an
+instrumented run* (Iter68F job 3200 below). On that basis neither of the two
+proposed next steps is justified by data yet: another start-propagation /
+rewind permutation was already tried twice (68C, 68D) with no change, and a
+whole-graph `hls::task` rewrite would replace the control protocol before the
+first blocked process has even been identified.
+
+### Iter68F — publish the recurrent context before the store call (2026-09-02)
+
+**A guaranteed deadlock found in the schedule, independent of the printed
+cycle.** `gdn_persistent_store_service.verbose.sched.rpt` (68E, `.autopilot/db`)
+schedules the QKVG hand-off as: ST_8 write `recurrent_command_raw` **and**
+start the `gemv32_store_or_qkvg_conv_stream` call (`[2/2]`); ST_9 = the call's
+completion state (`[1/2]`, waits for the callee's `ap_done`) **and** the write
+of `recurrent_context_raw ab_word`; ST_13 (after the call) the write of
+`scalar_word`. So both context beats are committed only after the store call
+returns. The consumer chain needs them first: `gdn_recurrent_boundary_relay`
+forwards command → 2 context beats → 64 q/k/v beats, and
+`gdn_persistent_recurrent_service` reads command → context → islands. Meanwhile
+the store writes q/k/v into 32-deep `q/k/v_raw` FIFOs, 8 beats per head, so
+head 5 blocks on a FULL q FIFO while the relay is still waiting for context
+that the blocked call must finish to release. The 68E stop itself corroborates
+the ordering: the recurrent service held the *command* (relay 0/1 had passed
+it) but not the *context* (relay 0 EMPTY on `recurrent_context_raw`) while the
+store was mid-call. The collectors were checked the same way and are safe:
+`gdn_persistent_collect3/6/7` and `gdn_persistent_final_collector` write their
+command **in the call's start state** (ST_2 write + ST_2 `[2/2]`), so the
+command is visible while the collect runs. HLS is free to reorder independent
+stream writes around a sub-call; the only robust ordering is a data
+dependency.
+
+**Fix.** New out-of-line helper `gdn_store_publish_recurrent()` (`inline off`)
+writes the command and, for QKVG, the two context words, and *returns the row
+count the store call consumes*, so the call is data-dependent on the publish.
+Behaviour is unchanged (native runs the reference path); only the RTL order of
+three stream writes moves ahead of the call. `gdn_model.cpp` SHA-256
+`cc604f44720ae065b94e3ff3eefb3d635566fcc61acf12ebb1722edb3f9a1750`
+(`gdn_model.h` unchanged, `2e68306c…`; HLS Tcl `a76930f3…`). Native `make
+gdn_eval` + `scripts/decode_correctness_check.sh --fast` → **PASS**.
+
+**Evidence boundary.** This fix removes a deadlock that *would* have occurred
+at head 5 of every QKVG. It does not claim to be the ≈9.1k-cycle stop, whose
+first blocked process is not yet identified; if that stop is real it will
+recur in job 3201 at the same place, which is the controlled A/B for this one
+change.
+
+**Two jobs, one variable, `diagnostics/iter68f_publish_order/`.** Snapshot
+`source_snapshot.tar` (`gdn_model.cpp cc604f44…`, hashes in
+`source_hashes.txt`).
+- Job **3200** `cosim_vcd.slurm` — instrumented run: `packed_bf16_cosim_check.sh
+  <out> 5.0 "-setup"` (csynth + generated sim files, no run), then the
+  generated `sim/verilog/gdn_forward.tcl` (`run all`) is replaced by
+  `iter68f_vcd_batch.tcl` (fail-closed if `run all` is absent) and the
+  generated launcher (`sim.sh`, else `run_xsim.sh`) is executed by hand.
+  The batch logs a VCD of: the deadlock detector at level 1 (all blocking
+  vectors and dependency data), the DUT top minus data buses (every process
+  `ap_start/done/ready/idle`, every FIFO `empty_n/full_n`, AXI handshakes),
+  every top-level process's FSM/handshake/blocking signals, every top FIFO's
+  pointers, and the three islands one level deeper. Runs 250 µs (50,000
+  cycles) in 5 µs slices with progress notes, detector **ON**, stops when
+  time freezes (`$finish`). Copies back `AESL_*.v`, `*autotb*.v`,
+  `gdn_forward.v`, all `.tcl/.sh/.prj/.log`, reports, and the gzipped VCD
+  before cleanup. `--time=12:00:00`, 12 CPU, 60 G, `build`, `acclnode03`.
+- Job **3201** `cosim_full.slurm` — the gate: `packed_bf16_cosim_check.sh <out>
+  5.0 ""` (detector ON, same command as 68B–E), `timeout 34h`,
+  `--time=36:00:00`, same copy-back. `acclnode03`.
+Both launched 2026-09-02 with detached completion watchers (exit marker or
+job gone from `squeue`); no polling. Result pending.
+
+**Job 3200 (instrumented) — FAILED at the first `open_vcd`, script fault,
+no waveform (2026-09-02).** 1:07:13 on `acclnode03`. `-setup` completed
+(`SETUP_STATUS 0`), the batch was installed (`BATCH_INSTALLED
+25e4d8b03c3af85d`), TV generation and xelab ran, and xsim then refused the
+VCD: `ERROR: [Simulator 45-10] The current simulation was compiled without
+trace information. To perform the requested operation, please recompile the
+design with -debug all or typical.` The generated `run_xsim.sh` runs xelab
+without any `-debug` switch, so xsim has no trace database; `open_vcd` is
+impossible on that build. The batch itself is not at fault (its logic was
+re-checked with `tclsh` stubs). The job *did* copy back the full 2024.2 cosim
+tree — `AESL_deadlock_detector.v` (15,966 lines), `AESL_deadlock_report_unit.v`
+(13,289), `AESL_deadlock_detection_unit.v`, `gdn_forward.autotb.v`, `run_xsim.sh`,
+`sim.sh` — which is what every earlier Iter68 job had deleted, and those
+sources settle part of the question below.
+
+**Job 3201 (68F, detector ON) — REJECTED as the ≈9.1k stop, exactly as the
+evidence boundary predicted.** 1:22:30 on `acclnode03`, exit 1. Preliminary C
+execution exact for both tokens (`one-layer all-BF16 cosim PASS: 2 tokens` from
+the C side), then `DEADLOCK DETECTED at 45715000` — **45,715,000 ps = 9,143
+cycles, to the picosecond the same time as 68E**. Same 13-process cycle; the
+only text change is the 68F FIFO names (`q/k/v_raw → q/k/v_mid → q/k/v_local`,
+`attention_raw/mid`), and the recurrent service is now blocked on the *q/k/v*
+FIFOs (EMPTY), i.e. it holds command and context and is waiting for the first
+head — the store had still received no results. So the store-service reorder
+(68F) is real but orthogonal to the stop, and the stop is insensitive to
+everything changed from 68B to 68F.
+
+**What the retained 2024.2 detector RTL establishes (read from the copied
+`AESL_deadlock_*.v`, not inferred).**
+- Process indices (91 detect units, `PROC_NUM=91`): 0 `entry_proc3`, 1
+  sequencer, 2–9 fixed relays, 10 port0 service, 11 frontend, 12–15 activation
+  relays 0–3, 16 island-0 wrapper (17 distributor, 18–22 mm2s, 23–25 clusters
+  0–2, 26 drain, 27 collect3), 28 island-1 wrapper (29–49), 50 island-2
+  wrapper (51–74), 75–78 result relays 0_3/1_3/2_7/3_7, 79 final collector,
+  80 store, 81–82 recurrent relays, 83 recurrent service (84–88 internals),
+  89 attention relay, 90 attention sink.
+- Edge classes are `data_FIFO`, `data_PIPO`, `start_FIFO`, `TLF_FIFO`,
+  `input_sync`, `output_sync`. An edge is *valid* while its `*_blk_n` is low;
+  a process is *blocked* while any out edge is valid. Dependency bits move one
+  hop per clock along valid edges (`dep_reg`, cleared the moment a process has
+  no valid out edge). A unit detects (`dl_detect_out`) when its own bit comes
+  back to it while it is blocked.
+- Report unit FSM: `IDLE → ST_FILTER_FAKE` on the first detection; the
+  originally detecting set (`dl_detect_reg`) must **all stay detecting for
+  `dl_keep_cnt >= 1000` consecutive clocks** or the FSM returns to IDLE and the
+  count resets; then `ST_DL_DETECTED → ST_DL_REPORT` walks a token from the
+  highest-index origin one hop per clock along the **highest-index valid out
+  edge (edge 0 unconditionally when none is valid)**; "(k): Process" prints only
+  for a token holder that is itself detecting; the reason line under (k) is the
+  k→k+1 edge and prints only when its `blk` signal and the FIFO's
+  `if_empty_n/if_full_n` agree; the walk ends when the token reaches the origin,
+  so **the last node's reason is never printed**; a hop through a
+  non-detecting node loses the previous-node context, so the next reason line
+  is also lost.
+- Applied to the report: (13) frontend's missing reason is the plain data-FIFO
+  edge `gemv_commands`/`gemv_activations` ← sequencer (`proc_11_data_FIFO_blk[0]
+  = ~gemv_commands_blk_n | ~gemv_activations_blk_n`), i.e. *waiting for command
+  1*, silent only because it is the last hop. (10) relay 0_3's missing reason is
+  a hop through **island 0 nodes that were not themselves detecting**: relay
+  0_3's edges are [0]→16 wrapper and [1]→27 collect3 (both `~result0_raw_i_blk_n
+  | ~result_command0_raw_i_blk_n`, i.e. *waiting for the next result burst*)
+  and [2]→76 (FULL on mid, not the case). Wrapper 16's out edges are the OR of
+  its children's external waits: [0]→13 `distributor.command0_local_i_blk_n`
+  (distributor *waiting for command 1*) | `cluster_0.gemv32_cl_load
+  ripple_613_blk_n` (`activation0_local`, *waiting for command 1's
+  activations*); [1]→10 `cluster_0.gemv32_cl_weight_stream weights_12_blk_n`
+  (cluster 0 waiting on the port-0 service's weight stream); [2]→75
+  (collect3 blocked writing raw, FULL — not the case). So the two silent edges
+  are *not* an `input_sync`/`output_sync` class as the 68E entry guessed from
+  the 2022.x RTL; they are report-format truncation plus an unprinted hop
+  through the island-0 wrapper/collector, whose edges into the cycle are
+  "waiting for command 1" and "waiting for the next burst".
+- Therefore **every edge of the detected cycle is a wait for the next
+  command or the next result**, and the only processes that make progress
+  during a GEMV — the 32 mm2s readers and the 16 cluster weight streams —
+  are outside it. Such a cycle is closed at every instant in which no result
+  beat is in flight. The detector's only defence against that is the
+  1000-clock filter.
+
+**Hypothesis (A), stated as a hypothesis: a false positive from the
+result-burst cadence.** Layer-0 QKVG streams 16,384 weight beats per port
+(256 rows × 64 beats) in 16 output packs, so island 0 emits a result burst
+about every **1,024 cycles** and the whole result/command chain is idle —
+every cycle edge valid — for ≈1,000–1,015 of them. A 14-node cycle needs
+≈14 clocks to propagate its bits and then 1,000 clocks of unbroken blocking:
+≈1,014. The margin is a handful of clocks, so the first gap that runs a few
+clocks long (an AXI-model stall, a pipeline flush) fires the detector, and
+the fire time is then a property of startup jitter, not of the design — which
+fits 9,083 / 9,139 / 9,543 / 9,143 / 9,143 across five otherwise different
+builds. Against (A): a *real* island-0 stall in the result path at ≈8,100
+cycles (hypothesis (B)) would print the same cycle, because the cycle never
+names an island node. The report cannot separate them; the two runs below can.
+
+**Two decisive runs, one variable each, launched 2026-09-02 with detached
+watchers.**
+- Job **3202** `cosim_vcd2.slurm` (`8a98dddc84d1e60e…`): job 3200 plus one
+  fix — after `BATCH_INSTALLED`, `sed -i 's|bin/xelab |bin/xelab -debug typical
+  |' run_xsim.sh`, fail-closed (exit 7/8) if the xelab line is missing or the
+  patch does not apply. Batch `iter68f_vcd_batch.tcl` (`ef49e86adfe66158…`) now
+  also logs the detector's child scopes (report unit `CS_fsm`, `dl_keep_cnt`,
+  `dl_detect_reg`, `dl_in_vec`; every unit's `dep_reg`/`dl_detect_out`/
+  `proc_dep_vld_vec`/token vectors) and the clusters' `grp_*` sub-process
+  scopes (the `*_blk_n` signals the edges use). Detector ON, 250 µs bound.
+  Decides (A) vs (B): the gap lengths on `result0_raw_U.if_empty_n`, whether
+  `weight*_stream`/`m_axi` handshakes were still moving at 45.715 µs, and the
+  clock at which `dl_keep_cnt` started its final count.
+- Job **3203** `cosim_nodl.slurm` (`fc687be0345c2444…`): job 3201 with
+  `cosim_design -disable_deadlock_detection` (switch present in the 2024.2
+  `libxv_hls_main.so`), `timeout 34h`, `--time=36:00:00`. If the design is
+  really deadlocked it hangs to the timeout; if it completes two exact
+  transactions the design is not deadlocked and (A) is confirmed independently
+  of the waveform. Until it passes, no hardware link is launched.
+
+**Job 3202 result (`cosim_vcd2`, exit 0, 1 h 28 m on the build partition,
+2026-09-02 17:40–19:08 UTC): the waveform decides it — the 9.1k-cycle report is
+a false positive of the detector's 1000-clock filter, and the design was at
+full throughput while the filter counted.** Evidence strength: RTL cosim
+waveform of the scaled one-layer configuration (5.0 ns clock, 21,275 logged
+signals, 0–46.41 µs; the detector's `$finish` at 45.715 µs only pauses xsim,
+so the last 0.7 µs are the report walk). All times below are in kernel clocks
+(ps/5000). Raw VCD 74,157,077 B, retained gzipped at
+`cosim_vcd2.results/solution/sim/verilog/gdn_forward_iter68f.vcd.gz`
+(13.86 MB); the extraction scripts are session scratch, not committed.
+
+*What the report unit itself did* (`AESL_deadlock_report_unit_inst`):
+
+| signal | measured |
+|---|---|
+| `CS_fsm` | IDLE 0→8,141.5; FILTER_FAKE 8,141.5→9,142.5; DETECTED 9,142.5; REPORT 9,143.5→9,159.5 |
+| `dl_keep_cnt` | **one** counting run, 8,142.5→9,142.5, reaching 1,001 — no earlier attempt, no reset |
+| `dl_detect_reg` (first detector) | {1} = the sequencer, latched 8,141.5 |
+| `dl_in_vec` (detecting set) | {1} at 8,140.5 → grows one node per clock 90, 89, 83, 82, 81, 80, 79, {11,76}, {12,75}, {13,16} → constant 14-node set 8,150.5→9,142.5 |
+| `origin_reg` / walk | origin 1; token walk 90→89→83→82→81→80→79→76→75→(16, non-detecting hop)→13→12→11→1, i.e. the printed cycle |
+
+The cycle closed the moment the sequencer blocked, and the first node to
+block was the sequencer itself — not a relay, not the store, not an island.
+
+*What the design was doing at the same clocks:*
+
+| clock | event (all from the VCD) |
+|---:|---|
+| 590.5 | sequencer writes command 0 (QKVG); island-0 distributor has it by 594.5; `store_commands` 598.5 |
+| 593.5 | sequencer queues the port-0 request set for layer 0 (`port0_requests_service` write) |
+| 602–663 | port 0 (`mm0`) issues the AUX_LAYER read: `ARVALID` high 61 clocks, then `RVALID` continuous **668.0→4,524.5 = 3,857 beats** — exactly 128 norm + 1 scalar + 2×1,024 tiny a/b + 1,536 conv-weight + 16 + 128 norm beats |
+| 670–989 | island-0 `mm1` reads 5 bursts (320 beats), fills `weights_U`; **no further `mm1` request until 8,207.5** — the cluster is not consuming because it has no activations yet |
+| 4,524→5,750 | no port-0 traffic; sequencer computing (`gdn_rmsnorm_rows_bf16` + two `gdn_gemv_tiny_from_stream`) |
+| 5,750.5→7,286.5 | sequencer forwards the 1,536 conv-weight beats into `gemv_context` (`if_write` high the whole span) |
+| 7,379 / 7,574 / 7,769 | port 0 fetches the three 192-beat conv-tail stripes on demand; sequencer forwards them 7,452→8,036 |
+| **8,038.5→8,102.5** | sequencer writes the 64 activation beats (`gemv_activations`); `activation0_raw` 8,040.5, `activation0_local` 8,042.5, ripple 8,044.5 |
+| 8,105 | port 0 starts streaming shard 0 (`WEIGHT0`): `weight0_stream.if_write` high from 8,108.5 **and never drops again** |
+| **8,140.5** | sequencer enters `token_receive_attention` (blocked on `gemv_attention_output`) → `dl_in_vec` = {1}; cycle closes over the next 10 clocks |
+| 8,141.5–8,145.5 | island 0 consumes: `weights_U..weights_4_U` `if_read` and `if_write` go high and **stay high through the whole window** (one beat per clock on all five mm2s FIFOs plus `weight0_stream`) |
+| 8,142.5→9,142.5 | **the filter window.** `mm0` issues 16 read requests (64-clock cadence), `mm1`/`mm2`/`mm12`/`mm13` 15 each; `RVALID` is continuous on all five masters (mm0 8,105→9,221+, mm1 8,273→9,232+). Of the 253 signals in the analysis set, the only ones changing inside the window are the ten AXI handshakes and nine island-0 FIFO enables that go high at 8,142–8,145 and stay high — flat *high*, not flat low |
+| 9,142.5 | detector fires (45.715 µs) |
+| **9,208.5** | first island-0 `cluster_results`; `result0_raw` 9,210.5; `store_results` 9,213.5→9,267.5 (54 beats); islands 1/2 result bursts 9,208–9,264 — **66 clocks after the fire** |
+
+*Mechanism, from the retained detector source* (`AESL_deadlock_detector.v:5366`):
+the island-0 wrapper's edge into the cycle is
+`proc_16_data_FIFO_blk[0] = ~distributor.command0_local_i_blk_n |
+~cluster_0.gemv32_cl_load.ripple_613_blk_n` — "distributor waiting for
+command 1" OR "cluster 0's load stage waiting for command 1's activations".
+Both hold for the whole duration of command 0's compute; the wrapper's
+back-end sub-processes (`gemv32_cl_weight_stream`, the dots, `cl_flush`,
+`collect3`), which were consuming a beat per clock, contribute no "busy"
+term. The other 13 edges are the relays', store's, collector's, recurrent
+service's and sequencer's waits for the *next* command or the *next* result
+burst. A GEMV command's first result burst needs one full output pack —
+1,024 weight beats per channel at one beat per clock — plus pipeline
+latency: measured **1,066 clocks** (8,142.5→9,208.5) from the last node
+blocking to the first result. The filter constant is `32'd1000`, hard-coded
+in `AESL_deadlock_report_unit.v:92`. So every first output pack of every
+GEMV command exceeds the filter by ≈66 clocks, deterministically — which is
+why five otherwise different builds fired within 460 clocks of each other,
+and why 68F (a store-side reorder) moved the fire time by zero clocks.
+
+*Verdict for the 9.1k stop:* **false positive — proven by the waveform, not
+inferred.** No process in the cycle was waiting on anything that had failed
+to happen; the wait was for a result that arrived 66 clocks later on
+schedule, and the six weight paths feeding island 0 were saturated
+throughout. Hypothesis (A) is confirmed in substance, but its arithmetic
+was wrong in a way worth correcting: it is not the *steady-state* burst
+cadence with a few clocks of jitter (the steady-state gap was never reached
+in any run and is not measured here — with a 54-beat burst it would be
+≈970 clocks, under the filter), it is the **first** output pack, whose
+window starts the instant the sequencer finishes delivering activations and
+is 1,066 clocks long by construction. Hypothesis (B) — a real island-0 stall
+in the result path — is refuted by the flat-high FIFO enables and continuous
+`RVALID` inside the window.
+
+*Evidence boundary.* The waveform proves the 68F design was not deadlocked
+at 45.715 µs in the scaled configuration; it does not prove the two
+transactions complete (job 3203 decides that), and it says nothing about the
+production 24-layer schedule beyond what the source makes structural.
+
+*Consequence for the cosim gate.* The 2024.2 detector cannot be used on this
+design: the filter is a hard-coded literal, and the design's first-pack
+latency exceeds it by design, not by defect. `packed_bf16_cosim_check.sh`
+already forwards `$3` to `cosim_design`, so the Iter68 gate runs with
+`-disable_deadlock_detection` and takes **completion with two exact
+transactions** as the no-deadlock proof — a stronger statement than the
+detector's silence, since a real deadlock cannot produce the outputs. Any
+future stall will then present as the 34 h timeout, and the VCD method above
+(xelab `-debug typical` + `iter68f_vcd_batch.tcl`) is the way to find its
+first blocked process. Do not paper over this by editing the generated
+report unit's constant.
+
+*Performance finding, recorded here because the waveform exposed it and
+labelled by strength (RTL cosim, scaled one-layer config, production
+dimensions).* The sequencer's per-layer prologue is serial and long:
+**7,510 clocks from command 0 (590.5) to the last activation beat
+(8,102.5)**, during which island 0 holds the command and 320 prefetched
+weight beats and does nothing. Source mapping (`gdn_token_sequencer`,
+`token_layer`): AUX_LAYER stream of 3,857 beats through the single port 0
+(≈3,857 clocks, overlapped with consumption); RMSNorm + two tiny a/b GEMVs
+(the 4,524→5,750 quiet gap plus the earlier overlap — ≈5,000 clocks for
+2,176 input beats, i.e. slower than II=1 somewhere); 1,536 conv-weight beats
+forwarded *through the sequencer* into `gemv_context` (1,536 clocks); three
+conv-tail stripes fetched only after the aux response drained, because port
+0 serves requests in order into one response FIFO chain (7,379→8,036). If
+this repeats per layer with no overlap it is 24 × 7.5k ≈ **180k clocks per
+token** — 7.5% of the current 2.41M-clock token at 100 MHz — and it is
+work that does not depend on the layer's activations (aux weights, conv
+weights, tails) plus two small compute steps that do. Whether Iter67c pays
+the same serial cost is not measured here. Levers, in order of simplicity:
+route conv weights and tails from the port-0 service straight to their
+consumers instead of through the sequencer; prefetch layer L+1's AUX_LAYER
+during layer L; csynth `gdn_rmsnorm_rows_bf16`/`gdn_gemv_tiny_from_stream`
+for their actual II. None of this is a deadlock concern and none of it is
+changed for Iter68F.
+
+*Status.* Job 3203 (`cosim_nodl`, detector off) running on `acclnode03`,
+1 h 41 m elapsed at the time of writing; watcher armed. Its completion with
+two exact transactions is the remaining gate before the 150 MHz link.
+
+**2026-09-03 09:30 UTC — job 3203 is 15 h 50 m in with no first
+transaction; job 3250 launched to tell "slow" from "stalled".** Reference
+point (measured, not estimated): the Iter66f two-token cosim of the same
+one-layer scaled configuration completed both transactions in **16,445 s
+total** (4.6 h incl. csynth/xelab; transaction 1 at 1.171 ms simulated,
+transaction 2 at 2.340 ms — ≈176k clocks per token at 6.667 ns). Job 3203's
+xsim has now run **14.7 h** (setup ended 18:44 UTC on 09-02) without printing
+`1 / 2`, i.e. 3.4× the whole Iter66f run. Its only in-run output is the
+inter-transaction progress line, so it cannot show whether it is simulating
+slowly (the persistent design has 91 processes; job 3202 measured 8.4
+clocks/s in the prologue *with* a 21k-signal VCD) or sitting in a stall after
+the point job 3202 could see (46 µs). Left running; hard bound is its 34 h
+timeout (≈04:40 UTC 09-04).
+
+Job **3250** `cosim_progress.slurm` (`c38daddefa5f15a1…`, batch
+`iter68f_progress_batch.tcl` `afdd8fffe23dae2a…`): the job-3202 mechanism
+(csynth + `cosim_design -setup`, xelab `-debug typical`, hand-run `sim.sh`)
+with **`-disable_deadlock_detection`**, the batch running to the testbench's
+`$finish` in 50 µs slices and printing per slice the wall clock, simulated
+time, `mm0/mm1/mm16/mm31 ARADDR`, FIFO occupancies (`gemv_commands`,
+`store_results`, `gemv_token_output`, `gemv_attention_output`, …), the
+sequencer/store/recurrent `ap_idle`, and the testbench transaction counters;
+VCD limited to the DUT top level, the 162 top FIFOs' flags and the top
+processes' `ap_*` (≈3.3k signals, ≈9 changes/clock in the prologue — the
+cluster internals that made job 3202's VCD 74 MB per 9k clocks are excluded).
+It therefore doubles as the detector-off gate: if it completes, the post-check
+compares both transactions. Watcher armed on its first three PROGRESS lines
+(gives the real clocks/s and the address progress) and on either job ending.
+
+**2026-09-03 14:20 UTC — job 3250's first three slices: the design is
+progressing, the simulator is the bottleneck. Measured rate ≈2 clocks/s,
+≥10× slower than the Iter66f cosim of the same test; neither 3203 nor 3250
+can finish two tokens inside its limit; job 3316 launched with the 3-day
+maximum.** Data (`cosim_progress.live.log`, xsim `RUN_START` 10:45:26 UTC,
+TOTAL_LOGGED 5,121 signals, 109 gauges):
+
+| slice | simulated | wall (UTC) | wall/slice | clocks/s | mm1 / mm16 ARADDR (beats) | mm31 ARADDR | mm0 ARADDR |
+|---|---:|---|---:|---:|---|---:|---:|
+| 1 | 50 µs = 10k clk | 11:13:25 | 28 min | 6.0 | 2,112 / 2,048 | 1,984 beats | 3,043,328 (aux region) |
+| 2 | 100 µs = 20k clk | 13:03:25 | 110 min | 1.5 | 12,096 / 12,096 | 9,408 beats | 3,682,304 |
+| 3 | 150 µs = 30k clk | 14:07:19 | 64 min | 2.6 | **16,320 / 16,320** | **7,827,456 B = state stripe** | 3,710,976 |
+
+What the gauges prove (routed-RTL simulation, not estimate): slice 2 moved
+the weight readers 9,984 beats in 10,000 clocks — the QKVG projection
+streamed at **one beat per clock per port** with the detector off. At slice
+3 mm1 and mm16 sit at beat 16,320 = the last 64-beat burst of the 16,384-beat
+QKVG command (issued, complete), and mm31 has jumped past the 7,569,408-byte
+shard end into the recurrent-state stripe (ports 28–31 hold the state tails):
+the layer's recurrent phase has begun. The sequencer is still in its
+post-activation blocking state (`ap_CS_fsm` bit 28, `ap_idle=0`),
+`gemv_commands`/`store_results`/`gemv_token_output` are empty as expected
+before the first result pack, `port0_requests_service` drained from 1 to 0,
+and the testbench counters are unchanged (`start_cnt=1`, `done_cnt=0`,
+`clk_cnt` = 9,977 / 19,977 / 29,977). **No process is stuck; 30k clocks in,
+the design is exactly where the schedule says it should be.**
+
+The problem is speed. Slurm accounting (`sstat`): job 3203 has AveCPU
+20:54:38 in 20:36:01 elapsed, MaxRSS 26.8 GB of 60 GB — CPU-bound, no memory
+pressure; job 3250 likewise (5:07:54 CPU in 4:45:03, 23.7 GB). Job 2508
+(Iter66f, same testbench, 6.667 ns) used 4:59:06 CPU for the *whole* job,
+MaxRSS 25.9 GB — so its RTL simulated ≥27 clocks/s where Iter68F's simulates
+1.5–2.6 clocks/s with a 5k-signal VCD, and job 3203 *without* a VCD has not
+reached transaction 1 (176k clocks) in 19.6 h of xsim, i.e. it is also below
+2.5 clocks/s. The ≥10× slowdown is a property of this RTL under xsim (same
+Vitis, same `cosim_design -O`, same xelab library set), not of the
+instrumentation, and it is **unexplained** — candidates are the permanently
+running free-running pipelines and relays (activity every clock even when
+idle) or long combinational handshake chains across the relay boundaries
+costing delta cycles; deciding that needs a per-phase rate profile (3250's
+later slices will give the recurrent and lm_head phases) and is not needed
+for the gate.
+
+ETA arithmetic at the measured rate: one token ≈ 118k streaming clocks at
+1.5/s (21.9 h) + ≈58k other clocks at ≥2.6/s (≤6.2 h) ≈ **28 h**; two tokens
+≈ 56 h. Job 3203 (`timeout 34h`, kill at ≈03:40 UTC 09-04) reaches 237k
+clocks at 2.0/s or 178k at 1.5/s — it may or may not print `1 / 2` before it
+dies, and cannot reach `2 / 2`. Job 3250 (36 h, ends 21:33 UTC 09-04) should
+complete token 1 around 10:30–13:00 UTC 09-04 and die ≈40% into token 2 —
+useful: its VCD then covers token 2's restart of the persistent services.
+
+Action: **job 3316** `cosim_nodl_3d.slurm` (`153fd7f3ac6b3673…`, a copy of
+job 3203's script with only `--time=3-00:00:00` and `timeout 71h` changed —
+one variable), submitted 14:19 UTC, pending on priority behind other users'
+3-day jobs; acclnode05 is idle. 56 h of xsim + 1.3 h setup fits the 72 h
+limit with ≈14 h margin *if* the lm_head phase is not slower than QKVG. Both
+older jobs stay running as calibration (3203: un-instrumented one-token
+time; 3250: per-phase rates and the token-2 waveform). Evidence label: the
+"no stall" statement is proven to 30k clocks only; everything after is
+schedule, not observation.
+
+**2026-09-03 14:46 UTC — job 3203 completed transaction 1: `// RTL
+Simulation : 1 / 2 [0.00%] @ "797028000"` (log mtime 14:45:52 UTC).** That
+is 797.028 µs = **159,406 clocks at 5.0 ns** for the first token of the
+one-layer scaled test — prologue, QKVG, recurrent, O, GU, down, lm_head with
+the fused argmax, store and state publish — with the deadlock detector off
+and no instrumentation. Wall: xsim started 18:44 UTC 09-02, so token 1 took
+≈20.0 h ⇒ **2.21 clocks/s** un-instrumented, confirming that the rate seen
+in job 3250 is the RTL's, not the VCD's. Iter66f's first token in the same
+test took 175,690 clocks (1,171,397,000 ps at 6.667 ns): Iter68F's token is
+**16,284 clocks (9.3 %) shorter** in this scaled configuration — first RTL
+evidence of the persistent-service schedule paying off; token 2 will show
+the steady-state figure. Evidence label: routed-RTL cosim, one transaction;
+transaction 2 (the restart of the persistent services) is still open.
+
+Job 3250 slices 4–5 (sim 200 µs at 14:21:45, 250 µs at 14:42:08 UTC): 11.5
+and 8.2 clocks/s — the recurrent phase simulates 4–8× faster than weight
+streaming (1.5–2.6 clocks/s), so the cost is the 16 clusters' arithmetic
+datapath, not the persistent control.
+
+Revised timeline at 2.21 clocks/s: job 3203 needs until ≈11:00 UTC 09-04
+for transaction 2 and is killed by its own `timeout 34h` at 03:40 UTC — it
+will not finish; kept running only until then (nothing else to learn from
+it). **Job 3316** (xsim from ≈15:25 UTC 09-03; 315k clocks for two tokens)
+should complete ≈**07:00 UTC 2026-09-05**, 55 h inside its 72 h limit. Job
+3250 (36 h) should pass token 1 ≈08:00 UTC 09-04 and record token 2's first
+≈100k clocks in its VCD before its limit at 21:33 UTC 09-04.
+
+**2026-09-03 15:50 UTC — Iter68F token 1 checked from the RTL test vectors
+without waiting for token 2: logits and recurrent state bit-exact, conv
+tails written in the WRONG ROW ORDER. Real bug in the persistent path;
+fixed as Iter68G.** Method: job 3203's node-local
+`sim/tv/rtldatafile/rtl.gdn_forward.autotvout_mem_weights_*.dat` (the AXI
+master models dump the bundle memory at each transaction's `done`) compared
+against `sim/tv/cdatafile/c.gdn_forward.autotvout_*` (C expected) and
+`autotvin_*` (input) for transaction 1, via `srun --jobid=3203 --overlap`
+(scripts and the three mm0 images copied to
+`diagnostics/iter68f_publish_order/{tv_region_compare.py,tv_region_trace.py,job3203_token1_tv/}`).
+
+| region (mm0 bundle word) | C changed | RTL changed | RTL = C |
+|---|---|---|---|
+| word 4113 (token id) | 1 | 1 | yes |
+| logits 39,635–41,634 (2,000 words = 32,000 FP32) | 2,000 | 2,000 | **yes, all** |
+| conv tails, 3 stripes × 192 words at 38,483 / 38,867 / 39,251 (384-word stride = FP32-sized reservation) | 576 | **192** | **no: 576 differ** |
+| mm28–mm31 (recurrent state, 4,096 beats each) | — | — | **`cmp` identical, 7,831,560 B each** |
+
+Inside each 192-word stripe (3 rows × 64 beats, row = 2,048 BF16 channels)
+the C image is `[old row1, old row2, new]` (`cout[w] == cin[w+64]` for all
+384 shifted words) while the RTL image is `[new, old row1, old row2]`: only
+the first 64 words changed, and each equals the C image's word +128. The
+RTL's data is right, its row order is not — re-emitting the RTL rows as
+[1, 2, 0] reproduces the C image **576 of 576 words**. Cause, from source:
+`gemv32_store_or_qkvg_conv_stream` reuses tail row 0 for the new raw row
+(`qkvg_stream_capture_new_tail`, per its own comment "the final packed
+store emits old rows 1/2 followed by this row"), and the Iter66 reference
+path does that rotation in `gdn_store_qkvg_conv_tails` (`source = p < 128 ?
+p + 64 : p - 128`). The Iter68 `gdn_persistent_store_service` emit loop
+(`persistent_store_emit_tail`) wrote `conv_tails[kind][beat]` in natural
+order — the rotation was dropped when the store became a persistent service
+(Iter68A–F all carry it). Consequence, inferred not yet run: token 2's
+`iter39_head_conv_restore_k` reads rows in age order, so every layer's q/k/v
+convolution would see the newest token as the oldest → wrong logits from
+token 2 on, in cosim and on card. Why nothing caught it: the native gate and
+the cosim's own C run execute `gdn_forward_reference` (`#ifdef
+__SYNTHESIS__` selects the persistent dataflow only for RTL), so csim is
+structurally blind to the persistent path; only a two-transaction RTL cosim
+or an on-card run could show it — ≈40 h into the cosim.
+
+Fix (Iter68G): `persistent_store_emit_tail` (and the unused older copy
+`gemv_service_emit_tail`) now emit `conv_tails[kind][source]` with the same
+[1, 2, 0] mapping as the reference path. `gdn_model.cpp` →
+`1be875a5e1e160f84a934bceed21abf95cb757442b33f69073c241c9e406b72e`,
+`gdn_model.h` unchanged `2e68306c…`. Native fast gate PASS (expected — the
+reference path is untouched; it proves only that the file still builds).
+
+Jobs: 3203, 3250, 3316 (all 68F source) cancelled at 15:47 UTC — 3316 would
+have run 40 h to a known token-2 mismatch. Launched on the fixed source:
+**job 3337** `iter68g-cosim-nodl-3d` (two-token cosim, detector off, 3-day
+limit, `diagnostics/iter68g_tail_order/`; token 1 ≈20 h after xsim starts,
+token 2 ≈40 h) and the hardware build **3338** `iter68g_islands_h200_f150_build`
++ on-card **3339** (afterok; queues behind the user's `gdn-fpga-table*`
+jobs 3252–3255 for the single FPGA), command:
+`HW_CFG_TEMPLATE=hw_iter68b_islands_f150.cfg EXTRA_SNAPSHOT_FILES="hw_iter68b_islands_f150.cfg iter68_islands_map.tcl apply_iter68_islands.tcl check_iter68_islands.tcl check_iter68_xo.py" XO_GATE_SCRIPT=check_iter68_xo.py HLS_FREQ=200 LINK_FREQ=150 JOBS=48 BUILD_TIME=2-12:00:00 bash run_hw_sbatch.sh iter68g_islands_h200_f150`.
+Decision to build before the cosim verdict: token 1 already proves the
+GEMV, recurrent, argmax, state-publish and tail-read paths in RTL; the fix
+changes 64-beat row order in one emit loop; the residual risk is token 2's
+restart of the persistent services, which the cosim checks in parallel.
+Plan: at token 1 of job 3337 repeat the TV comparison (must be 0 differing
+words on mm0); the two-transaction PASS remains the gate before any on-card
+number is promoted. Evidence labels — token-1 exactness: RTL cosim,
+measured; token-2 corruption without the fix: inferred from source, not run.
+
+**2026-09-03 16:55 UTC — Iter68G build 3338 stopped at the XO gate: the v++
+compile flattened `gdn_gemv_service_persistent` into `gdn_forward`; gate script
+fixed, build relaunched. Verdict on the design: none (HLS compile PASSED,
+link never started).** Job 3338 (`iter68g_islands_h200_f150_build`, build
+partition, 48 cores) finished `v++ -c` at HLS 200 MHz with `xo.exit=0`, then
+`check_iter68_xo.py` returned 2 with the single failure `required report
+missing: gdn_gemv_service_persistent_csynth.rpt`; `hw_build.slurm` wrote
+`xo_gate.exit=2`, `build.exit=2`, "Vivado link was not started", and Slurm
+cancelled on-card 3339 through `afterok`. Cause, read from the archived
+reports (`diagnostics/iter68g_islands_h200_f150/build_diagnostics.tar.gz`,
+611 `*_csynth.rpt`): the v++ HLS flow inlined the persistent service into the
+top — `gdn_gemv_island0/1/2_service_U0`, `gdn_persistent_store_service_U0`,
+`gdn_persistent_recurrent_service_U0`, `gdn_persistent_final_collector_U0`,
+the activation/result/recurrent/attention relays and the four `state0..3_U`
+FIFOs are direct instances of `gdn_forward_csynth.rpt`, and no service-level
+report exists. The `test.tcl`/cosim csynth the gate was written against keeps
+the extra hierarchy level (e.g. `iter68b_sequencer_ii/cosim_dfprof.results`).
+This is a gate-script hierarchy assumption, not a design failure.
+
+Fix: `check_iter68_xo.py` (SHA-256 `db59bc22c6bd1a4a95b568654c0b340aae99a0f6f6456b23b23424bb7095cf43`)
+now falls back to the top report when the service report is absent — the
+service children, the `state[0-3]_U` FIFO rows and the FIFO summary row are
+read from whichever report carries them, the top-instance expectation for
+`gdn_gemv_service_persistent` becomes 0 in the flattened case, and the JSON
+records `service_hierarchy: flattened|nested` plus a note. Every other check
+is unchanged. Verified on real reports before relaunch: the archived 3338
+set **PASSes** (flattened) and the archived Iter68B cosim csynth set still
+PASSes (nested).
+
+What the 3338 HLS compile measured (csynth, v++ 2024.2, 200 MHz target,
+kernel source `1be875a5…` = Iter68G):
+| | |
+|---|---|
+| estimated clock | 3.650 ns (274 MHz) against the 5.0 ns target; 150 MHz link authorised |
+| top resources (csynth) | BRAM18 2,086 · DSP 3,346 · FF 1,097,932 · LUT 964,123 · URAM 88 |
+| delta vs Iter67c | BRAM +91 · DSP −107 · FF +75,593 · LUT +43,330 · URAM +8 |
+| top latency | best 6,146,246 cycles, worst 11,085,544, average `undef` (services loop until the sequencer's final command) |
+| loops | 177 pipelined, 175 at target II; the two misses are the tolerated `rmsnorm_sq_half` (II 3) and `gemv32_argmax_merge` (II 2) |
+| weight path | 27 ordinary MM2S at II=1, four state-owner prefetch/weight/weight-only loops at II=1 (512/2048 beats), port-0 7/7 II=1, sequencer 21/21 II=1, both recurrent `read_row` loops II=1 |
+| islands | island0 clusters 0–2 / ports 1–5 / collect3; island1 clusters 3–8 / ports 6–17 / collect6; island2 clusters 9–15 / ports 18–27 + state 28–31 / collect7 — matches the pblock map |
+| arithmetic / state | 64 native BF16 multipliers, 0 FP32; four 4096×512 state FIFOs, 32 URAM |
+LUT 964K is 73% of the device (Iter67c 895K/68%) — the link, not csynth,
+decides whether this places; that is the reason this build exists. Evidence
+label: csynth only. Cosim 3337 (Iter68G two-token gate) is unaffected and
+still running on acclnode01 (1 h 12 m at 16:55 UTC).
+
+Relaunch: identical command with the fixed gate script in the snapshot, tag
+`iter68g_islands_h200_f150_b` — job IDs recorded below.
+Relaunched 16:56 UTC: build **3340** `iter68g_islands_h200_f150_b_build`,
+on-card **3341** (afterok:3340; still queues behind the user's
+`gdn-fpga-table*` chain 3252–3255 for the single FPGA).
+`diagnostics/iter68g_islands_h200_f150_b/`.
+18:00 UTC: build 3340 passed the fixed XO gate (`xo_gate.exit=0`,
+`service_hierarchy: flattened`, same csynth numbers as 3338) and entered the
+Vivado link at 150 MHz on acclnode03.
+
+**2026-09-03 20:10 UTC — Iter68G build 3340 failed in `opt_design` PRE: the
+same v++ hierarchy flattening broke the island map; map fixed, relaunched.
+Verdict on the design: none (link_design succeeded, no placement ran).**
+Job 3340 passed the XO gate, `link_design` completed (30 m 43 s, 23.4 GB peak,
+0 errors; post-synth kernel utilisation 708,725 LUT = 63.15% of device,
+774,203 FF, 1,171 BRAM, 88 URAM, 5,449 DSP), then
+`apply_iter68_islands.tcl` aborted at its first service-level role:
+`ERROR: [VPL_TCL 101-2] iter68 map: role 'frontend' expected exactly one cell
+for 'level0_i/ulp/gdn_forward_1/inst/gdn_gemv_service_persistent_U0/gdn_gemv_frontend_U0',
+matched 0` (`impl_1.runme.log` line 2452). The two kernel-root roles before
+it (`gdn_token_sequencer_U0`, `gdn_port0_service_U0`) resolved, so the kernel
+root is right and only the `gdn_gemv_service_persistent_U0/` level is gone —
+consistent with the 3338/3340 csynth report, where every child (three
+islands, store/recurrent service, final collector, relays, `state0..3_U`,
+the `*_mid_U` FIFOs) is a direct instance of `gdn_forward` under the same
+instance name. The map's fail-closed resolver did its job: it refused to
+constrain a netlist it did not describe. Wall cost of the miss: 1 h 55 m of
+build-node time; the XO gate fix (16:55) did not cover the Tcl because the
+Tcl never runs before the link.
+
+Fix: `iter68_islands_map.tcl` (SHA-256
+`c9c6fa51289d7c27b1bae1a0c4f50744f26dfbae7f9008b32e5a39e2bee784e4`) probes
+the open netlist once when sourced: if
+`<root>/gdn_gemv_service_persistent_U0` does not exist it sets
+`::gdn_iter68_service_flattened 1`, `gdn_iter68_full_name` strips that
+prefix from every relative path, and the service's own report-only entry is
+dropped. Prints `GDN_ITER68_HIERARCHY service_flattened=N`. Both hooks
+(`apply_iter68_islands.tcl`, `check_iter68_islands.tcl`) source the map, so
+they cannot disagree. Dry-run with a stub `get_cells` in tclsh: all 40 actor/
+relay/FIFO and report roles resolve to the flattened names taken from the
+3338 top csynth report; with the service present every path is byte-identical
+to before. Not verified against a live Vivado netlist — the first run of
+`opt_design` PRE in the relaunch is that verification (the resolver still
+fails closed).
+
+Relaunch, identical command, tag `iter68g_islands_h200_f150_c`:
+build **3342** `iter68g_islands_h200_f150_c_build`, on-card **3343**
+(afterok:3342), `diagnostics/iter68g_islands_h200_f150_c/`. The XO is
+re-synthesised (≈1 h), which is the price of keeping the build directory
+node-local.
+
+**2026-09-03 23:20 UTC — Iter68G build 3342 failed in `opt_design` PRE again:
+the flattening fix worked (10 roles resolved, `service_flattened=1`), then the
+first fixed relay `gdn_fixed_boundary_relay_80_173u_10_U0` matched 0 cells.
+Resolver instrumented, relays made non-fatal, relaunched. Verdict on the
+design: none.** `impl_1.runme.log` line 856: `role 'req_relay_seq' expected
+exactly one cell for 'level0_i/ulp/gdn_forward_1/inst/gdn_fixed_boundary_relay_80_173u_10_U0', matched 0`.
+The 3342 v++ csynth top report lists that instance (and the other seven
+`gdn_fixed_boundary_relay_*_U0`) directly under `gdn_forward`, so this is
+not the service-prefix problem. The kernel OOC synthesis log
+(`ulp_gdn_forward_1_0_synth_1/runme.log`, 8,930 lines, summarised verbosity)
+mentions only one fixed relay — `gdn_fixed_boundary_relay_512_13825u_14_U0/ap_done_reg_reg`
+constant-propagated — and says nothing about the 80-bit ones; Vivado
+"Rebuilding User Hierarchy" took 49 m 57 s. **Why the cell is absent is not
+determinable from the artifacts** (hypotheses, unproven: synthesis dissolved
+the small 80-bit relay hierarchy, or its logic merged into the neighbouring
+FIFO); the netlist lives only on the node-local NVMe and is deleted with the
+job. Wall cost: 2 h 03 m.
+
+Change (Tcl only, no source/config change):
+| file | SHA-256 | change |
+|---|---|---|
+| `iter68_islands_map.tcl` | `a01d1452…c06e3a` | on a miss: print every `<root>/*relay*` cell with its REF_NAME, search the whole kernel for the leaf name and use it if it exists exactly once (`GDN_ITER68_RELOCATED`); for `kind=relay` only, return empty and record the role (`GDN_ITER68_MISSING`) instead of erroring. Actors, FIFOs, report roots stay fatal. |
+| `apply_iter68_islands.tcl` | `093e1562…2fc0a6` | skip an empty resolve; `GDN_ITER68_DONE` now carries `missing_relays=N missing=<roles>` |
+| `check_iter68_islands.tcl` | `bdbb9cb9…75af6` | same skip; `GDN_ITER68_STRUCTURE` reports `missing_relays` |
+Consequence if relays are missing: those crossings get no soft SLR hint and
+no `USER_SLL_REG`; everything else in the recipe is unchanged. That is a
+weaker floorplan than designed, so a routed result from this run is
+labelled "Iter68G, fixed relays unconstrained (N missing)" and is not the
+final physical recipe — but it yields the placement, the congestion table
+and the missing-cell diagnostic in one run instead of a third abort.
+Dry-run with stub `get_cells` (flattened + 80-bit relays absent): the two
+80-bit roles skip with diagnostics, all other roles resolve. Not yet run
+against a live Vivado netlist.
+
+Relaunch, identical command, tag `iter68g_islands_h200_f150_d`:
+build **3344** `iter68g_islands_h200_f150_d_build`, on-card **3345**
+(afterok:3344), `diagnostics/iter68g_islands_h200_f150_d/`. First checkpoint
+of interest: the `GDN_ITER68_MISS*` / `GDN_ITER68_DONE` lines about 2 h in.
+
+### 2026-09-04 02:30Z — Iter68G build 3344 (`_d`): relay diagnostic read, `entry_proc3_U0` also gone, link aborted at a report-only root
+
+**Outcome: stopped at `opt_design` PRE hook, 2 h 59 m wall (acclnode03, 23:04:27Z → 02:03:46Z; v++ compile 1 h 02 m, kernel synthesis + `link_design` 1 h 56 m). On-card 3345 auto-cancelled. Not a design result — the kernel was never placed.**
+
+Evidence: `diagnostics/iter68g_islands_h200_f150_d/impl_1.runme.log` lines 2450–2611 (the hook's own `GDN_ITER68_*` output) and `build.live.log` line 856 (`ERROR: [VPL 101-2] iter68 map: role 'entry_proc' expected exactly one cell for 'level0_i/ulp/gdn_forward_1/inst/entry_proc3_U0', matched 0`). XO gate passed (`xo_gate.exit` 0), `GDN_ITER68_HIERARCHY service_flattened=1`.
+
+**What the instrumented resolver measured in the post-synthesis netlist** (this is the real data build 3342 could not give):
+
+| HLS instance (csynth lists all of these as direct children of `gdn_forward`) | in Vivado netlist? |
+|---|---|
+| `gdn_fixed_boundary_relay_512_106648u_12_U0` (rresp, svc side) | yes |
+| `gdn_fixed_boundary_relay_512_106648u_13_U0` (rresp, seq side) | yes |
+| `gdn_fixed_boundary_relay_512_2000u_16_U0` (logits, gemv side) | yes |
+| `gdn_fixed_boundary_relay_80_173u_10_U0` (req, seq side) | **absent** |
+| `gdn_fixed_boundary_relay_80_173u_11_U0` (req, svc side) | **absent** |
+| `gdn_fixed_boundary_relay_512_13825u_14_U0` (wdata, seq side) | **absent** |
+| `gdn_fixed_boundary_relay_512_13825u_15_U0` (wdata, svc side) | **absent** |
+| `gdn_fixed_boundary_relay_512_2000u_17_U0` (logits, port0 side) | **absent** |
+| `entry_proc3_U0` (report root only) | **absent** |
+| activation ×4, attention ×1, recurrent ×2, result ×4 boundary relays | all yes |
+
+Every absent cell also had `found_elsewhere=0` (no cell of that leaf name anywhere under the kernel root), so the hierarchy is not relocated — it is gone. The only loose leaves at the root that carry a relay name are `ap_sync_reg_gdn_fixed_boundary_relay_512_106648u_12_U0_ap_ready_reg` and `..._512_2000u_16_U0_ap_ready_reg` (FDRE), i.e. sync registers for two of the *surviving* relays. The five missing relays are exactly the ones whose output side is the port-0 service direction (req pair, wdata pair, logits→port0); the three survivors are the rresp pair and the gemv-side logits relay. That pattern is an observation, not an explanation.
+
+**Why it is gone is not in the artifacts.** The kernel OOC synthesis log (`ulp_gdn_forward_1_0_synth_1/runme.log`, in `build_diagnostics.tar.gz`) is the summarised form and names none of these instances; the post-synth checkpoint lived in the deleted node-local build directory. Hypothesis (unverified): Vivado dissolved hierarchies whose logic was fully absorbed by constant propagation / register merging (the same synth log does report `propagating constant 0 across sequential element ... gdn_fixed_boundary_relay_512_13825u_14_U0/ap_done_reg_reg`, so it did see the instance). Whether the relay *registers* were merged into the neighbouring process or removed is the question an instrumented netlist answers.
+
+**Consequence for the recipe.** The five missing relays lose their soft SLR hint and `USER_SLL_REG`; the route result of any build on this netlist must be labelled **"Iter68G, fixed relays unconstrained (5 of 8 missing)"** and is not the final physical recipe. The 78 actor / FIFO roots all resolved, so the floorplan itself is intact.
+
+**Fixes made (working tree, uncommitted):**
+
+| file | change | SHA-256 |
+|---|---|---|
+| `iter68_islands_map.tcl` | `gdn_iter68_resolve`: a miss of kind `report` is now recorded in `::gdn_iter68_missing` and skipped, like `relay` (`actor`/`fifo`/`regexp` stay fatal). A miss also lists up to 12 primitive cells whose name *contains* the instance name (`GDN_ITER68_MISS_TRACE`), so the next log says where the registers went if they were flattened into the parent | `d6d445449d9d470d1e9f519c8af310aaba240fb18e02cae46cf3eb7be0931058` |
+| `apply_iter68_islands.tcl` | report-root loop skips empty resolves instead of aborting | `a20412ef438623c5621bd3e75842d545eeb8c564ad7521440d1adfef51dcf45b` |
+| `check_iter68_islands.tcl` | unchanged (already skips empty resolves) | `bdbb9cb9c54c88b5ee4e7656f61f7bf12fc0bd43fbbb13b16453365b44b75af6` |
+| `slurm/hw_build.slurm` | new `KEEP_SYNTH_ARTIFACTS=1` knob: copies `gdn_forward.xo` and the kernel's post-synthesis `.dcp` (`ulp_gdn_forward_1_0_synth_1/*.dcp` → `kernel_synth.dcp`) into the diagnostics dir, so the netlist question can be answered on the real checkpoint without another 2 h link | `d0354ee99c1bc53cdcb94fdc575e23c3db3e7c2a194a11fbee1ce2b95e91f818` |
+
+Stub dry-run (`scratchpad/map_test3.tcl`, `get_cells` stubbed to reproduce the 3344 netlist): 93 roots resolved, 6 skipped (`req_relay_seq req_relay_svc wdata_relay_seq wdata_relay_svc logits_relay_port0 entry_proc`), no error. `info complete` passes on all three Tcl files; `bash -n` on the Slurm script.
+
+**Verdict for build 3344: stopped (tooling), inconclusive for the design.** Cost so far for Iter68G tooling shakedown: 3338 (gate), 3340 (1 h 55 m), 3342 (2 h 03 m), 3344 (2 h 59 m).
+
+**Next: relaunch as `iter68g_islands_h200_f150_e` with the same command plus `KEEP_SYNTH_ARTIFACTS=1`.** Job IDs recorded below when submitted.
+
+Submitted 02:36Z: build **3346** `iter68g_islands_h200_f150_e_build`, on-card **3347** (afterok:3346), `diagnostics/iter68g_islands_h200_f150_e/`. Command: `KEEP_SYNTH_ARTIFACTS=1 HW_CFG_TEMPLATE=hw_iter68b_islands_f150.cfg EXTRA_SNAPSHOT_FILES="hw_iter68b_islands_f150.cfg iter68_islands_map.tcl apply_iter68_islands.tcl check_iter68_islands.tcl check_iter68_xo.py" XO_GATE_SCRIPT=check_iter68_xo.py HLS_FREQ=200 LINK_FREQ=150 JOBS=48 BUILD_TIME=2-12:00:00 bash run_hw_sbatch.sh iter68g_islands_h200_f150_e`. Snapshot hashes in `source_hashes.txt`. Cosim 3337 (two-token gate) still running, 10 h 28 m, token 0/2.
+
+### 2026-09-04 11:45Z — Iter68G build 3346 (`_e`): routed clean, but the kernel clock was timed at 10 ns and auto-scaled to 101.7 MHz
+
+**Outcome: COMPLETED, exit 0, 9 h 16 m (acclnode03, 02:11:24Z → 11:27:47Z). XCLBIN produced; on-card 3347 started 11:27Z. Evidence: routed + timing-closed at the constraint Vivado actually used, which was 100 MHz, not 150.**
+
+`diagnostics/iter68g_islands_h200_f150_e/`: `impl_1.runme.log`, `gdn_final_qor/`, `placement_reports/`, `post_place.dcp`, and — new via `KEEP_SYNTH_ARTIFACTS=1` — `gdn_forward.xo` and `kernel_synth.dcp` (post-synthesis kernel checkpoint, for the missing-relay question).
+
+| stage | measured |
+|---|---|
+| XO gate | pass, `service_flattened=1` |
+| `opt_design` PRE hook | `GDN_ITER68_DONE topology=3/6/7 soft_assignments=28 slr0=5 slr1=13 slr2=10 relays=14 relay_regs=439 report_roots=65 missing_relays=6` — missing: `req_relay_seq, req_relay_svc, wdata_relay_seq, wdata_relay_svc, logits_relay_port0` (relays) and `entry_proc` (report). Same six as build 3344's netlist |
+| post-place structural gate | `GDN_ITER68_STRUCTURE roots=93 missing_relays=6 status=ok` |
+| placer | 2 h 10 m, peak 37.5 GB; estimated congestion level 6 (64×64) global/short, level 7 (128×128) timing — identical levels to Iter67c and Iter66e |
+| router initial estimate (% tiles) | SOUTH global 64×64 6.35, long 128×128 15.63; NORTH long 64×64 6.87 (Iter67c: 7.44 / 16.27 / 8.60) |
+| rip-up ladder | 712,649 → 147,569 → 27,834 → 5,436 → 1,226 → 374 → 147 → 87 → … → 6 → 1 → **0** |
+| route status | 0 nets with routing errors, `Router Completed Successfully` |
+| `dma_ip_axi_aclk_1` (fixed 250 MHz) | setup WNS **+0.003**, hold WHS **+0.009** |
+| `clk_kernel_00_unbuffered_net` | setup WNS **+0.176** over 1,878,644 endpoints, hold +0.010 — **at period 10.000 ns** |
+| routed CLB per SLR (SLR0/1/2) | **99.24 / 97.52 / 79.42 %** (Iter67c 99.29 / 87.51 / 81.97) |
+| SLL used | SLR0→1 12,758 (55.37 %), SLR1→0 5,928 (25.73 %), SLR1→2 6,974 (30.27 %), SLR2→1 5,555 (24.11 %); total 31,215 (Iter67c SLR1↔SLR0 84.76 %) |
+| auto-frequency scaling | `original frequency : 150.0 MHz` → `scaled frequency : 101.7 MHz` (`gdn_forward_link.log` line 383, `AUTO-FREQ-SCALING-04`) |
+
+**The 150 MHz link did not constrain the kernel at 150 MHz.** `vpl` was invoked with `--kernel_frequency 150` (link log line 92) and the scaler reports the original frequency as 150 MHz, yet every timing report in the implementation run — router estimate, post-route phys-opt, `report_final_qor` — has the kernel clock at `{0.000 5.000} 10.000 100.000`. 1/(10.000 − 0.176 ns) = 101.8 MHz is exactly the scaled value, so the scaler derived the achievable frequency from slack measured against a 100 MHz constraint. Place and route therefore optimised for 100 MHz and had no pressure toward 150. The kernel's clkwiz IP is generated at the platform default (`C_CLKOUT1_REQUESTED_OUT_FREQ 300`, MULT 12 / DIV 4) and reprogrammed by DRP at bitstream time.
+
+Not determinable from the copied artifacts: which constraint file sets the 10 ns period (the `.xdc` files are not collected, and the platform directory is not readable from `acclhead1`). The 2022.2-era 130 MHz links (iter24b: kernel WNS −1.432 at requested 130; Iter36: −0.948) *were* constrained at the requested frequency, so this is specific to the 2024.2 flow (Iter67c, requested 100, also shows period 10.000 — consistent but not diagnostic). Hypothesis: the 2024.2 `v++` link takes the timing constraint from `--clock.freqHz`/`--clock.defaultFreqHz` and uses the legacy `--kernel_frequency` only as the scaler's target. **Needs an instrumented check** (read `ulp_ulp_ucs_0.xdc` / the kernel clock `create_clock` from the impl checkpoint or the platform, in a Slurm job) before another "150 MHz" link is launched — a link that repeats this would cost 9 h and test nothing new about frequency.
+
+**What this build does establish (real, labelled):** the Iter68 architecture with the 3/6/7 island topology places and routes to zero overlaps at the same congestion levels as Iter67c, with SLR1↔SLR0 SLL traffic cut from 84.76 % to 55.37 % / 25.73 % while SLR1 CLB rose 87.51 → 97.52 %. Kernel WNS +0.176 at 10 ns (Iter67c +0.195) says nothing about 150 MHz feasibility.
+
+**Label for the image and any on-card number from job 3347: "Iter68G, DATA_CLK 101.7 MHz (auto-scaled from a 100 MHz-constrained route), fixed relays unconstrained (5 of 8 missing)".** Not comparable to a 150 MHz target; comparable to Iter67c only after normalising cycles by the verified DATA_CLK.
+
+Verdict for the physical result: **inconclusive for the 150 MHz objective; positive for routability of the Iter68 topology.** Not a commit candidate.
+
+### 2026-09-04 11:50Z — Iter68G on-card (job 3347): kernel never returned; job cancelled after 19 min
+
+**Image:** XCLBIN from build 3346 (`build.hw.gdn32.h200.f150.o48/gdn_forward.xclbin`, 11:27:46Z), `DATA_CLK` **101 MHz** in both `xclbinutil` and `xbutil examine -r platform` — confirms the 11:45Z finding that the "150 MHz" link was constrained at 10 ns and auto-scaled. Card `0000:41:00.1` on `acclnode01`.
+
+**What happened.** Weights, `.gdnstate` and the 63-step GPU reference loaded normally. The 8-token smoke printed `[progress] decode-from-state seed=21225 N=8` at 11:28:09Z and nothing after it: `host.exe` sat in `run.wait()` at 0.8 % CPU for 19 minutes. Iter67c's identical smoke finishes in under a second (avg 24.066 ms/step).
+
+**Card state, read inside the allocation (`srun --jobid=3347 --overlap`):**
+
+| probe | result |
+|---|---|
+| `xbutil examine -r dynamic-regions` | `gdn_forward_1` Usage **1**, Status **(IDLE)**, power 24.9 W |
+| `/sys/.../kds_custat_raw` | ctrl reg **0x4** = ap_idle only (ap_start 0, ap_done 0), usage 1 |
+| `kds_stat` | interrupt mode ert, `intr(disable)`, one CU |
+
+Evidence saved to `diagnostics/iter68g_islands_h200_f150_e/oncard_3347_hang_evidence.txt`. Job cancelled at 11:47Z to free the card (holding it 4 h would not have changed the outcome).
+
+**What this proves vs. suggests.** *Proves:* the first `gdn_forward` call of the Iter68G image does not complete to the host on card. *Suggests only:* 0x4 (idle, no done pending) is not the signature of a stuck dataflow (that shows ap_idle=0); it fits either "ap_start never took" or "done raised but the completion was lost". Root cause is **not tool-exposed** from this run; it needs an instrumented rerun (bounded `run.wait(timeout)` plus repeated control-register reads, and a `DATA_CLK`/reset check) — same kind of controlled run that pinned the earlier `link_design` crash. Note the two-token RTL cosim (job 3337) has also not finished token 0 after 20 h, so the pre-card gate for this source is still open.
+
+**Verdict: Iter68G on card — NEGATIVE (hang), not committed.** Zero TPOT or correctness data. Labels: routed and timing-closed at 10 ns only; on-card failed at first kernel call.
+
+### 2026-09-04 12:25Z — Iter68G hang: reproduced under control (jobs 3367/3368/3369); the fault is in the image
+
+**Offline first (no card):** `xclbinutil` dumps of the Iter67c (`fb4fc63f…`) and Iter68G (`99f15583…`) images: `IP_LAYOUT`, `CONNECTIVITY`, `MEM_TOPOLOGY`, all 34 args, `hwControlProtocol=ap_ctrl_chain`, `interrupt=true`, `deadlockDetection=local`, `swReset=false` — **identical**. Only the module hierarchy and the clock differ (Iter68G: "Requested 150 MHz, Achieved 101.7 MHz"). Dispatch metadata is not the difference.
+
+**Job 3367** (probe, no reset): every `load xclbin` — Iter67c control included — failed with XRT's own `CU was deadlocked? Hardware is not stable … err = -35`. Job 3347's hung command left the card unusable for *any* image until `xbutil reset`.
+
+**Job 3368** (reset, then control → Iter68G → control), same card `0000:41:00.1`, same host.exe, same weights/state, one variable = the xclbin:
+
+| phase | result |
+|---|---|
+| `xbutil reset --force` | OK, 6 s; CU table empty afterwards |
+| Iter67c, 3 tokens | **healthy**: `decode-from-state` → complete in 48 ms, avg 24.065 ms/step, CU usage 1→2 |
+| Iter68G, 3 tokens | **hang reproduced**: usage 0→1 at 12:09:09.065Z, no completion in 9 m 43 s, killed by `timeout` |
+| Iter67c again | `err = -35` — the card is wedged again after the Iter68G call |
+| **Job 3369** | second `xbutil reset` — card clean, `Number of CUs: 0`, UUID zero |
+
+**A correction to the 11:50Z entry.** During the healthy Iter67c run the `kds_custat_raw` status field stayed `0x4` throughout 24 ms kernel executions while sampled continuously (≈1 ms period, 6 changes logged, none showing busy). Under ERT scheduling the driver's status field is therefore **not the live `ap_ctrl` register**; the `0x4` seen on the hung Iter68G CU carries no information about ap_idle, and the earlier "not a classic deadlock" reading is withdrawn. The register-level distinction (never started / busy / done-lost) is **not obtainable through sysfs in ERT mode**.
+
+**What is proven:** the Iter68G image's first `gdn_forward` call never completes, on a card/XRT/host that runs Iter67c correctly seconds before and would again after a reset (2 of 2 runs, plus job 3347 = 3 of 3). The fault is in the image. **What remains a hypothesis:** the mechanism — internal dataflow deadlock, a memory transaction that never returns, or a control-handshake defect. Candidate instruments: a direct register read with ERT bypassed (`xrt.ini` `[Runtime] ert=false`, so the host driver polls the CU itself), or a re-link with HLS hardware deadlock detection if 2024.2 exposes it; the RTL cosim (3337) advances ~0.3 cycles/s (113 µs simulated in 20 h) and cannot reach the first token inside a 3-day job.
+
+Artifacts: `diagnostics/iter68g_islands_h200_f150_e/probe_hang{,2}.slurm`, `probe_hang-3367.log`, `probe_hang2-3368.log`, `probe_hang2_*.custat.trace`, `probe_hang2_*.host.log`, `reset_card-3369.log`, `xclbin_diff/` (scratch). **Verdict unchanged: Iter68G negative, not committed. The card was left reset and clean.**
+
+### 2026-09-04 13:40 UTC — Every Vitis 2024.2 link so far was implemented at 10.000 ns regardless of `--kernel_frequency`; Iter68G's "150 MHz" was a 100 MHz implementation. Iter69 = Iter67c source relinked with the kernel clock forced to 150 MHz (build 3371, on-card 3372).
+
+**What the checkpoints prove (read from the DCP constraint files, not inferred).**
+vpl carries the kernel clock into implementation as a generated clock on the
+ucs MMCM output, written by `ocl_util.tcl write_user_impl_clock_constraint`
+into `_user_impl_clk.xdc` (`# Kernel clock overridden by user`):
+
+| build | Vitis | `--kernel_frequency` | `_user_impl_clk.xdc` ratio (from 100 MHz `io_clk_freerun_00_clk_p`) | implemented kernel period |
+|---|---|---:|---|---:|
+| `build.hw.gdn32.h150.f100.o16` (Aug 19) | 2022.2 | 100 | `-divide_by 12 -multiply_by 12` | 10.000 ns |
+| Iter67c job 2993 (`iter67c_argmax_ii_hw/post_place.dcp`, `level0_wrapper_late.xdc:65475`) | 2024.2 | 100 | **`-divide_by 1 -multiply_by 1`** | 10.000 ns |
+| Iter68G job 3346 (`iter68g_islands_h200_f150_e/post_place.dcp`, `late.xdc:65475`) | 2024.2 | **150** | **`-divide_by 1 -multiply_by 1`** | **10.000 ns** (routed `timing_summary.rpt`: `{0.000 5.000} 10.000 100.000`) |
+
+The Tcl that computes the ratio is byte-identical between
+`/tools/Xilinx/Vitis/2022.2/scripts/ocl/ocl_util.tcl` and the 2024.2 copy
+(`initialize_clkwiz_debug` → `Init_Clkwiz`, `set_clkwiz_prop` →
+`GetClosestSolution`, `get_clkwiz_prop ChosenM/ChosenD/ChosenDiv0`); the
+values come from `librdi_iptasks`, so the difference is inside Vivado
+2024.2's clkwiz debug API, which handed back 1/1/1 for both requests. The
+synthesis-side constraint (`create_clock -name USER_ulp_ucs/aclk_kernel_00
+-period 6.667` via `write_user_synth_clock_constraint`) is computed
+arithmetically and was correct — only implementation saw 10 ns. Consequences:
+
+- Iter68G's `AUTO-FREQ-SCALING-04 ... original frequency 150 MHz ... changed
+  to 101.7 MHz` (`gdn_forward_link.log:383`) is the post-route WNS at 10 ns
+  (+0.17 ns → 101.7 MHz), not a 150 MHz attempt that missed by 3 ns. Iter68G
+  was never implemented at 150 MHz, so **it says nothing about whether the
+  refactor can close at 150 MHz**, and the hang is the only thing it measured.
+- Iter66e/Iter67c were requested at 100 MHz, and 1:1 happens to be 100 MHz,
+  so every 2024.2 result recorded for them is at the intended clock.
+- `optimization_log.md`'s 2022.2 entries (iter20/iter24b at 130 MHz, WNS
+  −0.955/−1.432) were real 130 MHz constraints; 2022.2 is not affected.
+
+**Fix, and why it is a hook rather than a flag.** `--clock.freqHz` goes
+through the same `write_user_impl_clock_constraint` (`is_user_set` true), so
+it would hit the same API. `apply_iter69_kernel_clock_f150.tcl`
+(`9492632638a4b0cfd98903f2f8a8de04bdba3afab6df2b46a768115abf3d5006`) runs as
+OPT_DESIGN.TCL.PRE with the full design open, re-creates
+`clk_kernel_00_unbuffered_net` on `mmcme4_adv_inst/CLKOUT0` with
+`-multiply_by 3 -divide_by 2` (6.667 ns), **fails closed** unless
+`get_property PERIOD` reads 6.667 ± 0.002, writes
+`placement_reports/iter69_clocks_after_override.rpt`, then sources the
+unchanged `apply_f150_physical_islands.tcl`. `hw_iter69_kernel_clock_f150.cfg`
+(`8c2448bad1259588ff213a2d3bcab808572e72b2076d7da220ff99cf6163a826`) is
+`hw_iter66e_frp_unpair_f100.cfg` with only that hook path changed. The ratio
+is a timing ratio only; XRT programs the MMCM by DRP from
+`CLOCK_FREQ_TOPOLOGY` at load.
+
+**Iter69 launched — hypothesis: the Iter67c netlist's true Fmax under a
+150 MHz constraint is the baseline that decides whether the Iter68 refactor
+was ever needed for frequency.** Source is the committed HEAD `caf512543`
+(Iter67c: `gdn_model.cpp` `2bc240e6a5cf…`, `gdn_model.h` `906b11e5ca36…`,
+`Makefile` `4c34696420f0…`, `hls_gdn_forward.tcl` `a76930f3332b…`), built
+from a detached worktree at `.claude/worktrees/iter69-f150` so the Iter68G
+working tree is untouched; `artifacts/` and the `.gdnstate` are symlinks to
+the main tree. Command (in that worktree):
+`HW_CFG_TEMPLATE=hw_iter69_kernel_clock_f150.cfg EXTRA_SNAPSHOT_FILES="hw_iter69_kernel_clock_f150.cfg apply_iter69_kernel_clock_f150.tcl" HLS_FREQ=150 LINK_FREQ=150 BUILD_TIME=2-00:00:00 bash run_hw_sbatch.sh iter69_iter67c_true_f150`
+→ build **3371**, on-card **3372** (afterok). Diagnostics:
+`diagnostics/iter69_iter67c_true_f150` (symlink into the worktree). Expected
+outcomes and what each means: closes at 6.667 ns → frequency was a free
+lever on Iter67c and Iter68 is shelved; AUTO-FREQ-SCALING lowers it → the
+reported value is the *measured* Fmax of the production architecture under a
+real 150 MHz constraint (the day-1 census projected −3.18 ns on the relaxed
+100 MHz route, which is a floor for the old route, not a prediction).
+
+Companion probe **3370** (`diagnostics/iter69_clock_probe/`): (1) calls the
+same clkwiz API vpl uses in Vivado 2024.2 and 2022.2 for 150/100/130/200 MHz
+requests and prints `ChosenM/D/Div0`; (2) opens the Iter67c `post_place.dcp`
+in 2024.2, applies the override, and prints the clock period — a 20-minute
+check that the hook's `create_generated_clock` redefinition takes before the
+build's ~2 h synthesis reaches OPT_DESIGN.
+
+**Probe 3370, part 1 result (API, both versions, `probe-3370.log`).** The
+clkwiz debug API vpl calls with the 2022-era signature
+(`Init_Clkwiz [current_project] test1 <part>`) fails in 2024.2 with
+`ERROR: [Ip 78-110] Invalid part string Project`; every subsequent
+`GetClosestSolution` returns `Could not get data from speedsfile.` and
+`ChosenM/ChosenD/ChosenDiv0` read **1.000 / 1 / 1.000** for 150, 100, 130 and
+200 MHz alike. Under 2022.2 the identical calls succeed: 150 MHz → M=12 D=1
+Div0=8 (100·12/8 = 150), 100 MHz → 12/1/12, 130 MHz → 117/10/9, 200 MHz →
+12/1/6. This is the mechanism behind `-divide_by 1 -multiply_by 1` in every
+2024.2 `_user_impl_clk.xdc`: `ocl_util.tcl` is byte-identical between the two
+releases, but the `librdi_iptasks` API it drives changed its argument
+contract, the error is swallowed, and the defaults fall through. Evidence
+boundary: the vpl `runme.log`/`vivado.log` of build 3101 do not show the
+error (it is caught), so "vpl hits exactly this error" is inferred from the
+identical call signature; the 1/1 result in the XDC is observed. Part 2 (DCP
+override) was still running at the time of writing.
+
+### 2026-09-04 14:00Z — Iter68G hang, Track B: instrumented host probe (job 3373) and source analysis
+
+`host.cpp` gained an **env-gated diagnostic path** (off unless
+`GDN_HOST_PROBE_TIMEOUT_MS` is set; production behaviour unchanged, `host.cpp`
+now `3a4534f8d07f…`): the CU is opened `cu_access_mode::exclusive`,
+`run.wait()` is bounded, and on a non-COMPLETED state the live AXI-Lite
+control block (`0x00` ap_ctrl, `0x04` GIER, `0x08` IER, `0x0c` ISR) is
+sampled six times over 3 s via `xrt::kernel::read_register`, then the whole
+52 MB workspace and the four BF16 state stripes are DMA'd back to
+`<GDN_HOST_PROBE_DUMP>.post.bin` (a `.pre.bin` is taken before `run.start()`;
+`GDN_HOST_PROBE_DUMP_ALWAYS=1` also dumps after a healthy completion).
+Job **3373** (`diagnostics/iter68g_hang_probe/probe_hang3.slurm`,
+`host_probe.exe` `17d2d5bbd68f…`, `light`, 1 h) runs, with `xbutil reset
+--force` between them: **A** Iter68G image (`99f15583…`) with the probe;
+**B** the same with `xrt.ini ert=false` (KDS polling instead of the embedded
+scheduler — an A/B on the completion path, a no-op if the driver ignores it);
+**C** Iter67c (`build.hw.gdn32.h150.f100.o48`) with dump-always as the healthy
+control. `analyze_dump.py` diffs pre/post per workspace region and per state
+layer × stripe to localise how far the token got. In parallel a read-only
+source analysis of the Iter68G `gdn_model.cpp` (persistent service / token
+sequencer / fixed relays) is being run for first-call stall candidates that
+C simulation cannot expose. Results below when they arrive.
+
+**Job 3374 result (job 3373 was a null run: `--decode-len 1` counts the
+seed, so zero kernel calls were made; rerun with `--decode-len 3`).**
+Measured on the card, `diagnostics/iter68g_hang_probe/probe_hang3-3374.log`
+and `A_iter68g.{pre,post}.bin`:
+
+| observation | Iter68G (A, and B identically) | Iter67c control (C) |
+|---|---|---|
+| `run.wait(60 s)` | `ERT_CMD_STATE_TIMEOUT` (8) | completes, 228 ms first call incl. load |
+| live ap_ctrl `0x00` after timeout, 6 samples over 3 s | **`0x0`** — ap_start 0, ap_done 0, **ap_idle 0**, ap_ready 0 | not sampled (completed) |
+| GIER/IER/ISR | 0/0/0 | — |
+| DMA read-back of 52 MB workspace + 4 stripes during the hang | works, ~80 ms | works |
+| conv tails (`head_buf`) | **all 24 layers written** (9,216 lanes each) | all 24 |
+| logits region | **written, 32,000 values** | written |
+| token slot (`x_norm[0]`) | **28723 = the golden first token** | 28723 |
+| recurrent state stripes, per layer | **0 lanes changed in all 24 layers × 4 ports** | ~130k of 131k changed per layer per port |
+
+Reading: the CU is *busy* (ap_idle=0), not idle-with-lost-completion, so
+the ERT/KDS completion path is exonerated (B's `xrt.ini ert=false` was
+also a no-op — `kds_stat` still reports `Interrupt mode: ert`). The token's
+entire compute path ran to the end and produced the correct argmax: all 24
+layers' convolutions, the LM head, and the on-chip argmax all landed in HBM.
+**What never happened is the recurrent-state write-back — not one BF16 lane
+of any layer reached the stripes on ports 28–31** — and the top never raised
+ap_done. The stall is therefore in the state-publish path (the
+`gdn_store_publish_recurrent` lineage Iter68F reordered), or in whatever the
+top waits on after it: the publisher either never starts (waiting on a
+stream/relay that no process feeds on the first call — recall Vivado
+dissolved 5 of the 8 fixed boundary relays and `entry_proc3_U0` in this
+image), or its first AXI write burst never completes (an incomplete
+WDATA burst keeps the m_axi write channel and the top busy forever). HBM
+itself is not wedged: the host DMA'd 77 MB out of it during the hang.
+Evidence boundary: which of those two it is needs either the cosim (3337)
+to reach the publish stage, or a source-level reading of the publish
+protocol; the on-card data cannot distinguish "never started" from "first
+burst incomplete" because both leave zero committed lanes.
+
+**Probe part 2 result (job 3375; 3370's DCP half died silently under its
+48 GB cap — the design needs ~51 GB in Vivado — and was rerun at 110 GB).**
+On the Iter67c `post_place.dcp` in Vivado 2024.2: `clk_kernel_00_unbuffered_net`
+**before: period 10.000 ns**, generated from the MMCM `CLKIN1`;
+after the hook's `create_generated_clock ... -multiply_by 3 -divide_by 2`:
+**period 6.667 ns, exactly one clock of that name**. The override the build
+3371 hook applies is therefore proven to take on the real netlist. (The
+probe's trailing `report_timing_summary` failed on a Tcl option conflict,
+`-no_detailed_paths` with `-max_paths`; no timing number was wanted from it.)
+
+**Cosim 3337 interim (one-layer Iter68 variant, deadlock detector OFF, 5.0 ns):** at ~22 h wall the log shows `RTL Simulation : 1 / 2 @ 797028000`, i.e. the **first transaction completed** (ap_done fired) at 797.03 µs simulated = 159,406 clocks. This is a one-layer, xsim-AXI-model run of the Iter68 source lineage; the on-card Iter68G image (24 layers, real HBM) never returned from call 1 with zero state lanes written. The two facts are not yet reconciled — candidates are a 24-layer-only dependency, an AXI write-response behaviour the xsim slave model accepts and HBM does not, or a configuration difference between the one-layer cosim top and the XO. Awaiting the second transaction and the testbench's state comparison (watcher armed on `cosim_nodl_3d.exit` / job 3337 leaving the queue).
+
+### 2026-09-04 15:30Z — Iter68G hang, Track B part 3: wider on-card probe (job 3376) and a static walk of the linked RTL's state-write path
+
+**Hypotheses tested.** After 3374, two "zero lanes" explanations were
+left open: (H1) the writes *did* go out but to the wrong address (wrong
+base register, wrong pointer, beat-vs-byte scaling, stray write elsewhere
+in the bank); (H2) the write channel is structurally broken in the RTL
+(tied-off handshake, AWLEN/AWVALID never asserted, adapter length
+shortcut, pointer FIFO imbalance). Both are testable without a waveform.
+
+**Job 3376** (`diagnostics/iter68g_hang_probe/probe_hang4.slurm`, `light`,
+2 m 51 s, exit 0; `host_probe.exe` `176a9aa256bf…` from `host.cpp`
+`c008965c89c3…` — the probe grew three env-gated pieces, production path
+unchanged: `GDN_HOST_PROBE_STRAY_MB=128` allocates a 128 MiB 0xA5-filled
+"catcher" BO on each of HBM[28..31] right after the shard BO;
+`GDN_HOST_PROBE_FULL=1` DMAs the *whole* 94 MB shard+stripe BO of ports
+28–31 and every catcher pre and post; and the probe reads the CU argument
+registers with `xrt::kernel::offset()` + `read_register` and compares them
+to `bo.address()`). Runs **A** Iter68G `99f15583…` and **C** Iter67c control:
+
+| observation during the hang (A) | result | control (C) |
+|---|---|---|
+| arg regs `aux`/`workspace`/`mm28..31` vs `bo.address()` | **all MATCH** (0x5368000 / 0x5911000 / 0x380000000 / 0x3a0000000 / 0x3c0000000 / 0x3e0000000); pre-launch they read 0, as expected before `run.start()` | same values |
+| bytes changed in the full 94 MB shard+stripe BO, ports 28–31 | **0, 0, 0, 0** | exactly 98,304 beats = 24 × 4,096 per port, at `[0x5368000, 0x5968000)` |
+| bytes changed in the 128 MiB catcher after each shard BO | **0, 0, 0, 0** | 0 (nothing should land there) |
+| workspace regions changed | `head_buf` 221,183, `logits` 32,000, `x_norm[0]` = 28723 (golden first token), everything else 0 | identical set |
+| `xbutil examine -r all` after | firewall level 0 **GOOD**, 0 trips; `kds_custat_raw` usage 1 (CU busy) | clean |
+| D2H timing during the hang | 94 MB in ~0.24 s, same as pre-launch — the read-back is live HBM data, not a stale host shadow | same |
+
+So **H1 is dead** for every address the probe could see: the base
+registers are right, and nothing — not one byte — landed anywhere in
+banks 28–31 (shard, stripe, or 128 MiB beyond it) or in the workspace
+outside the expected regions. Not covered: the `aux` BO on HBM[0]
+(`[0x5368000, 0x5911000)`) and shards 0–27 — a write with a *zero*
+pointer would land exactly at `0x5368000 + L·0x40000` in bank 0, but the
+pointer is proven non-zero below, so that hole is not load-bearing.
+
+**H2, walked in the linked RTL.** Provenance first, because this one
+bit: the `gdn_forward.xo` sitting in `build.hw.gdn32.h200.f150.o48/` is
+**not** the XO that was linked. It hashes `bacef990…` (job 3338's XO, mtime
+09-02 00:31), while `xo_manifest.sha256`/`build_manifest.sha256` of the
+linked build record `076d5d03…`, which is the copy in
+`diagnostics/iter68g_islands_h200_f150_e/gdn_forward.xo` (job 3346). The
+two differ in 528 lines of the island RTL alone (`state0_*` vs `state0_i_*`
+ports). All statements below are against `076d5d03…`, verified by hashing
+`gdn_forward.v`, `..._island_0_s.v` and `..._persistent_recurrent_service.v`
+out of that archive. (Stale-artifact trap #3 for the CLAUDE.md list: the
+build dir keeps the *previous* job's XO when the link is staged on
+node-local NVMe.)
+
+What the RTL says about the state write (all in the linked XO):
+
+- Ownership of the mm28 adapter: read side (`I_CH0_AR*`) is
+  `gdn_gemv_island2_service_U0` → nested `gdn_persistent_mm2s_with_state_28_U0`
+  (streams the state *into* the island through the `state0_i` FIFO); write
+  side (`I_CH0_AW/W/B`) is `gdn_persistent_recurrent_service_U0` → fu_226
+  `gdn_recurrent_attention_islands` → fu_380 `_islands_dataflow` →
+  `island_0_U0` (mm28+mm30) / `island_1_U0` (mm29+mm31). The islands' own
+  AR/R and the mm2s' own AW/W/B are tied off (`1'b0`) — correct, each half
+  is used from exactly one process.
+- The island issues `AWVALID=1, AWLEN=64'd4096` at state 2 with
+  `AWADDR = (recurrent_state_low_dout + zext((layer<<18) + 87457792)) >> 6`
+  — beat index; the adapter has `USER_ADDR_ALIGN=6`. 87,457,792 =
+  `shard_bytes`, `layer<<18` = 4,096 beats × 64 B: the same
+  `[0x5368000, 0x5968000)` window the control image writes. W beats come
+  from the `recur_island_update` pipeline with `WSTRB` all-ones and
+  `WDATA = {state_low_half_3, state_low_half_2}` (the freshly updated state).
+- `recurrent_state_low_dout` is the pointer FIFO `weight_data_mm28_c`
+  (`fifo_w64_d8`): written once per token by `mm2s_with_state_28` with
+  `din = weights` = the `weight_data_mm28` s_axi register (0x380000000);
+  read once per token by the service at state 1. Balanced, non-zero.
+- Completion: the island's `ap_done` is raised only in state 195, which is
+  blocked while `(mm30 BVALID==0) | (mm28 BVALID==0)` — the HLS-side B,
+  which the adapter's write module asserts (`out_HLS_BVALID = resp_valid &&
+  last_resp`) only after the real AXI `BVALID` of the last of the 64
+  sub-bursts (`ursp_write = wrsp_valid && (!wrsp_type || in_AXI_BVALID)`;
+  the no-AXI shortcut needs `wreq_len == 0` or bit 31 set, impossible for
+  4,096). **`BRESP` is never examined** — a DECERR/SLVERR acks the same
+  as OKAY. The dataflow region's `ap_done = island0_done & island1_done &
+  merge_done`; the service sits in state 4 until that `ap_done`, and only
+  then (state 5→6) starts the `persistent_recurrent_attention` pipeline
+  that emits the 64 attention beats. The `attention_commands` write is
+  hoisted to state 2, before the call — the same HLS reordering Iter68F
+  documented — harmless here since the consumer blocks on the beats.
+- `component.xml` READ_WRITE_MODE: mm0 and mm28–31 `READ_WRITE`, mm1–27
+  `READ_ONLY`; `CONSERVATIVE=1`, `MAX_WRITE_BURST_LENGTH 64`,
+  `NUM_WRITE_OUTSTANDING 8`. The xclbin's CONNECTIVITY and MEM_TOPOLOGY
+  sections are identical to Iter67c's (34 connections, arg30→HBM[28] base
+  0x380000000 size 0x80000 KB, etc.).
+- The candidate "97th command never published" stall is excluded by
+  source: `gdn_store_publish_recurrent` writes `recurrent_commands`
+  unconditionally for all 97 commands, and both the store and the
+  recurrent service loop over `GDN_GEMV_COMMANDS`.
+
+**The contradiction this leaves, stated exactly.** The linked RTL requires
+96 acknowledged 4,096-beat writes per token (24 layers × 4 ports) before
+any layer's attention beats can be emitted; the card produced the correct
+argmax, so all 24 layers' attention beats *were* emitted; yet no byte in
+banks 28–31 changed, the firewall is clean, and the CU is still busy.
+Static analysis cannot close this. The two classes still standing are (a)
+the AXI writes completed with an error response the adapter discards, so
+the data never committed — but the address, size and connectivity are the
+control image's, so what would produce the error is unknown; or (b) a
+dynamic RTL behaviour not visible statically (e.g. the adapter's write
+path in `CONSERVATIVE` mode with a 4,096-beat user request and 8
+outstanding bursts). Evidence boundary: neither is derivable from the
+artifacts on disk. The next datum is **cosim 3337**'s testbench, which
+counts "state lanes changed by this token" and FAILs on an untouched
+state: if the xsim AXI slave receives the writes, the fault is at the
+platform/HBM level (class a); if the state is untouched in simulation
+too, it is in the RTL and a waveform of the mm28 write channel will show
+it. Iter68G remains **inconclusive / not committed**; nothing from it is
+retained.
+
+### 2026-09-04 17:00Z — Iter68G hang, Track B part 4: cosim 3337 stopped, static analysis exhausted, the clock lead
+
+**What closed since part 3.**
+
+- **Cosim 3337 cancelled by hand** after the user asked why a stuck job was
+  still running. Its xsim had completed token 1 (`ap_done` at 797 µs sim
+  time) and was inside token 2 with the deadlock detector off; the
+  testbench's "state lanes changed" lines were **C-phase only** — they do
+  not verify the RTL's state write-back, which I had wrongly assumed in
+  part 3. The transaction count reached 1 of 2. Evidence it does give:
+  the RTL logic itself completes a full token in xsim, so an RTL-internal
+  handshake deadlock or a FIFO count mismatch is excluded; the hardware
+  hang is a platform/dynamic effect.
+- **The hung run published the correct token.** Workspace `x_norm` line 0
+  of the 68G hang dump holds token id **28723**, and its 24-layer logits
+  against the GPU step-1 reference: argmax 28723, NRMSE 0.00286, cosine
+  0.999996 (native CUDA vector gate, `analyze_dump.py`). All 24 layers
+  computed; only the four state stripes (0 lanes changed on every port,
+  every layer) and `ap_done` are missing.
+- **Island code is byte-identical to Iter67c.** `gdn_recurrent_attention_island`
+  extracted from `git show caf512543:c_impl/gdn_model.cpp` and from the
+  Iter68G snapshot: identical. In both designs the island receives state
+  via `state_low_stream/state_high_stream` from an `mm2s_with_state`
+  reader process and writes back through the pointer — the read/write
+  ownership split of mm28–31 across two dataflow processes is not new in
+  68G. `#pragma HLS interface` for mm28 identical (`num_read_outstanding=4
+  num_write_outstanding=8`, bursts 64).
+- **Pointer chain in the linked 68G RTL verified 64-bit end to end**, with
+  the +87,457,792-byte shard offset added exactly once (island for writes,
+  `gemv32_mm2s_with_state_28` for reads): `weight_data_mm28` →
+  `island2_service.w28` → `mm2s_with_state_28.weights` →
+  `weight_data_mm28_c` FIFO (w64 d8, written once at state 1) →
+  `recurrent_service.recurrent_state0_dout` (read once at state 1 into
+  `recurrent_state0_1_reg_675`) → `fu_226` → `fu_380
+  entry_proc_U0_recurrent_state0_c` → island `recurrent_state_low_dout`.
+  Live AXI-Lite arg registers match the BO addresses (job 3376).
+- **Adapter** (`gdn_forward_mem_weights_mm28_m_axi.v`): user-level B needs a
+  real bus BVALID for the last sub-burst unless the request length is 0 or
+  bit 31 set (`valid_length`), which a 4,096-beat write is not; BRESP is
+  never examined. AW/W/BREADY of the mm28 adapter come from
+  `gdn_persistent_recurrent_service_U0`, AR/RREADY from
+  `gdn_gemv_island2_service_U0`; `mm2s_with_state_28` has AWREADY tied 0.
+  Nothing wrong found.
+- **Control protocol identical**: both xclbins `ap_ctrl_chain`,
+  `interrupt="true"`, `deadlockDetection="local"`, `swReset="false"`;
+  IP_LAYOUT / CONNECTIVITY / arg tables identical.
+
+**The one measured difference left: the kernel clock.** 67c xclbin
+`CLOCK_FREQ_TOPOLOGY` DATA_CLK = **100 MHz**; 68G = **101 MHz** (v++
+AUTO-FREQ-SCALING-04: 150 → 101.7, from post-route WNS +0.176 at a
+10.000 ns constraint — the 2024.2 clkwiz bug logged 13:40Z). At the
+deployed 9.833 ns period the real setup margin is **~+0.009 ns**; 67c
+runs with +0.195 ns at 100.0. That is the only axis on which the two
+images differ that static analysis can see, and it is exactly the kind
+of fault that xsim cannot show and that leaves the logic mostly
+correct while one path fails. Evidence boundary: this is a hypothesis
+until the same bitstream is run slower.
+
+**Experiment 5 launched — same bitstream, slower clock (job 3377,
+`light`, ≤1 h).** `xclbinutil --replace-section CLOCK_FREQ_TOPOLOGY`
+produced two copies of the 68G xclbin with DATA_CLK **90** and **70**
+MHz (`diagnostics/iter68g_hang_probe/iter68g_dataclk{90,70}.xclbin`,
+SHA-256 `19a8e361…` / `c28ff007…`, from `99f15583…`), bitstream bytes
+untouched; XRT programs the kernel clock wizard from this section at
+load, and the job records `xbutil examine -r platform` clocks while the
+image is loaded. Runs: A90, then A70 only if A90 still hangs, then the
+unmodified 101 MHz image as the in-session control. Decode-len 3 with
+the bounded-wait probe. Readout: slow clock passes + control hangs ⇒
+cause is the zero-margin auto-scaled clock (a flow bug, not an
+architecture fault); all hang ⇒ timing excluded, next is the
+AIM-instrumented relink of the exact 68G XO (explicit
+`--profile.data gdn_forward:gdn_forward_1:M_AXI_MEM_WEIGHTS_MM28:counters`
+etc.) read live with legacy `/opt/xilinx/xrt/bin/unwrapped/xbutil status`
+during the hang. Iter68G remains **inconclusive / not committed**.
+
+### 2026-09-04 17:15Z — Iter68G hang, Track B part 5: the clock is excluded (job 3377); AIM relink launched (3378 crashed on harrier's /tmp, 3379 resubmitted)
+
+**Experiment 5 result — negative, timing excluded.** Same 68G bitstream,
+only `CLOCK_FREQ_TOPOLOGY` edited; `xbutil examine -r platform` confirmed
+the programmed clock each time (job 3377, `acclnode01`, card
+`0000:41:00.1`, card reset between runs):
+
+| DATA_CLK | outcome | state stripes after 60 s |
+|---|---|---|
+| 101 MHz (unmodified control) | hang, ap_ctrl 0x0 | 0 lanes changed, all 24 layers × 4 ports |
+| 90 MHz | hang, ap_ctrl 0x0 | 0 lanes changed |
+| 70 MHz | hang, ap_ctrl 0x0 | 0 lanes changed |
+
+Four nanoseconds of added setup margin change nothing, so the ~0.009 ns
+margin of the auto-scaled clock is not the cause. The fault is logical or
+platform-level. Arg registers matched the BO addresses in all three runs.
+
+**Experiment 6 — the exact 68G XO relinked with AXI monitors.**
+`diagnostics/iter68g_aim_relink/build_aim.slurm` stages build 3346's
+`source_snapshot.tar` (`664b705a…`) and its XO (`076d5d03…`), appends
+`VPP_LDFLAGS += --profile.data gdn_forward:gdn_forward_1:M_AXI_MEM_WEIGHTS_MM{28,29,30,31,0}:counters`
+to the staged Makefile, and runs `make xclbin` with the same
+`HW_CFG_TEMPLATE=hw_iter68b_islands_f150.cfg`, HLS 200 / link 150, 48
+jobs. One variable versus 3346: the five monitors. Readout plan: legacy
+`/opt/xilinx/xrt/bin/unwrapped/xbutil status` on the hung card — write
+byte/transaction counts and outstanding count per port tell "no bus
+write issued" from "written, acknowledged, never landed".
+- **Job 3378 (`harrier`) failed after 22 min**, not from the change:
+  kernel synthesis died on `ERROR: [Synth 8-728] Failed to close
+  './.Xil/Vivado-…/incrSyn/…/design.rtd': Invalid argument` (node-local
+  `/tmp` file error, 245/246 block-level jobs done). system_link had
+  accepted the `--profile.data` names (trace offload memory HBM[0]
+  configured). Stage was cleaned by the script before evidence could be
+  kept — fixed for the retry (crash logs, `vivado.log`, per-run
+  `runme.log`, and the inserted debug IP list from `dr.bd.tcl` are copied
+  back on failure).
+- **Job 3379 resubmitted** with `harrier` excluded.
+
+**Answer recorded for the user's question "put the recurrent state fully
+on chip so there is no write-back."** 24 MiB BF16 = 683 URAM raw of 960;
+islands pblock-pinned to SLR2 with 272 URAM free (9 layers); the
+partitioned low/high pattern budgets 96 URAM/layer (≈1,152 total, over
+the device); Iter59's ~600-URAM version worsened congestion in all
+directions. Feasible form is 9 resident layers in SLR2 (~5.8% of cycles)
+with 15 layers still written back, so it does not remove the write path.
+It is also not a proof against this hang: the write path is byte-identical
+to 67c's, which works; which of the four terminal processes never finishes
+is still unknown, so the missing state writes are a symptom, not a
+demonstrated stuck point.
+
+### 2026-09-05 03:00Z — Iter69 result: Iter67c at a true 6.667 ns constraint routes but FAILS timing by 1.594 ns; auto-scaled to 121 MHz it runs on card at 20.103 ms kernel / 20.188 ms TPOT (−16.6%) with identical gates — POSITIVE ON CARD, NOT TIMING-CLOSED AT THE CONSTRAINT, NOT PROMOTED
+
+**Hypothesis (from the 13:40Z entry):** the Iter67c netlist's true Fmax under
+a real 150 MHz constraint is well above the 100 MHz it has always been
+implemented at, and a relink with the kernel clock forced to 6.667 ns will
+either close or reveal where the wire wall is.
+
+**What was built.** Iter67c source unchanged — `gdn_model.cpp`
+`2bc240e6a5cf24b2…` = commit `caf512543`, `gdn_model.h` `906b11e5ca368b08…`,
+`host.cpp` `8bc562e6cc9ee01d…`. Physical recipe unchanged
+(`apply_f150_physical_islands.tcl` `cfbba5d5…`, `apply_iter66e_unpair.tcl`
+`1dab980e…`, DMA chain unchanged). Two new files only:
+`hw_iter69_kernel_clock_f150.cfg` `8c2448bad1259588…` and
+`apply_iter69_kernel_clock_f150.tcl` `9492632638a4b0cf…` (overrides the
+`_user_impl_clk.xdc` 10.000 ns period to 6.667 ns at OPT_DESIGN.PRE). Command
+recorded in the launch entry (`HLS_FREQ=150 LINK_FREQ=150`, build 3371 on
+`build`, on-card 3372 on `light`), worktree `.claude/worktrees/iter69-f150`,
+build dir `build.hw.gdn32.h150.f150.o48`. XCLBIN `91bd72bc…`, DATA_CLK 121 MHz
+(verified in the xclbin). Evidence: `diagnostics/iter69_iter67c_true_f150/`
+(`gdn_forward_link.log`, `impl_1.runme.log`, `gdn_final_qor/*`,
+`oncard.slurm-3372.log`, `post_place.dcp`).
+
+**Build.** 14 h 45 m 56 s total. place 2:06:07, post-place phys_opt 0:46:28,
+route 3:54:56, post-route phys_opt 3:53:37 (Vivado peak 43.7 GB). Routed
+clean: 0 routing errors, 0 overlaps.
+
+**Timing at the 6.667 ns constraint — FAILED.** Per clock:
+
+| clock | period | WNS | failing endpoints | WHS |
+|---|---|---|---|---|
+| kernel `clk_kernel_00` | 6.667 ns | **−1.594 ns** | **25,528** of 1,633,327 (TNS −10,351.9 ns) | 0.000 |
+| `dma_ip_axi_aclk_1` | 4.000 ns | +0.001 | 0 | +0.001 |
+
+v++ `AUTO-FREQ-SCALING-04` then set DATA_CLK to **121.0 MHz** (8.264 ns =
+6.667 + 1.594, i.e. exactly zero computed margin on the worst path; there is
+no STA report at 8.264 ns, so "closed at 121" is the auto-scaler's arithmetic,
+not a measured slack distribution). Hold is at 0.000 — routed, not comfortable.
+
+**Where the 1.594 ns goes — the finding that matters.** Every worst path is
+**route-dominated**, 1–3 logic levels with 7.5–8.2 ns of wire (94–98 % route):
+
+| path | data path | route share |
+|---|---|---|
+| `gemv32_store_or_qkvg_conv_stream … ap_start_reg → head_value_2_U/q0_reg[75]` | 8.087 ns | 94.8 % |
+| `gemv32_cluster2_3 … trunc_ln3301_8_reg_3058_pp0_iter28 → ys_2_U (fifo_w512_d68) mem_reg DIN` | 7.86 ns | ~95 % |
+| `gemv32_cl_flush ap_start_reg → p1_assign CE` | 7.94 ns | ~95 % |
+| `island_0 ap_CS_fsm_reg[99]_replic → partial_hi_14_U/q0_reg` | 8.212 ns | 98.4 % |
+
+These are high-fanout control nets (process `ap_start`, FSM state bits,
+pipeline-register CEs) that fan out across a whole pblock or between an SLR's
+BRAM columns and its CLB region, plus the 512-bit FIFO write bus into the
+collector FIFO. The arithmetic itself is not on any worst path: the design's
+logic is fast enough for 150 MHz; the **wire** is not. This is the same
+class of net Iter66e's `style=frp` removed two-thirds of; the survivors are
+what sets Fmax now.
+
+**Congestion (placer final, same recipe as Iter67c).** Level-7 windows:
+Iter67c had 5 (all South/Long and East/Short); Iter69 has 4 (North/Long ×2,
+South/Long ×2). Per-SLR CLB 98.22 / 92.08 / 80.40 % (Iter67c 99.29 / 87.51 /
+81.97). SLR1↔SLR0 SLL **86.74 %** (Iter67c 84.76), SLR2↔SLR1 57.50 %. The
+tighter clock pulled ~1.5 % more CLB into SLR1 and 2 points more SLL; no new
+congestion class.
+
+**On card (job 3372, `light`, card by BDF).**
+
+| | Iter67c (job 3101) | Iter69 (job 3372) | Δ |
+|---|---|---|---|
+| kernel ms/token (median of 63) | 24.099 | **20.103** | **−16.6 %** |
+| production TPOT ms/token | 24.208 | **20.188** | **−16.6 %** |
+| kernel cycles/token at DATA_CLK | 2.4099 M @ 100 | 2.4325 M @ 121 | +0.9 % cycles |
+| 8-token trajectory | exact | exact | — |
+| 64-token trajectory | exact | exact | — |
+| CUDA vector gate, 2,016,000 logits | NRMSE 0.00466 / min cos 0.99995 / top-5 5 / argmax 0 | NRMSE 0.004663 / min cos 0.999946 / top-5 5 / argmax 0 | identical to the digit |
+
+Scaling is 121/100 = 1.21× expected vs 24.099/20.103 = 1.199× measured; the
+0.9 % extra cycles are the HBM side not scaling with the kernel clock (the
+readers now request 7.74 GB/s/port against a 14.4 GB/s pseudo-channel peak, so
+this is latency, not the bandwidth wall). Host/XRT overhead 0.085 ms.
+
+**Verdict: POSITIVE on card, evidence label "routed-failing at 6.667 ns,
+deployed at auto-scaled 121 MHz, on-card exact 8/64 tokens + vector gate".
+NOT promoted to `run_hw` default and NOT committed yet** — the image has
+zero computed setup margin and WHS 0.000, and nothing at 8.264 ns was ever
+analysed by STA. Two things make it production-grade, both launched or
+planned: (1) longer on-card robustness on this exact image — 512-token
+drift vs the GPU (Iter66n protocol) and full 62-document WikiText-2 (Iter66o
+protocol), one `light` job; (2) a relink of the same source at an honestly
+closable period (8.0 ns / 125 MHz is the candidate: 0.3 ns above the measured
+worst path, so it should close with real margin and be reportable as
+timing-closed), after the Iter68G AIM job frees the build queue. Iter68G
+remains inconclusive and uncommitted; nothing of it is in this image.
+
+Not obtainable from these artifacts: the slack distribution at 8.264 ns
+(needs `report_timing_summary` on the routed DCP re-constrained at 8.264 —
+a Vivado job, not a card job) and whether the 121 MHz image is
+hold-marginal in silicon beyond the 64 tokens run (that is what the 512-token
+and WikiText runs answer).
+
+### 2026-09-05 07:10Z — Iter69 robustness on card (job 3388): 512-token drift and full WikiText-2 on the 121 MHz image are numerically identical to Iter66e/67c — POSITIVE
+
+Job 3388, `light`, `acclnode01`, card `0000:41:00.1`, DATA_CLK read back
+as 121 MHz after the run. Exact image and host as job 3372 (xclbin
+`91bd72bc…`, `host.exe` `cd095f07…`). Script and evidence:
+`diagnostics/iter69_iter67c_true_f150/{robustness.slurm, robustness-3388.log,
+card512.json, card512.gdnlog, card512_trend.txt, wikitext_full62.json,
+wikitext_full62_vs_gpu.json}`, exit marker `robustness.exit` = `1 0 0`
+(rc1=1 is the expected post-fork GPU comparison failure on a free-running
+512 run, as in Iter66n).
+
+**512-token free-running decode vs the GPU 512 reference (Iter66n protocol):**
+
+| | Iter66e (job 2529, 100 MHz) | Iter69 (job 3388, 121 MHz) |
+|---|---|---|
+| first argmax divergence | step 447 | **step 447** |
+| pre-fork NRMSE, first → last comparable window | 0.0048 flat | 0.00531 → 0.00564 (ratio 1.063) |
+| least-squares slope / step | ~1.5e-7 | 2.1e-6 |
+| pre-fork argmax mismatches (6 windows × 64) | 0 | 0 (one at window 384–447, which contains the fork) |
+| verdict | BOUNDED | **BOUNDED** |
+
+The fork lands on the same step as at 100 MHz — the hardware's trajectory
+did not change with the clock.
+
+**WikiText-2, teacher-forced, all 62 documents (Iter66o protocol), 2 h 03 m:**
+
+| | GPU reference | Iter66e on card (job 2822) | Iter69 on card (job 3388) |
+|---|---|---|---|
+| word perplexity | 16.776124 | 16.774840 | **16.774840** |
+| byte perplexity | 1.6944293 | 1.6944051 | **1.6944051** |
+| relative Δ vs GPU | — | −0.0077 % | **−0.0077 %** (gate 5 %) |
+| workload identity | 62 docs / 183 windows / 314,843 tokens | match | match |
+| kernel ms/token during scoring | — | 25.608 | **20.127** |
+
+The Iter69 result matches Iter66e/67c **to every printed digit** on 314,843
+scored tokens plus 512 decoded tokens — ~316k kernel invocations at 121 MHz
+with zero computed setup margin and WHS 0.000 produced no observable
+arithmetic fault. Evidence boundary: this is silicon behaviour on one card at
+one temperature; it is not an STA closure and does not replace a relink at a
+period that closes with margin (8.0 ns / 125 MHz planned once the build queue
+is free). Keeps the label "routed-failing at 6.667 ns, deployed at 121 MHz,
+on-card exact 8/64 + vector gate + 512-token bounded + WikiText-2 pass".
+
+### 2026-09-05 10:30Z — Iter69 paper protocol re-measurement (jobs 3389/3390): paired latency + board power vs A100 FP32 and BF16 on the 121 MHz image — MEASURED, evaluation.tex updated
+
+Same protocol as the Iter67c paper numbers (`GatedDeltaNet-eval`
+`scripts/slurm_fpga_tpot_power.sh`): 4,096-token WikiText prompt prefilled
+on the GPU, teacher-forced decode on both devices from the same `.gdnstate`,
+60 s loaded idle + 30 s warmup + 3 × 60 s intervals, power at 1.0 s from the
+board hwmon and NVML. Both jobs `light`, `acclnode01`, card `0000:41:00.1`
+(DATA_CLK read back 121 MHz after each run), GPU `GPU-94af67ba…` (same A100
+80GB PCIe as the Iter67c runs). Image `91bd72bc…` (sha verified by the
+script). Raw data: `/home/yaoz0b/gdn_fpga_eval/full/performance_iter69{,_bf16}/`.
+
+| | Iter67c @100 MHz (paper) | **Iter69 @121 MHz** | A100 FP32 (3389) | A100 BF16 (3390) |
+|---|---:|---:|---:|---:|
+| production TPOT (ms) | 24.166 | **20.266** | 33.270 | 32.321 |
+| device time (ms) | 24.082 | **20.144** | 33.192 | 32.247 |
+| tok/s | 41.38 | **49.34** | 30.05 | 30.93 |
+| idle / active W | 24.61 / 40.24 | 25.39 / **43.61** | 70.73 / 93.68 | 69.14 / 85.02 |
+| gross J/token | 0.973 | **0.884** | 3.119 | 2.749 |
+| idle-subtracted J/token | 0.378 | **0.369** | 0.765 | 0.514 |
+| kernel cycles/token | 2.4077 M | **2.437 M** (+1.2 %) | | |
+| FPGA p95 above median | 0.25 % | 0.36–0.91 % | | |
+
+Ratios (FPGA over GPU): speedup **1.64× / 1.60×**, gross energy efficiency
+**3.53× / 3.11×**, idle-subtracted **2.07× / 1.40×** (FP32 / BF16). The
+1.21× clock bought a 1.20× kernel speedup for +3.4 W active — not HBM-bound
+at 121 MHz.
+
+Two measurement issues, both fixed in the eval scripts (uncommitted):
+
+1. **3389 aggregation crashed** (`power trace does not cover a timing
+   boundary`): the sampler checked its stop file only at the top of its 1 s
+   loop, so the last FPGA sample landed 0.194 s before interval 2 ended. The
+   Iter67c runs passed only because `host.exe`'s teardown left one extra
+   sample. `sample_device_power.py` now takes one closing sample after the
+   stop request; `aggregate_power_eval.py` gained
+   `--boundary-tolerance-seconds` (default 0 = strict), which holds a
+   boundary at the edge sample and records every clamp in `comparison.json`.
+   3389 was re-aggregated with tolerance 1.0 → exactly one clamp, 0.194 s of
+   one 60 s interval held at 43.50 W. 3390 needed none.
+2. **The GPU baseline is bimodal and host-sensitive.** Per-interval GPU
+   medians: 3389 = 31.73 / 35.73 / 31.57 ms, 3390 = 31.85 / 31.84 / 31.86 ms;
+   the Iter67c-era runs were 35.9–36.4 throughout. p95 in a "fast" interval
+   is still 35.9 ms, i.e. both modes coexist within an interval. Same GPU
+   UUID, same node; the node was also running two 48-core Vivado jobs during
+   3389/3390 (and the earlier runs). Cause not isolated — the paper text now
+   states the observed 31.6–36.4 ms range, that precision does not move it,
+   and quotes the speedup against the fastest observed GPU interval (1.56×)
+   alongside the paired-mean 1.64×.
+
+`report/DATE_2027/sections/evaluation.tex` updated: setup wording (routed,
+constraint missed by 1.59 ns, clock scaled to 121 MHz and read back),
+`tab:platform` (121 MHz, CLB 98.2/92.1/80.4 %, SLL 86.7 %), method (embedding
+54 µs = 0.27 %), results prose and `tab:latency-energy`. No other section
+carries these numbers. Evidence label: on-card, paired, one card/one GPU,
+same protocol as the published Iter67c figures; the image is routed but not
+timing-closed at its 6.667 ns constraint (see the Iter69 entry above).
+
+### 2026-09-05 11:00Z — Iter68G hang, Track B part 6: the AXI monitors answer it as far as tooling allows — all 96 state write-backs were issued and acknowledged **128 MiB below their stripe**, then the CU sits with zero outstanding transactions (jobs 3379, 3393–3396)
+
+**Build 3379 (AIM relink of the exact 68G XO `076d5d03…`, `acclnode01`,
+8 h 03 m):** routed, `dma_ip_axi_aclk_1` +0.003/+0.009, kernel clock
+auto-scaled 150 → **100.6 MHz** (same as build 3346, so the five monitors
+changed nothing that matters), XCLBIN `51a209b6…`. The wrapper script died
+after `make` on its own `grep … | tee inserted_debug_ip.txt` (zero matches
+under `set -e -o pipefail`), before the copy-back and exit marker — jobs
+**3393/3394** (`light`, 8 cores) recovered the image and reports from
+`/tmp/yaoz0b-3379` on the node. `DEBUG_IP_LAYOUT` confirms five AIMs on
+`M_AXI_MEM_WEIGHTS_MM{28,29,30,31,0}` and one AM on the CU.
+
+**Job 3395 — readout method failed, not the image.** Legacy
+`/opt/xilinx/xrt/bin/unwrapped/xbutil status --aim` opens the card by
+*index* and dies with `Operation not permitted Device index 0` (the same
+BDF-vs-index trap as jobs 1354/2504). Replaced by
+`diagnostics/iter68g_aim_relink/aim_read.exe` — 90 lines around
+`xclDebugReadIPStatus(XCL_DEBUG_READ_TYPE_AIM|AM)` on a BDF-opened handle;
+works on XRT 2.13.479.
+
+**Job 3396 — the readout (`acclnode01`, card `0000:41:00.1`, reset before
+and after).** 23 samples: card idle, t+0, t+10 s (all zero — kernel not yet
+launched), then t+30 s … t+210 s. From t+30 s every counter is **frozen**,
+`kds_custat_raw` shows the CU busy, host `run.wait` returned
+`ERT_CMD_STATE_TIMEOUT` at 10:53:14, `ap_ctrl` 0x0:
+
+| master | WrBytes | WrTx | RdBytes | RdTx | Outstd | LastWrAddr | LastRdAddr |
+|---|---:|---:|---:|---:|---:|---|---|
+| mm0 | 1,012,800 | 321 | 94,283,264 | 23,115 | 0 | `0x005913000` | `0x005367000` |
+| mm28 | **6,291,456** | **1,536** | 93,749,248 | 22,888 | **0** | **`0x37d967000`** | `0x385367000` |
+| mm29 | 6,291,456 | 1,536 | 93,749,248 | 22,888 | 0 | `0x39d967000` | `0x3a5367000` |
+| mm30 | 6,291,456 | 1,536 | 93,749,248 | 22,888 | 0 | `0x3bd967000` | `0x3c5367000` |
+| mm31 | 6,291,456 | 1,536 | 93,749,248 | 22,888 | 0 | `0x3dd967000` | `0x3e5367000` |
+
+AM: `exec=0 start=1`, `execCyc = busyCyc` rising ≈1.019e9 per 10.2 s
+(≈100 MHz — the CU is running, not clock-stopped); stall counters 0
+(stall profiling not compiled in — uninformative).
+
+What the numbers say, arithmetic checked:
+
+1. **All the traffic of a full token happened.** 93,749,248 = 87,457,792
+   (one whole shard, incl. the `lm_head` slice, whose tail `0x5367000` is
+   each port's last read) + 6,291,456 (24 × 256 KiB state reads). mm0
+   `LastWrAddr 0x5913000` = workspace `0x5911000 + 0x2000`, the token-id
+   publish. So the kernel read every weight, ran all 24 layers and published
+   the (correct, per every earlier probe) token.
+2. **Every state write-back was issued and acknowledged.** 1,536 = 24 layers
+   × 64 sub-bursts of 4 KiB; 6,291,456 B = 24 × 4,096 beats × 64 B. This
+   kills the "nothing was written" reading of parts 2–5.
+3. **Every one of them was addressed exactly 2^27 B too low.** Expected last
+   write on mm28 = `0x380000000 + 0x5368000 + 23·0x40000 + 0x3F000 =
+   0x385967000`; observed `0x37d967000`; difference **`0x8000000` = 128 MiB
+   on all four ports**. Low 27 bits identical (`0x5967000`), upper part
+   = bank base − 1. That is the signature of a 27-bit offset (bit 26 is set
+   for every state offset ≥ `0x5368000`) being *sign*-extended before the
+   pointer add — equivalently a pointer of `0x378000000`. The writes landed
+   in the *neighbouring* bank (HBM[27] for mm28, …) at offset ≈474 MiB —
+   outside every BO and outside job 3376's 128 MiB catcher at
+   `[0x5968000, 0xD968000)`, which is why all probes saw zero lanes changed
+   and no firewall trip (a valid HBM address is accepted). Workspace offsets
+   are < 2^26, so mm0 is untouched, consistent with correct activations.
+   The state *reads* must have been addressed correctly: the step-1 token
+   matches the golden, which needs the right state in all 24 layers.
+4. **After that, an internal deadlock with the bus idle.** `Outstd = 0` on
+   all five monitored masters, CU `start=1 exec=0`, `ap_done` never raised.
+   Whichever of the terminal processes is stuck, it is not waiting on AXI.
+
+**Where the −2^27 comes from is NOT identifiable from the artifacts on disk
+— evidence boundary.** The linked 68G XO was unpacked next to the Iter69 XO
+(Iter67c source, which works on card) and the whole pointer chain walked:
+`control_s_axi.weight_data_mm28` → `island2_service.w28` (`ap_vld` tied 1)
+→ `gdn_persistent_mm2s_with_state_28_U0.weights` → `assign
+weight_data_mm28_c_din = weights` → top FIFO `weight_data_mm28_c_U`
+(`fifo_w64_d8_S`) → `recurrent_service.recurrent_state0_dout`, captured into
+`recurrent_state0_1_reg_675` in the same cycle as the pop (state 1, gated on
+`empty_n`) → `entry_proc` `recurrent_state0_c_din = recurrent_state0` → FIFO
+`recurrent_state0_c` (`fifo_w64_d3_S`) → island `recurrent_state_low_dout`.
+Every stage is value-transparent. The island address arithmetic is
+*textually identical* in both XOs: `add_ln2111[26:0] = $signed(zext(layer
+<< 18)) + $signed(27'd87457792)`, `zext_ln2111_2[63:0] = add_ln2111` (an
+unsigned 27-bit net — zero-extension by Verilog rules), `add_ln2111_3 =
+recurrent_state_low_dout + zext_ln2111_2`, `trunc[57:0] = add_ln2111_3[63:6]`,
+`AWADDR = $signed(trunc)`, `AWLEN = 4096`. The `mem_weights_mm28_m_axi`
+adapter is byte-identical in both XOs. The read side uses the same 27→64
+zero-extension (`tmp_s = {empty_432, 6'd0}` → `p_cast9`) and is correct on
+card. So the RTL as written yields `0x385967000` from pointer `0x380000000`
+and the hardware emitted `0x37d967000`: either the pointer value in flight
+was `0x378000000` (no producer for it exists in the netlist) or the
+implemented logic differs from the RTL text on this path. Deciding that
+needs a waveform of the mm28 AW channel and the pointer FIFO on the card
+(ILA) or a 24-layer RTL cosim (30+ h per layer measured). Neither is worth
+buying: the campaign is already judged dead below, and a separate
+ap_done deadlock would remain even with the address fixed. Whether the
+mis-address and the deadlock share a cause is unknown.
+
+Evidence label: on-card, instrumented (AIM/AM counters), one run; the
+interpretation of the counters is arithmetic, the mechanism is not
+established.
+
+### Iter68 campaign — CLOSED as STOPPED / INCONCLUSIVE (2026-09-05). Nothing from Iter68 is committed; no further Iter68 builds.
+
+Bet: persistent services + head-local sequencers would shorten the control
+wires enough to close 150–250 MHz. Outcome, all measured:
+
+| stage | result |
+|---|---|
+| csynth sweep (68B) | II repaired; timing estimates not better than Iter67c's at the same clock |
+| RTL cosim (68B–68F) | four consecutive deadlocks, each fixed at the source, one-layer token 1 completes only in 68F |
+| link (68G, builds 3344/3346/3379) | routes; kernel clock **auto-scaled 150 → 100.6 MHz** twice — no frequency gained over Iter67c |
+| on card (3347, 3367–3369, 3373, 3376, 3377, 3396) | **never returns**: every state write-back mis-addressed by −2^27 B, then an ap_done deadlock with the bus idle; independent of clock (101/90/70 MHz), ERT mode and reset |
+
+Verdict: the redesign did not improve timing and introduced two faults the
+static tooling cannot localise. **Dead** — the user's judgement, confirmed by
+the AIM readout. The source stays on disk under `diagnostics/iter68*` and in
+the Iter68 build snapshots for reference. Working-tree state, stated
+precisely because the earlier wording here got it backwards: the *main* tree
+still holds the Iter68G source **uncommitted** (`gdn_model.cpp` `1be875a5…`,
+`gdn_model.h` `2e68306c…`, plus the Iter68 `packed_bf16_one_layer_test.cpp`
+edit). The committed production source is HEAD `caf512543` (Iter67c,
+`gdn_model.cpp` `2bc240e6…`, `gdn_model.h` `906b11e5…`), and that is what
+Iter69 — and Iter70a below — build from, out of the clean worktree
+`.claude/worktrees/iter69-f150`. **Reverted 2026-09-05 ≈11:50Z on the
+user's instruction** ("git reset every to head except the optimization
+log"): every tracked file except this log was checked out from HEAD
+`caf512543`, so the main tree now holds the Iter67c source (`gdn_model.cpp`
+`2bc240e6…`, `gdn_model.h` `906b11e5…`). The full 14-file diff (Iter68G
+kernel, `host.cpp` hang probe, cosim `-O @COSIM_EXTRA@` hook,
+`XO_GATE_SCRIPT` in `hw_build.slurm`, and the uncommitted Iter67c doc/CLAUDE.md
+edits) is saved as
+`diagnostics/worktree_reset_20260905/all_tracked_changes_before_reset.patch`.
+
+### 2026-09-05 10:45Z — Iter69 fanout census on the post-place checkpoint (jobs 3391/3392) and the router's own record: the 150 MHz miss is **wire and SLL congestion**, not logic — MEASUREMENT ONLY
+
+Question: what exactly fails at 6.667 ns, and is it fixable by something
+simpler than Iter68? Inputs: `diagnostics/iter69_iter67c_true_f150/
+post_place.dcp` (the only checkpoint kept) and its `impl_1.runme.log`.
+
+- **Job 3391 failed** on a Vivado option conflict (`report_high_fanout_nets
+  -load_types` with `-clock_regions`; then `-slr` with `-clock_regions`) —
+  one bad report lost the run. Rewritten as separate guarded reports
+  (`census.tcl`); **job 3392** (`build`, `acclnode03`, 31 min, 26.9 GB)
+  produced everything except the per-region variant.
+- **Post-place (before routing): 835 failing endpoints, WNS −0.881 ns**, all
+  on top-level control into the four state ports: 512 endpoints in
+  `mem_weights_mm{28..31}_m_axi_U/store_unit_*/buff_wdata … WEBWE` driven by
+  the top `ap_CS_fsm_reg[97]`, 284 in the `w{28..31}_c_U` pointer FIFOs and
+  18 in `layer_index_c_U` driven from `layer_index_c_U`/top, 9 in mm0.
+  Worst path 4 LUT levels, **0.435 ns logic / 6.454 ns route (93.7 %)**,
+  inter-SLR compensation 0.232 ns — a top-FSM state bit crossing SLRs into
+  the SLR2 state ports.
+- **High-fanout nets (fo > 300): 400 listed**, only **one** with negative
+  post-place slack (`layer_dt_bias_1_c_U/w28_read`, fo 1,409, −0.876 ns).
+  The big ones — recurrent `recur_island_update` CE fo **5,203**,
+  `and_ln2107_reg…iter9` fo 5,198, `ap_CS_fsm_reg[104]` fo 3,739, the 16
+  cluster `gemv32_cl_weight_stream … ap_loop_init` fo 3,072–3,315, the 16
+  `gemv32_cl_flush … context_*` fo 2,048, `recur_island_read
+  ap_CS_fsm_reg[97]` fo 2,048, `head_fp32_3` CE fo 2,048 — all have
+  positive slack **at placement**. Placement is not the problem.
+- **Routing is.** `impl_1.runme.log`: post-place phys_opt drove the
+  estimate to **WNS +0.003**; the router then reported `[Route 35-3311]
+  high localized SLL routing demand` with per-column SLL demand up to
+  **211 / 200 / 200 %** on SLR1↔SLR2 and **155 / 132 / 125 %** on
+  SLR0↔SLR1 (1,440 SLLs per column), and `[Route 35-447] Congestion is
+  preventing the router from routing all nets … will prioritize routing all
+  nets over timing`. Node overlaps 1,119,616 → 0 in iteration 1; WNS then
+  went **−6.899 → −5.974 → … → −1.594** over the global iterations, ending
+  at 25,528 failing endpoints, the worst paths 1–3 logic levels with
+  7.5–8.2 ns of wire (Iter69 entry above).
+
+Conclusion (measured): the logic closes 150 MHz with margin before routing;
+the loss is **1.6 ns of detoured wire** on control and 512-bit FIFO nets
+whose SLR crossings are concentrated in three SLL columns at 2× capacity.
+Iter68 attacked control-wire *length* and left the crossing *topology*
+alone — consistent with it gaining nothing. The levers this points at are
+(a) fewer/spread SLR crossings — placement topology, not a directive: the
+recipe ran `SSI_SpreadSLLs` through Iter65 and already saw 190/160 % column
+overload with it, and Iter65b switched to `SSI_SpreadLogic_high` for SLR0
+CLB density, so swapping back is a listed experiment with a measured poor
+prior — and (b) deleting the surviving high-fanout control nets at the
+source, as Iter66e's `style=frp` did for the cluster clock-enable cones.
+
+Not obtainable from these artifacts: which nets occupy the 211 % columns
+(needs `report_design_analysis -congestion` and `report_route_status` on the
+*routed* DCP, which build 3371 did not keep).
+
+### 2026-09-05 11:30Z — Iter70a LAUNCH: Iter67c relinked at an honest 8.000 ns / 125 MHz constraint (planned item (2) of the Iter69 entry)
+
+**Hypothesis.** The Iter67c netlist closes 8.000 ns with real, reported
+margin. Basis: Iter69 routed the same netlist under a *failing* 6.667 ns
+target and the auto-scaler's arithmetic put the worst path at 8.264 ns with
+zero margin and WHS 0.000 (job 3371). A constraint the router can actually
+meet lets it trade the congestion-detour slack back into margin instead of
+"routing all nets over timing" (`[Route 35-447]`), so 8.000 ns is expected
+to close with positive setup *and* hold, giving the first 2024.2 image above
+100 MHz whose STA report says so. 125 MHz = ×5/4 of the 100 MHz free-running
+input, an exact MMCM ratio like Iter69's ×3/2.
+
+**Expected result if it holds:** kernel ≈ 2.41M cycles / 125 MHz ≈ **19.3 ms
+kernel, ≈19.4 ms TPOT** (−4% vs Iter69's 121 MHz, −20% vs Iter67c's 100 MHz),
+bit-identical trajectory and gates (Iter69 and Iter67c were identical at
+every gate, so a frequency-only change must be too — any difference is a
+timing failure, not arithmetic).
+
+**What is built.** Source = HEAD `caf512543` (Iter67c), from the clean
+worktree `.claude/worktrees/iter69-f150`: `gdn_model.cpp` `2bc240e6a5cf24b2…`,
+`gdn_model.h` `906b11e5ca368b08…`, `Makefile` `4c34696420f0f18f…`,
+`hls_gdn_forward.tcl` `a76930f3332baac5…`, `apply_f150_physical_islands.tcl`
+`cfbba5d58fa9ce36…`. Two new files, copies of the Iter69 pair with only the
+ratio and names changed: `apply_iter70_kernel_clock_f125.tcl`
+`77f70639ee856277…` (`create_generated_clock … -multiply_by 5 -divide_by 4`,
+fails closed unless the period reads 8.000 ± 0.002 ns, writes
+`placement_reports/iter70_clocks_after_override.rpt`, then sources
+`apply_f150_physical_islands.tcl`) and `hw_iter70_kernel_clock_f125.cfg`
+`c5e11ba90cf8015e…` (Iter69 cfg with the OPT_DESIGN.TCL.PRE path swapped;
+`SSI_SpreadLogic_high` / `AlternateCLBRouting` / pre+post-route
+`AggressiveExplore` / `report_final_qor.tcl` unchanged). One variable versus
+Iter69: the period.
+
+**Command** (in the worktree's `c_impl`):
+```
+HW_CFG_TEMPLATE=hw_iter70_kernel_clock_f125.cfg \
+EXTRA_SNAPSHOT_FILES="hw_iter70_kernel_clock_f125.cfg apply_iter70_kernel_clock_f125.tcl" \
+HLS_FREQ=150 LINK_FREQ=125 BUILD_TIME=2-00:00:00 bash run_hw_sbatch.sh iter70a_iter67c_f125
+```
+HLS stays at 150 MHz so the XO schedule is byte-for-byte the Iter69/Iter67c
+one; only the link period changes. Build dir `build.hw.gdn32.h150.f125.o48`.
+Evidence will land in `diagnostics/iter70a_iter67c_f125/` (worktree).
+Submitted 2026-09-05 ≈11:35Z: **build job 3397** (`build`, 48 cores, 192 G,
+2 days), **on-card job 3398** (`light`, afterok:3397).
+
+**Gate for "retained":** routed, `report_final_qor` shows `clk_kernel_00`
+WNS ≥ 0 **and** WHS > 0 at 8.000 ns (not the design-wide figure), DATA_CLK
+in the xclbin = 125 MHz with no `AUTO-FREQ-SCALING` downgrade, and the 8/64-
+token on-card gates identical to Iter69 (exact trajectory, CUDA vector gate
+NRMSE 0.00466 / min cosine 0.99995 / top-5 exact / zero argmax mismatches).
+Anything else is logged as rejected or inconclusive and not promoted.
+
+**Not launched, and why.** A 150 MHz attempt by directive swap
+(`SSI_SpreadSLLs` back on) is a listed experiment with a measured poor prior
+(190/160 % column overload under it through Iter65, see the census entry);
+a real 150 MHz fix means changing where the 512-bit buses cross SLRs, which
+is a floorplan/partition campaign of several multi-day links and is the
+user's call, not an auto-proceed step.
