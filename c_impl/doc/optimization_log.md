@@ -13718,3 +13718,91 @@ That selection is well matched to the census: it hits the reset net that holds t
 **Standing caution from the Iter66 campaign, now relevant again.** Checkpoint route-repair on a dense placement was measured *seven times* across two failure classes and made things worse every time (16→51, 5→22, 3→42 overlaps) because pin conflicts cannot be re-permuted per-net. This design routes legally, so the situation is not identical, but the lesson stands: a post-route surgical fix on a 97.8%-CLB SLR0 is the least promising of the three options even once the option error is fixed. Prefer (1) or (2).
 
 **Nothing promoted, nothing changed.** Iter67c remains HEAD and the `run_hw` default; Iter75b at 142.5 MHz remains the fastest correct image.
+
+### 2026-09-09 — Iter75c-R2: pre-route forced replication and full reroute
+
+User authorized correcting3706. R1 failed after15m52s solely because Vivado
+2024.2 rejects `-force_replication_on_nets` in post-route mode. No optimization
+or reroute ran; the unchanged -0.349ns/1733-endpoint baseline was reconfirmed.
+The failed script and its logs are retained; do not reuse the unsupported mode.
+
+Slurm read-only inventory of job3700 found routed and postroute-physopt top
+checkpoints, but no retained top-level placed/pre-route DCP. Therefore R2 does
+not pretend to reopen an original pre-route snapshot. It opens a private copy
+of the preserved routed DCP, removes routing while retaining placement and
+fixed shell nets, verifies fixed-net membership and route equality, then runs
+forced replication before the new route. DCP SHA256 stays
+`3dd12e18f6c6f1dc998dcf4385a26bd8b7b76113d1f22f095e98047775eff98c`.
+
+Qualification job3727 tests the actual Vivado2024.2 sequence on a small U55C
+design first: synth/place/route, fix one signal route, `route_design -unroute`,
+assert fixed route unchanged, then forced replication. The full-design job
+must not run unless this probe succeeds. This qualifies command-stage support,
+not full-design timing or equivalence. Scripts/logs are under
+`diagnostics/iter75c_r2_preroute/`; the inventory alone needed acclnode01 for
+node-local files; qualification and reroute are unpinned Slurm build jobs.
+
+Same eight exact targets and fanout/connectivity assertions as3706. No new
+reset stage, pblock relaxation, arithmetic change, or clock change. Reset
+replicas can still be constrained by the SLR0 platform pblock; report actual
+placement rather than claiming this pass necessarily fixes that path.
+After replication save a DCP, route with existing AlternateCLBRouting, save
+routed DCP, run existing post-route AggressiveExplore, then save final DCP.
+This is a full dynamic reroute, not `route_design -preserve` on unchanged wires.
+Keep fixed shell routes and the original correct142.5MHz XCLBIN untouched.
+
+Final gate: legal route (fully routed count equals routable count, errors0),
+kernel150MHz and original DMA/HBM periods, all three setup/hold>=0. Preserve
+failure checkpoints/reports before returning a failing exit. Report all failing
+families, target load-driver locations, utilization/SLL, congestion, DRC and
+bus skew. Positive physical results still need DRC/bus-skew review, packaging
+and on-card checks; no automatic promotion or commit. Existing HLS/XO/address
+validation is reused because source and synthesis are unchanged.
+
+Full reroute request:8CPUs/128GiB/12h limit, no GRES/no node pin, exclude
+harrier's known scratch issue; runtime estimate3–6h excluding queue/probe.
+Shell/Tcl structural checks and route-statistic parser fixture pass. Tool
+qualification and physical outcome pending. No production hook edits.
+
+Qualification3727 COMPLETED in2m56s, exit0: fixed test-net route and fixed
+property remained identical across `route_design -unroute`, and subsequent
+`phys_opt_design -force_replication_on_nets` completed successfully in
+Vivado2024.2. This directly checks the mode transition that failed in3706.
+Full-design R2 submitted as3728 with `afterok:3727`; source and baseline
+artifacts unchanged. Tcl SHA256
+`a2a2a8d36bd04915049d21b36025aeb09a2ca9f5df68dc593e3f36ca8794132c`;
+Slurm SHA256
+`af0fdfd590ad650ce66453ac80c055448522cf91e8455cdbc94ee9d9dbdf0a6a`.
+Shared logs `iter75c_r2_preroute/vivado.live.log`, `repair.live.log`,
+`slurm-3728.log`; checkpoints/reports in `reports-3728/`. Initial launch sentry
+only; hand off rather than poll through routing. Physical verdict pending.
+
+### 2026-09-09 15:16Z — Iter75c-r2 pre-route repair (job 3728) **killed OUT_OF_MEMORY at its 128 GB request**, in a `get_nets -hierarchical` query *before* any repair ran. Infrastructure, not a design result. STOPPED; retry at 192 GB with the query scoped.
+
+**Job.** 3728 `iter75c_r2_f150_route`, `build`, `acclnode03`, 8 CPU / **`--mem=128G`** / 12 h. State **OUT_OF_MEMORY**, Elapsed **00:56:27**, `repair.exit=137` (SIGKILL). `sacct`: MaxRSS **134,215,940 K = 128.0 GiB**, MaxVMSize 133,938,644 K — it hit the cgroup limit exactly, so this is the request being too small, not a runaway.
+
+**Where it died — and it is not where the memory was expected to go.** The last log line is
+```
+set fixed_nets [get_nets -hierarchical -filter {IS_ROUTE_FIXED == 1}]
+```
+i.e. a **shell-routing sanity check inside `report_load_drivers before`**, which runs *before* `route_design -unroute`, before the replication, and before any re-route. The preceding `get_nets` in the same proc already cost **27.5 GB peak** on its own (`Memory (MB): peak = 27551.238`) with 239 GB physical still free at that moment. An unscoped `-hierarchical` query on this design is the known trap recorded in `CLAUDE.md`: `get_nets -hierarchical` returns **one object per hierarchy segment**, which is how a few dozen physical nets became 35,632 objects and aborted a build three hours in during the Iter66 campaign. Here it is materialising the full segment expansion of ~1.59M routable nets in one Tcl list.
+
+**So no design conclusion is available from this run.** Stages reached: checkpoint open (13:46), baseline re-measurement, target selection (`targets.tsv`, the same eight drivers), then death. The `unroute → phys_opt -force_replication_on_nets → route_design → phys_opt` sequence never started; `reports-3728/` holds only `before/` and `targets.tsv`, and none of the five planned checkpoints exist.
+
+**The baseline reproduced a third time**, on `acclnode03` this time rather than `acclnode01`, which makes it node-independent:
+
+| clock | period | setup | hold |
+|---|---:|---:|---:|
+| `clk_kernel_00_unbuffered_net` | 6.667 | **−0.349** | 0.000 |
+| `dma_ip_axi_aclk_1` | 4.000 | +0.003 | +0.008 |
+| `hbm_aclk` | 2.222 | +0.061 | +0.009 |
+
+`before failing_endpoints=1733 timing_ok=0`. Three independent measurements (jobs 3705, 3706, 3728) now agree exactly.
+
+**Two fixes needed before the next attempt, and both are cheap.**
+1. **Ask for 192 GB.** `build`'s `MaxMemPerNode=196800` (192.2 GiB), so `--mem=192G` is the ceiling and is 50% more headroom than this run had. Note this design's *link* peaks at 64–69 GB (`CLAUDE.md`); a **checkpoint-manipulation** job that unroutes and re-routes is a different and heavier profile, so the link's figure was the wrong guide.
+2. **Scope the `get_nets` queries.** Replace `get_nets -hierarchical -filter {IS_ROUTE_FIXED == 1}` with `-top_net_of_hierarchical_group` (one object per flat net — the documented fix for exactly this trap), or better, drop the check to a bounded probe: the shell's fixed routing can be confirmed from a single known net rather than by enumerating all of them. The same applies to the earlier 27.5 GB `get_nets` in that proc.
+
+**Standing view unchanged, and now better supported.** This is the second failed attempt at repairing the 0.349 ns on a checkpoint (3706: unsupported post-route option; 3728: OOM in a pre-flight query). Neither failure says anything about whether replication would work. Combined with the Iter66 finding that checkpoint route-repair on a dense placement worsened overlaps in all seven attempts, the **`FORCE_MAX_FANOUT` in a `PLACE_DESIGN.PRE` hook, implemented from placement through the normal `run_hw` flow** remains the better route — it is this repo's proven pattern (`apply_iter23/35/43/54_*`), it needs no checkpoint surgery, and it cannot hit either failure mode. The checkpoint path's only advantage was speed, and it has now spent 1 h 12 m across two attempts to produce zero design data.
+
+**Nothing promoted, nothing changed.** Iter67c remains HEAD and the `run_hw` default; Iter75b at 142.5 MHz remains the fastest correct image.
