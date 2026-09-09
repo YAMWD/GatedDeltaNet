@@ -13527,3 +13527,94 @@ Gate is 5%; this is **653× inside it**. And it reproduces the Iter66o card resu
 **Preservation.** The only durable copy of this image is `diagnostics/iter75b_recover/gdn_forward_f142.xclbin`; `build.hw.gdn32.h150.f142.o1/` is a staging copy any `make` can clobber. It is the fastest *correct* artifact the project has produced.
 
 **Harness note for the next revision.** Stage 2 pipes through `tail -40`, which buffers the whole stream, so a 101-minute run shows zero output and a genuine stall would be indistinguishable from progress (liveness had to be inferred from `sstat` RSS). Replace with a line-buffered `tee` to a file. Kept as-is for this run to preserve comparability.
+
+### 2026-09-09 — Iter75c exact-150 locality repair: checkpoint preservation and full census
+
+User authorized the proposed sequence: classify all remaining paths, apply
+targeted locality/replication repairs to a checkpoint copy, re-route, and verify
+before considering a source rebuild. First job is measurement-only; do not
+blindly apply a global fanout/placement sweep or modify the registered writer.
+
+Reference result: build3700 completed a legal route (zero errors), but failed
+the exact-frequency gate after 9h23m30s: DATA was auto-scaled to142.5 MHz
+(metadata integer142). At150 MHz, kernel WNS=-0.349 ns, TNS=-183.784 ns,
+1733 failing endpoints; hold WNS=0. DMA setup/hold=+0.003/+0.008 ns.
+Native and all576 actual-XO RTL/synth/opt address checks passed. Subsequent
+on-card3703/3704 measurements belong to the scaled image, not a closed150 MHz
+candidate. Preserve their image and do not overwrite or promote it.
+
+Recover the exact `level0_wrapper_postroute_physopt.dcp` and actual XO from
+job3700's /tmp directory into a shared, separately named artifact directory,
+record SHA256 hashes, then inspect the original checkpoint read-only at6.667 ns.
+This job alone is pinned to acclnode01 because the required source DCP is
+node-local there; later repair jobs can use any eligible node. Slurm build,
+8 CPUs/96 GiB, Vitis/Vivado2024.2, no card, no constraints/source changes.
+
+Census outputs: all failing kernel endpoints and source/destination families,
+LOC/SLR/clock-region placement; detailed timing paths; connectivity, driver
+properties and load distribution of implicated nets with>=16 pins; per-clock
+setup/hold, route status, utilization, and reset-register control connections.
+Require unscaled6.667 ns and reconcile endpoint count with1733. Cap20000
+paths and fail if capped; no silent partial census. Do not use named-cell
+signal absence to infer a missing datapath. The report hook's DATA_CLK alias
+miss is avoided by querying actual `clk_kernel_00_unbuffered_net`.
+
+Scripts: `diagnostics/iter75c_f150_locality/census.{tcl,slurm}`.
+Tcl SHA256 `05f4d60b3b3132cb1e5cd53277d851263ba659df1a6ba540579ac2b93449fd83`;
+Slurm SHA256 `6d770489ba9827001f64c2812539c5e78d39f872cfd99382d4992cebb4f35c51`.
+Shell syntax and Tcl completeness checks passed; Vivado execution pending.
+Estimated census30–60 minutes including checkpoint load, then review exact
+targets before the first repair. Shared live log:
+`diagnostics/iter75c_f150_locality/census.live.log`. No commits or new bitstream
+in this measurement step; no >10-minute polling after bounded launch sentry.
+
+Submitted3705, running on acclnode01. Preserved 689 MiB post-route-physopt
+DCP and64 MiB actual XO under `iter75c_f150_locality/artifacts/` before analysis.
+Original and shared DCP hashes match:
+`3dd12e18f6c6f1dc998dcf4385a26bd8b7b76113d1f22f095e98047775eff98c`.
+XO hash `e80b1f2a1518fa3bafcaae6853e619ae07e19fefb7d9e8454ddb720afd39c7e1`.
+Launch preflight has435 GiB scratch free. Analysis pending; no repair selected
+or executed yet. Live logs `census.live.log` and `vivado.live.log`, Slurm output
+`slurm-3705.log`; hand off rather than wait for the checkpoint census.
+
+### 2026-09-09 11:41Z — Iter75c locality census on the 142.5 MHz routed checkpoint (job 3705): the residual **−0.349 ns is diffuse and route-dominated**, 1,733 endpoints across ~40 families, 97% net delay at 1–7 logic levels. **Control distribution is the largest single slice (top_fsm 542 endpoints, reset holds the WNS)**; the Iter73a state writers are immaterial. MEASUREMENT ONLY, no design change.
+
+**Job.** 3705 `iter75c_f150_census`, `build`, `acclnode01`, **26:08**, `census.exit=0`, `CENSUS_COMPLETE: no design changes made`. Reports in `diagnostics/iter75c_f150_locality/reports-3705/`; `census.status` = `paths=1733 reference_paths=1733 inspected_nets=236` (the path count reconciles exactly with the link's own 1,733 failing endpoints, so the census covers the whole failing set, not a sample). Harness logs through `tee`, so progress was visible live — the fix for the `tail`-buffered stage-2 problem noted at 10:44Z.
+
+**Per-clock state of the checkpoint** (`clock_slacks.tsv`, `route_status.rpt`):
+
+| clock | period | setup | hold |
+|---|---:|---:|---:|
+| `clk_kernel_00_unbuffered_net` | 6.667 ns | **−0.349** | 0.000 |
+| `dma_ip_axi_aclk_1` | 4.000 ns | +0.003 | +0.008 |
+| `hbm_aclk` | 2.222 ns | **+0.061** | +0.009 |
+
+Route legal: 1,592,094 fully routed, **0 routing errors**. Note `hbm_aclk` is *positive* here at the full 450 MHz — the Iter72 r2 build had it at −0.026 and auto-scaled to 444.8. So the HBM clock is no longer a gate on this netlist; only the kernel clock is.
+
+**The gap is not one hotspot.** 1,733 failing endpoints spread over ~40 driver→endpoint families, the largest holding 20% of them:
+
+| family | endpoints | WNS | TNS |
+|---|---:|---:|---:|
+| `top_fsm->gemv_other` | 353 | −0.260 | −33.573 |
+| `gemv_other->gemv_other` | 267 | −0.312 | −22.183 |
+| `rmsnorm->rmsnorm` | 179 | −0.343 | −26.349 |
+| `auxiliary->axi_0` | 143 | −0.309 | −15.602 |
+| `top_fsm->axi_0` | 121 | −0.304 | −13.136 |
+| `auxiliary->auxiliary` | 104 | −0.232 | −9.444 |
+| `gemv_launch->gemv_other` | 79 | −0.344 | −9.882 |
+| `cluster_5->cluster_5` | 74 | −0.312 | −12.478 |
+| `gemv_other->cluster_2` | 69 | −0.244 | −6.804 |
+| **`reset->gemv_other`** | 43 | **−0.349** | −6.385 | ← holds the WNS
+| `cluster_6->cluster_6` | 38 | −0.168 | −3.150 |
+| `axi_31->gemv_other` | 35 | −0.142 | −2.121 |
+| `axi_28->state_writer_28` | 22 | −0.170 | −2.512 |
+
+Aggregated by driver: **`top_fsm->*` 542 endpoints** (worst −0.341), `gemv_launch->*` 85 (−0.344), **`reset->*` 51 (−0.349, the critical path)**, everything else 1,055 (−0.343). So roughly **a third of the failing set is control distribution** — the top-level FSM and reset fanning into the GEMV region and the AXI adapters — and it is also where the worst path sits.
+
+**Every failing path is route-bound, not logic-bound.** Worst three: 6.444 ns with **97.98% route** at **1 logic level** (a single LUT4); 6.667 ns with 91.0% route at 7 levels; 6.411 ns with 95.4% route at 3 levels. A one-LUT path taking 6.44 ns is a wire problem, not a depth problem, so **pipelining will not fix this** — the levers are replication, placement locality, and shortening the physical span of high-fanout control nets.
+
+**Two findings that close open questions.** (1) The **Iter73a state writers are not a timing problem**: `axi_28->state_writer_28` contributes 22 endpoints at −0.170, well off the critical path, and no `state_writer` family appears in the top ten. The registered-writer fix cost nothing in timing while fixing correctness. (2) The **`AWVALID` FSM-gating structure I flagged on 2026-09-08 is not implicated** — this census's control families are FSM→GEMV/AXI *data-path enables*, and the write path now works; that earlier concern is closed by the on-card pass, not merely unproven.
+
+**Levers this census actually supports, cheapest first.** (a) **Reset fanout repair** — it holds the WNS with only 51 endpoints, and this repo already has the tooling lineage (`apply_iter23/35/54_dma_*` fanout repairs, `apply_iter43_reset_fanout.tcl`) plus `reset_driver_properties.rpt` from this run naming the `reset_kernel_slr*` drivers. Smallest possible change for the WNS. (b) **Top-FSM control replication/localisation** — the largest slice at 542 endpoints and −33.6 ns TNS on the `gemv_other` family alone; this is Codex's item 1, now measured on a legally routed 150 MHz design rather than inferred from an unrouted estimate. (c) `rmsnorm->rmsnorm` (179 at −0.343) and the cluster-internal families are genuinely diffuse and argue for placement work, not source work. **What this census rules out:** a single structural fix. Recovering 0.349 ns needs the WNS holder *and* a dent in the TNS mass, so expect two or three combined changes, each verifiable by whether its family disappears from `failing_endpoints.tsv`.
+
+**Nothing promoted, nothing changed.** Iter67c remains HEAD and the `run_hw` default; Iter75b at 142.5 MHz remains the fastest correct image, unpromoted pending a timing-closed clock and a J/token measurement.
