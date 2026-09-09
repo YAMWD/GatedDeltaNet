@@ -1,18 +1,44 @@
 # Cycle-First Optimization Roadmap After Iter67c
 
-**Current cycle reference (rebased 2026-09-01):** **Iter67c**, all-BF16,
-**2.4099M cycles/token = 24.099 ms kernel median / 24.208 ms production TPOT**
-at a true 100 MHz, WNS +0.003 / WHS +0.007 ns design-wide, zero routing errors,
-and an exact 64-token trajectory. This supersedes Iter66e's 2.5625M / 25.625 ms
-as the number every remaining stage is costed against.
+**Current cycle reference (unchanged, reaffirmed 2026-09-09):** **Iter67c**,
+all-BF16, **2.4099M cycles/token = 24.099 ms kernel median / 24.208 ms
+production TPOT** at a true 100 MHz, WNS +0.003 / WHS +0.007 ns design-wide,
+zero routing errors, and an exact 64-token trajectory. This supersedes Iter66e's
+2.5625M / 25.625 ms as the number every remaining stage is costed against.
 
-**Current priority (2026-09-05):** the Iter68 frequency-locality redesign is
+**Iter67c is still the cycle reference after Iter73--75b, deliberately.** The
+fastest *correct* image the project has is now Iter75b at 142.5 MHz
+(17.233 ms kernel / 17.343 ms production TPOT, on-card jobs 3703/3704), but its
+**cycle count is 2.4557M -- 1.9% worse than Iter67c's 2.4099M**. Every
+millisecond it gains comes from the 1.425x clock, none from the schedule, so
+rebasing onto it would silently inflate the denominator every remaining stage
+is costed against. The same holds for Iter69 (2.4324M at 121 MHz) and Iter72 r2
+(2.4724M at 137.7 MHz). Cycle counts rising with clock is itself a measurement:
+HBM-side latency is not fully hidden above 100 MHz, and it is the reason the
+frequency lever and the cycle levers in this roadmap are **not additive** --
+see §10.
+
+**What Iter73--75b did contribute to this roadmap's premises.** 73b2's
+straight-line emit inside the frp weight-stream loop cut csynth FF ~11% and LUT
+~11% versus Iter67c at identical latency, and Iter75b's cycles are 0.7% better
+than Iter72 r2's at a higher clock, which is consistent with that but is not
+isolated by any single run. Neither is a cycle stage; both are physical-design
+headroom, which is what made the 142.5 MHz route legal where 3491/3661 were
+deterministically unroutable.
+
+**Current priority (2026-09-09):** the Iter68 frequency-locality redesign is
 closed as stopped/inconclusive and 250 MHz is no longer a target (see
 [frequency_250mhz_roadmap.md](frequency_250mhz_roadmap.md) for its record and
-`optimization_log.md` for the verdict). The open frequency lever is the
-retained Iter67c netlist relinked at an honest 125 MHz constraint (Iter70a,
-in flight); 150 MHz on this netlist is blocked by SLL column congestion, not
-logic. Iter67c remains the retained architecture.
+`optimization_log.md` for the verdict). Iter70a's 125 MHz relink was rejected.
+The frequency lever has since been measured properly and its status is now
+specific: **the Iter73/75b netlist routes legally and runs correctly on card at
+142.5 MHz, and misses a timing-closed 150 MHz by -0.349 ns with 1,733 failing
+endpoints of 1,342,323.** That is a timing gap, not the SLL-congestion wall the
+earlier note described -- the Iter74 re-placement control closed 150 MHz outright
+at +0.005 ns / 0 failing on the same netlist family. Iter67c remains the
+**retained and committed** architecture; Iter75b is correctness-complete but
+unpromoted because its clock is auto-scaled (rule 4) and no J/token has been
+measured on it.
 
 **Status of the original stages.** Iter57 completed the recurrent-head portion
 of Stage 4 and the physical decomposition. Iter66e then delivered the "Beyond
@@ -23,6 +49,17 @@ Iter67c then completed the recurrent-read II lever: its five-phase schedule
 reduced the measured token by another 152,600 cycles without reassociation.
 Output-projection head-chunk accumulation and chunk-streamed MLP remain open
 and remain percent-level.
+
+**Iter73--75b closed no stage in this roadmap.** It fixed a functional defect
+(the recurrent state write-back landed 128 MiB below its stripe, introduced by
+Vivado kernel synthesis sign-extending a 27-bit byte offset; see
+`optimization_log.md` 2026-09-08/09) and it bought clock, not cycles. It also
+produced two durable pieces of *method* that every remaining stage should use:
+a pre-link synthesized-address gate that localises a defect to a compiler stage
+in ~48 minutes instead of a 9--20 h link, and a validated checkpoint-reuse path
+that turns a routed checkpoint into a testable image in ~34 minutes. Both change
+the cost of attempting the stages below, which is why they are recorded here and
+not only in the log.
 
 ## 0. The one thing that changed how levers must be costed
 
@@ -54,7 +91,7 @@ Rank remaining levers by measured share of the token:
 
 | Lever | Measured basis | Upper bound | Physical risk |
 |---|---|---:|---|
-| Sub-byte weights (INT4) | weight beats 1,268,224 -> ~317,056/port | **37%** (-> ~16.1 ms) | new datapath, retires the current quality baseline |
+| Sub-byte weights (INT4) | weight beats **1,366,528** -> ~341,632/port | **needs re-deriving** (the old **37% / ~16.1 ms** came from a wrong 1,268,224 beat figure) | new datapath, retires the current quality baseline |
 | Recurrent state fully on chip | `load_state`+`update`, 395,904 cyc | 16.4% (realistically 8--12%) | **blocked** — see below |
 | Partial state residency, SLR2-local | 9 of 24 layers x 16.4% | 6.2% | low — no new cross-SLR path |
 | Head-chunked output projection | roadmap Stage 4 remainder | percent-level | moderate |
@@ -422,7 +459,16 @@ Every sub-variant must pass the evidence level appropriate to its size:
 6. resource comparison against Iter57, Iter54c, and the timing-closed Iter39C
    reference;
    and
-7. optimization-log entry whether retained or rejected.
+7. optimization-log entry whether retained or rejected;
+8. **(added 2026-09-09) if the change touches an `m_axi` address or a memory
+   write path, the pre-link synthesized-address gate**
+   (`check_state_writer_addresses.py`, `STATE_ADDRESS_GATE=1`). Gates 1--4 above
+   all operate on C or on HLS RTL, and the Iter73a defect was invisible to every
+   one of them: the address was correct in HLS RTL (48/48 pass) and wrong after
+   Vivado kernel synthesis (48/48 fail, all displaced by exactly 128 MiB). One
+   layer of RTL cosim passed while seeding, checksumming and gating on the state
+   stripe, because cosim simulates the half of the toolchain that was correct.
+   Two campaigns (Iter68G, Iter73a) were lost to this before the gate existed.
 
 For the major attention and MLP milestones, additionally require:
 

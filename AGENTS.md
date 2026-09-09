@@ -145,6 +145,19 @@ after synthesis. Before starting the next iteration:
    `c_impl/doc/cycle_optimization_roadmap.md`: mark the completed stage, replace
    estimates with measured evidence, rebase the current cycle reference when
    applicable, and revise the remaining targets or dependencies.
+3b. **If the change touches an `m_axi` address or any memory write path, run
+   the pre-link synthesized-address gate** (`c_impl/check_state_writer_addresses.py`,
+   enabled by `STATE_ADDRESS_GATE=1` in `run_hw_sbatch.sh`) and record its
+   verdict. csim, csynth and RTL cosim are all blind to this failure class:
+   Vivado's *kernel synthesis* can transform an address that HLS emitted
+   correctly, and cosim simulates the HLS RTL. Measured twice, a year of
+   campaign time apart in effect: Iter68G and Iter73a both wrote recurrent state
+   exactly 128 MiB below its stripe on hardware while passing every pre-link
+   gate, including a one-layer cosim that seeded, checksummed and gated on the
+   state stripe. The gate simulates the same address stimulus at HLS-RTL,
+   post-synthesis and post-opt, so it both catches the defect and localises it
+   to a compiler stage, in ~48 minutes rather than a 9--20 h link.
+
 4. After that improvement is demonstrated and documented, commit the retained
    source architecture changes, necessary build/config/Tcl or launcher files,
    the positive result, and all accumulated optimization-log entries in focused
@@ -155,6 +168,30 @@ after synthesis. Before starting the next iteration:
 Do not move on to the next optimization iteration with an unrecorded result.
 Never commit an architectural or build change whose measured result is negative
 or neutral; commits mark demonstrated improvements only.
+
+**Two evidence rules learned the hard way (2026-09-08/09); both produced wrong
+published conclusions before they were adopted.**
+
+- **A name-presence check inside one hierarchy is not a test of a datapath.**
+  Synthesis may relocate logic out of the module you exported, so "signal X does
+  not appear in cell Y" proves nothing about whether X's function happens.
+  Follow connectivity across hierarchy boundaries and *evaluate the logic*
+  (the Iter73a write-address channel appeared absent from the writer cell and
+  was in fact present and computing a displaced address).
+- **Diff immutable build snapshots, never the working tree against HEAD.** Every
+  build writes `diagnostics/<tag>/source_snapshot.tar` and
+  `source_hashes.txt`; comparing two of those is the only way to attribute a
+  change to one iteration. A working-tree-vs-HEAD diff silently credits an
+  iteration with everything uncommitted, which is normal in this repo.
+
+**Reproducibility notes that cost jobs.** A `v++` link is *deterministic* for
+identical inputs: builds 3491 and 3661, submitted 14 hours apart, failed with
+byte-identical overlap and unrouted-net counts, so re-running an unchanged
+recipe is never a lever. Placement variance (>=1.3 ns) only appears between runs
+that start from *different* states, such as a re-placement from a checkpoint. And
+when a build fails a late policy gate (for example `exact_clock` on an
+auto-scaled clock) it never copies its XCLBIN back, so a usable image can exist
+only in the job's node-local stage dir -- recover it before that node is reused.
 
 ## Generated Artifacts
 
