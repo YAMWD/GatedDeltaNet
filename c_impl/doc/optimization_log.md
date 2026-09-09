@@ -13805,4 +13805,96 @@ i.e. a **shell-routing sanity check inside `report_load_drivers before`**, which
 
 **Standing view unchanged, and now better supported.** This is the second failed attempt at repairing the 0.349 ns on a checkpoint (3706: unsupported post-route option; 3728: OOM in a pre-flight query). Neither failure says anything about whether replication would work. Combined with the Iter66 finding that checkpoint route-repair on a dense placement worsened overlaps in all seven attempts, the **`FORCE_MAX_FANOUT` in a `PLACE_DESIGN.PRE` hook, implemented from placement through the normal `run_hw` flow** remains the better route — it is this repo's proven pattern (`apply_iter23/35/43/54_*`), it needs no checkpoint surgery, and it cannot hit either failure mode. The checkpoint path's only advantage was speed, and it has now spent 1 h 12 m across two attempts to produce zero design data.
 
+Codex verification of3728: Slurm explicitly reports OUT_OF_MEMORY, elapsed
+56m27s, MaxRSS134215940KiB (approximately127.998GiB), wrapper exit137,
+and one cgroup oom_kill event. Death occurred during the bulk fixed-routing
+audit, before its next progress marker and before unroute/replication/rerouting.
+The exact allocating subexpression is not established by the final echoed
+Tcl line alone: the script both enumerates hierarchical fixed-net objects and
+requests all their ROUTE values in a single collection. This audit is outside
+`report_load_drivers`, not inside that procedure. The preceding27.5GB figure
+is cumulative process peak, not memory allocated by that individual get_nets
+call. Do not conclude that physical optimization itself requires>128GiB.
+Any retry should first bound/deduplicate the audit and avoid retaining all
+route strings together; raising memory alone is not an adequate fix. A bounded
+sample would only check sampled routes, not prove whole-shell equivalence.
+No retry or production changes were made in this status-check turn.
+
+### 2026-09-09 — Iter75c-R3: bounded fixed-route audit and192GiB retry
+
+User requested fixing the3728 audit OOM and increasing memory concurrently.
+Prior R2 result: OUT_OF_MEMORY at56m27s, peak134215940KiB, before unroute,
+replication or reroute. No design performance/congestion result was obtained.
+R2's scripts/logs are preserved and excluded from production.
+
+R3 changes only diagnostic memory handling and allocation: use
+`get_nets -hierarchical -top_net_of_hierarchical_group` for canonical fixed
+physical nets; read ROUTE for one net at a time, hex-encode name/route and
+stream to node-local files. Sort records externally with32MiB memory, then
+compare all records byte-for-byte before/after unroute. Compare count and retain
+SHA256 as well. This retains full-set verification, not a sample. Canonical
+net handles remain in memory, but the bulk hierarchy-segment and all-ROUTE
+value collections are eliminated. Report progress every1024 records so future
+memory/runtime failures can be localized. Full-device peak is not yet measured.
+
+Fast Tcl audit tests PASS: reject bulk property calls, comparison independent
+of iteration order, multiline/metacharacter serialization, changed-route and
+removed-net detection. Repeat tests in the Slurm job before Vivado. Reuse
+3727's passed command-stage qualification (unroute preserves a fixed test net
+and enables pre-route forced replication); do not confuse that small test with
+full-device qualification.
+
+Input DCP hash remains
+`3dd12e18f6c6f1dc998dcf4385a26bd8b7b76113d1f22f095e98047775eff98c`.
+Same eight target drivers, placement, fixed shell routes, registered state
+writer,150MHz constraint, AlternateCLBRouting and post-route AggressiveExplore.
+No source, arithmetic, production configuration, or XCLBIN changes. Request
+192GiB (was128GiB),8CPUs,12h limit, build partition, no GRES or node pin;
+exclude harrier for its recorded scratch issue and require60GiB scratch free.
+Scripts under `diagnostics/iter75c_r3_bounded_audit/`; reports/route and exact
+three-clock setup/hold gates unchanged. ETA3–6h after allocation, potentially
+longer if full audit or route is slow. Record outcome before another retry;
+no commit or retention pending physical and on-card evidence.
+
+Submitted3735. Repair Tcl SHA256
+`e8cb76e4cc20f6e7a1bdfb73ed1a93771834a05f5d9907c1b444a6616d635af8`;
+audit Tcl `6ffd828a6d60591f36bc6f14c6f6e2d61d9b6f55fc1e49bf10aa4f5b39620fba`;
+test `e85f4a43febaf17ba3a0f4ddae76bca59f6a00c4b7f48d6de5af1790e7206486`;
+Slurm `6a56323e7c39b6cf8c334ce24c50fd9e1083f833b38f50706f3394d993c954f7`.
+Shared live logs `iter75c_r3_bounded_audit/vivado.live.log`, `repair.live.log`,
+and `slurm-3735.log`; physical outcome pending. End after launch sentry rather
+than polling through the long stage.
+
 **Nothing promoted, nothing changed.** Iter67c remains HEAD and the `run_hw` default; Iter75b at 142.5 MHz remains the fastest correct image.
+
+### 2026-09-09 16:31Z — Iter75c-r3 "bounded audit" repair (job 3735) **FAILED: the audit was not bounded.** It streamed 363,135 net `ROUTE` strings to disk at 42 nets/min — 143 hours to completion — and died on `no space left on device` before the repair began. **Third consecutive infrastructure failure on the checkpoint path, ~2 h 10 m spent, zero design data. RECOMMENDATION: abandon checkpoint surgery.**
+
+**Job.** 3735 `iter75c_r3_f150_route`, `build`, `acclnode03`, 8 CPU / **192 GB** / 12 h. FAILED at **00:58:19**, `repair.exit=1`, MaxRSS 154.4 GB (so the 192 GB fix did work — memory was no longer the limit).
+
+**The failure, verbatim from `repair.tcl:137` → `audit_fixed_routes`:**
+```
+FIXED_AUDIT before canonical_count=363135 begin streaming
+FIXED_AUDIT before processed=1024/363135
+error writing "file5": no space left on device
+    while executing
+"puts $fp "$name_hex\t$fixed\t$route_hex""
+```
+It hex-encodes every net's full `ROUTE` property and writes one record per physical net. Measured rate: **1,024 nets in 24 m 14 s = 42.3 nets/min**, so 363,135 nets would need **143 hours** — 12× the job's own wall limit. It exhausted the filesystem first. The 3728 post-mortem replaced an unbounded `get_nets` *query* with an unbounded per-net *loop* writing unbounded strings; the word "bounded" in the directory name describes the intent, not the code.
+
+**The audit is also unnecessary.** Its stated purpose is to confirm the shell's routing is fixed before `route_design -unroute`. On a DFX design that is true **by construction** — the static region carries `IS_ROUTE_FIXED` and `unroute` on the reconfigurable partition cannot touch it — and it is confirmable from a *single* known net. Enumerating and serialising 363K route strings to prove a structural invariant is a category error, not a thorough check.
+
+**Three attempts, three distinct infrastructure faults, no design evidence:**
+
+| job | fault | elapsed | reached the repair? |
+|---|---|---:|---|
+| 3706 | `-force_replication_on_nets` unsupported in **post-route** phys_opt | 15:52 | no |
+| 3728 | **OOM** at 128 GB in an unbounded `get_nets -hierarchical` | 56:27 | no |
+| 3735 | unbounded per-net `ROUTE` serialisation → **disk full** at 1,024/363,135 | 58:19 | no |
+
+Cumulative: **2 h 10 m 38 s** of build-partition time to produce zero data about whether replicating the eight measured drivers recovers any of the 0.349 ns. Each fix addressed the previous fault and introduced a new one — the classic signature of a workflow that is wrong in kind, not in detail.
+
+**The baseline reproduced a fourth time**, again before the audit: kernel −0.349 / 1,733 failing endpoints, DMA +0.003, HBM +0.061, route legal (1,592,094 fully routed, 0 errors), and the failing-family table byte-identical to job 3705's. That invariance across four opens on two nodes is now the best-established fact in this sub-campaign — and the only one it has produced.
+
+**RECOMMENDATION, stated plainly: stop the checkpoint-surgery path.** Use `FORCE_MAX_FANOUT` on the eight drivers in a `PLACE_DESIGN.PRE` hook and implement from placement through the normal `run_hw` flow. It is this repo's proven pattern (`apply_iter23/35/43/54_*` all set fanout properties pre-placement), it needs **no** fixed-route audit, no unroute, and no post-route option, so it cannot hit any of the three faults above. It costs one full build (~9 h) instead of the ~1 h the checkpoint path promised — but that path has now spent 2 h 10 m for nothing, and the Iter66 campaign separately measured checkpoint route-repair worsening overlaps in **all seven** attempts on a dense placement. The expected-value comparison is no longer close.
+
+**Nothing promoted, nothing changed.** Iter67c remains HEAD and the `run_hw` default; Iter75b at 142.5 MHz remains the fastest correct image, now with measured energy (0.798 J/token gross, 46.1 W active).
