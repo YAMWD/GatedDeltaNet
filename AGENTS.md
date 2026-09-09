@@ -58,31 +58,45 @@ explicitly asks otherwise.
   shared directly. Continue staging heavy Vitis/Vivado working trees under
   `/tmp/$USER-$SLURM_JOB_ID` because NFS builds are slower.
 - Submit compute-only HLS, RTL cosim, synthesis, and linking to `build`, request
-  no accelerator GRES, and stay within 48 CPUs and 192 GiB. **Do not pin a
-  build node by default.** Request the required Vitis/Vivado feature (for
+  no accelerator GRES, and stay within 48 CPUs and 192 GiB per job and the
+  per-user `build` cap of **96 CPUs / 393,600 MB** across running build jobs
+  (two full links fit; a third queues). Set `--time` explicitly — the 12 h
+  default kills a 150 MHz link (measured 8–18 h; Vivado peaks at 64–69 GB).
+  **Do not pin a build node by default.** Request the required Vitis/Vivado feature (for
   example `vivado2024.2`) and let Slurm select any eligible node; use
   `--nodelist` only when the user requests a particular host or a measured
   node-specific requirement leaves no alternative. Do not force these jobs
   onto `harrier`. Verify the required toolchain and U55C platform after
-  allocation and before a production link. As of 2026-08-24, `acclnode01` and
-  `acclnode03` advertise Vitis/Vivado 2022.2; `acclnode02` is not registered.
-  A measured missing dependency may be handled with `--exclude` without
-  pinning a replacement node. As of 2026-08-28, `acclnode05` advertises
-  `vivado2024.2` but lacks the U55C platform, so exclude it from U55C builds.
+  allocation and before a production link. As of 2026-09-07 every node
+  advertises `vivado2020.2`–`vivado2024.2`; XRT is per node (`xrt2.14.354`
+  harrier, `xrt2.13.479` acclnode01/03, `xrt2.13.0` acclnode05, none on
+  acclnode04) and the U55C platform exists only on `acclnode01`, `acclnode03`
+  and `harrier`, so a U55C link carries `--exclude=acclnode04,acclnode05`.
+  `harrier`'s node-local `/tmp` was 100% full on 2026-09-06 and killed build
+  3449 inside synthesis (a v++ link writes 41–47 GB and our stage dirs are
+  never cleaned), so links since then also exclude `harrier`
+  (`BUILD_EXCLUDE=acclnode04,acclnode05,harrier`); check `df -h /tmp` at job
+  start and re-include the node once its scratch is cleaned.
 - Submit hardware execution as a separate `light` job with
   `--gres=fpga:u55c:1`, at most 8 CPUs and 32 GiB. Do not assume the request
   routes to `harrier`: inspect the allocated node and XRT version, then confirm
   the expected U55C with `xbutil examine`. Make it `afterok`-dependent on the
   build job when both are submitted together.
-- A card is usable only inside the job that requested it. Confirm
-  `xbutil examine` shows exactly the allocated card before loading the XCLBIN.
-  Do not infer allocation from `/dev/dri`.
+- A card is usable only inside the job that requested it. Select it by PCIe
+  BDF (`host.cpp` accepts a BDF wherever a device index goes) and re-verify with
+  `xbutil examine --device <bdf>`. Do **not** gate on "exactly one card": on
+  `acclnode01` an inaccessible U280 is listed beside the allocated U55C, and
+  that guard killed jobs 1354 and 2504. The `[XRT] WARNING: dev_init failed`
+  / `Operation not permitted Device index 0` lines there are benign. Do not
+  infer allocation from `/dev/dri`. `jq` is not installed on the compute nodes.
 - Source `/tools/Xilinx/Vitis/2024.2/settings64.sh` for builds (the version is
   pinned once as `VITIS_VERSION` in `c_impl/Makefile` — follow that knob if it
   moves) and `/opt/xilinx/xrt/setup.sh` for card runs. Keep the U55C platform
   at `xilinx_u55c_gen3x16_xdma_3_202210_1`.
-- Treat `QOSMaxJobsPerUserLimit` as normal queueing when one job of that class
-  already exists. For failures, start with `scontrol show job` and `sacct`, then
+- Treat `QOSMaxJobsPerUserLimit` (`light`/`vnc`, or a 25th build job) and the
+  per-user CPU/memory reasons on `build` (`QOSMaxCpuPerUserLimit`,
+  `QOSMaxMemoryPerUser` — hit when two 48-core links already run) as normal
+  queueing, not failures. For failures, start with `scontrol show job` and `sacct`, then
   inspect the Slurm output and detailed Vitis/Vivado log.
 - Use persistent Slurm output, detailed live logs, status, and exit-code files
   in the shared workspace. Do not add a separate polling/mirroring supervisor

@@ -160,9 +160,17 @@ The host-side exact shard validator compares every copied FP32 weight against
 the source blob before native decode, rather than relying only on token parity.
 
 One weight shard is **1,366,528 beats = 87,457,792 bytes (83.4 MiB)** of packed
-BF16, 32 values per 512-bit beat; the 32 shards allocate 2.799 GB and carry
-1,298,661,376 dense parameters, so a token reads **2.597 GB of real weight
-bytes** (it was 5.195 GB in FP32). Ports 28--31 append one 3,145,728-value
+BF16, 32 values per 512-bit beat; the 32 shards hold exactly
+1,399,324,672 dense parameters with no padding, so a token reads **2.799 GB of
+weight bytes** (it was 5.598 GB in FP32).  That count is the five hidden-size
+projections per layer (`q/k/v/g/o_proj`) plus `gate/up/down_proj`, times 24,
+plus `lm_head`; the embedding table stays on the host.  It is confirmed twice
+over: from the checkpoint tensor shapes, and from the reader's own bound
+`total_weight_beats = rows_per_ch * k_packs` summed over the 97 GEMV calls,
+which totals 1,366,528 beats per port and equals
+`GDN_COMPILED_WEIGHT_SHARD_BEATS`.  (Earlier revisions of this document said
+1,298,661,376 parameters / 2.597 GB / 1,268,224 beats; that omitted one
+2048x2048 projection per layer, 98,304 beats per port.) Ports 28--31 append one 3,145,728-value
 BF16 state stripe (**6 MiB**) after that fixed boundary. The small norms, A/B
 projections, convolution kernels, and final norm are packed into
 `aux_weights`.
@@ -172,7 +180,7 @@ still a **5.87 GB FP32-container** blob whose values are required to be
 BF16-exact — `gdn_validate_bf16_exact_weights()` rejects a non-conforming blob
 before decode. The *device* image is the packed-BF16 shard set above. Neither
 is "the weights are 5.6 GB" in the bandwidth sense; per-token traffic is
-2.597 GB.
+2.799 GB.
 
 Port 0 is special. Its loader first copies the local GEMV activation into the
 cluster ripple and then streams shard-0 weights. This gives the dataflow region
@@ -539,9 +547,9 @@ Five changes separate Iter66e from Iter61, and the order matters because only
 the last one made the design routable.
 
 **1. Packed BF16 weights.** Each 512-bit beat carries 32 BF16 values instead of
-16 FP32. Per-token weight traffic halves to 2.597 GB. This alone did *not*
-halve the token: the measured gain is **1.582x**, because at 2.597 GB the 32
-ports are busy only 49.5% of the token and the design is no longer
+16 FP32. Per-token weight traffic halves to 2.799 GB. This alone did *not*
+halve the token: the measured gain is **1.582x**, because at 2.799 GB the 32
+ports are busy only 53.3% of the token and the design is no longer
 bandwidth-bound.
 
 **2. A native `ap_float<16,8>` multiplier.** `gemv32_four_dots` now emits 64

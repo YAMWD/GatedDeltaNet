@@ -11179,3 +11179,2351 @@ Anything else is logged as rejected or inconclusive and not promoted.
 a real 150 MHz fix means changing where the 512-bit buses cross SLRs, which
 is a floorplan/partition campaign of several multi-day links and is the
 user's call, not an auto-proceed step.
+
+### 2026-09-05 12:30Z — Iter69 routed worst-20 paths, classified by site and SLR crossing (from job 3371's `gdn_final_qor/timing_summary.rpt`) — MEASUREMENT ONLY
+
+Question (user): what has to change for 150 MHz, and is the `ap_none`
+scalar/control path the bottleneck? Source: the 20 violating `clk_kernel_00`
+paths the final QoR report lists (of 25,528 failing endpoints; the routed DCP
+was not kept, so the other 25,508 cannot be classified). Every path is
+0.08–0.73 ns of logic and 7.2–8.1 ns of wire. Extract:
+`diagnostics/iter69_fanout_census/routed_worst20_paths_sites.txt`.
+
+| # of 20 | family | the long net | where it runs |
+|---|---|---|---|
+| **10** | `gemv32_cluster2_3` **straddles SLR1/SLR0** | `cl_flush … p3_assign` fo **2,048**, 6.96–7.11 ns; `cl_weight_stream … trunc_ln3301_8 … iter28` fo **1,920**, 6.6–7.0 ns into `ys_2_U` (RAMB36_X1Y84–88) | source flops at Y275–291 (SLR1), loads at Y228–231 and the FIFO BRAM at Y84–88 (SLR0); the report marks `SLR Crossing[1->0]` on the data path |
+| **8** | ~1,000–1,500-load **LUTRAM address nets inside one SLR** | `gemv32_store_or_qkvg_conv_stream … head_value_2_U/…/A1` fo **1,536**, 5.78 ns; `qkvg_stream_pack` fo 1,025, 4.88 ns; island_0 `partial_hi_14_U`/`partial_lo_14_U` fo **1,004**, 7.36–7.45 ns from X136Y579 to X180Y625 | all inside SLR2 (the islands inside `pb_iter56_recurrent_slr2`), no SLR crossing — fanout + distance |
+| 1 | scalar pointer FIFO chain (`ap_none`-class) | `w28_c_U/dout_vld → w29_c_U/w28_read` fo **1,411**, 4.63 ns, crossing SLR1→SLR2 | the same net that was the single negative-slack high-fanout net at placement (−0.876) |
+| 1 | state write data, island → port, **unregistered SLR2→SLR0** | `mem_weights_mm28 … store_unit_0/buff_wdata … in_HLS_WDATA[8]` fo **1**, **7.22 ns** on one wire | SLICE_X148Y599 (SLR2) → RAMB36_X8Y46 (SLR0), two die crossings, no register |
+
+Answer to the question: **no.** The scalar/control (`ap_none`) path is one
+of four families and the smallest of them in the routed worst-20 (1 of 20;
+302 of the 835 endpoints that failed at placement, before phys-opt fixed
+them). The worst routed paths are (1) a cluster the placer split across the
+SLR0/SLR1 boundary so its fo≈2,000 control nets cross an SLL, and (2)
+1,000–1,500-load LUTRAM address nets that Vivado did not replicate enough
+inside SLR2. Both are wire. Iter68 targeted the control-path class and left
+(1), (2) and the SLL column overload untouched.
+
+Evidence boundary: the worst-20 are the paths with the least slack, not the
+composition of the 25,528; with the router in "route all nets over timing"
+mode many of the rest are congestion detours whose families are unknown
+without a routed DCP. Nothing here is a demonstrated fix.
+
+### 2026-09-05 13:10Z — Iter69 post-place checkpoint re-routed standalone for congestion / SLL / failing-endpoint census — MEASUREMENT ONLY, no design change
+
+**Why.** The 150 MHz question ("what has to change?") was answered above from
+Iter69's 20 worst paths only. The other 25,508 failing endpoints and the
+identity of the nets in the 211 % / 200 % SLL columns are not in any artifact
+the v++ link keeps: it writes no routed DCP, and `report_final_qor.tcl`
+reports 20 paths and per-SLR crossing totals only. The one checkpoint the
+flow does keep is the post-place DCP written at PLACE_DESIGN.POST
+(`check_f150_physical_islands.tcl`, copied back by `hw_build.slurm`), so the
+cheapest way to a routed checkpoint is to replay the recipe's remaining steps
+on it — no synthesis, no placement, no on-card job.
+
+**Hypothesis.** Re-routing Iter69's placement with the recipe's own
+directives reproduces its failure class (WNS ≈ −1.6 ns at 6.667 ns, tens of
+thousands of failing endpoints, SLL column overload). The census then says
+(a) how the failing endpoints split by start/end SLR and hierarchy family —
+whether the 10/20 cluster-3 SLR-straddle and 8/20 LUTRAM-address families in
+the worst-20 are representative of the whole, and (b) which drivers occupy
+the crowded Laguna columns. That decides which of the five 150 MHz options
+(cluster re-pinning, LUTRAM address registering, registering the state-write
+wire, pointer-FIFO registering, placement directive) is worth a build.
+
+**Inputs (hashes).**
+
+| item | value |
+|---|---|
+| post-place DCP | `.claude/worktrees/iter69-f150/c_impl/diagnostics/iter69_iter67c_true_f150/post_place.dcp`, 642,621,181 B, sha256 `8ea2b36890abc63b68ee87a31df72030d278d4196447e393e7f7a13617f88bb3` |
+| netlist / recipe in the DCP | Iter67c source `caf512543`, `hw_iter69_kernel_clock_f150.cfg` (kernel clock recreated at 6.667 ns, `SSI_SpreadLogic_high` placement) |
+| analysis Tcl | `diagnostics/iter69_route_analysis/iter69_route_analysis.tcl`, sha256 `8cb548760b1b955887b33d5c47253f8d3ee435713e797ac4c380df347d3f03c3` |
+| job script | `diagnostics/iter69_route_analysis/route_analysis.slurm`, sha256 `8292fa3d013f9d4a8ed086c0657599a78610cdfee626ce55f476d1ee9d128ee0` |
+
+**What the job does** (Vivado 2024.2, `build` partition, 16 cores / 128 GB /
+`--time 1-06:00:00`, `general.maxThreads 8` = the link's `VIVADO_IMPL_JOBS`;
+runs on NFS because harrier's `/tmp` took job 3378 down):
+
+1. `open_checkpoint`; **fail closed** unless `clk_kernel_00_unbuffered_net`
+   reads 6.667 ns (guards against a 10 ns checkpoint).
+2. `phys_opt_design -directive AggressiveExplore` → `route_design -directive
+   AlternateCLBRouting` → `write_checkpoint routed.dcp` — the same two steps
+   the cfg ran, in the same order.
+3. Report set `routed/`: `report_route_status`, per-clock WNS/WHS + failing
+   endpoint counts, `report_timing_summary -max_paths 100`,
+   `report_utilization -slr`, `report_design_analysis -congestion` and
+   `-timing`, `report_high_fanout_nets`, `report_qor_suggestions`, plus two
+   TSVs: **`failing_endpoints.tsv`** (one row per failing endpoint: slack,
+   logic levels, logic/net delay, inter-SLR compensation, start/end SLR,
+   start/end hierarchy family, largest-fanout net on the path) and
+   **`sll_nets.tsv` / `sll_capacity.tsv`** (every net occupying a `UBUMP`
+   node in a `LAG_LAG` tile, with its Laguna tiles, driver cell/SLR/family,
+   fanout, and the SLRs its cells span; per-tile UBUMP capacity and use).
+4. `phys_opt_design -directive AggressiveExplore` (post-route, as the cfg) →
+   `routed_physopt.dcp` → second report set `routed_physopt/`.
+
+Every report is `catch`-wrapped, so one failing command costs only that
+report. Expected duration from Iter69's `runme.log`: phys-opt 0:46 + route
+3:55 + post-route phys-opt 3:54 + checkpoints and reports ≈ 10–12 h; peak
+memory there was 45 GB.
+
+**Submitted** 2026-09-05 13:09Z as **job 3416**
+(`diagnostics/iter69_route_analysis/route_analysis-3416.log`, Vivado log
+`run-3416/vivado.log`, exit marker `route_analysis.exit`). Watcher armed on
+the marker / queue departure.
+
+**Evidence boundary, stated up front.** This is a re-route of the same
+placement, not Iter69's route: Vivado's router is deterministic for identical
+inputs and thread count, but the pre-route phys-opt in the v++ flow ran with
+v++'s own parameter set, so the routed result may differ in detail from job
+3371's WNS −1.594 / 25,528 failing endpoints. The first thing to read is
+`routed/clock_slacks.tsv` against those two numbers; the census is only
+representative of Iter69 if they agree to within the noise of a re-run.
+Nothing here changes the design, so it produces no verdict — it produces the
+data the next 150 MHz iteration will be argued from.
+
+### 2026-09-05 21:40Z — Job 3416 RESULT: Iter69 netlist re-routed at 6.667 ns — census of what fails at 150 MHz — MEASUREMENT ONLY, no verdict on a design
+
+**Run.** Job 3416 on `build`/vivado2024.2, exit 0, 14 h 30 m wall
+(`run-3416/vivado.log`, node-local timestamps UTC+3): open DCP 10 min,
+pre-route phys-opt 50 min, `route_design` 3 h 46 m, post-route phys-opt
+1 h 51 m, two report sets ~1 h each. Output:
+`diagnostics/iter69_route_analysis/run-3416/{routed,routed_physopt}/` plus
+`routed.dcp` (780,788,661 B) and `routed_physopt.dcp` (780,718,150 B, sha256
+`aa5da9c56d01…`). Fully routed 1,749,822/1,749,822 nets, 0 routing errors,
+0 node overlaps at both report points.
+
+**Headline timing (per clock).**
+
+| clock | period | routed WNS / failing | after post-route phys-opt | Iter69 job 3371 (v++ flow) |
+|---|---|---|---|---|
+| `clk_kernel_00_unbuffered_net` | 6.667 | **−2.502 / 28,617** | **−2.030 / 26,893** | −1.594 / 25,528 |
+| `dma_ip_axi_aclk_1` | 4.000 | −0.521 / 105 | +0.001 / 0 | closed |
+| `clk_kernel_01_unbuffered_net` | 2.000 | +0.604 / 0 | +0.604 / 0 | closed |
+
+Same failure class and magnitude as Iter69, ~0.44 ns worse WNS — the
+representativeness test in the launch entry passes for composition, not for
+the exact number. Evidence boundary: this is a standalone re-route of
+Iter69's post-place checkpoint, not the v++ route; everything below is about
+*this* routed result.
+
+**What fails — 26,893 endpoints after post-route phys-opt
+(`routed_physopt/failing_endpoints.tsv`).**
+
+| cut | share |
+|---|---|
+| wire-dominated (net delay > logic delay) | 97%; median net delay 6.53 ns vs logic 0.23 ns, median 2 logic levels |
+| crosses an SLR | 42%: SLR1→SLR0 16.7%, SLR1→SLR2 8.3%, SLR0→SLR1 7.3%, SLR2→SLR0 4.4%, SLR0→SLR2 2.4% |
+| same-SLR | 58%: SLR2→SLR2 29.6% (recurrent islands), SLR1→SLR1 20.4%, SLR0→SLR0 10.7% |
+| path contains a ≥512-fanout net | ~78% |
+
+By hierarchy family (start cell):
+
+| family | endpoints | note |
+|---|---:|---|
+| GEMV clusters (16) | 10,140 (37.7%) | cluster 5 **3,599**, 13: 1,574, 7: 1,010, 12: 798, 3: 699, 15: 697, 11: 592, 9: 351 |
+| recurrent islands (SLR2) | 4,985 (18.5%) | same-SLR, under the Level 7 congestion window |
+| `store_or_qkvg_conv_stream` | 2,280 (8.5%) | `qkvg_stream_pack` fanout 1,026 |
+| shell `hmss_0` | 1,705 (6.3%) | platform HBM subsystem, SLR0 |
+| top FSM `ap_CS_fsm_reg[97]_replica_1` | 1,145 (5.2%) | SLR1→SLR0 |
+| m_axi store units (mm28 573, mm29 433) | 1,340 (5.0%) | |
+| `scalar_word_U` | 753 (2.8%) | SLR1→SLR2 — the `ap_none` scalar path is a minor contributor |
+| `bus_read` mm0 | 352 (2.1%) | SLR2→SLR0 |
+
+A dozen HLS-generated control nets sit on ~13,000 of the failing paths
+(top-24 max-fanout nets cover 12,874 endpoints): cluster 5
+`cl_weight_stream_fu_401/ap_loop_init` fanout 3,073 → **3,072 endpoints**
+(cluster 5 straddles SLR0/SLR1 — a placer outcome, it is not pinned);
+cluster 13 `frp_pipeline` fanout 1,539 → 1,459; `ap_CS_fsm_state6` fanout
+1,414 in clusters 15/11/7 → 549/533/396; recurrent-island LUTRAM/partial
+nets fanout 1,005–1,009/518/647 → ~2,460; `qkvg_stream_pack` fanout 1,026 →
+962; `scalar_word_U/…/E[0]` fanout 1,025 → 427; cluster 5 `cl_flush` flow
+control fanout 1,025 → 329; cluster 3 `frp_pipeline_v` fanout 515 → 342.
+
+**SLL occupancy (post-route, UBUMP census `sll_capacity.tsv`, one side per
+boundary; totals match the congestion report's crossing counts 19,979 /
+13,245 to within the half-tile accounting).**
+
+| boundary | SLLs used | of 23,040 | Laguna columns at 100% |
+|---|---:|---:|---|
+| SLR0 \| SLR1 | 20,031 | **86.9%** | **9 of 16** (X60–X142 except X115 at 99.9%); X52 96%, X40 88%, X31 73%, X23 62%, X12 58%, X4 13% |
+| SLR1 \| SLR2 | 13,247 | **57.5%** | 4 of 16 (X96, X123, X134, X142); X69 84%, X60 70%, rest ≤61% |
+
+Owners of the crossing nets (congestion report, nets *owned* per level):
+shell `level0_i`/`blp`/`hmss path_12/slice0_12` ≈ 4,069+856+347 + ~3,700 +
+1,217+1,217 — roughly **half of the lower boundary is the platform's own**;
+kernel: `gdn_forward_1` port nets 1,551 (0-1) + **2,663 double crossings
+(0-2)** + 626 (1-2), `grp_gdn_gemv_fu_1054` dataflow 2,488 (0-1) + 2,057
+(1-2), `inst` dataflow 2,348 + 622 (0-2) + 736. Per-cluster owned crossings
+are ≤44 each.
+
+**Router congestion (`routed_physopt/congestion.rpt`).** Level 7 (Long,
+North) over the recurrent islands in SLR2 (CLEM_X64Y504–CLEL_L_X127Y631,
+island_0 53% of the window); Level 6 North windows over the islands
+(X64–127, Y512–607); Level 6 South in SLR0 at cluster 6 `four_dots` + `hmss
+path_12` (X49–80, Y62–157); Level 5 East/West at LAG_LAG_X31Y528–537
+(island_1 ~50%). Placer-final: Level 5/6 north (islands, conv), Level 5/6
+south (cluster 5 `four_dots` 41%, hmss 28%).
+
+**Tooling defect, recorded so it is not repeated.** `sll_nets.tsv` is
+header-only in both report sets: the batch `get_nets -quiet -of_objects
+$allnodes` was handed a flattened Tcl list of node *names* (`lappend
+allnodes {*}$nodes`), which `get_nets -of_objects` rejects, and `-quiet`
+hid it. The per-tile `get_nets -of_objects $node` calls in the same proc
+worked (3,252 tiles report `ubump_nodes_used` > 0), so per-column occupancy
+is valid and per-net driver identity is not. Fix: query per tile with the
+node *objects* and accumulate net objects in a dict (done in job 3428).
+
+**Reading.** At 6.667 ns the blockers are (a) ~12 HLS control nets with
+>1,000 loads (loop-init, frp pipeline valid, FSM state, LUTRAM address, FIFO
+enable) whose loads span SLRs whenever a cluster straddles a boundary, (b)
+the SLR0|SLR1 boundary at 87% with the placer free to straddle clusters
+5/3/7/12 across it, and (c) the recurrent islands' own Level 7 window in
+SLR2. The `ap_none` scalar path is measured minor (2.8%). Which of the five
+150 MHz options this favours is deferred until job 3428 delivers the
+per-cluster SLR split and the SLL owners by column. **No design verdict; no
+commit.**
+
+### 2026-09-05 21:43Z — Job 3428 LAUNCHED: query `run-3416/routed_physopt.dcp` for per-actor SLR spread, SLL net identity, high-fanout load split — MEASUREMENT ONLY
+
+Three things job 3416 did not deliver, read from its saved checkpoint with
+no implementation step: (1) leaf primitives per SLR for every GEMV cluster,
+collector, mm2s reader, m_axi master and top-level process (the placement
+hook reports only the pinned actors); (2) the SLL census with driver
+cell/family/SLR per net, aggregated per Laguna column (fixed query); (3) the
+load-per-SLR split of the 24 highest-fanout nets on failing paths
+(`hifo_nets.txt`, 12,874 endpoints).
+
+| item | value |
+|---|---|
+| input DCP | `run-3416/routed_physopt.dcp` sha256 `aa5da9c56d01df76a7285ae08d1fc7abfe9b92a849429ee70a1a8c0a22656c16` |
+| Tcl | `diagnostics/iter69_route_analysis/iter69_dcp_census.tcl` sha256 `b086ce9b1d4bde3cb8bc56672289bfe87fed9f34f07b892840e3575c622f7682` |
+| net list | `hifo_nets.txt` sha256 `ea6bba183c1ae6720f9494f5fa9de5ff3ae6f94e5ff0fbacc2d938875b9af540` |
+| job | `build`/vivado2024.2, 8 cores, 96 GB, `--time 6:00:00`, **job 3428**, log `dcp_census-3428.log`, output `census-3428/`, exit marker `dcp_census.exit` |
+
+Watcher armed on the marker / queue departure. Outputs: `actor_slr_spread.tsv`,
+`sll_nets.tsv`, `hifo_net_loads.tsv`. No design change; no commit.
+
+### 2026-09-05 22:00Z — Iter70a RESULT: Iter67c relinked with the kernel clock at 8.000 ns (125 MHz) — **REJECTED** (build failed in a Vivado report crash; routed timing before the crash already rules the image out)
+
+**What ran.** Build job 3397 on `acclnode01` (`build`/vivado2024.2, 48
+cores), 10 h 27 m, `build.exit=2`, no XCLBIN; on-card job 3398 cancelled by
+`afterok`. Diagnostics: `.claude/worktrees/iter69-f150/c_impl/diagnostics/iter70a_iter67c_f125/`
+(`impl_1.runme.log`, `build.slurm-3397.log`, `build_diagnostics.tar.gz` with
+both v++ timing summaries and the crash log, `post_place.dcp` sha256
+`3d6860814a79…`). Source `gdn_model.cpp` `2bc240e6a5cf…` (= Iter67c, HEAD
+`caf512543`), recipe `hw_iter70_kernel_clock_f125.cfg` `c5e11ba90cf8…` +
+`apply_iter70_kernel_clock_f125.tcl` `77f70639ee85…` (`create_generated_clock
+-multiply_by 5 -divide_by 4` on the MMCM CLKOUT0; `iter70_clocks_after_override.rpt`
+confirms `clk_kernel_00_unbuffered_net` period 8.000).
+
+**How it ended.** After post-route phys-opt, v++'s own
+`report_timing_summary … hw_bb_locked_timing_summary_postroute_physopted.rpt`
+segfaulted inside Vivado 2024.2 (`hs_err_pid4021015.log`: `libxv_timing.so
+HASTSTable::isColumnEmpty` ← `HASTRTimingSummary::writeIctDetails`), so
+`impl_1` failed before `write_bitstream`. The earlier `ERROR: [Ip 78-110]
+Invalid part string Project` in `_full_init_post.tcl` is not the cause — it
+appears exactly once in the Iter66e, Iter67c, Iter69 and Iter70a logs alike
+and the flow continues past it.
+
+**Timing before the crash (`hw_bb_locked_timing_summary_routed.rpt`, per clock).**
+
+| clock | period | WNS | failing / total endpoints | WHS |
+|---|---|---|---|---|
+| `clk_kernel_00_unbuffered_net` | 8.000 | **−2.216** | **20,800** / 1,633,023 | +0.006 |
+| `dma_ip_axi_aclk_1` | 4.000 | +0.003 | 0 / 307,241 | +0.008 |
+| `clk_kernel_01_unbuffered_net` | 2.000 | +0.718 | 0 | +0.034 |
+
+Post-route phys-opt changed nothing (`Physopt 32-745`: negative slack too
+large to be worth trying; 0 cells touched). Had the bitstream been written,
+the platform's auto-scaling would have set the kernel to 1/(8.000+2.216 ns) =
+**97.9 MHz — below the 100 MHz production image.** Reject on that alone.
+
+**Where the 2.2 ns went — and this is the finding.** The placement meets
+8.000 ns: the placer's post-phys-opt estimate is WNS **+0.003**, and the
+router's own pre-routing timing is −0.021 (same value as Iter66e/67c at
+10 ns). Then, in Phase 4.2, `WARNING: [Route 35-447] Congestion is preventing
+the router from routing all nets. The router will prioritize the successful
+completion of routing all nets over timing optimizations`, preceded twice by
+`Route 35-3311 … high localized SLL routing demand`. The first routing pass
+lands at WNS −5.010; rip-up recovers to −2.216 and stops. Iter69 at 6.667 ns
+followed the identical sequence (−0.021 → 35-447 → −1.847 routed). Iter67c at
+10 ns saw one 35-447 too but recovered to −0.017 estimated / +0.195 final;
+Iter66e saw none. The ten worst paths are all **one logic level with
+9.8–10.1 ns of route delay**: `island_0/ap_CS_fsm_reg[99]` → FP adder input
+buffers, and cluster 13 `cl_weight_stream ap_start_reg` → 300+ `yp1` resets —
+the same >1,000-load HLS control nets job 3416's census put on ~13,000 of
+the failing endpoints at 6.667 ns.
+
+**Reading.** 125 MHz fails for the same reason 150 MHz does, and it is not
+"the logic needs more than 8 ns": the timing is lost when the router enters
+congestion-recovery mode and stretches a handful of high-fanout SLR-crossing
+control nets to ~10 ns. WNS being *worse* at 8.000 ns than at 6.667 ns
+(−2.216 vs −1.594/−1.847) is consistent with that — it depends on which nets
+the router sacrifices, not on the period. So a frequency step above 100 MHz
+has to relieve SLL demand / fanout first; the period itself is not the
+binding constraint at either clock tried. Which lever, and its expected
+size, waits on job 3428's per-cluster SLR split and SLL-owner census.
+
+**Verdict: REJECTED. Not committed.** `hw_iter70_kernel_clock_f125.cfg` /
+`apply_iter70_kernel_clock_f125.tcl` stay in the worktree as record only;
+the `run_hw` default remains the 100 MHz Iter67c recipe.
+
+### 2026-09-05 22:36Z — Job 3428 RESULT (partial): per-actor SLR spread of the Iter69 netlist as routed by job 3416 — MEASUREMENT ONLY; job 3429 relaunched for the two failed steps
+
+Job 3428 exit 0 in 53 min (open DCP 11 min, actor spread 39 min). The
+`actor_slr_spread` step delivered; `sll_census` and `hifo_loads` **failed in
+0–105 s** on a Tcl error of mine (`can't set "n": variable is array` — the
+actor step left a global array `n`, which the later `foreach n` loop tried to
+reuse as a scalar). Fixed by renaming the scalars, actor step made skippable
+(`RA_SKIP_ACTORS=1`), resubmitted as **job 3429** (Tcl sha256 `981469e3827c…`,
+same DCP, `census-3429/`, watcher armed).
+
+**Leaf primitives per SLR (`census-3428/actor_slr_spread.tsv`, 328 actors).**
+
+| actor | SLR0 | SLR1 | SLR2 | note |
+|---|---:|---:|---:|---|
+| clusters 0, 8, 9, 10, 11, 15 | 0 | 60,808 each | 0 | whole; 8 and 10 are the pinned ones, the other four landed whole by choice |
+| clusters 2, 3, 5, 6, 12, 13 | ~52,700 | ~8,100 | 0 | 13% in SLR1 |
+| clusters 4, 7, 14 | ~34,300 | ~26,500 | 0 | **44% straddle** |
+| cluster 1 | 0 | 7,900 | 53,000 | 13% in SLR1 |
+| `mem_weights_mm1..27` m_axi | 2,838 each | 0 | 0 | all 32 masters sit in SLR0 (mm1/mm17: 1,148+1,690 split) |
+| `mm0`, `mm28..31` (aux/state ports) | ~5,050 | ~1,700 | (mm0: 1,865) | |
+| `mm2s_with_state_28..31` | ~850 | ~2,060 | 0 | |
+| `gemv32_store_or_qkvg_conv_stream` | 3 | 26 | 71,194 | SLR2 |
+| rmsnorm / gemv_tiny / output_norm / swiglu / conv load+store | ≤424 | ≤156 | 3,478–17,193 | SLR2 |
+| shell `hmss_0` | 163,331 | 7,296 | 8,978 | SLR0 |
+| `control_s_axi_U` | 5,932 | 0 | 0 | SLR0 |
+| `grp_gdn_gemv_fu_1054` total | 434,905 | 524,287 | 380,235 | |
+
+SLR primitive totals: SLR0 795,711 / SLR1 680,667 / SLR2 560,244.
+
+**Reading.** Nine clusters (2–7, 12–14) are SLR0-majority alongside all 32
+HBM masters and the 163k-leaf shell HBM subsystem — SLR0 is the full die
+(99.29% CLB in Iter67c), so the placer pushes 8k–26k leaves of each of them
+across the SLR0|SLR1 boundary. That is where the 87%-full lower SLL boundary
+and the SLR1→SLR0 failing paths come from. Straddle fraction alone does not
+predict failures (cluster 5 at 13% has the most, 3,599; clusters 4 and 14 at
+44% are not in the top eight) — it is which *control* nets end up with loads
+on both sides. Per-net load split is what job 3429 measures. No design
+verdict yet.
+
+### 2026-09-05 22:49Z — Jobs 3429/3430 FAILED (script errors, 11 min each), job 3431 LAUNCHED — census of SLL net owners and high-fanout load split
+
+Job 3429 exited 1 at line 58: `if {…} ra_step …` without a brace-wrapped
+body (`wrong # args: extra words after "else" clause`). Fixed, resubmitted as
+3430, then a stubbed `tclsh` dry run of the script (`proc unknown {args}
+{return 6.667}` so every Vivado command returns a value, exercising all code
+paths in seconds) exposed a third clash — `unset` vs `array unset` on a
+variable that the cell-set step had left as a scalar — so 3430 was cancelled
+at 17 s and the corrected script (sha256 `4cc6dbd9672f…`) submitted as
+**job 3431** (`census-3431/`, watcher armed). Lesson recorded: dry-run every
+checkpoint query script in plain `tclsh` with stubbed commands before paying
+the 11-minute `open_checkpoint`; `info complete` catches brace balance only.
+Measurement-only; nothing to commit.
+
+### 2026-09-05 23:30Z — Job 3431 RESULT: SLL owners per Laguna column and load split of the 24 worst-fanout nets, Iter69 netlist as routed by job 3416 — MEASUREMENT ONLY, no design change
+
+Job 3431 exit 0 in 23 min on `build` (open `run-3416/routed_physopt.dcp`
+613 s, `sll_census` 780 s, `hifo_loads` 3 s; Tcl sha256 `4cc6dbd9672f…`,
+inputs in `census-3431/input_hashes.txt`). Outputs
+`diagnostics/iter69_route_analysis/census-3431/{sll_nets.tsv,hifo_net_loads.tsv}`
+in the `iter69-f150` worktree: 28,848 nets with a `*UBUMP*` node, each with
+its Laguna tiles, driver cell/SLR/hierarchy, and pin count. 24,466 nets use
+2 tiles (one SLL), 4,381 use 4 (cross both boundaries), one 52-tile net.
+Cross-check: 19,982 SLLs on SLR0|SLR1 and 13,247 on SLR1|SLR2 versus job
+3416's 20,031 / 13,247 UBUMP-node counts — agreement to 0.25%.
+
+**Naming correction for the 05:00Z table.** HLS instance
+`gemv32_cluster2_N_U0` is dataflow call N−1 (ports `mm2(N−1)`, `mm2(N−1)+1`),
+and the unsuffixed `gemv32_cluster2_U0` is call 15 (mm30/31). Evidence:
+instance 2 reads `xr_1`, 11 reads `xr_10`, 13 reads `xr_12` (net names in
+`failing_endpoints.tsv` / `sll_nets.tsv`), and the SLL owners below line up
+only under this mapping (instance 9 pulls mm16/mm17 across, instance 11 pulls
+mm20/mm21, instance 1 — the one in SLR2 — pulls mm0/mm1 across both
+boundaries). Labels below are instance labels with the ports in brackets.
+
+**SLL owners, SLR0|SLR1 boundary — 19,982 of 23,040 (86.7%).**
+
+| owner | SLLs | share | kernel-controlled? |
+|---|---:|---:|---|
+| shell static: `blp` PCIe/DMA/firewalls, `ulp_ucs`, level0 pipe | 4,691 | 23.5% | no |
+| shell `hmss_0/path_12` triple-SLR register slices (host↔HBM path) | 1,218 | 6.1% | no |
+| `hmss_0/path_N` **read-data return to kernel ports** mm0, mm1, mm17, mm28, mm29, mm30, mm31 (7 × 514) | 3,598 | 18.0% | **yes** — attributed to the shell by driver, but it is the kernel's HBM read data reaching adapters/readers that sit in SLR1 |
+| `mem_weights_mm{16,20,21}_m_axi_U` read data (3 × 504) | 1,512 | 7.6% | yes |
+| `ws_14, ws_15, ws_18, ws_19` weight-stream FIFOs (4 × 515) | 2,060 | 10.3% | yes |
+| `xr_1, xr_6, xr_10, xr_13` activation relays (4 × ~513; `xr_1` crosses both boundaries) | 2,053 | 10.3% | yes |
+| recurrent islands → state write to mm28–31 (SLR2 → SLR0, crosses both boundaries) | 2,176 | 10.9% | yes, inherent while the islands are in SLR2 and the state lives on HBM[28–31] |
+| `grp_gdn_forward_Pipeline_drain_logits` (SLR2 → workspace on mm0, crosses both) | 512 | 2.6% | yes — the optional 128 KB logit export |
+| clusters 2–7, 12–14 own control/`ys` nets (121–178 each) | 1,262 | 6.3% | yes |
+| `mm29/mm31/mm0` partial, `w28..31_c` command FIFOs, <40-net owners | ~900 | 4.5% | mixed |
+
+Kernel-attributable total **14,073 (70.4%)**; fixed shell 5,909 (29.6%).
+The 14 × 512-bit weight buses for the seven clusters whose weights come from
+SLR0 — instances 1 [mm0/1], 8 [mm14/15], 9 [mm16/17], 10 [mm18/19],
+11 [mm20/21], 15 [mm28/29], 0 [mm30/31] — are **7,170 SLLs, 51% of the
+kernel's share**, regardless of whether the crossing is an HLS FIFO (`ws_*`),
+the adapter's read-data (`m_axi`), or the platform's AXI return (`hmss`).
+
+**SLL owners, SLR1|SLR2 boundary — 13,247 of 23,040 (57.5%).**
+
+| owner | SLLs |
+|---|---:|
+| shell static + `path_12` slices | 5,693 |
+| recurrent islands → state write (continuing to SLR0) | 2,277 |
+| `state_stream0..3` state read, SLR1 → islands (4 × ~514) | 2,054 |
+| `drain_logits` | 515 |
+| instance 1 [mm0/1] in SLR2: `hmss` mm0 514 + `m_axi` mm1 504 + own 127 | 1,145 |
+| `xr_1` (instance 1's activation relay down to SLR0) | 514 |
+| `gemv32_collect_final` → `gemv32_store` in SLR2 | 513 |
+| `w28..31_c`, `load_qkvg_conv_context`, <40-net owners | ~540 |
+
+**Per Laguna column, SLLs used of 1,440 (SLR0|SLR1 first, SLR1|SLR2 second).**
+
+| column | X4 | X12 | X23 | X31 | X40 | X52 | X60 | X69 | X78 | X87 | X96 | X104 | X115 | X123 | X134 | X142 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| SLR0\|1 | 190 | 837 | 896 | 1,051 | 1,253 | 1,382 | **1,440** | **1,440** | **1,440** | **1,440** | **1,440** | **1,440** | **1,438** | **1,440** | **1,440** | **1,440** |
+| SLR1\|2 | 117 | 743 | 285 | 152 | 389 | 504 | 1,005 | 1,209 | 846 | 877 | **1,440** | 542 | 818 | **1,440** | **1,440** | **1,440** |
+
+Top owners of the full lower-boundary columns: X60 `m_axi` 451 / recurrent
+351 / `xr_10` 224; X69 `m_axi` 609 / recurrent 604; X78 shell 516 /
+recurrent 275 / `m_axi` 199; X87 recurrent 560 / `m_axi` 258 / shell 228;
+X96 shell 796 / recurrent 252 / `m_axi` 218; X104 shell 1,217; X115 shell
+1,361; **X123, X134, X142 shell 1,440 each** — the PCIe/DMA static region owns
+the three rightmost columns outright on both boundaries. All 3,030 free
+lower-boundary SLLs are in the six left columns X4–X52; the kernel's crossing
+traffic sits over the right HBM stack (mm16–31) and the shell.
+
+**Load split of the 24 worst-fanout nets on failing paths
+(`census-3431/hifo_net_loads.tsv`; these 24 cover 12,874 of the 26,893
+failing endpoints).**
+
+| net (instance label [ports]) | fanout | driver | loads SLR0 / SLR1 / SLR2 | crosses? |
+|---|---:|---|---|---|
+| inst 5 [mm8/9] `cl_weight_stream/ap_loop_init` | 3,073 | SLR1 | 2,048 / 1,024 / 0 | **yes** |
+| inst 12 [mm22/23] `cl_weight_stream/ap_loop_init` | 3,316 | SLR0 | 2,254 / 1,061 / 0 | **yes** |
+| inst 9 [mm16/17] `cl_weight_stream/ap_loop_init` | 3,316 | SLR1 | 0 / 3,315 / 0 | no |
+| inst 15, 11, 7 `ap_CS_fsm_state6` (3 nets) | 1,414 | SLR1 | 0 / 1,413 / 0 | no |
+| inst 7 `empty_1002_fu_5140` | 1,665 | SLR1 | 0 / 1,664 / 0 | no |
+| inst 12 `and_ln3317…iter28_reg` | 1,034 | SLR1 | 0 / 1,033 / 0 | no |
+| inst 13 `frp_pipeline_valid[21]` | 1,539 | SLR0 | 1,538 / 0 / 0 | no |
+| inst 3 `frp_pipeline_valid[29]` | 515 | SLR0 | 0 / 514 / 0 | **yes** |
+| inst 5 `cl_flush yp0_34…` | 1,025 | SLR1 | 0 / 1,024 / 0 | no |
+| `scalar_word_U/…/E[0]` (per-head scalar broadcast) | 1,025 | SLR1 | 0 / 0 / 1,024 | **yes** |
+| `scalar_word_U/…/a_log_storage_0_preg_reg[31]` | 514 | SLR1 | 0 / 0 / 512 | **yes** |
+| island_0 `mem_weights_mm28_0_AWREADY_repN_alias` | 115 | SLR1 | 0 / 0 / 114 | **yes** |
+| islands `partial_hi_14_ce0`, `partial_*_ce0`, retrieval `_ce0` (3 nets) | 647–1,009 | SLR2 | 0 / 0 / all | no |
+| island `recur_island_update p_0_in[0]` | 518 | SLR2 | 0 / 0 / 517 | no |
+| `qkvg_stream_pack ram_reg…n_68` (2 nets) | 1,026 | SLR2 | 0 / 0 / 1,025 | no |
+| `out1_U` FIFO pop | 529 | SLR2 | 0 / 0 / 528 | no |
+| mm21 / mm31 `bus_read rs_rdata load_p2` (2 nets) | 514 | same SLR | all in driver SLR | no |
+
+**17 of the 24 worst nets have every load in the driver's SLR.** They fail
+with 8–10 ns of route delay on one logic level because the router, once in
+`[Route 35-447]` congestion-recovery mode, gives them up first — not because
+they cross SLRs. The seven that do cross are two `ap_loop_init` resets of
+clusters that straddle (instances 5 and 12), one pipeline-valid bit, the two
+`scalar_word` head-scalar broadcasts from SLR1 into the SLR2 islands, and one
+AXI-ready alias.
+
+**What this pins down, and what it does not.**
+
+1. The 150 MHz (and 125 MHz, Iter70a) miss is routing congestion, with two
+   measured sources: (a) the SLR0|SLR1 SLL boundary at 86.7% with the nine
+   right-hand columns at 100% while 3,030 SLLs idle on the left, 70% of the
+   demand being the kernel's — chiefly 14 weight buses for the seven clusters
+   whose weights arrive from SLR0, all of them fed from the *right* HBM stack
+   (mm14–31) whose adapters sit under the right columns; (b) Level 7
+   congestion over the recurrent islands in SLR2 (job 3416), where six of the
+   24 worst nets live (`_ce0` LUTRAM enables, `p_0_in`, `qkvg_stream_pack`).
+2. The kernel's SLL *count* is near the floor for a design that overflows
+   SLR0 by seven clusters: each cluster placed outside SLR0 costs ~1,030
+   SLLs of weight data plus ~513 for its activation relay if the relay
+   crosses. Only the *distribution* over columns is open — and the right
+   columns are also where the shell puts its 5,909 fixed crossings.
+3. Not obtainable here: whether the netlist would meet 6.667 ns with the
+   congestion removed. The placer estimated +0.003 and the router −0.021
+   before routing, so the margin is nil even in the best case; a successful
+   re-pin would most likely land between the 121 MHz Iter69 already runs at
+   and 150 MHz, not at 150.
+
+**Bearing on the five 150 MHz candidates (data only, no build launched):**
+
+| option | what the census says | size |
+|---|---|---|
+| (5) placement directive swap | measured poor prior (190/160% columns under `SSI_SpreadSLLs` through Iter65); the right-column saturation is structural (right HBM stack + shell) | not supported |
+| (3) register the state-write wire | 2,176 SLLs per boundary but **zero** of the 24 worst nets; registering changes no SLL count | no timing evidence |
+| (4) pointer/scalar FIFO registering | `scalar_word_U` E[0] and `preg[31]`: 1,024 + 512 loads SLR1→SLR2, 2 of 24 worst nets, 2.8% of failing endpoints | real, small |
+| (2) LUTRAM address/CE registering in the islands | 6 of 24 worst nets, all SLR2, under the Level 7 congestion; islands are 18.5% of failing endpoints | best-supported *source* change for the SLR2 half; does nothing for the SLL boundary |
+| (1) cluster re-pinning | the only lever aimed at the binding constraint; the census names the move: let the clusters that must live in SLR1 draw from the **left** HBM stack (mm0–13, Laguna X4–X52, 3,030 free SLLs) instead of the right one, i.e. swap the SLR1 set (currently instances 8–11, 15, 0 on mm14–21, 28–31) with same-size SLR0-resident clusters on mm2–13. Size-neutral for SLR0 CLB (clusters are identical). Outcome unmeasured; one 8–30 h link per variant | the one worth a build, if any; expected landing 121–150 MHz |
+
+Verdict: measurement only. Nothing to promote or commit; Iter67c at 100 MHz
+remains the shipping timing-closed image and Iter69 at 121 MHz the measured,
+not-promoted faster one.
+
+### 2026-09-06 00:06Z — Iter71 LAUNCHED: cluster re-pinning, tested as a controlled re-placement of the Iter69 netlist (four variants, no v++ link yet)
+
+**Goal (user, 2026-09-06: "proceed, as long as it raise freq").** Raise the
+achieved kernel clock above Iter69's 121 MHz. Job 3431 pinned the 6.667 ns
+miss on routing congestion at the SLR0|SLR1 SLL boundary: 86.7% full overall,
+nine right-hand Laguna columns (X60–X142) at 100%, ~3,030 SLLs idle on the
+six left columns (X4–X52). Kernel SLL demand is near its floor, so the only
+open lever is *which columns* the kernel's crossings use.
+
+**Per-column owners on SLR0|SLR1 (job 3431 census, re-tabulated by port).**
+The right columns hold everything tied to the right HBM stack plus the shell:
+static shell X123/X134/X142 = 3 × 1,440 and X115 236; `hmss_0` (PCIe path_12
+and the read-data return of mm17/mm28–31) X78–X115 ≈ 3,770; the recurrent
+state write X60–X104 = 2,176; `drain_logits` X69–X96 = 512; `m_axi` mm16 at
+X78–X96 (504) and mm20/21 at X52–X69 (1,024); `xr_13` X78–X115 (514).
+The left columns hold the left-stack traffic: `hmss` mm0/mm1 read data
+X4–X40 (1,028), `xr_1` X12/X23 (512), `ws_18/19` X12–X52 (1,030), `ws_14/15`
+X31–X60 (1,030), `xr_6`/`xr_10` X23–X60 (~1,000). So the router already
+pushes some SLR1-cluster buses left; what it cannot move is the state
+(mm28–31, 4,232 SLLs on the right) and the right-stack cluster ports.
+
+**Hypothesis.** Today's SLR1 set is instances {0, 8, 9, 10, 11, 15} = ports
+mm30/31, 14/15, 16/17, 18/19, 20/21, 28/29. Instances 15 and 0 (mm28–31) are
+free riders — their read-data crossing exists for the state whichever SLR they
+sit in — so the swappable part is {8, 9, 10, 11} (mm14–21, the right stack's
+start). Replacing them with left-stack clusters {2, 3, 4, 5, 6} (mm2–11;
+instance 4 straddles 44/56 today, so it is pinned whole to keep SLR0's leaf
+count where it is) moves ~10 weight buses onto the left columns and removes
+`xr_1`'s SLR0|SLR1 crossing (instance 1 → 2 becomes SLR2 → SLR1). Estimated
+boundary load: left six columns ≈ 85–89%, right ten ≈ 73% plus the fixed
+100% shell columns — instead of today's 65% / 93–100%. Same total (~14k
+kernel SLLs), CLB-neutral for SLR0, about +2% CLB in SLR1. Expected landing
+if it works: between 121 and 150 MHz, since the placer's own estimate at
+6.667 ns was +0.003 with no margin.
+
+**Method — change one variable, measure, before paying for a link.** Rather
+than four 8–30 h v++ links, each variant re-places the *same* Iter69 netlist
+from its post-place checkpoint (`iter69_iter67c_true_f150/post_place.dcp`,
+sha256 `8ea2b36890abc63b3…`, kernel clock verified 6.667 ns, static region
+locked): `place_design -unplace` (drops every non-`IS_LOC_FIXED` cell; a
+fail-closed check aborts if any static cell lost its placement), the variant's
+pblocks, then the recipe's own steps — `place_design -directive <D>`,
+`phys_opt_design AggressiveExplore`, `route_design AlternateCLBRouting`,
+post-route `phys_opt_design AggressiveExplore` — with the job-3416 report set
+(per-clock WNS, failing endpoints by SLR/family, SLL nets per Laguna column,
+congestion, per-SLR utilization) plus a per-cluster SLR census after
+placement, so the pin is verified before routing. Tcl
+`diagnostics/iter71_repin/iter71_repin.tcl` sha256 `3dcf7379bf1ee1481…`,
+Slurm `iter71_repin.slurm` sha256 `ecdf24f27b1a9f107…`; `build` partition,
+`vivado2024.2`, 8 threads (= `VIVADO_IMPL_JOBS`), 96 GB, `--time 1-06:00:00`,
+`acclnode04/05` excluded. tclsh dry run with stubbed Vivado commands passed
+end to end before submission. Instance naming as corrected 2026-09-06:
+`gemv32_cluster2_N_U0` = call N−1 = ports mm2(N−1), mm2(N−1)+1; the
+unsuffixed instance is call 15 = mm30/31.
+
+| variant | pblocks | place directive | tests |
+|---|---|---|---|
+| **V0** | recipe's (cluster 8, cluster 10 + ws_20/21 + xr_10, recurrent, relays) | `SSI_SpreadLogic_high` | control: the re-place-from-checkpoint procedure itself, against job 3416 (−2.502 / −2.030) and the Iter69 link (−1.594) |
+| **V1** | recipe's | `SSI_SpreadSLLs` | the listed directive swap; poor prior (Iter65: 190/160% column overload) on a netlist that has since lost 30% of its FFs and all CE cones — stated, not assumed |
+| **V2** | cluster 8/10 pblocks deleted; **{2, 3, 4, 5, 6, 15, 0} hard-pinned to SLR1**; recurrent + relays unchanged; 7–14 and 1 free | `SSI_SpreadLogic_high` | the re-pin hypothesis |
+| **V3** | as V2 but **{2, 3, 4, 5, 6, 7, 15, 0}** (8 clusters) in SLR1 | `SSI_SpreadLogic_high` | same idea, ~6% more SLR1 CLB, ~2% less SLR0 (SLR0 is at 99.29% and carries Level 6 congestion over cluster 6 + hmss) |
+
+**Success criterion.** Kernel-clock WNS after post-route phys_opt better than
+Iter69's −1.594 ns at 6.667 ns ⇒ achieved frequency above 121 MHz
+(f = 1/(6.667 + |WNS|)); fewer or no `[Route 35-3311]`/`[Route 35-447]`
+congestion-recovery events; per-column SLL occupancy no longer pinned at
+1,440 on the kernel-accessible columns. Only a variant that measures better
+earns the production v++ link (`hw_iter69_kernel_clock_f150.cfg` clock,
+`apply_f150_physical_islands.tcl` and `check_f150_physical_islands.tcl`
+updated together, frozen via `EXTRA_SNAPSHOT_FILES`), then the on-card gates.
+Evidence level of anything from these jobs: **routed checkpoint of a re-placed
+netlist** — not a v++ image, not on card.
+
+**Submitted 2026-09-06 00:06Z (Slurm start time; the 07:20Z first written here was a clock misread), all four RUNNING on `harrier` within 20 s
+(8 CPUs / 96 GB each, `--time=1-06:00:00`).**
+
+| variant | job | Slurm log | Vivado log / reports | exit marker |
+|---|---|---|---|---|
+| V0 control | **3432** | `diagnostics/iter71_repin/repin-3432.log` | `diagnostics/iter71_repin/run-V0-3432/` | `diagnostics/iter71_repin/V0.exit` |
+| V1 SpreadSLLs | **3433** | `repin-3433.log` | `run-V1-3433/` | `V1.exit` |
+| V2 repin 7 | **3434** | `repin-3434.log` | `run-V2-3434/` | `V2.exit` |
+| V3 repin 8 | **3435** | `repin-3435.log` | `run-V3-3435/` | `V3.exit` |
+
+Job IDs also in `diagnostics/iter71_repin/jobids.txt`. Expected wall ≈ 11–13 h
+each from job 3416's stage times (open 10 min, phys_opt 50 min, route 3.8 h,
+reports 50 min, post-route phys_opt 1.9 h) plus the new `place_design`. One
+detached watcher fires per variant on its exit marker or on the job leaving
+`squeue` without one. Results pending — nothing below this line is measured yet.
+
+### 2026-09-06 08:30Z — Iter71 V2 RESULT (job 3434): re-pinning {2,3,4,5,6,15,0}→SLR1 routes at **−0.476 ns ⇒ 140 MHz** (was −2.502 same stage, −1.594 Iter69 final). Positive, provisional. Vivado segfaulted in post-route phys_opt.
+
+> **CORRECTED 2026-09-06 15:45Z — this entry's routed numbers are wrong.** Job 3434's `route_design` aborted (`[Route 35-3] Design is not routable as its global congestion level is 7`, 2,542,614 node overlaps); `routed.dcp` holds 1,514,688 *unrouted* nets of 1,732,225. "−0.476 / 305 / 140 MHz" is a placement-stage estimate, not routed timing. See the 15:45Z correction entry. The placement facts (where the clusters landed, CLB per SLR, SLL demand table) stand.
+
+**Evidence level: routed checkpoint of the re-placed Iter69 netlist, before
+post-route phys_opt.** Not a v++ image, not on card. Post-route phys_opt ran
+1 h 38 m to an *estimated* WNS −0.390 and then Vivado died with SIGSEGV
+(`hs_err_pid624426.log`: "An unexpected error has occurred (11)", exit 139,
+MaxRSS 42.3 GB of 96 GB; node `harrier` had 3–4 GB free physical during the
+run with three sibling Vivados resident — a Vivado crash, cause not
+determinable from the artifacts). `routed.dcp` and the full `routed/` report
+set were written before the crash; `routed_physopt.dcp` does not exist.
+
+**Timing, kernel clock at 6.667 ns (`run-V2-3434/{placed_clock_slacks.tsv,
+routed/clock_slacks.tsv}`):**
+
+| stage | V2 (3434) | same stage, Iter69 placement (3416) | Iter69 v++ link |
+|---|---:|---:|---:|
+| placed (estimate) | −0.877 / 879 failing | +0.003 | +0.003 |
+| routed, before post-route phys_opt | **−0.476 / 305 failing** | −2.502 | — |
+| post-route phys_opt | est. −0.390 (crashed) | −2.030 | **−1.594** |
+| achievable f = 1/(6.667+\|WNS\|) | **140.0 MHz** (routed) | 109 | 121 |
+| `dma_ip_axi_aclk_1` routed | +0.003 / 0 failing | | |
+| hold WHS kernel, routed | −0.237 (phys_opt hold-fix was skipped: "does not violate hold threshold 250 ps") | | |
+
+**Where the clusters landed (`placed_actor_slr_spread.tsv`, leaves):** SLR1 =
+instances 2, 3, 4, 5, 6, 15, 0 at 60.8k each, plus `collect4`, both
+`collect6`, `collect_final` and the three relays (all SLR1); SLR0 = instances
+7–14, each 52.5–53.3k in SLR0 with a consistent 7.5–8.3k in SLR1; instance 1
+(mm0/1) 52.5k in SLR2 + 8.3k in SLR1; islands 252k SLR2; `hmss_0` 163k SLR0.
+Per-SLR CLB **98.46 / 90.03 / 78.84 %** (Iter67c routed: 99.29 / 87.51 /
+81.97). SLL totals **unchanged, as predicted**: SLR1↔SLR0 20,517 (89.05%),
+SLR2↔SLR1 13,125 (56.97%) versus 19,982 / 13,247 before.
+
+**What moved (the router's own per-column demand estimate, `[Route 35-3311]`
+table, SLR[0-1], 16 columns left→right):**
+
+| | col 1–4 | col 5–8 | col 9–12 | col 13–16 (shell-fixed) | peak |
+|---|---|---|---|---|---|
+| 3416 (Iter69 placement) | 26 70 67 64 % | 81 65 89 54 % | **155 132 125** 85 % | 115 101 101 101 % | 155% |
+| V2 | 11 45 82 **127** % | 89 91 75 **126** % | **128 105 112** 57 % | 114 104 103 101 % | 128% |
+
+Demand spread left as intended and the peak dropped 155→128%, but the
+shell's three fixed columns stay at 101–104% and `35-3311` (2×) and `35-447`
+(1×) still fired — the router still entered completion-over-timing mode, just
+with far less to repair. (My `ra_sll_tsv` copy is the batch-query variant that
+returns 0 nets — `nets occupying UBUMP nodes: 0` — so the *actual* per-column
+occupancy needs the per-tile census of `iter69_dcp_census.tcl` on
+`routed.dcp`; follow-up, not blocking.)
+
+**What still fails (305 endpoints, `routed/failing_endpoints.tsv`):** the
+SLR2 recurrent islands, which were 30% of 3416's 26,893 failures, are
+**gone (0)**; clusters contribute 2. 291 of 305 (95%) sit on the shared
+**`mem_weights_mm0_m_axi_U`** adapter in SLR0 — 238 inside `store_unit_0`
+(`fifo_wreq/full_n_reg → raddr_reg`, SLR0→SLR0, worst −0.476, 7.07 ns of
+which 6.54 net), 42 from `gdn_read_qkvg_conv_context` (SLR1) into
+`load_unit_0/fifo_rreq` SRL CEs (−0.470), 11 inside `load_unit_0`. Mean
+datapath 6.55 = 0.28 logic + **6.27 net**: still wire, now SLR0-local.
+`routed/congestion.rpt` shows SLR0 at Level 7 across its full width
+(North/Long `CLEL_R_X0Y56→CLEL_L_X127Y183`, South/Global
+`CLEL_R_X0Y48→CLEL_L_X127Y207`) — eight clusters plus `hmss` at 98.46% CLB.
+That is exactly the pressure **V3** (also moves cluster 7 out of SLR0)
+targets.
+
+**Stage times (8 threads):** open 610 s · unplace 119 s · `place_design`
+**8,839 s** (2.45 h) · phys_opt_pre 2,778 s · `route_design` 7,986 s (2.2 h)
+· write dcp 303 s · reports 4,393 s (qor alone 3,133) · phys_opt_post 5,880 s
+to crash. Total 8 h 14 m.
+
+**Verdict: positive, provisional.** Re-pinning alone lifts the achievable
+kernel clock from 121 to **≥140 MHz** on identical RTL — +15.7% on the token
+if it carries into a v++ link — and moved the bottleneck from SLL detours /
+SLR2 islands to SLR0 congestion around mm0. Not promoted: no image, no card
+run, and V0 (control), V1, V3 (all in `route_design` since ~04:15Z) are
+needed to attribute the gain and to pick the production set. Decision after
+V3: link at 150 MHz and accept the auto-scaled clock, or at the closable
+period (≈7.0–7.1 ns) for a timing-closed image.
+
+*Timestamp correction (2026-09-06 08:40Z):* the headers from "Job 3416
+RESULT" through "Iter71 LAUNCHED" were first written with a clock ~7 h ahead
+of UTC. They are now set from Slurm's own records (`sacct` Start/End): 3416
+ran 09-05 13:06–21:35Z, 3428 21:43–22:35Z, 3429/3430 failed 22:36–22:49Z,
+3431 22:49–23:12Z, Iter71 jobs 3432–3435 started 09-06 00:06:46Z. RESULT
+headers are placed between their job's end and the next launch that depended
+on them; the Iter70a RESULT header is anchored to build job 3397's end, 09-05 21:58Z.
+
+### 2026-09-06 10:51Z — Iter71 V1 RESULT (job 3433): `SSI_SpreadSLLs` without re-pinning — **REJECTED** (not legally routed, −5.360 ns, DMA clock fails too)
+
+*Evidence level: routed checkpoint of the Iter69 netlist re-placed from `post_place.dcp` with `place_design -unplace` + `-directive SSI_SpreadSLLs` at the forced 6.667 ns period. Slurm 3433 on harrier, 8 CPUs, 96 GB; Elapsed 10:44:58, MaxRSS 43.56 GB. `DONE` at 13:51 harrier-local = 10:51Z. Artifacts `diagnostics/iter71_repin/run-V1-3433/` (`post_place.dcp`, `routed.dcp`, `routed/`, `routed_physopt/`, `vivado.log`).*
+
+**Hypothesis under test.** Vivado's own SLL-spreading directive, applied with the Iter56/66b cluster pblocks left in place, might relieve the 101–155 % right-column demand on SLR0|SLR1 without hand-choosing which clusters move. Prior was low (the directive does not know which crossings are structurally movable). Control for the V2/V3 re-pin.
+
+| stage | kernel WNS (ns) | failing | DMA 250 MHz WNS | DMA failing |
+|---|---:|---:|---:|---:|
+| placed (`SSI_SpreadSLLs`) | −0.509 | 124 | +0.003 | 0 |
+| routed (`AlternateCLBRouting`) | **−5.360** | **40,643** | **−2.953** | **1,465** |
+| post-route phys_opt | *skipped by Vivado* — `[Vivado_Tcl 4-1385] Design is not legally routed` | | | |
+
+`report_route_status`: **2,608 nets with routing errors**. The image is not buildable, so there is no "achievable frequency" to report; 1/(6.667+5.360) = 83 MHz would be the number if it were legal, i.e. worse than the shipping 100 MHz.
+
+**Why it failed — the directive scattered the clusters instead of moving whole ones.** `placed_actor_slr_spread.tsv` (leaf primitives per SLR):
+
+| actor | SLR0 | SLR1 | SLR2 | note |
+|---|---:|---:|---:|---|
+| cluster instances 2, 3, 4 | whole | – | – | |
+| 5, 6, 7 | majority | ~8k | – | |
+| 8, 9, 10 | – | whole | – | |
+| 11 | – | 53.2k | 7.6k | split |
+| 12 | 34.7k | 18.4k | 7.7k | **three-way split** |
+| 13, 14 | majority | – | ~7k | split |
+| 15 (mm30/31) | – | 28.0k | 32.9k | split |
+| 0 (mm0/1) | – | 23.1k | 37.7k | split |
+| 1 (mm2/3) | 35.3k | 25.4k | – | split |
+| collect4 | SLR0 | | | |
+| `collect6_U0` | | | SLR2 | |
+| `collect6_16_U0`, collect_final, relays | | SLR1 | | |
+
+Per-SLR CLB after place: **99.65 % / 93.40 % / 64.04 %** (Iter69 placement 98.5/90/79). SLL count after route: SLR0|SLR1 20,566 (89.26 %), SLR1|SLR2 14,372 (62.38 %) — *more* crossings on both boundaries than the pinned placement (20,517 / 13,125). Router per-column demand estimate, SLR[0-1], 16 columns: `14 103 28 40 89 93 93 92 102 91 99 93 206 112 101 101 %` (91.08 % total) — one column at **206 %**, worse than the 155 % it was meant to cure; SLR[1-2]: `1 1 5 17 38 25 37 80 107 114 145 47 88 221 204 201 %` (83.12 %). `[Route 35-3311]` and `[Route 35-447]` both fired; route took 5.1 h (07:15→12:22 harrier-local) against V2's 2.2 h.
+
+Failing endpoints after route (54,736 rows incl. DMA clock): SLR0→SLR0 21,825, SLR1→SLR0 13,231, SLR1→SLR2 8,310, SLR1→SLR1 5,693, SLR2→SLR2 2,940, SLR0→SLR1 1,722. Mean datapath 6.06 ns = 0.39 logic + **5.67 net** — the same 94 % wire signature as job 3416, just deeper. Top families: `hmss_0` (shell HBM switch, SLR0) 16,764; a replicated `ap_CS_fsm_reg[108]` cone 5,814; `mem_weights_mm31_m_axi_U/store_unit_0` 5,795; cluster 13 5,305; cluster 12 2,295; cluster 9 1,832. Congestion Level 7 in SLR0 in all four directions (Short/Long/Global) plus a North Long L7 through SLR1/SLR2.
+
+**Verdict: REJECTED.** Confirms the low prior directly: `SSI_SpreadSLLs` optimises a global crossing count it cannot lower (the 32 HBM ports fix where each cluster's traffic enters), so it pays by tearing clusters apart across SLRs, packing SLR0 to 99.65 %, and adding wire everywhere. Not a lever; do not re-run. The controlled comparison it provides is still useful: the same re-place step with the pinned placement (V0, pending) and with the hand re-pin (V2: −0.476 routed) brackets what the *placement*, not the directive, buys.
+
+### 2026-09-06 11:21Z — Iter71 V0 RESULT (job 3432): control — same pblocks, re-placed from scratch — routes legally at **−0.675 ns ⇒ 136 MHz**. Most of Iter69's deficit was placement variance, not the floorplan.
+
+*Evidence level: routed + post-route-phys-opt checkpoint of the Iter69 netlist, re-placed from `post_place.dcp` with `place_design -unplace` then `place_design -directive SSI_SpreadLogic_high` under the unchanged Iter56/66b pblocks at the forced 6.667 ns period. Slurm 3432 on harrier, 8 CPUs, 96 GB; Elapsed 11:14:49, MaxRSS 49.14 GB (Start 00:06:46Z, End 11:21:35Z). Artifacts `diagnostics/iter71_repin/run-V0-3432/` (`post_place.dcp`, `routed.dcp`, `routed_physopt.dcp`, `routed/`, `routed_physopt/`, `vivado.log`). Route status: **0 nets with routing errors** at both routed stages.*
+
+**Purpose.** V0 isolates the *re-place step itself* from the *re-pin*: identical pblocks, identical directive to the production recipe, only the placer's starting state differs (unplaced netlist instead of the v++ opt_design output). Without it, V2's gain could not be attributed to the cluster move.
+
+| stage | job 3416 (Iter69 placement, re-routed) | **V0** (same pblocks, re-placed) | V2 (re-pin 7 → SLR1) | V1 (`SSI_SpreadSLLs`) |
+|---|---:|---:|---:|---:|
+| placed (after pre-route phys_opt for 3416; placer report for the rest) | −0.881 / 835 | −0.633 / 577 | −0.877 / 879 | −0.509 / 124 |
+| routed | −2.502 / 28,617 | **−0.688 / 13,837** | **−0.476 / 305** | −5.360 / 40,643 (illegal) |
+| post-route phys_opt | −2.030 / 26,893 | **−0.675 / 13,836** | est. −0.390 (Vivado crashed) | skipped |
+| `route_design` wall | 3.77 h | 4.28 h | 2.2 h | 5.1 h |
+| `[Route 35-3311]` / `[35-447]` | yes / yes | 2 / **0** | 2 / 1 | 2 / 1 |
+| achievable kernel clock, 1/(6.667+\|WNS\|) | 115 MHz | **136.2 MHz** | **140.0 MHz** (141.7 est.) | — |
+
+DMA 250 MHz clock +0.003 / 0 failing at every V0 stage; kernel hold WHS +0.002 routed. Placed per-SLR CLB **99.47 / 91.04 / 73.71 %** (routed 99.48 / 91.05 / 73.71). Total SLLs used 33,471 (V2: 33,690). Per-tile SLL census (`routed/sll_capacity.tsv`, 4,800 LAG_LAG tiles, matches the utilization report exactly): SLR0|SLR1 **20,819 of 23,040 = 90.4 %**, columns X31–X142 all at **100 %**, X23 82 %, X12 54 %, X4 10 %; SLR1|SLR2 12,652 = 54.9 % (X78/X123/X134/X142 at 67 %, the rest 8–59 %). Router per-column demand estimate, SLR[0-1]: `33 50 48 54 111 106 80 109 158 110 90 109 140 132 104 102 %` (96.07 % total, 22,134 — *higher* than 3416's 89.31 %); SLR[1-2]: `1 1 37 29 42 29 21 18 116 63 112 38 109 210 203 200 %` (76.79 %).
+
+**What is left failing in V0 is high-fanout stall nets, not the islands.** By SLR pair: SLR0→SLR2 5,274, SLR1→SLR0 5,239, SLR0→SLR0 1,898, SLR0→SLR1 439, SLR1→SLR1 437, SLR2→SLR2 356. Mean datapath 6.42 ns = 0.34 logic + **6.09 net** (95 % wire, as in every run of this campaign). Paths through nets with >2,000 loads account for 7,929 of the 13,836:
+
+| driver → endpoint family | fanout | failing endpoints |
+|---|---:|---:|
+| `mem_weights_mm29_m_axi_U/store_unit_0` (`fifo_wreq` full, SLR0) → `gdn_recurrent_attention_island_1_U0` `recur_island_update` stall cone (SLR2) | **5,204** | **5,203** — every SLR0→SLR2 failure is this one net, mean 0.14 logic + 6.19 net |
+| `gemv32_cluster2_12_U0` internal (SLR1 → its ~8k-leaf SLR0 spill) | 2,049 / 3,316 | 1,448 + 304 |
+| `gemv32_cluster2_13_U0` internal (SLR1 → SLR0 spill) | 2,049 | 850 |
+| `gemv32_cluster2_4_U0` internal (SLR0) | 2,049 | 124 |
+| rest: cluster 3 (SLR0→SLR0) 1,286, `mm30 store_unit_0` 264, replicated FSM regs ~450 | | |
+
+The 5,204-load net is the recurrent-state *write* backpressure: the island's `recur_island_update` pipeline writes state straight into the mm29 master, so that adapter's write-FIFO full flag is the pipeline's clock-enable, and it travels from the SLR0 HBM adapter across **two** SLR boundaries into the SLR2 island. It exists in every variant; in V2 the same adapter landed at 5,056 SLR0 / 1,695 SLR1 leaves (V0: 6,524 / 221) and the net does not appear among V2's 305 failures — V2's only >2,000-fanout failing path is the shell reset (fanout 38,913, one endpoint). Whether that is structure or luck is not decidable from one sample each; what *is* decided is that it is the same class of clock-enable cone that `style=frp` removed from the clusters in Iter66e, and the islands are not frp. That, and the Iter61 rule (put a FIFO between the block and the port), make a registered/FIFO-decoupled state write the obvious follow-up if this net reappears in the production link.
+
+**Reading.** (1) Re-placing the *same* floorplan moved the routed result from −2.030 to −0.675 ns, so roughly two-thirds of Iter69's 6.667-ns deficit was placer variance between two runs of one recipe, not a property of the pblocks. Placement-to-placement noise on this design is therefore **≥1.3 ns at route**, and a single v++ link is one draw from that distribution — the production link must be read with that in mind. (2) V2 beats V0 by a further 0.2 ns of WNS, which alone would be inside that noise; the stronger evidence for the re-pin is structural: **305 vs 13,836** failing endpoints (45×), the island and state-port failures gone entirely, the SLR[0-1] demand peak 158 % → 128 %, and a 2.2 h route against 4.3 h. `[Route 35-447]` (completion-over-timing) does not separate them the way one would expect — V2 fired it once, V0 not at all — so it is not a discriminating signal here. (3) Neither V0 nor V2 touches the SLR1|SLR2 shell columns (200–212 %), which both routers still flag.
+
+**Verdict: V0 is the control and is retained as evidence only; it is not a candidate floorplan.** It is strictly dominated by V2 on WNS, failing endpoints and route time with the same netlist. Decision on the production link waits for V3 (re-pin 8), still routing.
+
+### 2026-09-06 12:11Z — Iter71 V3 RESULT (job 3435): re-pin **8** clusters {2,3,4,5,6,7,15,0} → SLR1 — legal but **−1.670 ns ⇒ 120 MHz**; over-packs SLR1 and re-lights the islands. **REJECTED in favour of V2.**
+
+*Evidence level: routed + post-route-phys-opt checkpoint, same flow as V0/V2 (re-place from the Iter69 `post_place.dcp` with the two SLR1 cluster pblocks replaced by `pb_iter71_clusters_slr1` holding eight instances, `SSI_SpreadLogic_high`, forced 6.667 ns). Slurm 3435 on harrier, Elapsed 12:04:32, MaxRSS 50.11 GB (Start 00:06:46Z, End 12:11:18Z). Artifacts `diagnostics/iter71_repin/run-V3-3435/`. 0 nets with routing errors at both routed stages.*
+
+| stage | V3 | V2 (7 clusters) | V0 (control) |
+|---|---:|---:|---:|
+| placed | −1.291 / 2,142 (DMA clock −1.823 / 1 at placement, +0.003 routed) | −0.877 / 879 | −0.633 / 577 |
+| routed | −1.673 / 25,045 | **−0.476 / 305** | −0.688 / 13,837 |
+| post-route phys_opt | **−1.670 / 25,044** | est. −0.390 | −0.675 / 13,836 |
+| `route_design` wall | **5.25 h** | 2.2 h | 4.28 h |
+| placed CLB SLR0 / SLR1 / SLR2 | 97.02 / **95.83** / 80.79 % | 98.46 / 90.03 / 78.84 % | 99.47 / 91.04 / 73.71 % |
+| SLL demand SLR[0-1] total / peak column | 93.81 % / 162 % | 92.03 % / 128 % | 96.07 % / 158 % |
+| SLL demand SLR[1-2] total / peak | 78.95 % / 208 % | 77.41 % / 212 % | 76.79 % / 210 % |
+| total SLLs used | 34,354 | 33,690 | 33,471 |
+| achievable kernel clock | 119.9 MHz | **140.0 MHz** | 136.2 MHz |
+
+The re-pin landed as designed — SLR1 holds {2,3,4,5,6,7,15,0} whole (60.8k leaves each) plus all four collectors; SLR0 holds {8..14} each with the same ~8.1k-leaf SLR1 spill seen in V2; instance 1 again sits in SLR2 (52.6k) with 8.2k in SLR1; the `mm0` shared adapter is now split three ways (3,747 / 1,906 / 1,892).
+
+**What failed (25,044 endpoints, mean 0.40 logic + 6.25 net ns — 94 % wire again).** By SLR pair: SLR2→SLR2 5,340, SLR1→SLR1 4,107, SLR0→SLR1 4,058, SLR0→SLR2 3,539, SLR1→SLR0 3,019, SLR1→SLR2 2,392 — spread over every pair, unlike V2 (one adapter) or V0 (one net). Families: `gemv32_store_or_qkvg_conv_stream_U0` 2,105 (internal, SLR2), `mm31 store_unit_0` → islands 2,064 (SLR0→SLR2, the state-write backpressure nets at fanout 451–481; the 5,204-load `fifo_wreq` net contributes 77), islands internal 1,995, shell `hmss_0` 1,897, cluster 14 1,858, cluster 12 1,013 (fanout-3,316 cone 597), `layer_index_c_U` → islands 896. Congestion: Level 7 South/Global in SLR0, Level 6 East Global/Long across SLR1–SLR2.
+
+**Reading.** The eighth cluster costs more than it saves. SLR1 CLB goes 90 → 96 %, the SLR0|SLR1 column peak comes back (128 → 162 %, one column over the seven-cluster case), 664 more SLLs are used, and the island/conv-stream failures that V2 had removed reappear in SLR2 — consistent with the placer pushing SLR1 logic outward (instance 1 and part of `mm0` into SLR2) to make room. V3 lands where Iter69 landed (121 MHz on card), i.e. no better than the floorplan it was meant to replace.
+
+**Verdict: REJECTED.** Seven clusters in SLR1 (V2) is the right count on this die; eight is over the knee. Do not re-run with a different eighth member without a reason the CLB figure above does not already answer.
+
+### 2026-09-06 12:20Z — Iter71 DECISION: V2 floorplan {2,3,4,5,6,15,0} → SLR1 goes to the production link at 150 MHz (Iter72)
+
+> **CORRECTED 2026-09-06 15:45Z — V2 was not legally routed (see the 15:45Z entry); its row below ("legal: yes", 140 MHz) is void. The best legal result of Iter71 is V0 at −0.675 ns.** Iter72 r2 (build 3453) was launched on this table.
+
+Ranking of the four re-placements plus the two references, all on the same netlist at 6.667 ns:
+
+| | routed WNS | failing | legal | achievable |
+|---|---:|---:|---|---:|
+| **V2** re-pin 7 | **−0.476** (est. −0.390 after phys_opt) | **305** | yes | **140 MHz** |
+| V0 same pblocks re-placed | −0.675 | 13,836 | yes | 136 MHz |
+| Iter69 (on card, v++ flow) | −1.594 | 25,528 | yes | 121 MHz |
+| V3 re-pin 8 | −1.670 | 25,044 | yes | 120 MHz |
+| 3416 Iter69 placement re-routed | −2.030 | 26,893 | yes | 115 MHz |
+| V1 `SSI_SpreadSLLs` | −5.360 | 40,643 | **no** | — |
+
+*Why 150 MHz and not a "closable" 7.1 ns:* the production flow is a fresh placement draw and V0-vs-3416 showed ≥1.3 ns of draw-to-draw spread on the same floorplan, so no period can be called closable from one sample; linking at the same 6.667 ns as Iter69 keeps the comparison controlled (one variable: the cluster pblocks) and v++'s clock scaling delivers whatever the draw achieves. If the achieved clock lands where V2 predicts, a second link at that period for a timing-closed image is the follow-up. *Evidence boundary:* V2 is one routed checkpoint of a re-placed netlist; the on-card number is what counts, and it is labelled auto-scaled unless the kernel clock closes.
+
+### 2026-09-06 12:28Z — Iter72 LAUNCH (build 3449 → on-card 3450): production v++ link of the Iter71 V2 floorplan at 150 MHz
+
+**Hypothesis.** The Iter71 V2 re-pinning (seven clusters {2,3,4,5,6,15,0} → SLR1, clusters 8/10 and
+their FIFOs freed) reproduces in the full production flow what job 3434 measured on the re-placed
+checkpoint: a legal route with the recurrent-island and state-port failures gone, and an achieved
+kernel clock above Iter69's 121 MHz (V2 predicts ~140 MHz at −0.476 ns; ≥1.3 ns draw-to-draw
+placement spread means the exact number is one draw). Success = on-card gates pass at a verified
+`DATA_CLK` above 121 MHz; timing-closed is better, auto-scaled counts if labelled.
+
+**One variable versus Iter69 (build 3371).** Same netlist — every shared snapshot file hashes
+identical to Iter69's `source_hashes.txt` (`gdn_model.cpp` `2bc240e6a5cf24b2…`, `gdn_model.h`
+`906b11e5ca368b08…`, `host.cpp` `8bc562e6cc9ee01d…`, `Makefile` `4c34696420f0f18f…`,
+`hls_gdn_forward.tcl` `a76930f3332baac5…`, `apply_iter66e_unpair.tcl` `1dab980ec5709bb8…`, DMA
+chain, `report_final_qor.tcl`, `check_native_bf16_xo.py`); main tree = HEAD `caf512543` (Iter67c).
+Same kernel-clock override, same directives (`SSI_SpreadLogic_high`, pre/post-route
+`AggressiveExplore`, `AlternateCLBRouting`), same HLS/link frequencies. Only the floorplan and its
+matching post-place gate changed. Four new files, none of the shipping recipe edited in place:
+
+| file | SHA-256 | derived from | change |
+|---|---|---|---|
+| `hw_iter72_repin_f150.cfg` | `76636f057badf93c…` | `hw_iter69_kernel_clock_f150.cfg` `8c2448bad1259588…` | `OPT_DESIGN.TCL.PRE` → `apply_iter72_kernel_clock_f150.tcl`; `PLACE_DESIGN.TCL.POST` → `check_iter72_repin_islands.tcl` |
+| `apply_iter72_kernel_clock_f150.tcl` | `daab6316e8b844d1…` | `apply_iter69_kernel_clock_f150.tcl` `9492632638a4b0cf…` | final `source` → `apply_iter72_repin_islands.tcl`; report name |
+| `apply_iter72_repin_islands.tcl` | `5c4388129945f79e…` | `apply_f150_physical_islands.tcl` `cfbba5d58fa9ce36…` | `pb_iter56_cluster8_slr1` + `pb_iter66b_cluster10_slr1` replaced by `pb_iter71_clusters_slr1` = SLR1 range, exactly `gemv32_cluster2_{2,3,4,5,6,15}_U0` + `gemv32_cluster2_U0`, clusters only, `IS_SOFT false`, `CONTAIN_ROUTING false`, `USER_SLR_ASSIGNMENT SLR1`; clusters 8/10, ws20/21, xr10 added to the resolve-once free-root list; recurrent SLR2 pblock, relays + `pb_iter56_result_boundary_slr1`, reset fanout unchanged |
+| `check_iter72_repin_islands.tcl` | `95bb575d247d1b5d…` | `check_f150_physical_islands.tcl` `41ab6ea1b744b465…` | fatal gates now `pb_iter56_recurrent_slr2 SLR2 1`, `pb_iter71_clusters_slr1 SLR1 7`, `pb_iter56_result_boundary_slr1 SLR1 4`; cluster 8 added to the observation list |
+
+The pblock set is the one job 3434's `pblocks_post_repin.txt` recorded (7 roots, all
+`user_slr={SLR1}`, range `CLOCKREGION_X0Y4:CLOCKREGION_X7Y7`). Dry-run in plain `tclsh` with stubbed
+Vivado commands: the chain resolves 3 kernel pblocks, the seven-cluster pblock holds 7 cluster roots
+and no `ws_`/`xr_` FIFO, all seven carry `USER_SLR_ASSIGNMENT SLR1`, the two old pblocks are not
+created, and the script ends with `GDN_ITER72_DONE … transport_roots_free=11 relay_regs=6` (relay
+count stubbed to 3). Note the experiment's own `PBCHECK` "outside ≈ 10%" is a counting artifact of
+that script — the production gate (LOC → site → SLR) reported `outside=0` on all four pblocks in
+Iter69 and is what runs here.
+
+**Command** (main tree `c_impl/`, 12:28:53Z):
+`HW_CFG_TEMPLATE=hw_iter72_repin_f150.cfg EXTRA_SNAPSHOT_FILES="hw_iter72_repin_f150.cfg apply_iter72_kernel_clock_f150.tcl apply_iter72_repin_islands.tcl check_iter72_repin_islands.tcl" HLS_FREQ=150 LINK_FREQ=150 BUILD_TIME=2-12:00:00 bash run_hw_sbatch.sh iter72_repin7_f150`
+— build **3449** (`build`, 48 CPUs, 192 GB, 2-12:00:00, `--constraint=vivado2024.2`, excl. acclnode04/05),
+on-card **3450** (`light`, `afterok:3449`, 4 h). Evidence dir `diagnostics/iter72_repin7_f150/`
+(`build.live.log`, `build.exit`, `impl_1.runme.log`, `gdn_final_qor/`, `placement_reports/`,
+`post_place.dcp`, `oncard.slurm-3450.log`). Build dir `build.hw.gdn32.h150.f150.o48` (fresh XO on
+node-local NVMe; the shared dir held no image to overwrite). Queue at submit: both PENDING, no other
+job held.
+
+**What will be read on completion:** per-clock WNS for `clk_kernel_00_unbuffered_net` and
+`dma_ip_axi_aclk_1` from the routed timing summary, route legality (`[Route 35-…]` errors,
+overlaps), `DATA_CLK` in the XCLBIN (`xclbinutil` / `xbutil examine`), the `GDN_ITER56_CHECK` lines,
+the exact 8/64-token gates and the CUDA vector gate, and `kernel_ms`/`per_step_tpot_ms`. Failure
+families to compare against V2 — in particular whether the 5,204-fanout `mm29 fifo_wreq` → island
+stall net (V0) reappears.
+
+### 2026-09-06 13:34Z — Iter72 build 3449 FAILED before placement: harrier node-local `/tmp` full (infrastructure, not design)
+
+**Stage reached:** v++ link, block-level synthesis of `ulp_gdn_forward_1_0_synth_1` (226 of 227 synth jobs done), 1 h 05 m after submission; the XO and the `check_native_bf16_xo.py` gate had passed at 13:15Z. On-card job 3450 was cancelled by its `afterok` dependency.
+
+**What the log says** (`diagnostics/iter72_repin7_f150/build_diagnostics.tar.gz` → `prj.runs/ulp_gdn_forward_1_0_synth_1/runme.log`, line 511–513):
+```
+NDup write error: No space left on device
+Warning: Recover from fatal write
+ERROR: [Synth 8-728] Failed to close './.Xil/Vivado-1120054-harrier//incrSyn/4179937250/u/e/design.rtd': Invalid argument
+```
+The wrapper only surfaces the second line (`Invalid argument`), which looks like a tool fault; the first line is the cause. `sacct`: MaxRSS 66.4 GB, MaxDiskWrite 23.6 GB in this job alone.
+
+**Why the disk was full:** `slurm/hw_build.slurm` stages into `/tmp/${USER}-${SLURM_JOB_ID}` and never removes it (no `rm -rf`, no `trap`). Builds that staged on harrier since 08-29 and left their scratch behind: 2259, 2502 (Iter66e), 2993 (Iter67c), 3378, 3449 — 20–60 GB each including `_x_temp` and the routed project. This is an inference from the script; the actual occupancy is being measured by a list-only audit job (3451, `diagnostics/harrier_tmp_audit/`) before anything is deleted.
+
+**Verdict: STOPPED (infrastructure).** No design evidence produced — the Iter72 floorplan (`apply_iter72_repin_islands.tcl` `5c4388129945f79e…`, `hw_iter72_repin_f150.cfg` `76636f057badf93c…`) is untested in the production flow and the LAUNCH entry's hypothesis stands. Relaunch with the same snapshot once the node has space. Follow-up for the build script (not yet applied): delete stale `/tmp/${USER}-*` dirs of finished jobs at job start, so the previous build's scratch stays inspectable until the next build on that node needs the space.
+
+**Rung 0 of the 150 MHz plan launched in parallel:** job 3452 (`diagnostics/iter72_v2_closure_census/`, Tcl `d78b43a025da599e…`, on a non-harrier `build` node) re-opens the V2 `routed.dcp` and writes the QoR-suggestion file (`write_qor_suggestions`; the routed report already generated `RQS_TIMING-3` FORCE_MAX_FANOUT for 196 of 305 failing paths, `RQS_CONG-16` density, `RQS_CONG-9` over-replication), every failing setup path with per-net delay, and the driver/load-SLR + RPM bounding box of every >100-fanout net in the shared `mem_weights_mm0` adapter (mm5 as control).
+
+### 2026-09-06 13:42Z — Iter72 relaunched as r2 (build 3453 → on-card 3454), harrier excluded; harrier `/tmp` audit result
+
+**Relaunch command** (main tree `c_impl/`, 13:42:27Z), identical to 3449 except the node exclusion:
+`BUILD_EXCLUDE=acclnode04,acclnode05,harrier HW_CFG_TEMPLATE=hw_iter72_repin_f150.cfg EXTRA_SNAPSHOT_FILES="hw_iter72_repin_f150.cfg apply_iter72_kernel_clock_f150.tcl apply_iter72_repin_islands.tcl check_iter72_repin_islands.tcl" HLS_FREQ=150 LINK_FREQ=150 BUILD_TIME=2-12:00:00 bash run_hw_sbatch.sh iter72_repin7_f150_r2`
+— build **3453** (`build`, 48 CPUs, 192 GB, started 13:42 on **acclnode01**), on-card **3454** (`light`, `afterok:3453`). Evidence dir `diagnostics/iter72_repin7_f150_r2/`. `source_hashes.txt` is byte-identical to 3449's (same `gdn_model.cpp`, cfg and all four Iter72 Tcl files), so r2 tests exactly the LAUNCH entry's hypothesis. Census 3452 runs on the same node concurrently (8 CPUs, 96 GB; node has 474 GB free).
+
+**Harrier audit (job 3451, list-only, 13:39Z)** — measured, not inferred:
+
+| fact | value |
+|---|---|
+| `/` (holds `/tmp`) | 879 GB, **833 GB used, 1.4 GB free, 100%** |
+| my stage dirs `/tmp/yaoz0b-*` | 33 dirs, **≈64 GB** total (largest: 2993 11G, 2502 9.9G, 735 9.5G, 2259 8.7G, 3449 3.1G; five cosim dirs 0.6–2.0G each) |
+| other users' readable dirs | ≈30 GB (`vrrpack_*`, `balasuk-*`, `mohaam0e-*`); the remaining ~740 GB is not readable by me |
+| stage dir at rest vs peak write | finished link dirs are 10–11 GB at rest, but `sacct MaxDiskWrite` for a full link is **46–47 GB** (2502 46.4G, 2993 47.3G, 3371 47.3G): the link needs ~50 GB free to complete, then leaves ~11 GB behind |
+| checkpoints that exist only on harrier | Iter67c `level0_wrapper_routed.dcp` (777,252,321 B, `/tmp/yaoz0b-2993/.../impl_1/`), Iter66e routed.dcp (753,757,783 B, `/tmp/yaoz0b-2502/...`), both `post_place.dcp`s, both xclbins (the xclbins are also in the repo build dirs) |
+
+Consequence: my scratch is ~8% of the disk, so deleting it restores ~64 GB — enough for one more link on harrier (needs ~50 GB), not a fix. The node is full mainly from data outside my account; that is an admin matter. Cleanup of my dirs is **not done** — it deletes the only copies of the Iter66e/Iter67c routed checkpoints, so it waits for an explicit go-ahead and copies the Iter67c `routed.dcp` to `diagnostics/iter67c_argmax_ii_hw/` (sha-verified) first. Until then all builds exclude harrier.
+
+### 2026-09-06 14:51Z — Iter72 rung-0 census RESULT (job 3452): all 305 V2 failures are SLR0↔SLR2 double crossings in the `mm0` adapter handshake — the lever is a floorplan pin, not `FORCE_MAX_FANOUT`
+
+**Evidence class: routed-checkpoint measurement** (re-opened `iter71_repin/run-V2-3434/routed.dcp`, SHA `dbef77a8…`, with `v2_closure_census.tcl` SHA `d78b43a0…`). Job 3452 on `acclnode01`, 8 CPUs, 1:11:41, MaxRSS 32.2 GB; `open_checkpoint` 585 s, `report_qor_suggestions` 3,115 s. Artifacts: `diagnostics/iter72_v2_closure_census/out-3452/`.
+
+**Step failure, recorded:** the `qor_suggestions` step FAILED after writing the report — `ERROR: [Common 17-54] The object 'qor_suggestion' does not have a property 'STATUS'` (my per-object property loop) — so `write_qor_suggestions` never ran and **no `.rqs` exists**. Moot for the plan (below), but if one is ever needed use `report_property` instead of naming properties.
+
+**What Vivado suggests (`qor_suggestions_400.rpt`, 5 rows):** RQS_CONG-16 (reduce density), RQS_CONG-9 (over-replication), **RQS_TIMING-3** (`FORCE_MAX_FANOUT`, 380 paths, worst −0.476 — the `mem_weights_mm0_m_axi_U/store_unit_0/fifo_wreq/full_n_reg` → `raddr_reg[6]` path, 24 logic levels, 7.065 ns datapath at 92.5% net delay), RQS_TIMING-5_2 (BUFG on the reset into `control_s_axi_U/int_interrupt_reg`, −0.068), RQS_TIMING-59 (LUT replication, −0.103).
+
+**What the paths themselves say (`failing_paths_detail.rpt`, 305 paths, SLR sequence from placed-site Y rows; SLR0 Y<240, SLR1 <480, SLR2 <720):**
+
+| SLR sequence of the cells on the path | paths | family |
+|---|---:|---|
+| SLR0 → SLR2 → SLR0 | **251** | `mem_weights_mm0_m_axi_U` internal (249) — the user-side FIFO handshake whose *loads* sit in SLR2 |
+| SLR1 → SLR2 → SLR0 | **42** | `grp_gdn_load_qkvg_conv_context_fu_1465` → `mem_weights_mm0_m_axi_U` |
+| SLR0→1→0, SLR2→1→0, SLR0→2→0 (others) | 12 | top FSM replica `ap_CS_fsm_reg[108]_rep__0_replica_1` (SLR2) → `mm14/mm13/mm6` adapter `buff_rdata` enables; `gemv32_mm2s_16/23` → `mm16/mm23` adapters; `gemv` `ap_start` replica; reset → `control_s_axi` |
+| single crossing SLR0→SLR1 | 2 | cluster-13 / cluster-10 pipelines |
+
+So **293 of 305 (96%) are the `mm0` adapter talking to its SLR2 clients across the whole die and back inside one 6.667 ns cycle**, and the remaining 14 are all within **−0.097 ns** of closing and are the *same* structural shape (an SLR2-placed top-level control replica reaching an SLR0 adapter through SLR1). Worst path anatomy: SLR0 top → SLR2 bottom → SLR0, two ≈2.8 ns hops = 5.7 of 7.07 ns; the RQS_TIMING-3 fanout-176 net contributes 0.64 ns. Replicating it cannot recover 1.9 ns of die traversal.
+
+**Why the adapter is split** (`mm0_actor_slr.tsv`, leaf cells per SLR0/1/2): `mem_weights_mm0_m_axi_U` **5,527 / 40 / 1,980** — `bus_write` 3,522/0/0 and `store_unit_0` 669/3/107 are in SLR0 where the HBM port is, but `bus_read` is **656 / 1 / 1,575** and `load_unit_0` 680/36/298, dragged toward its clients: `grp_gdn_load_qkvg_conv_context_fu_1465` **424 / 22 / 7,476** (94% SLR2) and `grp_gdn_store_qkvg_conv_tails_fu_1484` **327 / 0 / 2,506** (88% SLR2). For contrast `mem_weights_mm5_m_axi_U` is 2,838/0/0 — a one-SLR adapter, and not failing. Iter67c at 10 ns has the same family as its worst kernel path (9.35 ns, three crossings 0→1→2→0, `ap_CS_fsm_reg[103]` → `mm2` `buff_rdata`, slack +0.153) — at 100 MHz it fits, at 150 it cannot.
+
+**Verdict — census, so neither retained nor rejected; it changes rung 2 of the 150 MHz plan.** V2R (`FORCE_MAX_FANOUT` on the RQS nets) is **dropped**: the failing distance is die traversal, not fanout. Replacement is **V5** = V2's seven-cluster re-pin **plus** a pblock keeping `mem_weights_mm0_m_axi_U` in SLR0 and its clients (`grp_gdn_load_qkvg_conv_context_fu_1465`, `grp_gdn_store_qkvg_conv_tails_fu_1484`, `grp_gdn_load_recurrent_scalars_fu_1442`, plus whatever census2 names) in **SLR1** — SLR0 CLB is 98.46% so the clients cannot join the adapter there; SLR1 is 90.03%. Client↔adapter then crosses once, and the client→conv-tail BRAM writes are one-way. V4 (move one SLR0 cluster to SLR2) stays as the density fallback if SLR0 overflows. Not yet measured: the slack floor of everything *outside* this family (is there a second wall between −0.1 and +1.0 ns once the mm0 family is fixed?) and the SLR of the other top-level actors the clients talk to. That is census2 (job 3456, `diagnostics/iter72_v2_census2/`, same checkpoint), launched 15:01Z, ~20–60 min.
+
+### 2026-09-06 15:45Z — CORRECTION: Iter71 V2 (job 3434) never routed — `route_design` aborted at congestion level 7. Its "−0.476 ⇒ 140 MHz" was an unrouted estimate. Rung-2 (floorplan-only) has **no legal gain** over placer variance; Iter72 r2 is linking a floorplan the harness could not route.
+
+**What the artifacts actually say (`diagnostics/iter71_repin/run-V2-3434/`):**
+
+| fact | source |
+|---|---|
+| `ERROR: [Route 35-3] Design is not routable as its global congestion level is 7.` after Phase 4.10, 2 h 06 m into routing | `vivado.log` |
+| `Number of Node Overlaps = 2542614` (initial routing, before the abort) | `vivado.log` Router Utilization Summary |
+| `GDN_RA 09:25:49 FAIL route_design after 7986 s` … `WARN route_design returned an error; reporting whatever state exists` — the harness then wrote `routed.dcp` and ran the whole report set on it | `vivado.log` |
+| routable nets 1,732,225 · **unrouted 1,514,688** · fully routed 217,471 (= the 217,457 fixed-route shell nets + 14) · 66 nets with routing errors | `routed/route_status.rpt` |
+| router congestion windows: South/Global 128×128 **100.1 %** `INT_X0Y80→X127Y207`; East 16×16 116.9 %; West 109.4 %; North 93.4 % | `vivado.log` |
+| placer congestion level **7**: South/Global `CLEL_R_X10Y55→X71Y182`, North/Long `CLEL_R_X16Y60→X77Y187` — SLR0, full width, 99–100 % RAMB in the windows | `routed/congestion.rpt` |
+| Slurm state **FAILED**, Elapsed 08:13:38 (the later SIGSEGV in post-route phys_opt is secondary — phys_opt ran on an unrouted design) | `sacct -j 3434` |
+
+`clock_slacks.tsv` / `failing_endpoints.tsv` for V2 were therefore computed with 87 % of the nets unrouted: they are placement-stage estimates. The tell was in the numbers already logged — V2 is the only run in the campaign whose "routed" WNS *improved* on its placer estimate (−0.877 → −0.476); V0 went −0.633 → −0.688, V3 −1.291 → −1.673, 3416 −0.881 → −2.502. I read `clock_slacks.tsv` without reading `route_status.rpt`. **New rule for the harness: `route_status.rpt` is read first, and a step that returns an error writes its reports under `failed_*/`, never under `routed/`.**
+
+**Corrected Iter71 ranking — legal routes only, same netlist, 6.667 ns:**
+
+| | routed WNS (kernel) | failing | route status | achievable |
+|---|---:|---:|---|---:|
+| **V0** same pblocks, re-placed (job 3432) | **−0.675** | 13,836 | legal, 0 errors, `Router Completed Successfully` | **136 MHz** |
+| Iter69 production v++ link | −1.594 | 25,528 | legal (image ran on card) | 121 MHz |
+| V3 re-pin 8 → SLR1 (job 3435) | −1.670 | 25,044 | legal, 0 errors | 120 MHz |
+| 3416 Iter69 placement re-routed | −2.030 | 26,893 | legal | 115 MHz |
+| V1 `SSI_SpreadSLLs` (job 3433) | — | — | **not routed** (2,109 overlaps, `route_design` failed) | — |
+| **V2 re-pin 7 → SLR1 (job 3434)** | — | — | **not routed** (level 7, 2,542,614 overlaps) | — |
+
+So after four re-placements the only legal number better than Iter69 is V0, which changed *nothing* but the placer's starting state: **the cluster re-pin lever has no demonstrated gain**. Seven clusters in SLR1 leaves eight in SLR0 and SLR0 becomes unroutable (V2); eight in SLR1 routes but puts SLR1 at 95.8 % CLB and times at −1.670 (V3).
+
+**Consequences.**
+1. The 12:20Z DECISION table is void where it says V2 is legal; Iter72 r2 (build **3453**, on-card 3454 afterok) is linking the V2 pblocks at 150 MHz in the production flow. It is left running as the one production-flow draw of that floorplan (fresh placement, same directive) — the harness predicts a level-7 route abort; if it routes, its per-clock WNS is real data. Cancel with `scancel 3453 3454` if the node is needed.
+2. Rung-0 census 3452 and census2 3456 analysed V2's `routed.dcp`. Their **placement facts stand** (adapter/client/FSM SLR locations, the two-crossing handshake-loop shape, per-SLR utilization); their **slack values are estimates on an unrouted design** and are not routed timing. The RQS_TIMING-3 / `mm0` findings are demoted from "measured critical path" to "placement hazard".
+3. **V5 (V2 + `pb_v5_mm0_adapter`/`pb_v5_mm0_clients`/`pb_v5_top_ctrl`) is dropped unbuilt.** It was designed from V2's slack table and would add ~2 K leaves + 58 BRAM to the SLR that is already at congestion level 7.
+
+**Census2 (job 3456, 27 min 16 s on acclnode01, `iter72_v2_census2/out-3456/`) — placement facts, retained with the caveat above:** the top-level `gdn_forward` FSM (`inst/ap_CS_fsm_reg[*]`, replicas and the un-pblocked top-level glue) sits in **SLR2** with the conv-context/scalar storages; its loads are the 32 `m_axi` adapters and the gemv activation muxes in SLR0. In the estimate, every path within +0.28 ns of the edge was multi-SLR and the single-SLR slack floor was +0.280; `ap_CS_fsm_reg[108]_rep__0_replica_1` (SLR2) → 30 adapters' `load_unit_0`/`store_unit_0` enables (SLR0) covered 735 paths (min −0.074, p10 +0.294) and `ap_CS_fsm_reg[103]` → `mul_loc_c*_channel_U` 461 paths (min +0.021). 72 actors tabulated in `top_actor_slr.tsv`; 14,692 near-critical paths in `near_critical_paths.tsv`.
+
+**What the best *legal* result (V0, `run-V0-3432/routed_physopt/failing_endpoints.tsv`) says the knot is** — endpoints grouped by driver→endpoint family, count and worst slack:
+
+| class | endpoints | worst | structure |
+|---|---:|---:|---|
+| `mm29_m_axi_U/store_unit_0` write-FIFO full → `island_1` `recur_island_update` stall cone, fanout **5,204**, SLR0→SLR2 | 5,203 | −0.465 | the state-write back-pressure crosses two SLRs in one cycle |
+| cluster 12 / 13 internal `frp` valid/CE nets, fanout 2,049–3,316, SLR1→SLR0 | 3,330 | **−0.675** | each non-SLR1 cluster leaves a consistent **8.1–8.3 K-leaf spill** in SLR1 (clusters 8/10/11/15 in SLR1 spill 0); the spill is the result path toward the SLR1 collectors (`collect4`, both `collect6`, `collect_final` all landed in SLR1) |
+| cluster 3 / 4 internal nets, SLR0-local, fanout 1,026–2,049 | 1,550 | −0.588 | 6+ ns of net inside one SLR = detours at 99.47 % CLB |
+| `m_axi` adapters `store_unit_0` internals, SLR0-local, fanout 99–216 | 280 | −0.646 | same SLR0 detours |
+| `bus_read → inst` (adapter → top FSM), SLR1→SLR0 | 271 | −0.305 | FSM/adapter split |
+| `gdn_gemv_tiny_compute` SLR2-local, fanout 873 | 137 | −0.394 | |
+
+V3 adds one useful data point: cluster 1 placed in SLR2 with `ws_2`/`ws_3` in SLR1 and `mm2s_2/3` in SLR0 produced **no failing endpoint on the weight-FIFO handshakes** — its failures were its own 8.2 K straddle (−0.718) and the result path into `ys_U` in a 95.8 %-full SLR1 (−1.609). A FIFO in the middle SLR did not itself fail at 6.667 ns in that draw (one draw; not proof).
+
+**Reading.** The three structures above are properties of the netlist, not of any pblock set: (a) 16 clusters cannot be split 8/8 or 7/9 across SLR0/SLR1 at this density (V2, V3), and SLR2 has the room (73.7 % CLB) but a cluster there needs its weight and result streams relayed through SLR1; (b) every non-SLR1 cluster's result path is a cross-SLR handshake, which is what the placer expresses as the 8.1 K spill and the frp-valid failures; (c) the island state-write is gated by an SLR0 adapter flag through two SLRs. Placement variance on top of that is ≥1.3 ns between draws of one recipe, so no floorplan-only link can be called closable at 6.667 ns from one sample.
+
+**Verdict: rung 2 (floorplan-only re-pinning) is exhausted on legal data and REJECTED as a route to 150 MHz.** Nothing here is promoted; no source or production config changed. A timing-closed 150 MHz image needs source-side work (rung 4) on the three structures above — registered relays on cross-SLR streams (the collector-cut relay pattern), decoupling the island state-write from the adapter's full flag, and enough SLR2 residency to unload SLR0 — each of which re-opens csynth → cosim → link → card. Awaiting the decision to open that campaign versus settling for the best legal auto-scaled image (V0-class, ~130–136 MHz, one draw at a time). Iter72 r2's outcome arrives first either way.
+
+### 2026-09-06 19:40Z — Iter73 OPENED (rung 4, source-side campaign to a timing-closed 150 MHz): plan, and Iter73a = island state write-back through FIFOs + un-pinned writer processes
+
+**Decision (user, 2026-09-06 "do A").** Floorplan-only re-pinning is rejected on legal data (15:45Z entry); the user chose the source-side campaign for a *timing-closed* 6.667 ns image (WNS ≥ 0 on `clk_kernel_00_unbuffered_net` **and** `dma_ip_axi_aclk_1`, hold ≥ 0, `DATA_CLK` 150, on-card gates pass) over settling for a legal auto-scaled ~130–136 MHz draw. Each change goes csynth → one-layer RTL cosim → 150 MHz production link → card, logged here first, and nothing is promoted or committed until the on-card result is in hand.
+
+**The three netlist structures the campaign targets** (from Iter71 V0, the best *legal* draw, `run-V0-3432/routed_physopt/failing_endpoints.tsv`, 13,836 failing endpoints):
+
+| # | failing class | endpoints | worst | fix |
+|---|---|---:|---:|---|
+| (a) | `mem_weights_mm29_m_axi_U/store_unit_0` write-FIFO **full** flag (SLR0) → `island_1` `recur_island_update` clock-enable cone, fanout **5,204**, in SLR2 | 5,203 | −0.465 | **Iter73a, this entry**: island writes state to a FIFO; a free-placed writer drains it into the port |
+| (b) | non-SLR1 clusters' result paths into the SLR1 collectors: `cl_flush p3_assign` fo 2,049, `cl_weight_stream` `ap_loop_init` fo 3,316 / `empty_1369` fo 1,281, `ap_CS_fsm_state6` fo ~1,030, `yp1` fo 1,026 — each such cluster leaves an 8.1–8.3 K-leaf spill in SLR1 | ~5,000 | **−0.675** | Iter73b, to be designed from census 3477 (which sub-module spills) |
+| (c) | SLR0 at 99.47 % CLB / 72.6 % LUT: SLR0-local nets of 6+ ns (clusters 3/4, adapter `store_unit_0` internals, `mm0`) | ~1,900 | −0.653 | Iter73c: ≥2 clusters into SLR2 (73.7 % CLB, 44 % LUT) behind relayed streams |
+
+Placement variance between draws of one recipe is ≥ 1.3 ns, so **a single link cannot attribute a sub-nanosecond gain; the attributable evidence for each fix is whether its failing-endpoint *class* disappears** from `failing_endpoints.tsv`, and only the stacked result is judged by WNS.
+
+**Iter73a — hypothesis.** Today `gdn_recurrent_attention_island<ISLAND>` stores each updated BF16 state Beat straight into `recurrent_state_low/high[...]` = kernel ports `mm28..31`. HLS turns that pointer store into the island's own `m_axi` write bundle, so the port adapter's *write-buffer full* flag (SLR0, `store_unit_0/fifo_wreq`) is a stall condition of the update pipeline — and the whole island is pblock-pinned to SLR2 (`pb_iter56_recurrent_slr2`), so that flag crosses SLR2↔SLR0 in one cycle and lands on a 5,204-load clock-enable cone. This is the Iter61 anti-pattern (the port inside the block) on the write side. The read side already has the right shape: `gemv32_mm2s_with_state` (un-pinned, lands in SLR1 in V0) reads the port and fills `state_stream0..3` (URAM, depth 4,096), and in V0 **no** failing endpoint sits on that read path. Iter73a builds the mirror: the island `write()`s the updated Beat into `state_wr0..3` (URAM FIFO, depth 4,096 = one full eight-head window, so the island never waits on write acceptance within a layer), and four new sibling dataflow processes `gemv32_state_writer<28..31>` drain them into `state_out28..31` with a 4,096-iteration II=1 loop. The writers are not in any pblock, so the placer can put each beside its adapter; the island's only stall input becomes a local FIFO full flag. Expected: class (a) gone; +32 URAM (80 → 112 of 960; SLR1 has 291 free); cycles unchanged or slightly lower (the update loop's 1,035 cycles/head already includes almost no write stall); HBM addresses and write order identical (`layer_index*8*512 + head*512 + i`), so csim stays bit-exact.
+
+**Source change** (`gdn_model.cpp`, `2bc240e6…` → `765d8899361159444c4dd3a177e227c91109d05447137f4252e585a3d98446b1`; `gdn_model.h` unchanged `906b11e5…`):
+- `gdn_recurrent_attention_island<ISLAND>`: params `Beat512 *recurrent_state_low/high` → `hls::stream<Beat512> &state_low_out/&state_high_out`; the two pointer stores become `state_low_out.write(join_bf16_halves(state_low_half)); state_high_out.write(...)`; `head_state_base_bf16` and the `state_out_*` aliases deleted.
+- `gdn_recurrent_attention_islands_dataflow` and the `gdn_recurrent_attention_islands` wrapper: `Beat512 *recurrent_state0..3` → `hls::stream<Beat512> &state_wr0..3`; island<0> gets (`state_wr0`, `state_wr2`), island<1> (`state_wr1`, `state_wr3`) — same port pairing as before.
+- New `template <int CHANNEL> static void gemv32_state_writer(hls::stream<Beat512> &state_wr, Beat512 *state, uint32_t layer_index, bool qkvg_recurrent_mode)` (placed after `gemv32_mm2s_with_state`): returns at once when not in recurrent mode, else `for i in 0..4095: state[layer_index*4096 + i] = state_wr.read()` under `pipeline II=1`.
+- `gdn_gemv`: four new streams `state_wr0..3`, `#pragma HLS stream depth=4096` + `bind_storage type=fifo impl=uram`; the islands call takes them in place of `state_out28..31`; four `gemv32_state_writer<28..31>(state_wrN, state_outN, layer_index, qkvg_recurrent_mode)` calls appended to the dataflow region.
+- `packed_bf16_cosim_check.sh` (`dd03dbba…`): source guard `require_count 4 'depth=4096'` → `8` — the new FIFOs are layer-count independent (one head window) and are deliberately *not* scaled by the one-layer sed.
+
+**Native gate (bit-exact, before any HLS run):** `bash scripts/decode_correctness_check.sh --fast` — PASS: `exact_traj_match True`, `exact_ref_mismatch 0`, `argmax_mismatch 0`, `max_abs 3.81e-06` on 160,000 pre-argmax logits (identical to the pre-change figures; the 3.8e-6 is the cached golden's own cross-run noise field, not a change). Evidence label: **native only**.
+
+**What csim cannot show and the next two runs must:** (1) csynth — that `gemv32_state_writer_beat` schedules at II=1 and the islands' `recur_island_update` cycle count and II are unchanged, that no new high-fanout net appears in the islands, the URAM delta (+32 expected), the estimated clock; (2) one-layer RTL cosim at 6.667 ns — that the new dataflow region (islands + four writers on 4,096-deep FIFOs) completes a transaction and the exported state matches: a wrong FIFO sizing or a writer that never sees `qkvg_recurrent_mode` would deadlock only in RTL (the Iter68 lesson).
+
+**Launch (this entry):** two parallel `build`-partition jobs from the same working tree, staged on node-local `/tmp`, harrier excluded (its `/tmp` is full, 13:34Z entry): `diagnostics/iter73a_state_writer_probe/probe.slurm` (`make xo JOBS=16 VITIS_VERSION=2024.2`, HLS clock 150 MHz via the Makefile default, copies `csynth.rpt` + `vitis_hls.log`) and `diagnostics/iter73a_state_writer_cosim/cosim.slurm` (`packed_bf16_cosim_check.sh <stage> 6.667`). Job IDs, node, and wall time are recorded in the RESULT entry. The production link waits for both verdicts and for census 3477 (fix b design input); build-QoS caps (96 CPU / 384 GiB, with 3453 + 3477 holding 56 CPU / 288 GiB) do not admit a link now anyway.
+
+### 2026-09-06 19:46Z — Census 3477 aborted on its own legality gate (parser bug, not the checkpoint); resubmitted as 3482
+
+Job 3477 (`iter73_v0_hier_census`, acclnode03, 14 min) opened V0's `routed_physopt.dcp`, wrote `route_status.rpt`, and then exited 4 ("not legally routed"). The report itself says **routable 1,732,138 = fully routed 1,732,138, routing errors 0** — identical to V0's original report — so the checkpoint is legal and the gate misread it: the regex `errors\.*:\s*(\d+)` needed the colon right after the dots, but the report prints `errors.......... :           0 :` (a space before the colon), and the `# of unrouted nets` line is simply absent when the count is zero. Fixed in `v0_hier_census.tcl`: `\.*\s*:\s*`, absent unrouted line ⇒ 0, and legality now requires `routable == fully routed && errors == 0 && unrouted == 0`. Verified in plain `tclsh` on both the V0 report (legal=1) and V2's failed-route report (unrouted 1,514,688 / errors 66 / fully routed 217,471 ⇒ legal=0). Aborted output kept as `out-3477-abort-regex/`. Resubmitted as **job 3482** at 19:45:53Z; watcher re-armed. No design fact was produced or changed by 3477.
+
+### 2026-09-07 00:25Z — Iter73a RESULT: csynth (job 3480) and one-layer RTL cosim (job 3481) both PASS; functionally identical, timing effect only judgeable at the 150 MHz link
+
+**Evidence class: csynth + RTL cosim (one layer, 6.667 ns). No link, no card.**
+Source under test: `gdn_model.cpp` `765d8899361159444c4dd3a177e227c91109d05447137f4252e585a3d98446b1`, `gdn_model.h` `906b11e5ca368b08da0c4dfbdb2e3a8ddf10683efbc912e4f07223124f89ac53` (the 19:40Z entry describes the change: islands write `state_low_out/high_out` streams; four `gemv32_state_writer<28..31>` processes drain depth-4096 URAM `state_wr0..3` into `state_out28..31`, so no island touches an `m_axi` write port).
+
+| job | node | elapsed | MaxRSS | exit | artifacts |
+|---|---|---|---|---|---|
+| 3480 `iter73a_probe` (`make xo JOBS=16`, 150 MHz HLS) | acclnode03 | 00:47:12 | 7.2 GB | 0 | `diagnostics/iter73a_state_writer_probe/{csynth.rpt,vitis_hls.log,xo.sha256}`; export.xo `53416d844ba83c3ca3f9cc3f3fc959b56c4c2b4db1b28ec214496a86c53e13dd` |
+| 3481 `iter73a_cosim` (`packed_bf16_cosim_check.sh <stage> 6.667`) | acclnode03 | 02:48:37 | 26.4 GB | 0 | `diagnostics/iter73a_state_writer_cosim/{cosim.out,gdn_forward.log,source_hashes.txt}` |
+
+**csynth, Iter73a vs Iter67c baseline (`diagnostics/iter67c_fivephase_probe/csynth.rpt`, same `.o16` flow):**
+
+| | Iter67c | Iter73a | Δ |
+|---|---:|---:|---:|
+| `gdn_forward` latency estimate (cycles) | 6,659,691 | 6,659,691 | 0 |
+| islands / layer | 37,283 | 36,723 | −560 (`recur_island_head` 4,660 → 4,590 per head) |
+| `recur_island_load_state` / `recur_island_read` / `recur_island_update` | 1,027 / 1,289 / 1,035 | 1,027 / 1,289 / 1,034 | 0 / 0 / −1, all II=1 |
+| `recur_island_update` FF | 753 | 650 | −103 |
+| islands FF / LUT | 140,319 / 144,465 | 137,080 / 142,322 | −3,239 / −2,143 |
+| `gemv32_state_writer_beat` (new, ×4) | — | II=1, 4,097 cycles/call, 663 FF + 743 LUT each | +4 processes |
+| top FF / LUT | 1,022,339 / 920,867 | 1,026,580 / 924,377 (70%) | +4,241 / +3,510 |
+| BRAM18 / DSP | 1,995 / 3,453 | 1,995 / 3,453 | 0 |
+| URAM | 80 | 112 | +32 (four depth-4096 × 512-bit writer FIFOs) |
+| estimated Fmax | — | 205.47 MHz | — |
+
+The top-level latency estimate is unchanged because the writer runs concurrently with the islands' own loops; the −560 cycles/layer inside the islands is the removed AXI write handshake, and whether it shows on card is a link question.
+
+**Cosim (one layer, all-BF16 fixture, 6.667 ns):** `one-layer all-BF16 cosim PASS: state checksum 0xbb4cb96a71380000 -> 0xacb4a86a2cb00000, logits checksum=0xbf34f7736c726725 nonzero=32000` — **bit-identical to the Iter66e cosim** on the same fixture (`diagnostics/iter66e_frp_cosim/cosim.out`). C/RTL PASS, no deadlock. The transaction completed at 1,123,332,000 ps = 168,492 cycles (Iter66e 175,701, −7,209); that span also contains Iter67c's II=1 read gain and no Iter67c one-layer cosim exists on disk, so Iter73a's share is not separable from cosim — csynth attributes ~280 cycles/layer per island pair to it. The staged one-layer copy's hashes (`source_hashes.txt`: `28fb8a5f…` / `9d8b2362…`) differ from the working tree because the harness rewrites the one-layer copy; `source.sha256` records the working-tree hashes above.
+
+**Verdict: class (a) fix is functionally correct (RTL cosim bit-identical), resource-neutral except +32 URAM, and cycle-neutral at the top level.** It is retained in the working tree for the stacked 150 MHz link. It is NOT a demonstrated improvement yet: the target is the `store_unit_0` write-FIFO-full CE cone (5,203 failing endpoints in V0), and only `failing_endpoints.tsv` of a 6.667 ns link can show whether that class disappears. Not committed.
+
+### 2026-09-07 00:25Z — Census 3482 RESULT: what actually spills out of every SLR0 cluster, and where the collectors sit (V0 `routed_physopt.dcp`, legal: 0 unrouted, 0 overlaps)
+
+**Evidence class: routed checkpoint measurement (job 3482, acclnode03, 00:14:17, MaxRSS 27.7 GB, exit 0; `diagnostics/iter73_v0_hier_census/out-3482/{hier_slr_census.tsv,hifo_net_loads.tsv,route_status.rpt}`).** Leaf-primitive counts per SLR for every hierarchy under `grp_gdn_gemv_fu_1054`.
+
+| actor | SLR0 | SLR1 | SLR2 | note |
+|---|---:|---:|---:|---|
+| clusters 3,4,5,6,7,9,12,13,14 (each) | 52.6–53.1K | **7.7–8.3K** | 0 | every SLR0 cluster spills ~8.1K leaves into SLR1 |
+| clusters 0,1,8,10,11,15 (each) | 0 | ~60.8K | 0 | whole cluster in SLR1 |
+| cluster 2 | 8,669 | 52,143 | 0 | SLR1 majority, 8.7K in SLR0 |
+| all 16 `ys_N_U` (8 BRAM each), `collect4`, `collect6` ×2, `collect_final`, `slr0/1/2_result_U`, `slr0/1/2_boundary_U`, `boundary_relay_0/1/2_U0` | 0 | **100%** | 0 | the whole result tree is in SLR1; **the three relays never cross an SLR in V0**, so the relay pattern is not demonstrated cross-SLR at 6.667 ns |
+
+**Anatomy of one spill (cluster 12, 8,296 leaves in SLR1):**
+
+| sub-hierarchy | SLR1 leaves | what it is |
+|---|---:|---|
+| `Pipeline_gemv32_cl_weight_stream` | 4,144 | `<leaf>` 3,307 (1,282 FF + 2,016 LUT: the yp/emit tail of the frp loop), `fadd_U2786` 490 (all SLR1), `flow_control_loop_pipe_sequential_init_U` 336, four_dots 11 |
+| `Pipeline_gemv32_cl_flush` | 2,882 | `<leaf>` 1,827 (1,048 FF + 777 LUT), `flow_control…` 1,055 LUT of 3,088 |
+| cluster `<leaf>` | 1,053 | 1,049 FF = **100% of the cluster-level FFs** (`yp0/yp1` + FSM) |
+| `fadd_U2940` | 153 of 490 | one of the six cluster-level reduce adders torn; U2935–U2939 all SLR0 |
+| `cl_load`, `x_bf16_U` | 55, 7 | negligible |
+
+**So the spill is the cluster's ys-write side**: the yp0/yp1 packers, the flush pipeline and its 64-word argument latch, and the emit stage of the frp loop — pulled into SLR1 by the `ys` FIFO and the collectors.
+
+**Which nets fail (V0 `failing_endpoints.tsv`, 6,102 of 13,836 involve a cluster) and their fanouts (`hifo_net_loads.tsv`):**
+
+| net (per cluster) | fanout | role | V0 failure |
+|---|---:|---|---|
+| `Pipeline_gemv32_cl_flush/p3_assign` | 2,049 | flush latches all 64 ring words at `ap_start` | cluster 12: 2,615 endpoints SLR1→SLR0, worst −0.675; cluster 13: 1,045, −0.653; cluster 4: 274, −0.588 |
+| `cl_weight_stream/ap_loop_init` | 3,316 | loop-entry init mux of the 2,048-bit rings + 1,024-bit yp + counters | cross-SLR in every SLR0 cluster; **closes in all six SLR1-local clusters** (0,1,8,10,11 have zero failing endpoints) |
+| `cl_weight_stream/icmp_ln3301…pp0_iter20` (`empty_1369`) | 1,281 | loop-exit write-back of the rings to cluster-level registers | cluster 3: 1,286 endpoints **SLR0-local**, −0.138, 2 logic levels |
+| cluster `ap_CS_fsm_state6` | 1,029 | FSM state that shifts/copies yp0/yp1 | clusters 13 and 6: 117/90 endpoints SLR1→SLR1, **0 logic levels, 6.45–6.96 ns** |
+| `cl_flush/…yp1_88…i_2` and flush `ap_loop_init` | 1,026 / 1,030 | flush's yp init and loop init | part of the cluster 12/13 classes above |
+| `cl_weight_stream/frp_pipeline_valid_U_valid_out[21]` | 1,539 | frp stage-21 valid gating the ring/yp updates (inherent to loop-carried state with bubbles) | cluster 15: 38 endpoints SLR1-local, −0.276 |
+| cluster-level `fadd_…full_dsp` internals → flush `yp*_81`, weight_stream `s0/s1_reg` | — | reduce adders torn across the SLR | 27–65 endpoints per SLR0 cluster, −0.60, 8–11 logic levels |
+
+**Reading.** Five of the seven wide nets exist only because the accumulator state (2,048-bit rings + 1,024-bit yp) is handed between three modules: the frp loop writes it back on exit, the cluster FSM holds it, and the flush pipeline latches it at start and hands it back again. That hand-over logic is what the placer separates from the datapath and drags toward `ys`. The two nets that would survive a merge (`ap_loop_init` 3,316 and `valid_out[21]` 1,539) demonstrably close when the cluster is compact in one SLR. **Iter73b therefore targets the hand-over, not the fanout:** retire the final group inside the frp loop itself (nine trailing iterations with the weight reads suppressed) so that no ring or yp value leaves the pipeline, deleting `gemv32_cl_flush`, the cluster-level yp registers, and all five hand-over nets at the source. The SLR crossing then reduces to the frp loop's last stage writing a 512-bit word into the SLR1 `ys` BRAM FIFO — the same register→BRAM-FIFO form the census shows closing for the `ws` FIFOs written in SLR1 and read by SLR0 clusters, and for the `state_stream` URAM FIFOs into SLR2.
+
+### 2026-09-07 00:29Z — Iter73b LAUNCHED: retire the final group inside the frp loop (deletes `gemv32_cl_flush`, the cluster-level `yp0/yp1` registers and the five ring/packer hand-over nets) — csynth probe 3483 + one-layer cosim 3484
+
+**Hypothesis (from census 3482 and V0 `failing_endpoints.tsv`, entries above):** the ~8.1K-leaf SLR1 spill of every SLR0 cluster and the 2,049/1,281/1,030/1,029/1,026-load nets that fail in it exist because the accumulator state (eight 8-slot FP32 rings = 2,048 bits, two 512-bit packers) is handed between the frp loop, the cluster FSM and a separate flush pipeline. If the final group is retired inside the loop, none of that state is read after the loop, HLS has nothing to write back or latch, and the only thing that can still be pulled toward the SLR1 `ys` FIFO is the loop's 512-bit emit stage.
+
+**Change (`gdn_model.cpp` `0dc4040d14df561550892e2630254cfad784645dfcd0569b23af7ae3aee052f4`, `gdn_model.h` unchanged `906b11e5…`; Iter73a stacked underneath; pre-change copy in scratchpad `gdn_model.cpp.pre_iter73b`):**
+- `gemv32_cl_weight_stream` now runs `total_weight_beats + 9` iterations. The nine trailing iterations execute the same body with `draining = flat >= total_weight_beats` suppressing the two `ws` reads (weights read as zero; the accumulations they feed land in rings that are dead after the retire). Eight of them have `wb == 0` and `group == row_groups`, so the existing "retire the previous group" path retires the last group; the ninth (`wb == 1, context == 0`) emits the port-one word through the existing path.
+- Half pack (odd `row_groups`, i.e. `lm_head`'s 1000 rows/channel): `half_pack = group == row_groups && (row_groups & 1)`; the emitted copy is `yp >> 256` (lanes 8–15 moved to 0–7, zero padded), the same words the old post-loop `yp >>= 256; ys.write` produced.
+- The per-pair `yp0 = yp1 = 0` clear is removed: sixteen 32-bit inserts overwrite all 512 bits before a full pack is emitted, and the half-pack copy zero-fills lanes 8–15 by the shift, so the clear was functionally dead (and was a 1,024-load net).
+- Deleted: `gemv32_cl_flush`, `final_group`, the two post-loop `ys.write`s. `gemv32_cl_init_contexts` and the `Beat512 yp0 = 0, yp1 = 0` loop-entry values are kept — one variable per iteration; the `ap_loop_init` net (3,316 loads) they create is the known residual, and the census shows it closes when the cluster is SLR-compact.
+- Cycle cost per cluster per GEMV call: +9 loop iterations against the removed 8-iteration flush plus its FSM states and two writes — expected neutral (csynth will say).
+
+**Validation so far:** `make -C c_impl` then `bash scripts/decode_correctness_check.sh --fast` (run by hand — Bash edits do not trigger the hook): **PASS**, `exact_ref_mismatch=0`, exact trajectory, `full_logits_parity` 160,000 values, 1 m 10 s. Native-only evidence.
+
+**Launch (this entry):** two parallel `build`-partition jobs from the same working tree (harrier excluded), while Iter72 r2 (3453, 48 CPU/192 GB) is still linking — 76 CPU / 284 GB of the 96 / 393.6 GB QoS caps:
+
+| job | purpose | script / log |
+|---|---|---|
+| **3483** `iter73b_probe` | `make xo JOBS=16 VITIS_VERSION=2024.2` at 150 MHz on a `/tmp` stage; asks whether HLS still accepts `style=frp` with conditional stream reads (II=1), whether `gemv32_cl_flush` is gone, and the cluster/top FF/LUT and latency deltas vs job 3480 | `diagnostics/iter73b_merged_flush_probe/{probe.slurm,probe.live.log,probe.exit}` |
+| **3484** `iter73b_cosim` | `packed_bf16_cosim_check.sh` one-layer RTL cosim at 6.667 ns; expected checksums identical to jobs 2500/3481 (`state … -> 0xacb4a86a2cb00000`, logits `0xbf34f7736c726725`) | `diagnostics/iter73b_merged_flush_cosim/{cosim.slurm,cosim.live.log,cosim.exit}` |
+
+Submitted 2026-09-07T00:28:49Z; one detached watcher armed on both exit markers / `squeue` departure.
+
+### 2026-09-07 01:20Z — Iter73b csynth RESULT (job 3483): II=1 frp kept, `gemv32_cl_flush` and all 66 loop-exit write-backs gone, latency unchanged — but a 29-stage × 512-bit `emitted_word` phi chain adds 14,848 FF per cluster. Retained pending cosim 3484; the FF is fixable in source → Iter73b2
+
+**Evidence label: csynth** (v++ `-c` at 150 MHz, Vitis 2024.2, `acclnode03`, 00:40:02 wall, MaxRSS 6.5 GB, `probe.exit` 0, `export.xo` `4d069460…`). Reports copied out of the `/tmp` stage by copy-only jobs 3485/3486 into `diagnostics/iter73_hls_reports/{3480-i73a,3483-i73b}/` (top and per-module `*_csynth.rpt`, the `gemv32_cl_weight_stream` `verbose.sched.rpt`/`verbose.bind.rpt`, and the real HLS logs `hlslog_solution.log` / `hlslog_autopilot.flow.log` / `hlslog_runme.log`).
+
+**Correction to both probe records (3480 and 3483):** `probe.slurm` grepped `find "$STAGE/c_impl" -name vitis_hls.log | head -1`, which matched the rsynced repo file `c_impl/vitis_hls.log` — a 91-line Sep-4 head-node `config_rtl` help dump, not a build log. The "ALL II violations" and "frp" sections in `probe.live.log` of both probes are therefore vacuous, and the copies at `diagnostics/iter73{a,b}_*_probe/vitis_hls.log` are that stale file. II was verified instead from the `csynth.rpt` loop tables (below) and from the fetched `solution.log`: no `II violation`/`Unable to schedule` message in either build. Future probes must exclude `$STAGE/c_impl/vitis_hls.log` and read `_x_compile/…/solution/solution.log`.
+
+**Loop-table diff (all ~99 loops):** identical between 3480 and 3483 except (a) the `gemv32_cl_flush` loop is absent and (b) `gemv32_cl_weight_stream` trip 64,000 → 64,009. Every other loop keeps its II, depth and trip. `Pipeline-0 : II = 1, D = 30` for the weight-stream loop in both — HLS accepts `style=frp` with the two conditional `ws` reads.
+
+| per cluster (`gemv32_cluster2`) | Iter73a (3480) | Iter73b (3483) | Δ |
+|---|---|---|---|
+| `cl_weight_stream` loop | FF 31,057 / LUT 27,426 / DSP 128, trip 64,000, depth 30 | FF 42,906 / LUT 25,466 / DSP 140, trip 64,009, depth 30 | **FF +11,849**, LUT −1,960, DSP +12 |
+| `cl_flush` | FF 3,285 / LUT 688 | absent | −3,285 / −688 |
+| cluster-level FSM / hand-over mux | FF 2,479 / LUT 3,632 | FF 89 / LUT 283 | −2,390 / −3,349 |
+| cluster total | FF 36,821 / LUT 31,746, latency 64,232 | FF 42,995 / LUT 25,749, latency 64,221 | +6,174 / −5,997, −11 cycles |
+| ×16 → `gdn_forward` | FF 1,026,580 / LUT 924,377 | FF 1,125,364 (43%) / LUT 828,425 (63%) | **+98,784 / −95,952** |
+
+`gdn_forward` latency 6,659,691 in both (cycle-neutral, as predicted). BRAM18 1,995, DSP 3,453 (+192 = 12 × 16), URAM 112 — unchanged except DSP. Loop register breakdown: Register FF 11,792 → 22,255; Expression LUT 5,088 → 3,516; Mux LUT 970 → 1,024; Instance FF 19,265 → 20,651 (the +12 DSP are the two `gemv32_reduce_parts` trees — six `fadd` — now inside the loop). Loop-exit `ap_auto` write-backs in the schedule: **66 → 0** (48 ring words, 16 more, plus `yp0_114_out`/`yp1_114_out` in 73a; none in 73b). That is the whole 1,281-load `icmp_ln3301…pp0_iter20` loop-exit class and the flush's 2,049-load `p3_assign` class removed at the source, which was the hypothesis.
+
+**Where the +11.8K FF per loop comes from (schedule evidence, `3483-i73b/…weight_stream.verbose.sched.rpt` vs `3480-i73a`):**
+- In 73a the emit was fully if-converted: `%emitted_word…` selects at S30 straight from `%yp0_61`/`%yp1_61`, `ys.write` at S30, no carried value.
+- In 73b HLS left the `wb == 1` emit as a real branch (`br_ln3381` → `if.then61.i` / `if.end66.i`): `emitted_word_17` selected at S29, `emitted_word_18` at S30, merged by a 512-bit phi `emitted_word_248_i` at S30. Because the phi's operands are produced in different stages and blocks, the frp scheduler lowers it as `ap_phi_reg_pp0_iter1..29_emitted_word_248_i_reg_504` — a **29-stage × 512-bit register chain = 14,848 FF per cluster, 237,568 FF design-wide**. The `yp0` update lands at S29 (`store_ln3322`) and `yp1` at S30 (`store_ln3323`).
+- The `if (!draining)` reads add `ap_phi_reg_pp0_iter1/2_weight0/1_0_i` (4 × 512 = 2,048 FF per cluster) — the read at S2 feeds a phi at S3 that carries a 512-bit zero on the drain path.
+- 14,848 + 2,048 − 3,285 (flush) − 2,390 (FSM) ≈ +11.2K, which accounts for the loop's +11,849 within the packer/`half_pack` selects.
+
+**Verdict — csynth-clean, retained pending cosim 3484, with one source fix queued.** The structural goal (no state read after the loop, no flush pipeline, no hand-over nets) is met and latency is unchanged; the FF regression is not inherent to the merged retire — it is the unconverted `wb == 1` branch, and the same write *was* if-converted in 73a. **Iter73b2** rewrites the emit as straight-line selects (`emit0`/`emit1` flags computed once, `word0`/`word1` selected unconditionally, one `if (emit0 || emit1) ys.write(emit1 ? word1 : word0)`) so there is no phi to carry; success criterion is `ap_phi_reg_pp0_iter*_emitted_word*` absent from the schedule and loop FF back near 73a's 31K, with II=1 / depth 30 / latency 6,659,691 retained. The 2,048 FF of weight phis are accepted (they are what makes the drain iterations well-defined). Cosim 3484 is still running on the 73b source; its checksums, if they match, also cover 73b2 only after 73b2's own cosim — the emit path is exactly what changes.
+
+### 2026-09-07 01:25Z — Iter73b2 LAUNCHED: straight-line emit in `gemv32_cl_weight_stream` (no 512-bit value merged across basic blocks) — csynth probe 3487
+
+**Hypothesis:** probe 3483's +11.8K FF per cluster loop is the `emitted_word_248_i` phi lowered as a 29-stage × 512-bit chain because the `wb == 1` emit stayed a real branch. If the retire and the emit are written so that every 512-bit value is computed unconditionally and only a scalar assignment and the `ys.write` are predicated, there is no phi to carry; the loop should return to about 73a's 31K FF with 73b's structure (no flush, no loop-exit write-backs, latency 6,659,691) intact.
+
+**Change (`gdn_model.cpp` `78f5afc6ed3b83a8e80d16d4923c273ff605eff02c12b30b95db30e115ccb495`, `gdn_model.h` unchanged `906b11e5…`; pre-change copy in scratchpad `gdn_model.cpp.pre_iter73b2`), one block of the frp loop body, nothing else:**
+- `retire = group != 0 && wb == 0`; `result0/1 = gemv32_reduce_parts(...)` computed every iteration (the six `fadd` were already inside the loop in 73b — DSP +12 per cluster expected unchanged); `yp0_next/yp1_next = (yp >> 32)` with lane 15 inserted, then `if (retire) { yp0 = yp0_next; yp1 = yp1_next; }` — a plain select.
+- `emit0 = retire && context == 7 && ((group & 1) == 0 || half_pack)`; `emit1 = wb == 1 && context == 0 && ((group >= 2 && (group & 1) == 0) || half_pack)` — mutually exclusive (wb 0 vs 1); `emit_src = wb == 1 ? yp1 : yp0`; `emitted_word = half_pack ? emit_src >> 256 : emit_src`; `if (emit0 || emit1) ys.write(emitted_word)`. Two 512-bit muxes instead of 73a's three; same words on the stream in the same iterations as 73b.
+- The `if (!draining)` conditional `ws` reads are unchanged (their 2 × 2 × 512 FF of phis are the price of the well-defined drain).
+
+**Validation so far:** `make -C c_impl` + `bash scripts/decode_correctness_check.sh --fast` by hand: **PASS**, `exact_ref_mismatch=0`, exact trajectory, 160,000 logits, 1 m 16 s. Native-only.
+
+**Launch:** job **3487** `iter73b2_probe`, `build` partition (16 CPU / 48 GB / 4 h, harrier and acclnode04/05 excluded), `make xo JOBS=16 VITIS_VERSION=2024.2` at 150 MHz on `/tmp/yaoz0b-3487-i73b2`; `diagnostics/iter73b2_straightline_emit_probe/{probe.slurm,probe.live.log,probe.exit,reports/}`. The script now reads `solution/solution.log` (not the stale repo `vitis_hls.log`) and copies the weight-stream `verbose.sched.rpt`/`verbose.bind.rpt` itself, so the phi-chain check (`ap_phi_reg_pp0_iter*_emitted_word*` count, expected 0) is in `probe.live.log` without a fetch job. Concurrent load: 3453 (48/192G) + 3484 (12/44G) + 3487 (16/48G) = 76 CPU / 284 GB of the 96 / 393.6 GB QoS caps. Submitted 2026-09-07T01:25:12Z; one detached watcher armed on `probe.exit` / `squeue` departure. Cosim 3484 (73b source) continues; 73b2 gets its own cosim after this probe.
+
+### 2026-09-07 02:12Z — Iter73b2 csynth RESULT (job 3487): phi chain gone, `gdn_forward` FF 887,268 (−13.6% vs Iter73a, −11% vs Iter67c) and LUT 820,777 (−11.2%), II=1 frp depth 30, latency unchanged, every other loop identical — RETAINED at csynth; one-layer RTL cosim 3489 launched
+
+**Evidence label: csynth** (v++ `-c`, 150 MHz HLS clock, Vitis 2024.2, `acclnode03`, 00:42:46, MaxRSS 6.5 GB, `probe.exit` 0, `export.xo` `23c7299c…`). Artifacts in `diagnostics/iter73b2_straightline_emit_probe/`: `csynth.rpt` (design-wide summary, fetched by copy-only job 3488 — `probe.slurm` had saved the top-module report, now `gdn_forward_top_csynth.rpt`), `reports/all/` (all 233 per-module reports), `reports/gemv32_cluster2_1_Pipeline_gemv32_cl_weight_stream.verbose.{sched,bind}.rpt`, `hlslog_solution.log`, `hlslog_autopilot.flow.log`.
+
+**Phi chain check (the hypothesis):** `ap_phi_reg_pp0_iter*` registers in the weight-stream loop module — 73b: 38 (29 × 512-bit `emitted_word_248_i` + 8 `weight0/1_0_i` + 1) → **73b2: 8, all `weight0_0_i`/`weight1_0_i`** (the two conditional `ws` reads, 2,048 FF, accepted). Schedule: `emitted_word` phi ops 0; loop-exit `ap_auto` write-backs 0 (73a had 66); one `ap_fifo` write. Real HLS log (`solution.log`): `Pipelining result : Target II = 1, Final II = 1, Depth = 30, loop 'gemv32_cl_weight_stream'`; `Enabling free running pipeline (frp)` on all 16 cluster modules. The only `II Violation` messages are the three pre-existing ones (`load_embedding_local` II=2, `onorm_sq_half` II=3, `rmsnorm_sq_half` II=3) — present with identical II in 73a/73b/Iter67c.
+
+| | Iter73a (3480) | Iter73b (3483) | **Iter73b2 (3487)** | 73b2 − 73a |
+|---|---|---|---|---|
+| `cl_weight_stream` loop | FF 31,057 / LUT 27,426 / DSP 128 | FF 42,906 / LUT 25,466 / DSP 140 | **FF 28,025 / LUT 24,988 / DSP 140** | −3,032 / −2,438 / +12 |
+| loop Register FF | 11,792 | 22,255 | **7,374** | −4,418 |
+| `cl_flush` | FF 3,285 / LUT 688 | — | — | −3,285 / −688 |
+| cluster-level FSM/mux | FF 2,479 / LUT 3,632 | FF 89 / LUT 283 | FF 89 / LUT 283 | −2,390 / −3,349 |
+| `gemv32_cluster2_1` | FF 36,821 / LUT 31,746, lat 64,232 | FF 42,995 / LUT 25,749, lat 64,221 | **FF 28,114 / LUT 25,271, lat 64,221** | **−23.6% / −20.4%**, −11 cycles |
+| `gdn_gemv` | FF 878,832 / LUT 772,618 | FF 977,616 / LUT 676,666 | **FF 739,520 / LUT 669,018** | −139,312 / −103,600 |
+| `gdn_forward` | FF 1,026,580 / LUT 924,303 | FF 1,125,364 / LUT 828,351 | **FF 887,268 (34%) / LUT 820,777 (62%)** | **−13.6% / −11.2%** |
+| `gdn_forward` BRAM18 / DSP / URAM / latency | 1,995 / 3,453 / 112 / 6,659,691 | same | **same** | 0 |
+
+The loop is now 3K FF *below* 73a's: 73a's loop carried 66 loop-exit write-back registers (48 ring words × 32 bit + `yp0/yp1` × 512 = 3,072 FF) for the flush to read, and those have no consumer any more. All 98 loops in the design-wide table are identical between 73b and 73b2 (name, achieved II, trip, iteration latency) — the change touched exactly one loop body and moved nothing else. Estimated clock 4.679 ns against the 6.667 ns target, unchanged.
+
+**Against the shipping image (Iter67c csynth: FF 1.00M / LUT 895K):** −11% FF, −8% LUT, with the same BRAM/DSP/URAM and the same latency. This is the first Iter73 step with a resource delta of the sign and size that matters for the 99.47%-CLB SLR0 (target class c) as well as removing the class-b nets — a routed 150 MHz link is the only thing that can say whether it converts into timing.
+
+**Verdict — csynth-clean, RETAINED as the Iter73 baseline source (`gdn_model.cpp` `78f5afc6…`); Iter73b (`0dc4040d…`) is superseded, not reverted to — 73b2 contains it.** Cosim **3489** `iter73b2_cosim` submitted 2026-09-07T02:13:06Z (`build`, 12 CPU / 44 GB / 12 h, harrier and acclnode04/05 excluded; `diagnostics/iter73b2_straightline_emit_cosim/{cosim.slurm,cosim.live.log,cosim.exit}`; expected checksums identical to jobs 2500/3481: `state … -> 0xacb4a86a2cb00000`, logits `0xbf34f7736c726725 nonzero=32000`). Cosim 3484 on the 73b source is left running to completion (it still tests the shared drain/retire semantics in RTL). Concurrent load: 3453 (48/192G) + 3484 (12/44G) + 3489 (12/44G) = 72 CPU / 280 GB. One detached watcher armed on 3489.
+
+### 2026-09-07 03:35Z — Iter73b one-layer RTL cosim RESULT (job 3484): PASS, checksums identical to Iter67c/73a; and HLS's own fanout estimate for the cluster loop fell 13,091 → 5,123 (73b) → below the 5,000 reporting threshold (73b2)
+
+**Evidence label: RTL cosim (one layer, eight heads, 6.667 ns), on the Iter73b source `0dc4040d…`** — `acclnode03`, 03:01:37 wall, MaxRSS 26.9 GB, `cosim.exit` 0. `cosim.out` line 9885/9886: `one-layer all-BF16 cosim PASS: state checksum 0xbb4cb96a71380000 -> 0xacb4a86a2cb00000, logits checksum=0xbf34f7736c726725 nonzero=32000`, `*** C/RTL co-simulation finished: PASS ***` — the same words as jobs 2500 (Iter67c) and 3481 (Iter73a). So the merged retire — nine drain iterations with the two `ws` reads suppressed, the port-one word emitted from the following iteration, the half-pack `>> 256` copy — is RTL-exact and live under the frp handshake, not only in C. Iter73b2 shares all of that and changes only the emit selects; its own cosim is 3489.
+
+**Side finding from the real HLS logs (RTGEN `206-104 Estimated max fanout`, reported only when a module's largest HDL-expression fanout exceeds roughly 5,000 — the smallest value ever printed is 5,123):**
+
+| probe | cluster weight-stream module | expression | modules reported |
+|---|---|---|---|
+| Iter73a (3480) | **13,091** | `(1'b0 == ap_block_pp0_stage0_11001)` — the frp stall/block condition | 22 (16 clusters + 2 recurrent islands 8,834 + `gdn_swiglu` 7,215 + 3 others) |
+| Iter73b (3483) | **5,123** | same | 22 |
+| Iter73b2 (3487) | **not reported → < 5,000** | — | 6 (the 16 clusters are gone from the list) |
+
+That block condition is the source of the frp valid/CE nets that failed in V0 at 2,049–3,316 loads (target class b). The estimate is pre-synthesis and per HLS module, not a routed fanout, so it says nothing about slack yet — but it is the first direct HLS-side confirmation that 73b removed most of the cone's load and 73b2 the rest of what the emit path added. The remaining ≥5K estimates (recurrent islands 8,834, `gdn_swiglu` 7,215) are the same in all three and are untouched by Iter73 so far.
+
+**Verdict:** Iter73b RTL-exact (PASS). Superseded by 73b2 as the carried source; nothing to revert. Waiting on cosim 3489 (73b2) and the Iter72 r2 link 3453.
+
+### 2026-09-07 05:15Z — Iter73b2 one-layer RTL cosim RESULT (job 3489): PASS — the stacked 73a+73b2 source is RTL-exact and cleared for the 150 MHz link
+
+**Evidence label: RTL cosim, one layer, 6.667 ns (HLS clock 150 MHz).** Job 3489, `build` partition, `acclnode03`, 12 CPU / 44G, staged on node-local `/tmp/yaoz0b-3489-i73b2`; `packed_bf16_cosim_check.sh <stage> 6.667`. COMPLETED in **02:58:02**, MaxRSS **26.5 GB**, `cosim.exit` = 0, ended 05:11:08Z (`sacct`). Artifacts: `diagnostics/iter73b2_straightline_emit_cosim/{cosim.out,gdn_forward.log,source_hashes.txt,source.sha256}`.
+
+| item | value |
+|---|---|
+| source | `gdn_model.cpp` `78f5afc6ed3b83a8e80d16d4923c273ff605eff02c12b30b95db30e115ccb495` (73a + 73b2), `gdn_model.h` `906b11e5…` (unchanged), `packed_bf16_one_layer_test.cpp` `7f09526e…`, `packed_bf16_cosim_check.sh` `dd03dbba…` |
+| C side | `one-layer all-BF16 cosim PASS: state checksum 0xbb4cb96a71380000 -> 0xacb4a86a2cb00000, logits checksum=0xbf34f7736c726725 nonzero=32000` |
+| RTL side | same line, `*** C/RTL co-simulation finished: PASS ***` |
+| vs earlier passes | identical checksums to jobs 2500 (Iter66e), 3481 (73a), 3484 (73b) |
+| RTGEN cluster fanout message | none in this csynth either — the weight-stream frp block condition is now below RTGEN's ~5,000 reporting floor (was 13,091 in 73a, 5,123 in 73b) |
+
+**What this proves:** the straight-line emit (no `wb == 1` branch on 512-bit values, no flush stage, no loop-exit write-backs) computes the same BF16 state and the same 32,000 logits as the C model in RTL at the 6.667 ns schedule, with the four state-writer FIFOs (73a) and the frp weight stream live together in one layer. **What it does not prove:** anything about place-and-route or timing — the failing-endpoint classes (a) and (b) were placement facts from V0 and can only be re-measured by a full 150 MHz link.
+
+**Verdict: RETAINED (RTL-exact).** 73a+73b2 is the Iter73 carried source. Next step per the campaign plan: the 150 MHz production-floorplan link of this source (Iter69 recipe, source the only variable).
+
+### 2026-09-07 05:16Z — Iter73 (73a + 73b2) 150 MHz production-floorplan link LAUNCHED: build job 3491, on-card job 3492 (afterok)
+
+**What is being tested.** The first full link of the source-side campaign: the stacked Iter73a (island state write-back through four 4,096-deep URAM FIFOs + free-placed `gemv32_state_writer<28..31>`) and Iter73b2 (straight-line result emit inside the frp weight-stream loop; flush stage and 512-bit phi chain gone) source, at the 6.667 ns kernel clock on the **unchanged production floorplan** (Iter69 recipe). Source is the only variable against Iter69 (job 3401, −1.594) and Iter71 V0 (job 3432, −0.675, best legal draw).
+
+**Command** (from `c_impl/`, working tree, 05:16:39Z):
+```
+BUILD_EXCLUDE=acclnode04,acclnode05,harrier HW_CFG_TEMPLATE=hw_iter69_kernel_clock_f150.cfg \
+EXTRA_SNAPSHOT_FILES="hw_iter69_kernel_clock_f150.cfg apply_iter69_kernel_clock_f150.tcl" \
+HLS_FREQ=150 LINK_FREQ=150 BUILD_TIME=2-00:00:00 bash run_hw_sbatch.sh iter73b2_f150
+```
+Build **3491** (`build`, 48 CPU / 192G, `acclnode01`, alongside the still-running Iter72 r2 link 3453 — 96 CPU / 384G of the 96 / 393,600M per-user QoS), on-card **3492** (`light`, `afterok:3491`; queued behind 3454 for the single FPGA). Diagnostics: `diagnostics/iter73b2_f150/` (`build.live.log`, `build.slurm-3491.log`, `source_snapshot.tar`, `source_hashes.txt`; exit marker `build.exit`, then `oncard.exit`).
+
+**Frozen inputs** (`source_hashes.txt`): `gdn_model.cpp` `78f5afc6ed3b83a8e80d16d4923c273ff605eff02c12b30b95db30e115ccb495`, `gdn_model.h` `906b11e5…`, `hw_iter69_kernel_clock_f150.cfg` `8c2448ba…`, `apply_iter69_kernel_clock_f150.tcl` `94926326…` (sources `apply_f150_physical_islands.tcl` `cfbba5d5…`), `apply_iter66e_unpair.tcl` `1dab980e…`, `check_f150_physical_islands.tcl` `41ab6ea1…`, `hls_gdn_forward.tcl` `a76930f3…`, `Makefile` `4c346964…`, `host.cpp` `8bc562e6…`. Hook compatibility checked before submit: the pblock Tcl pins only cluster/FIFO/relay/collector/island roots (none renamed by 73a/73b2); the unpair filter is a union, so the vanished `Pipeline_gemv32_cl_flush` family cannot trip its zero-match gate while `gemv32_four_dots` and `bus_write/fifo_burst` still match.
+
+**Hypothesis, stated as failing-endpoint classes (placement variance ≥ 1.3 ns between draws makes WNS alone non-attributable):**
+| V0 class | V0 evidence | expected in this link |
+|---|---|---|
+| (a) `store_unit_0` write-FIFO-full CE cone, SLR0 → SLR2 islands, fanout 5,204 | 5,203 failing, −0.465 | **absent** — the islands no longer own an `m_axi` write bundle; the flag now stalls a free-placed writer, not `recur_island_update` |
+| (b) cluster result-side tear: flush `p3_assign` 2,049 / `ap_loop_init` 3,316 / loop-exit write-back 1,281 into SLR1 | 8.1K-leaf spill per non-SLR1 cluster | **absent** — no flush module, no loop-exit write-backs, phi regs 38 → 8; the frp block condition fell under RTGEN's 5,000 floor |
+| (c) SLR0 CLB 99.47% detours | +6 ns paths | **unchanged** (Iter73c not yet applied) — expected to remain the dominant residual |
+Resources are also expected to help placement: csynth FF 887,268 (−11% vs Iter67c) / LUT 820,777 (−8%).
+
+**Read order when 3491 reports:** `route_status.rpt` (0 unrouted / 0 overlaps) before any timing; then per-clock WNS/WHS (`clk_kernel_00_unbuffered_net` and `dma_ip_axi_aclk_1`) and the failing-endpoint census by class from `gdn_final_qor/`; `GDN_ITER56_CHECK` / `GDN_ITER66E_DONE` hook lines; `DATA_CLK` in the XCLBIN; then the on-card gates and `kernel_ms` from 3492. Watcher armed on `build.exit` or 3491 leaving `squeue`.
+
+### 2026-09-07 11:00Z — Iter72 r2 RESULT (build 3453 / on-card 3454): the seven-cluster SLR1 re-pin **routed legally** in the production flow; kernel clock auto-scaled 150 → **137.7 MHz** (WNS −0.592 ns at 6.667 ns); on card **17.955 ms kernel / 18.053 ms TPOT** (−25.5% vs Iter67c) with identical gates — POSITIVE ON CARD, NOT TIMING-CLOSED AT THE CONSTRAINT, NOT PROMOTED (awaiting the user's review)
+
+**Record-keeping note.** Both jobs completed at 07:53:53Z / 07:54:29Z; this entry was written at 11:00Z from the artifacts in `diagnostics/iter72_repin7_f150_r2/` (`build.slurm-3453.log`, `gdn_forward_link.log`, `impl_1.runme.log`, `gdn_final_qor/*`, `oncard.slurm-3454.log`, `source_hashes.txt`, `xo_gate_summary.json`) and `sacct`. The result sat unrecorded for three hours while Iter73 (3491) was already linking — a violation of rule 1, noted so it is not repeated. The XCLBIN was copied into the diagnostics dir at 11:00Z (`gdn_forward.xclbin`, sha `bcb96b680548d5b1…` verified) because build 3491 targets the same `build.hw.gdn32.h150.f150.o48` directory and its on-card job will overwrite the repo copy.
+
+**What was built** — byte-identical inputs to the 12:28Z LAUNCH entry (`source_hashes.txt`): `gdn_model.cpp` `2bc240e6a5cf24b2…` (= HEAD `caf512543`, Iter67c), `gdn_model.h` `906b11e5…`, `host.cpp` `8bc562e6…`, `Makefile` `4c346964…`, `hls_gdn_forward.tcl` `a76930f3…`, `hw_iter72_repin_f150.cfg` `76636f05…`, `apply_iter72_kernel_clock_f150.tcl` `daab6316…`, `apply_iter72_repin_islands.tcl` `5c438812…`, `check_iter72_repin_islands.tcl` `95bb575d…`, `apply_iter66e_unpair.tcl` `1dab980e…`, DMA chain `aa0d8a15…`/`d6cd2074…`/`268f9e9f…`, `report_final_qor.tcl` `45fb4513…`, `check_native_bf16_xo.py` `a779d747…`. Same netlist as Iter69 (job 3371) and Iter71 V0 (job 3432); the only variable against Iter69 is the floorplan. XCLBIN `bcb96b680548d5b15f62ddda2f6fe7930522d261f41e0a11f4c01b683a0b2365` (80,758,411 B). `xclbinutil --info`: scalable clocks **137 MHz** (DATA_CLK), 444 MHz (HBM), 500 MHz; requested 150.
+
+**Build (job 3453, `acclnode01`, 48 CPU / 192 GB).** Elapsed **18:11:26**; `sacct` MaxRSS **63.8 GB** (build 3449 on harrier had reached 66.4 GB before its disk-full abort — both above the 51 GB peak recorded for the 100 MHz links), MaxDiskWrite 47.3 GB. Phases from `build.live.log`: link synthesis 1:55:29, opt_design 0:13:43, place_design 2:55:59, route_design **5:54:09**, post-route phys_opt + bitstream 6:24:49. XO gate clean: 64 native BF16 multipliers, 0 FP32 multipliers, `four_dots` II=1, `estimated_fmax_mhz` 205.5, no failures. Post-place structural gate: `GDN_ITER72_DONE collector_cut=4/6/6 recurrent=full_slr2 slr1_clusters=2,3,4,5,6,15,0 cluster8=free cluster9=free cluster10=free transport_roots_free=11 relay_regs=35 reset_fanout=32 narrow_pblocks=0`; pblocks `pb_iter56_recurrent_slr2` SLR2 cells=1, `pb_iter71_clusters_slr1` SLR1 cells=7, `pb_iter56_result_boundary_slr1` SLR1 cells=4.
+
+**Route — LEGAL.** `gdn_final_qor/route_status.rpt`: routable nets 1,749,650, fully routed **1,749,650**, nets with routing errors **0**. The 15:45Z prediction ("the harness predicts a level-7 route abort") was **wrong for the production flow**: v++'s own placement of the same seven-cluster pblock set routed. The placer still reports level-7 windows (`congestion.rpt`: South Global/Long 7 `CLEL_R_X16Y46→CLEM_X77Y173` in SLR0 — `gdn_forward` top glue 22%, cluster 12 `four_dots` 15%, `hmss_0` 13%, RAMB 98%; North Long 7 `CLEM_X11Y453→X72Y580` in SLR2 — `island_1` 30%) but the router completed. Routed utilization per SLR0/SLR1/SLR2 (`utilization_slr.rpt`): CLB **97.61 / 93.20 / 75.78 %** (Iter67c: 99.29 / 87.51 / 81.97), LUT 61.67 / 65.20 / 48.34 %, registers 44.07 / 39.57 / 27.55 %, BRAM tiles 77.31 / 82.29 / 44.72 %, URAM 0 / 32 / 48, DSP 73.44 / 63.41 / 47.72 %; **33,099 SLLs** used. The re-pin moved ~1.7 points of CLB out of SLR0 and ~5.7 into SLR1.
+
+**Timing at the 6.667 ns constraint — FAILED, three clocks read separately** (`gdn_final_qor/timing_summary.rpt`):
+
+| clock | period | setup WNS | failing / total endpoints | TNS | hold WHS |
+|---|---:|---:|---:|---:|---:|
+| `clk_kernel_00_unbuffered_net` | 6.667 ns | **−0.592** | **5,568** / 1,633,445 | −1,199.3 | 0.000 |
+| `dma_ip_axi_aclk_1` | 4.000 ns | +0.003 | 0 / 307,194 | 0 | +0.009 |
+| `hbm_aclk` | 2.222 ns | **−0.026** | **22** / 270,102 | −0.262 | +0.003 |
+
+v++ then emitted **`AUTO-FREQ-SCALING-04` 150 → 137.7 MHz** (7.262 ns ≈ 6.667 + 0.592, zero computed margin on the worst path) and — for the first time in any link log on disk under `diagnostics/*/gdn_forward_link.log` — **`AUTO-FREQ-SCALING-07` `hbm_aclk` 450 → 444.8 MHz**. The HBM controller clock is a third gate at higher kernel clocks; whether the 22 failing HBM endpoints are our SLR0 density or the shell's is not established here.
+
+**Worst paths, all at −0.592/−0.591** (52 `VIOLATED` paths printed; the top ones are the same net): `mem_weights_mm31_m_axi_U/store_unit_0/fifo_wreq/full_n_reg_replica/C` → `mem_weights_mm29_m_axi_U/store_unit_0/fifo_wreq/U_fifo_srl/mem_reg[68][*]_srl32_*/CE`, data path **6.674 ns of which 6.378 ns (95.6%) is route**, 2 logic levels. `qor_suggestions.rpt` `RQS_TIMING-3-1` (FORCE_MAX_FANOUT, 56 paths): `gdn_gemv/ws_31_U/full_n_reg/C` → `gemv32_mm2s_with_state_31/…/mem_weights_mm31_addr_read_reg_147_reg[186]/CE`, 2 logic levels, 6.877 ns, 97.4% route. Both residual classes live in the **state-port (mm29/mm31) adapter and reader neighbourhood** — wire, not logic. The Iter71 V0 class (a) (`mm29 store_unit_0` full flag → `island_1 recur_island_update` CE cone, 5,203 endpoints) does not appear among the printed worst paths; a per-class census of the 5,568 endpoints was **not** produced by this harness (no `failing_endpoints.tsv` in `gdn_final_qor/`), so "class (a) gone" is *suggested* by the top-52 listing, not proven.
+
+**Versus Iter69 and Iter71 V0 (same netlist):** Iter69 production link −1.594 ns / 25,528 failing → Iter72 r2 **−0.592 ns / 5,568 failing**; Iter71 V0 (unchanged pblocks, re-placed) −0.675 / 13,836. With ≥1.3 ns draw-to-draw placement variance measured in this campaign, r2's 0.08 ns edge over V0 is **not attributable to the re-pin**; what is attributable is that the floorplan is routable in the production flow and yields the best legal draw to date. The 15:45Z rung-2 verdict ("no demonstrated gain over placer variance") therefore stands on timing; its routability claim is corrected here.
+
+**On card (job 3454, `acclnode01`, XRT 2.13.479, 36 s including XCLBIN load):**
+
+| gate | result |
+|---|---|
+| 8-token exact gate | PASS, `exact_traj_match True`; 7 steps × 32,000 logits vs GPU: NRMSE 0.00434710, worst step 0.00982, `tolerance_fail 0` |
+| 64-token exact gate | PASS, `exact_traj_match True`, `first_divergence_index −1`, top-1 100% |
+| CUDA vector gate, 2,016,000 logits | global NRMSE **0.00466269633**, worst-step 0.0119080019, global cosine 0.999989166, min step cosine **0.99994632**, min top-5 overlap **5**, `argmax_mismatch 0` — identical to Iter67c and Iter69 (same netlist, same arithmetic) |
+| `kernel_ms` (median / mean of 63) | **17.955 / 17.948 ms** |
+| `per_step_tpot_ms` (median / mean) | **18.053 / 18.046 ms** (host overhead 0.098 ms) |
+
+17.955 ms × 137.7 MHz = **2.472M kernel cycles**, +2.6% over Iter67c's 2.410M at 100 MHz (Iter69 at 121 MHz: 2.432M) — the HBM-side latency now shows in the cycle count, as the clock-scoped HBM note predicts. Relative to Iter67c: kernel **−25.5%**, production TPOT **−25.4%**; relative to Iter69: −10.7%.
+
+**Not run on this image:** 512-token drift, WikiText-2 perplexity, paired-power protocol. Iter69 ran the first two on the 121 MHz image (job 3388) and they were numerically identical to Iter66e/67c; the same netlist makes the same outcome expected here, but it is unmeasured at 137.7 MHz. A promotion would require them (rule 4: never promote an intermediate result).
+
+**Verdict: POSITIVE ON CARD, NOT TIMING-CLOSED at the 6.667 ns constraint, NOT PROMOTED.** Two facts for the promotion decision: (1) the committed *recipe* would not reproduce this *image* — a relink of the same files is a new placement draw with ≥1.3 ns spread, so the artifact worth preserving is the XCLBIN itself (now in `diagnostics/iter72_repin7_f150_r2/`), which the commit discipline forbids committing; (2) the image passes every gate the production image passed and is the fastest legal image built so far. If retained, the four Iter72 files (cfg, kernel-clock Tcl, repin Tcl, check Tcl) plus this log entry are the commit; if not, they stay uncommitted with this entry. Iter73 (3491/3492) is the source-side route to a *timing-closed* 150 MHz and is unaffected either way.
+
+### 2026-09-07 14:35Z — Iter73 (73a + 73b2) 150 MHz link RESULT (build 3491): **NOT ROUTED** — 11,197 node overlaps, 15,197 signals failed to route; on-card 3492 cancelled by `afterok` — NEGATIVE at `route_design`, verdict on the source changes INCONCLUSIVE
+
+**Jobs.** 3491 `iter73b2_f150_build`: **FAILED**, 08:48:11 on `acclnode01` (05:16:39Z → 14:04:50Z), `sacct` MaxRSS **68.6 GB** (highest yet; 63.8 GB job 3453, 66.4 GB job 3449), MaxDiskWrite 41.0 GB, `build.exit` = 2. 3492 `iter73b2_f150_oncard`: CANCELLED, never started. No watcher process was alive when the result was checked at 14:20Z; this entry is from `diagnostics/iter73b2_f150/` (`build.live.log`, `gdn_forward_link.log`, `impl_1.runme.log`, `placement_reports/`, `post_place.dcp`, `source_hashes.txt`). No `gdn_final_qor/` exists — the flow died before post-route phys_opt, so there is **no routed timing and no failing-endpoint census** for this build.
+
+**Inputs as frozen at launch (05:16Z entry):** `gdn_model.cpp` `78f5afc6…` (73a + 73b2), `gdn_model.h` `906b11e5…`, `hw_iter69_kernel_clock_f150.cfg` `8c2448ba…`, `apply_iter69_kernel_clock_f150.tcl` `94926326…` → `apply_f150_physical_islands.tcl` (the unchanged production floorplan), `apply_iter66e_unpair.tcl` `1dab980e…`. Source is the only variable against Iter69 (job 3371, same floorplan, routed legally at −1.594) and Iter71 V0 (job 3432, re-placed, −0.675).
+
+**Phases.** link synthesis 1:47:15 · opt_design 0:13:13 · place_design 2:56:09 · route_design 2:58:30 to `Route finalize`, then Phase 9 verification failed. XO gate passed (the flow reached `vivado_link`). Hooks: `GDN_ITER66E_DONE soft_hlutnm_cleared=64432 hlutnm_cleared=15360 residual_ce_nets_over_2000=16` (Iter69: 113,648 / 15,360 / 32 — the `Pipeline_gemv32_cl_flush` family no longer exists, so the unpair filter clears 49K fewer soft pairs; the high-fanout CE census halved as 73b2 predicted). Post-place structural gate: all four pblocks `outside=0` (`pb_iter56_recurrent_slr2` 261,059 placed; `pb_iter56_cluster8_slr1` 47,070; `pb_iter66b_cluster10_slr1` 47,341; `pb_iter56_result_boundary_slr1` 758).
+
+**Post-place, Iter73 (3491) vs Iter69 (3371), same floorplan** (`placement_reports/`):
+
+| | SLR0 | SLR1 | SLR2 | note |
+|---|---:|---:|---:|---|
+| CLB % — Iter69 | 98.22 | 92.06 | 80.39 | |
+| CLB % — **Iter73** | **97.83** | **74.06** | 78.18 | design shrank, SLR1 emptied, **SLR0 did not** |
+| LUT % — Iter73 | 63.07 | 46.37 | 48.43 | Iter69: 63.99 / 61.22 / 50.15 |
+| DSP % — Iter73 | 83.23 | 54.04 | 48.44 | Iter69: 81.25 / 55.44 / 48.37 |
+| URAM — Iter73 | 0 | 32 | **80** | +32 = the four `state_wr` FIFOs, in SLR2 with the islands |
+| SLLs used | 32,819 | | | Iter69: 33,072 |
+
+Timing endpoints on the kernel clock fell **1,633,235 → 1,341,941 (−17.8%)**. Post-place estimate: kernel WNS **−1.039** (584 failing) vs Iter69's −0.881 (835 failing) at the same stage — placement-stage numbers, not routed timing.
+
+**The one measured placement difference that names itself:** cluster 9 is a free root in this floorplan (neither cluster-8 nor cluster-10 pblock holds it). `actor_slr_distribution.rpt`: Iter69 put **cluster 9 entirely in SLR1** (61,076 leaves); 3491 put it in **SLR0** (43,385 leaves SLR0, 3,690 SLR1, 6,646 unplaced at report time; the cluster is 53,721 leaves now, −12% from 73b2). Cluster 10 (pinned) stayed in SLR1 at 47,071. That is ~43K leaves added to the SLR at 97.8% CLB while SLR1 sat at 74%.
+
+**Placer congestion** (`placement_reports/congestion.rpt`): level-7 windows South Global `CLEL_R_X16Y47→CLEM_X77Y174`, South Long `CLEM_X17Y44→DSP_X77Y170`, North Long `CLEL_R_X16Y52→CLEM_X77Y179` — all full-width SLR0; owners `gdn_forward` top glue 21%, `hmss_0` 16–19%, **cluster 2 `four_dots` 12%**. Iter69's placement also carried level-7 South Long / North Long windows in SLR0 and routed, so the placer level alone does not discriminate.
+
+**Router** (`impl_1.runme.log`): after Phase 5 rip-up, `Intermediate Timing Summary WNS=-6.078 TNS=-21896.6`; Router Utilization Summary `Number of Node Overlaps = 11197`; Phase 9 `[Route 35-162] 15197 signals failed to route due to routing congestion`; effective congestion **N4 / S7 / E5 / W4** (Iter69 at the same point: N6 / S4 / E3 / W2, overlaps 10 → 0). The South-7 window is `INT_X1Y61→INT_X128Y188` — SLR0, full width. The router's top-10 contended nodes are, however, in **SLR2** (`island_1` `recur_island_update`/`faddfsub` at `INT_X61Y545`; `gdn_swiglu` × `q_mlp_gate_storage` at `Y628`; `k_stream_U` at `Y602`; `gemv_out_storage` × `conv_tail_storage_2` at `Y503–507`), so the overlaps are not confined to the SLR0 window. v++: `[VPL 35-2] Design is not legally routed. There are 11197 node overlaps.` (The preceding `[VPL 78-110] Invalid part string Project` is the report-only root seen in Iter68G build 3344, not the cause.)
+
+**What this run proves / suggests.** *Proves:* the stacked 73a + 73b2 source, on the unchanged production floorplan, did not route in this v++ draw. *Suggests, not proves:* the loss of routability is placement, not the source's wire structure — the design has 18% fewer endpoints and 11% less FF, the only named difference from Iter69 is the free cluster 9 landing in SLR0, and this campaign has already measured one recipe routing on one draw and failing on the next (Iter71 V0 legal, V1 not; Iter72 V2 predicted unroutable, routed in production). The class-(a)/(b) hypotheses of the launch entry are **untestable on this artifact** — there is no routed timing. Where the four `gemv32_state_writer` processes landed is **not exposed** by the actor report (it lists only the pre-73 roles) and needs a `post_place.dcp` query.
+
+**Verdict: NEGATIVE at `route_design` (not legally routed); INCONCLUSIVE on the Iter73a/73b2 source.** Nothing promoted, nothing committed; the source stays in the working tree (`gdn_model.cpp` `78f5afc6…`) pending the user's decision. Candidate next steps, not launched: (i) re-place the 3491 netlist through the Iter71 harness with cluster 9 added to the cluster-8 pblock (the topology Iter69 got by luck) — cheap, one variable, answers the placement-vs-source question; (ii) query `post_place.dcp` for the writers' SLRs and the SLR0 leaf census before choosing (i); (iii) only then a second production link.
+
+### 2026-09-07 18:30Z — Census 3516 RESULT: placement diagnosis of the unrouted Iter73 build 3491 — class (a) gone, class (b) halved, SLR0 *less* full than the legal V0 draw; no single structural cause exposed, cluster 2 torn 35K/11K is the one new anomaly — MEASUREMENT ONLY
+
+**Job.** 3516 `iter73_3491_census`, `build`, 8 CPU / 96 GB, COMPLETED in 25:28 (open_checkpoint 622 s). Input `diagnostics/iter73b2_f150/post_place.dcp` (`79fb474e…`), Tcl `diagnostics/iter73_3491_placement_census/census.tcl` (`b1d9f9af…`), outputs in `out-3516/` (`actor_slr_census.tsv` 5,814 actors, `handshake_nets.tsv`, `high_fanout_split.tsv` 139 nets > 1,000 loads, `design_analysis_congestion.rpt`, `utilization_slr.rpt`, `placed_near_critical_paths.tsv` 1,367 endpoints < 0.3 ns). Everything below is a **placed, unrouted** checkpoint: leaf locations are facts, slacks are estimates. Placed primitives per SLR: **770,920 / 505,947 / 535,873**.
+
+**1. Where the actors landed (leaves, SLR0 / SLR1 / SLR2).**
+
+| actor | SLR0 | SLR1 | SLR2 | note |
+|---|---:|---:|---:|---|
+| clusters **2,3,4,5,6,7,9,12,14** (nine) | 35.3–43.7K each | 3.1–11.5K each | 0 | spill per SLR0 cluster **3.1–3.8K** (V0: 7.7–8.3K) except cluster 5 (7.3K) and **cluster 2 (11.5K)** |
+| clusters 0,8,10,11,13,15 (six) | 0 | 46.8K each | 0 | whole |
+| **cluster 1** | 0 | 3.8K | **43.0K** | whole cluster in SLR2 (as in Iter71 V3, which routed at −1.670) |
+| `gemv32_state_writer_28..31` | **790 each** | 1–4 | 0 | landed beside their adapters, as designed |
+| `state_wr0..3_U` (URAM FIFO) | 68–73 | 2–6 | 74 | write side (URAM) in SLR2 with the islands, read-side logic in SLR0 with the writers |
+| `state_stream0..3_U` | 71 (0 for #0) | 75–147 | 1 | unchanged pattern |
+| `gemv32_mm2s_with_state_28..31` | 0.5–0.9K | 2.1–2.4K | 0 | SLR1 majority, as in V0 |
+| islands | 0 | 0 | 248,665 | pinned |
+| `gemv32_store_or_qkvg_conv_stream` | 0 | 25 | 71,195 | |
+| `collect4/6/6/final`, `ys_*` | 0 | 100% | 0 | whole result tree in SLR1, as in V0 |
+| `mem_weights_mm0_m_axi_U` | 5,218 | 237 | **1,953** | torn across three SLRs (as census2 found on V2) |
+| `mem_weights_mm28..31_m_axi_U` | ~5,080 each | ~1,670 each | 0 | the four state-port adapters |
+| other 27 adapters | 2,838 each | 0–12 | 0 | except mm1 (SLR2 majority) and mm24 (SLR1 majority) |
+| `control_s_axi_U` | 5,932 | 0 | 0 | |
+
+SLR0 by family: clusters 378,493 · adapters 98,044 · `control_s_axi` 5,932 · writers 3,184 · everything else of the kernel ~20K; the remaining ~265K SLR0 primitives are shell (`hmss_0`, the HBM switch, lives in SLR0 by construction). **Nine clusters in SLR0 is the same count as Iter71 V0** (V0: 3,4,5,6,7,9,12,13,14; 3491: 2,3,4,5,6,7,9,12,14 — cluster 13 swapped for cluster 2). **Correction to the 14:35Z entry:** cluster 9 in SLR0 is a difference from Iter69, not from the best legal draw V0, so it is *not* a discriminator for routability.
+
+**2. Handshake nets — did the Iter73a FIFOs move the backpressure path?** (`handshake_nets.tsv`: fanout, driver SLR, loads per SLR)
+
+| net | fanout | driver | loads SLR0/1/2 | reading |
+|---|---:|---|---|---|
+| `mm28..31 store_unit_0/fifo_wreq/full_n_reg_0` | **51–61** | SLR0 | **51–61 / 0 / 0** | **class (a) is gone at placement**: V0's 5,204-load SLR0→SLR2 cone is now a 51-load SLR0-local net into the writer |
+| `mm28..31 store_unit_0/buff_wdata/full_n_reg_0` | 14–17 | SLR0 | 11–17 / 0–3 / 0 | local |
+| `state_wr0..3_U/*_full_n` | **8** | **SLR1** | 1–3 / 1–3 / **4** | the island's new stall input: still crosses SLRs (SLR1 → SLR2 island, SLR0 writer-side), but 8 loads, not a cone |
+| `state_wr0..3_U/*_empty_n` | 15 | SLR0 | 11–15 / 0–4 / 0 | writer side, local |
+| `gemv32_state_writer_*` `ap_start`/`ap_done` | 3–44 | mixed | up to 17/26/1 | dataflow sync glue, small |
+| `ws_*` full/empty (189 nets) | — | SLR0 111, SLR1 78 | 177 single-SLR, **12 `ws_full` two-SLR** | the weight FIFOs are local except 12 |
+
+Answer to Codex's second question: **partly yes.** The write-FIFO-full stall no longer reaches the islands, but the replacement FIFO's own `full_n` is driven from SLR1 (the placer split the FIFO's control between the SLR2 URAM and the SLR0 reader) and is consumed in SLR2 — a cross-SLR handshake of 8 loads. Placed estimate for that family: `state_wr2→state_wr0` 51 endpoints worst −0.286, `state_wr2` internal 50 at −0.411, `state_wr1→state_wr3` 26 at −0.098 (SLR1→SLR0). Small, but not free.
+
+**3. High-fanout nets (139 > 1,000 loads; 16 cross an SLR).** The kernel's cross-SLR wide nets are exactly the SLR0 clusters' loop control: per SLR0 cluster, `cl_weight_stream/ap_loop_init` (2,052–2,359 loads, **1,024 of them in SLR1**), `frp_pipeline_valid_U_valid_out[29]` (**1,025 loads, all SLR1**), `empty_*_fu_1920` (1,156, SLR0-local). The 1,024/1,025 SLR1 loads are the frp stage-29 emit registers — the 2×512-bit result words — placed by the `ys` FIFOs and collectors in SLR1. **Class (b) shrank from the 8.1K yp/flush tail to a 1,024-bit emit tail per SLR0 cluster, but it still crosses SLR0→SLR1 as a wide net.** Cluster 2 is the extreme: `ap_loop_init` driven from SLR0 with **all 2,052 loads in SLR1**, `empty_947` 1,156 in SLR1, `valid_out[29]` 1,025 in SLR1 — its entire weight-stream loop control sits in SLR1 while 35K leaves (the `four_dots` datapath) sit in SLR0. Clusters 12 and 14 are the mirror (driver in SLR1, 1,028 loads in SLR0). The islands' 26 wide nets (up to 7,264 loads) are SLR2-local; the four state adapters' 6 each (1,170) are SLR0-local.
+
+**4. Placed-timing class census (ESTIMATE, slack < 0.3 ns, 1,367 endpoints).**
+
+| endpoints | worst | path class |
+|---:|---:|---|
+| **283 + 66 + 33** | **−1.039** | top `ap_CS_fsm_reg[86]/[90]` (SLR1) → `mem_weights_mm0_m_axi_U` store/load units (SLR0, and 33 SLR1-local) — Codex's item 1, the same family census2 saw on V2 |
+| 82 + 44 | −0.517 | `mm0 load_unit_0` internal, SLR0→SLR1 and SLR0→SLR2 — the adapter is torn across three SLRs |
+| 119 | +0.286 | `gemv32_store_or_qkvg_conv_stream` SLR1→SLR2 (its 25 SLR1 leaves) |
+| 51 + 50 + 26 + 25 | −0.411 | `state_wr*` FIFO control, SLR1→SLR0 (item 2 above) |
+| 71 | +0.088 | `xr_1_U` → `xr_2_U`, SLR2→SLR0 |
+| 44 + 27 | −0.029 | clusters 12 / 14 internal SLR1→SLR0 (their torn loop control) |
+| 10 | −0.705 | `gdn_gemv ap_start` replica → `qkvg_recurrent_mode_c_U`, SLR0-local |
+
+**5. Congestion, the tool's view** (`report_design_analysis -congestion`): placer level-7 windows South Global `CLEL_R_X16Y47→CLEM_X77Y174`, South Long, North Long — the same full-width SLR0 windows V0 and Iter69 carried and routed through. Routed utilization is not available (unrouted). SLR0 CLB **97.83 %** versus V0's **99.47 %** and Iter69's 98.22 %: **the failed draw's SLR0 is less full than the legal one.**
+
+**Diagnosis.** (i) Both Iter73 source changes did at placement what they were designed to do: the 5,204-load state-write stall cone is gone (class a), and the per-cluster SLR1 spill halved from ~8.1K to ~3.4K leaves (class b), with FF −11% / endpoints −18%. (ii) SLR0 density, cluster count in SLR0, and the level-7 windows are all equal to or better than the legal V0 draw, so **none of them explains why 3491 did not route.** (iii) What is new and worse in this draw is **tearing**: cluster 2 split 35K/11K with all its loop control in the wrong SLR (V0: cluster 2 was SLR1-majority 52K/8.7K), clusters 12/14 with control drivers in SLR1, `mm0` torn 5.2K/0.2K/2.0K, and the `state_wr` FIFO control landing in the middle SLR. The router's 15,197 failed signals were spread over SLR0 South *and* SLR2 (top contended nodes in `island_1`, `swiglu`, storages), which is the signature of a placement that the router could not converge, not of one hotspot. (iv) Placement-to-placement variance in this campaign is already known to flip routability on an unchanged netlist (V0 legal, V1 not). **The evidence therefore does not show the Iter73 netlist to be unroutable; it shows one draw that tore two clusters and the shared adapter across SLRs.** Whether the netlist is worse *on average* than Iter67c's needs a second draw.
+
+**Standing residual for any 150 MHz attempt (all draws so far):** the top FSM → `mm0` adapter control paths (−1.039 estimate here, 735 near-critical on V2) — a source or floorplan item independent of Iter73a/b2.
+
+**Not launched; options for the user:** (A) re-place the 3491 netlist in the Iter71 harness with each cluster constrained whole to the SLR it landed in here (soft `USER_SLR_ASSIGNMENT`: {2,3,4,5,6,7,9,12,14}→SLR0, {0,8,10,11,13,15}→SLR1, {1}→SLR2) plus `mm0` kept whole — a crossing-aware anti-tear constraint rather than a re-pin, testable in ~6 h without a v++ link; (B) a plain second production draw of the same recipe (9 h) to measure variance; (C) source-side: register the top-FSM → adapter enables (Codex item 1) before any further link. Nothing is promoted; the Iter73 source remains uncommitted.
+
+### 2026-09-07 15:45Z — Iter73 failed-route recovery and conflict census (3517 → 3518)
+
+**Purpose:** distinguish actual routing conflicts from the placement-only
+hypotheses in census 3516 before choosing a source or floorplan repair.
+Build 3491 remains NEGATIVE: 15,197 failed signals and 11,197 node overlaps.
+Its pre-route phys-opt WNS eventually reached −0.039 ns, but neither that
+estimate nor timing on an illegal route establishes 150 MHz closure.
+
+**Recovery 3517: PASS.** The original 691 MiB routed-error DCP was still in
+job 3491's node-local tree on acclnode01. A one-CPU/2 GiB build job was pinned
+there solely to recover that artifact. Source and copy SHA-256 match:
+f67aee95eebb2022420af6b287c3a6e824aad2ea2e24a36a813ad85828987bd4.
+The original is untouched. Shared retained copy:
+diagnostics/iter73_3491_routed_error_census/routed_error.dcp.
+
+**Census 3518: SUBMITTED, measurement only.** Build partition, feature
+vivado2024.2, no node pin or accelerator GRES, eight CPUs, 96 GiB,
+three-hour wall limit, dependent on successful recovery 3517.
+Vivado uses fresh node-local staging. Slurm output, detailed live log,
+reports and exit marker are shared immediately under
+diagnostics/iter73_3491_routed_error_census/.
+
+Commands: sbatch c_impl/diagnostics/iter73_3491_routed_error_census/recover.slurm;
+then sbatch --dependency=afterok:3517
+c_impl/diagnostics/iter73_3491_routed_error_census/diagnose.slurm.
+
+Read-only Tcl captures route status, congestion/complexity, per-SLR
+utilization, net-route-status counts, problem-net driver/load families and
+SLRs, shared route nodes, high fanout, diagnostic timing and QoR suggestions.
+Connectivity is capped at 20,000 problem nets; node enumeration stops starting
+new nets after two million node visits. A coverage report identifies any
+truncation. Shared-node counts cover enumerated problem nets, not an assumed
+replacement for Vivado's authoritative overlap total.
+
+Diagnostic Tcl SHA-256:
+592bb268edc014cd7555d07ffd7e7b1c1cc7e0ebbdff0d8a8a1ac58c8456dd09.
+Slurm script SHA-256:
+f9ac118f33bdeb4e1b3dfe2f6e288ca13b55f8ab03c616e06429537185b9069a.
+Shell syntax and Tcl lexical completeness checks pass.
+Estimated duration: 30–90 minutes after allocation.
+No hardware retry is chained automatically.
+
+**Decision gate:** choose one measured locality correction using failed-route
+module/window attribution, not blanket whole-cluster containment or an
+unmeasured directive sweep. Source, config, precision, the 150 MHz requested
+clock, and existing dirty files are unchanged. No improvement claimed; no
+commit. After the bounded launch sentry, await the user's next instruction.
+
+### 2026-09-07T17:15Z — Census 3518 partial failure; conflict-attribution-only v2 retry
+
+**3518 result: INCOMPLETE / diagnostic-script failure, not a new hardware
+failure.** Slurm FAILED 2:0 after 00:53:10, peak RSS approximately 35.1 GiB.
+Route status, congestion, utilization, high fanout, diagnostic timing and
+QoR completed. Conflict attribution stopped after 86 rows because an empty
+object collection reached get_property. The raw hierarchy returned 103,078
+CONFLICTS aliases; these are not independent physical routing failures.
+Vivado's authoritative report confirms 15,197 conflicted nets. QoR took
+28:58 and will not be repeated. All out-3518 evidence is preserved.
+
+**Fix (measurement tools only):** new files under
+diagnostics/iter73_3491_conflicts_v2/. Use report_route_status -show_all as
+the authoritative net and conflicting-node list; reconcile the parsed
+unique-net count to 15,197 and conflict-node count to the router's 11,197.
+Resolve exact names through a single hierarchy traversal rather than
+interpreting bit-index names as globs. Guard every potentially empty
+property/pin/cell collection. Keep constant-net conflict nodes, but label
+their intentionally skipped large sink walks. Record individual attribution
+exceptions and continue; any exception or count mismatch makes the diagnostic
+exit nonzero and is visible in coverage.txt.
+
+**Validation:** native helpers_test.tcl PASS for empty collections,
+bit-index names, the real report's authoritative count, inline and multiline
+node lists, and exclusion of site-pin annotations. Bash syntax PASS.
+This does not replace validation of Vivado object queries on the checkpoint.
+
+**Retry scope:** same retained routed-error DCP
+f67aee95eebb2022420af6b287c3a6e824aad2ea2e24a36a813ad85828987bd4.
+No new placement, routing, synthesis, QoR or timing run. Scheduler-selected
+vivado2024.2 build node, 8 CPUs / 96 GiB / 2 h wall limit, no GRES.
+Estimated 20–45 minutes after allocation; direct shared live.log and
+Slurm output. No automatic hardware retry, source/config change or commit.
+
+Tcl SHA-256: 09039e7b09c73915232960b827799728cd0adef656b63ed330e20c08135cce5f.
+Slurm SHA-256: b3f7b07b580a914e8c6a7e81b554a601331e66b586f42739495f21ccfe284cb8.
+
+Submitted as **3519** with sbatch
+c_impl/diagnostics/iter73_3491_conflicts_v2/run.slurm.
+Scheduler selected acclnode01. Startup verified: Vivado 2024.2 is opening
+the retained routed-error checkpoint; shared live.log exists. No startup
+exception observed. Await completion before choosing a hardware repair.
+
+### 2026-09-07T18:06Z — Census 3519 report-limit failure; canonical-object v3 retry
+
+**3519 verdict: INCOMPLETE / diagnostic-script failure.** FAILED 1:0 after
+11:44. The checkpoint opened successfully; attribution never started.
+The script incorrectly assumed report_route_status -show_all removes the
+ten-net listing limit. It expands node/pin detail within listed nets;
+-list_all_nets is required to remove the net limit. The count guard caught
+10 listed nets versus 15,197 routing errors. No hardware change or result.
+
+**Fix:** diagnostics/iter73_3491_conflicts_v3/ obtains canonical conflict
+objects directly with report_route_status -return_nets -route_type CONFLICTS,
+preserves their names, and checks the unique count against 15,197. A separate
+-list_all_nets -show_all report supplies complete conflict-node detail.
+Attribution uses the returned objects without a global hierarchical alias
+scan or glob/name resolution. Incomplete node-report parsing is flagged as
+incomplete coverage but no longer discards independent driver/load attribution.
+Per-net exceptions remain recorded; constants retain their conflict nodes
+while their very large sink walks remain explicitly excluded.
+
+Same failed-route DCP SHA-256:
+f67aee95eebb2022420af6b287c3a6e824aad2ea2e24a36a813ad85828987bd4.
+Tcl SHA-256:
+7d1d493ed1901fa8cd0bf425caeaa0e7885693ac6b5589ace0e09f730bfa81c8.
+Slurm SHA-256:
+4bed4ba63322a5ff76afffc399dc227e484898089101707d072293bd08198a0e.
+
+**Validation:** Bash syntax and native Tcl helper/parser regressions PASS;
+Tcl completeness and both corrected report-query flags checked. Actual
+Vivado checkpoint attribution remains the pending validation, not yet proven.
+Submit command: sbatch c_impl/diagnostics/iter73_3491_conflicts_v3/run.slurm.
+Build partition, vivado2024.2 feature, scheduler-selected node, 8 CPUs,
+96 GiB, 2 h limit, no accelerator. ETA approximately 30–60 minutes after
+allocation. Reuse 3518 congestion, timing and QoR reports; no repeated QoR,
+placement, routing, synthesis, source/floorplan modification, or commit.
+
+Submitted as **3520**, RUNNING on scheduler-selected acclnode01. Startup
+verified: staged DCP/Tcl/Slurm hashes match the recorded identities, Vivado
+2024.2 launches, and the shared live.log exists. No startup error observed.
+
+### 2026-09-07T18:51Z — Census 3520 constant-net count failure; v4 reconciliation
+
+**3520 verdict: INCOMPLETE / diagnostic-script failure.** FAILED 1:0 after
+11:31, peak RSS 26,893,744 KiB. The canonical-object query worked and saved
+15,196 distinct net names, but a hard-coded equality guard expected 15,197
+and aborted before the complete report or attribution. The existing route
+report includes GLOBAL_LOGIC0, absent from the returned object list; all
+nine listed nonconstant report nets are present. This supports a report-only
+constant explanation but full name-set reconciliation remains pending.
+
+**v4 fix:** retain the union of returned objects and parsed report nets;
+handle exactly GLOBAL_LOGIC0/GLOBAL_LOGIC1 as report-only constants without
+requiring a Tcl net object. Preserve their conflicting nodes and explicitly
+skip their sink walks. Record object-only and report-only names separately.
+No hard-coded count mismatch aborts attribution. Catch report generation/
+parsing failures, continue independent driver/load attribution, and flag
+partial coverage. Per-net exceptions and SLR-map failures remain explicit.
+Report/node reference count differences remain warnings, not claims of
+complete agreement. Missing report coverage, unresolved nonconstant objects,
+or attribution errors yield a PARTIAL result after preserving usable output.
+
+**Validation:** Bash syntax PASS; native Tcl helper/parser tests PASS,
+including the actual 15,196-object fixture reconciled with GLOBAL_LOGIC0.
+Full-script simulated Vivado tests PASS for a report-only constant and for
+a failed report with independent attribution retained. These test script
+control flow, not real Vivado API semantics on the checkpoint.
+
+Same routed-error DCP SHA-256:
+f67aee95eebb2022420af6b287c3a6e824aad2ea2e24a36a813ad85828987bd4.
+v4 Tcl SHA-256:
+cf7de25d867ab6214103ac1d6e7515015585275e3e1d815a43488be12c5b4840.
+v4 Slurm SHA-256:
+5df79e50c945fc7c2a2555a4e7d070b7205d403d4ac666aef8b041fc7430bbc1.
+Command: sbatch c_impl/diagnostics/iter73_3491_conflicts_v4/run.slurm.
+Build partition, vivado2024.2 feature, 8 CPUs, 96 GiB, 2 h limit; no node
+pin or accelerator. ETA 30–60 minutes after allocation. Shared live logs,
+node-local staged checkpoint; reuse all completed 3518 timing/QoR reports.
+Diagnostic only: no synthesis, placement, routing, hardware retry, kernel or
+floorplan change. No improvement claimed and no commit.
+
+Submitted **3521**, RUNNING on scheduler-selected acclnode01. Startup
+verified: Vivado 2024.2 launched, staged DCP/script hashes match, shared
+live.log exists. Await real checkpoint attribution before selecting a fix.
+
+### 2026-09-07 19:30Z — Iter73 failed-route conflict attribution LAUNCHED (job 3522) after four tooling failures; what the completed reports already say — MEASUREMENT ONLY
+
+**Goal.** Attribute build 3491's route failure (15,197 conflicted nets / 11,197 node overlaps) to named nets, node families and tiles, so the next repair targets measured congestion instead of another speculative floorplan change. No kernel or floorplan repair is validated yet.
+
+**Four prior diagnostic jobs failed on tooling, not on the design** (recorded so they are not retried): empty-object dereference (`get_property` with no object, job 3518, which still produced its QoR set); Vivado's **ten-net limit** on `report_route_status` detail; a count discrepancy (`-return_nets -route_type CONFLICTS` yields **15,196** objects while the summary says **15,197** — `GLOBAL_LOGIC0` is report-only); and job **3521**, which wrote a **2.65 GB** `-list_all_nets -show_all` report and then died in `max size for a Tcl value (2147483647 bytes) exceeded`. Verified this turn: that 2.65 GB file contains **only 10** `Conflicting Routing Nodes:` sections, so it is not a source of node attribution. 3521 did salvage `authoritative_conflict_nets.txt` (15,196 names).
+
+**Job 3522** (`build`, 8 CPU / 96 GB / 6 h, `iter73_3491_conflicts_v5`), on `routed_error.dcp` (`diagnostics/iter73_3491_routed_error_census/`): every object guarded, no whole-file `read`, the 10-net limit worked around by chunked `-of_objects` calls whose usable chunk size is **probed** (10/40/160), a 9,000 s budget on the detail phase with coverage recorded rather than aborted, and the heavy grouping done afterwards by a streaming `python3` pass. Outputs to `diagnostics/iter73_3491_conflicts_v5/out-3522/`: `coverage.txt`, `problem_net_connectivity.tsv`, `conflict_node_net_pairs.tsv`, `conflict_node_families.tsv`, `conflict_tiles.tsv`, `conflict_actor_pairs.tsv`, `net_exceptions.tsv`. Scripts `conflicts.tcl` `6c8385b0…`, `group.py` `1acbc100…`. Watcher armed on `run.exit` / `squeue` departure.
+
+**Correlation available before it lands** (job 3518 reports, failed-route checkpoint — these are facts about the *failed* route, unlike the 3516 census which read the placement):
+
+| fact | value |
+|---|---|
+| route status | ROUTED 1,634,742 · **CONFLICTS 103,078 hierarchical objects = 15,197 flat nets** · INTRASITE 4,133,534 · NOLOADS 745,917 |
+| per-SLR CLB | **97.84 / 74.08 / 78.19 %** (SLR1 is a third empty) |
+| BRAM tile / DSP, SLR0 | 84.08 % / 83.23 % |
+| SLLs used | 32,948 |
+| nets crossing an SLR, `grp_gdn_gemv_fu_1054` | **7,324** (SLR0↔SLR1 3,221 · SLR0↔SLR2 2,050) |
+| nets crossing, `gdn_forward_1/inst` level | 2,715 (1,626 · 519) |
+| router level-7 windows | `CLEM_X1Y61→X128Y188` and `CLEM_X33Y29→X128Y188` (South Global), `CLEL_R_X0Y56→X127Y183` and `CLEM_X32Y56→X127Y215` (North Long) — **SLR0 at nearly full device width**, owned **45–55 % by `grp_gdn_gemv_fu_1054`**, 16–27 % by the shell `hmss_0` |
+| level-6/7 named cluster owners | `gemv32_cluster2_2`, `_7`, `_9` weight-stream `four_dots` |
+| SLR2 windows | level 6 only, `island_1` (`CLEM_X9Y502→X40Y565`, `CLEM_X11Y467→LAG_LAG_X40Y530`) |
+
+Reading so far, pending 3522: the failure is concentrated in **SLR0**, in the GEMV cluster datapath plus the shell's HBM switch sharing the same rows, not in the recurrent islands — and SLR1 has a third of its CLBs free. Whether the conflicts are local interconnect exhaustion or SLL/crossing exhaustion is exactly what `conflict_node_families.tsv` will separate; no repair is proposed until it does.
+
+### 2026-09-07 20:00Z — Iter73 failed-route attribution RESULT (jobs 3522 + 3537): the route failure is **local interconnect exhaustion in the east-low corner of SLR0**, shared with the shell's HBM switch — **98.1% of conflicts are on non-crossing nets and zero are on Laguna/SLL nodes** — MEASUREMENT ONLY
+
+**Jobs.** 3522 (`build`, 8 CPU / 96 GB, 12:36, exit 0) established full coverage and clean tooling; 3537 (12:58, exit 0) re-ran with a corrected parser after 3522 attributed route-tree nodes instead of *conflicting* nodes. Outputs `diagnostics/iter73_3491_conflicts_v5/out-3537/`; raw `conflict_detail_all.rpt` (112 MB) is retained so no future analysis needs Vivado. Scripts `conflicts.tcl` `6c8385b0…`(v5 patched), `group.py`, `run.slurm`.
+
+**Coverage — the count now reconciles with Vivado's own error line.**
+
+| | |
+|---|---|
+| nets with routing errors (summary) | 15,197 |
+| conflict net objects returned | 15,196 — delta 1 is `GLOBAL_LOGIC0`, report-only; recorded, not fatal |
+| nets with node detail | **15,196 of 15,196** |
+| conflicting-node instances | 22,287 |
+| distinct conflicting nodes | **11,192** vs Vivado's `Number of Node Overlaps = 11,197` |
+| nodes contended by ≥2 nets | 11,090 |
+| exceptions / failed steps | **0 / 0** |
+
+The four earlier diagnostic failures were tooling (empty-object dereference, the 10-net report limit, the 15,197/15,196 discrepancy, a 2.65 GB file hitting Tcl's 2 GB value limit). Two facts kill those traps for good: with `-of_objects` the **10-net limit does not apply** — a probe accepted **chunk=160** — and the whole extraction then costs ~4 minutes.
+
+**1. Crossing versus local — the crossing hypothesis is dead.**
+
+| net class | conflicting-node instances |
+|---|---:|
+| **LOCAL** (driver and all loads in one SLR) | **21,853 (98.1%)** |
+| CROSSING | 434 (1.9%) |
+
+**2. Wire class — no SLL involvement at all.**
+
+| class | instances | share |
+|---|---:|---:|
+| local interconnect (`INT_NODE_SDQ` 5,579 · `INT_NODE_IMUX` 3,072 · `INT_INT` 1,488 · `BYPASS` 1,128 · …) | 12,761 | 57% |
+| short wires (NN1/NN2/SS1/EE1/EE2/WW1/WW2/SS2) | 5,507 | 25% |
+| medium (NN4/EE4/WW4/SS4) | 2,428 | 11% |
+| long (NN12/EE12/SS12/WW12) | 1,591 | 7% |
+| **Laguna / SLL** | **0** | **0%** |
+
+Node-level exhaustion of the switch box, not wire length and not SLL. `SSI_SpreadSLLs`-class levers and cross-SLR registered relays cannot address 98% of this.
+
+**3. Where — SLR0, and one corner of it.**
+
+| SLR | instances |
+|---|---:|
+| **SLR0** | **21,283 (95.5%)** |
+| SLR2 | 913 (4.1%) |
+| SLR1 | **91 (0.4%)** |
+
+By tile-Y band the mass is Y40–99 (13,508 = 61%); by tile-X the peak is X120–139 (6,712 = 30%). The single box **X120–137 × Y40–70 holds 4,720 = 21.2% of all conflicts**. The worst tiles are `INT_X132..135Y51..58`, 30–44 conflicting nodes each. SLR1, which the 3516 census showed at **74.08% CLB**, is essentially conflict-free.
+
+**4. Who — half of it is the shell, and the kernel's share is one cluster.**
+
+| owner (driver family) | instances |
+|---|---:|
+| **`SHELL:hmss_0/inst`** (the HBM switch) | **11,171 (50.1%)** |
+| `gemv32_cluster2_4_U0` | **3,854 (17.3%)** |
+| `gemv32_cluster2_9_U0` | 1,265 |
+| `gemv32_cluster2_3_U0` | 802 |
+| `gdn_recurrent_attention_islands_U0` | 646 |
+| `mem_weights_mm30/28/4/19/18…` adapters | 343 / 142 / 140 / 115 / 107 |
+| all other clusters (2,5,6,7,12,14) | 100–336 each |
+
+Top contended-node pairs: shell↔shell **7,259**, cluster4↔cluster4 2,488, cluster9↔cluster9 1,019, **shell↔cluster4 837**, cluster3↔cluster3 653, shell↔cluster9 590. In the hotspot tiles the owner is cluster 4 almost exclusively (`INT_X134Y56` 44/44, `INT_X133Y56` 44/44), with `hmss_0` alongside.
+
+**Diagnosis.** The shell's HBM switch cannot route *itself* (7,259 shell-vs-shell contended nodes) in the low-east rows of SLR0, because free-placed **cluster 4** was smeared into the same switch boxes; cluster 9 and cluster 3 repeat the pattern at a third the scale. Neither the recurrent islands (646, SLR2, 4%) nor any cross-SLR path (1.9%) is material. Note the apparent paradox with density: SLR0 here is **97.84% CLB**, *lower* than the legal Iter71 V0 draw's **99.47%** — so the binding variable is **where** the placer put cluster 4, not how full SLR0 is. Cluster 4 is not held by any pblock in this recipe (only clusters 8/10, the recurrent island and the result boundary are pinned), so nothing prevented it.
+
+**Recommended repair — one variable, testable without a v++ link.** Re-place the 3491 netlist through the Iter71 harness (`routed_error.dcp`'s netlist, ~6 h, no link) with a single change: **move `gemv32_cluster2_4_U0` to SLR1 and keep the remaining SLR0 clusters out of the HBM-switch corridor** (exclude the eastern low columns containing X120–137 / Y40–70 from the SLR0 cluster pblock). Rationale, all measured: it removes 17.3% of conflicts directly plus the 837 shell-shared contended nodes; it moves ~43.7K leaves (≈10% of SLR0 CLB) into the SLR that carries 0.4% of the conflicts and has 26% of its CLBs free; and it is *one* cluster, unlike Iter71 V2/V3 which moved seven or eight and either broke SLR0 (V2, level-7 abort) or over-packed SLR1 to 95.8% (V3, −1.670 ns). Success criterion is the conflict census repeated on the result: shell-vs-shell contention in X120–139 must fall, and the route must complete.
+
+**Explicitly NOT recommended on this evidence:** registered relays on cross-SLR streams, top-FSM→adapter control-path decoupling, and `FORCE_MAX_FANOUT`-class fanout repair. They target ≤1.9% of the conflicts. The FSM→`mm0` path (−1.039 ns placed estimate) remains a live **timing** item for a *routed* image; it is not the routability blocker. Nothing here is promoted or committed; the Iter73a/73b2 source stays uncommitted.
+
+### 2026-09-07 20:30Z — Iter74 LAUNCHED (jobs 3557 / 3558 / 3559): the measured repair for build 3491's route failure — move free-placed cluster 4 out of the shell's HBM-switch corridor — tested as three controlled re-placements of the Iter73 netlist, no v++ link
+
+**Basis.** The conflict census (3522/3537, entry above) attributes the failure to **local interconnect exhaustion in SLR0**, not to crossings: 98.1% of conflicting-node instances are on nets whose driver and loads share one SLR, 0% are on Laguna/SLL nodes, 95.5% are in SLR0, and the owners are the shell's HBM switch (50.1%, 7,259 shell-vs-shell contended nodes) and free-placed `gemv32_cluster2_4_U0` (17.3%, 837 nodes contended *with* the shell) sharing switch boxes in `X120–137 / Y40–70`. Cluster 4 is held by no pblock in this recipe, which is why nothing stopped it.
+
+**Harness reused verbatim** — `replace.tcl` is a byte copy of `iter71_repin.tcl` (`3dcf7379…`), so these draws are directly comparable with Iter71 V0–V3. It opens a post-place checkpoint, `place_design -unplace`s the kernel while the locked static region keeps its placement, optionally rewrites the cluster pblocks, then runs the recipe's own `place_design -directive SSI_SpreadLogic_high` → pre-route `phys_opt AggressiveExplore` → `route_design -directive AlternateCLBRouting` → post-route `phys_opt`, and writes the full report set at both routed stages. Input is **Iter73's own post-place checkpoint** (`diagnostics/iter73b2_f150/post_place.dcp`, 603,314,551 B, 6.667 ns — the script aborts if the period is not 6.667), so the netlist is the stacked 73a+73b2 source and **placement is the only variable**.
+
+| variant | job | change versus the 3491 recipe | resulting cluster split |
+|---|---:|---|---|
+| **W0** control | 3557 | none — original pblocks (clusters 8 and 10 pinned to SLR1), fresh placement draw | 9 SLR0 / 6 SLR1 / 1 SLR2 (as 3491, modulo the placer) |
+| **W1** the repair | 3558 | `RP_SLR1_SET="8 10 4"` — the two pinned clusters **plus cluster 4** to SLR1 | 8 / 7 / 1 |
+| **W2** | 3559 | `RP_SLR1_SET="8 10 4 9"` — also cluster 9, the second offender (1,265 instances) | 7 / 8 / 1 |
+
+W0 is not optional: Iter71 already showed one recipe routing on one draw (V0) and failing on the next (V1), so without a control a W1 success cannot be attributed to the re-pin rather than to draw variance. W1 is the minimal one-variable change; note that its 7-in-SLR1 / 8-in-SLR0 split matches the *legal* V0 draw's effective split, and that SLR1 carries only **0.4%** of the conflicts at **74.08%** CLB, so it has the room — 43,669 leaves ≈ 10% of SLR0's CLBs move out.
+
+**Submitted** 20:30Z, `build`, 8 CPU / 96 GB / 36 h each, `--exclude=acclnode04,acclnode05,harrier` (harrier's `/tmp`), 24 CPU / 288 GB of the 96 / 393,600M per-user cap. Evidence dirs `diagnostics/iter74_cluster4_replace/run-{W0,W1,W2}-<jobid>/`, exit markers `W0.exit`/`W1.exit`/`W2.exit`, `replace.tcl` `3dcf7379…`, `run.slurm` `0f86d018…`. One detached watcher armed on all three.
+
+**Read order when they report:** `routed/route_status.rpt` first — **`# of nets with routing errors` is the primary metric** (3491: 15,197; a legal route is 0) — then `routed_physopt/` per-clock WNS from `clock_slacks.tsv`, the placed actor census for where cluster 4 and the hotspot actually landed, and `congestion.rpt`. If a variant still fails to route, its `routed.dcp` goes straight into the v5 conflict census (12 min) to see whether the hotspot moved or merely shrank. Nothing is promoted; the Iter73 source and the Iter72 137.7 MHz result remain uncommitted and unpromoted.
+
+### 2026-09-08 05:00Z — Iter74 RESULT (jobs 3557/3558/3559): **all three re-placements route legally, and the CONTROL closes 150 MHz — kernel WNS +0.005 ns, 0 failing endpoints.** The recommended cluster-4 re-pin is unnecessary and slightly harmful. Build 3491's failure was a bad placement draw of a netlist that meets timing.
+
+**Jobs.** 3557 (W0) COMPLETED 09:31:17 · 3558 (W1) COMPLETED 09:31:56 · 3559 (W2) COMPLETED 08:25:55, all on `acclnode03`, all exit 0. Same netlist for all three (`diagnostics/iter73b2_f150/post_place.dcp`, Iter73a+73b2, 6.667 ns), harness `replace.tcl` = `iter71_repin.tcl` verbatim, so these are directly comparable with Iter71 V0–V3.
+
+**Route: legal in every variant** — `# of nets with routing errors: 0`, 1,581,644 / 1,581,818 / 1,581,717 fully routed. Against build 3491's 15,197 conflicted nets and 11,197 overlaps on this *same netlist and same recipe*, that settles the question the census opened: **3491 was a placement draw, not a property of the source.**
+
+**Timing per clock, read from each stage's own `clock_slacks.tsv` (not inferred from a glob):**
+
+| variant | stage | kernel WNS | failing | `clk_kernel_01` | `dma_ip_axi_aclk_1` | hold |
+|---|---|---:|---:|---:|---:|---:|
+| **W0 control** | routed | −0.280 | 97 | +0.728 / 0 | +0.002 / 0 | +0.009 |
+| **W0 control** | **routed_physopt** | **+0.005** | **0** | **+0.728 / 0** | **+0.002 / 0** | **+0.007** |
+| W1 cluster4→SLR1 | routed | −0.029 | 5 | +0.565 / 0 | +0.003 / 0 | +0.010 |
+| W1 | routed_physopt | −0.029 | 5 | +0.565 / 0 | +0.003 / 0 | +0.010 (phys_opt changed nothing) |
+| W2 clusters 4+9→SLR1 | routed | −0.436 | 1,920 | +0.703 / 0 | +0.003 / 0 | +0.006 |
+| W2 | routed_physopt | −0.387 | 1,900 | | | |
+
+**W0 satisfies every condition of the Iter73 goal statement** (19:40Z 2026-09-06): WNS ≥ 0 on `clk_kernel_00_unbuffered_net` **and** on `dma_ip_axi_aclk_1`, hold ≥ 0, legal route — at a true 6.667 ns constraint. What is *not* yet satisfied: `DATA_CLK` 150 in an XCLBIN and on-card gates, because this is a **re-placement, not a `v++` link** (the harness re-places from a post-place checkpoint with the static region locked; `v++` draws its own placement from synthesis).
+
+**Where the campaign now stands at the same 6.667 ns constraint:**
+
+| draw | netlist | WNS | failing |
+|---|---|---:|---:|
+| Iter69 production link (3371) | Iter67c | −1.594 | 25,528 |
+| Iter71 V0 (3432), best legal before today | Iter67c | −0.675 | 13,836 |
+| Iter72 r2 production link (3453) → 137.7 MHz on card | Iter67c | −0.592 | 5,568 |
+| **Iter74 W0 (3557), same pblocks** | **Iter73** | **+0.005** | **0** |
+| Iter74 W1 (3558) | Iter73 | −0.029 | 5 |
+| Iter74 W2 (3559) | Iter73 | −0.387 | 1,900 |
+
+**Attribution.** Holding the floorplan fixed, the Iter73 source moves failing endpoints from 13,836 (V0) to 97 before phys_opt and to **0** after — a −99.3% / −100% change that dwarfs the ≥1.3 ns draw variance measured on the Iter67c netlist, so the gain is attributable to 73a+73b2, not to luck. Note also that W0's largest pre-phys_opt failing class was the Iter73a state writers (59 of 97 endpoints, `islands` SLR2 → `state_wr*` SLR0, worst −0.156) and phys_opt cleared it.
+
+**The recommendation of the 20:00Z entry was wrong, and the census that produced it was still right.** The census correctly excluded crossings (98.1% local), SLL (0%), SLR2 (4%) and density (SLR0 was *less* full than the legal V0 draw), and correctly concluded "placement, not source" — but it then over-fitted the *specific* hotspot to a repair. Cluster 4 was the top kernel owner of conflicts in the failed draw; pinning it to SLR1 costs **0.034 ns** and 5 endpoints versus letting the placer choose. Pinning cluster 9 as well costs 0.39 ns. **Lesson: attribute a failed draw to a class (placement vs source vs crossing), then re-draw the control first; do not pin from one draw's hotspot.** W0's own placement put cluster 4 in SLR0 and clusters 9, 10, 11, 15, 8, 0 in SLR1, with cluster 1 alone in SLR2 — a 9/6/1 split, and routed CLB 97.28 / 76.85 / 81.77 %, SLLs 32,329.
+
+**Verdict: W0 RETAINED as the configuration to link; W1 and W2 REJECTED.** Nothing is promoted or committed — a re-placement is not an image, and rule 4 forbids promoting an intermediate result.
+
+**Next step LAUNCHED (05:00Z): the production `v++` link, second draw of the identical Iter73 recipe** — i.e. a literal re-run of build 3491, whose only variable is the placement draw, now justified because a re-placement of that netlist closes timing. Command from `c_impl/`:
+```
+BUILD_EXCLUDE=acclnode04,acclnode05,harrier HW_CFG_TEMPLATE=hw_iter69_kernel_clock_f150.cfg \
+EXTRA_SNAPSHOT_FILES="hw_iter69_kernel_clock_f150.cfg apply_iter69_kernel_clock_f150.tcl" \
+HLS_FREQ=150 LINK_FREQ=150 BUILD_TIME=2-00:00:00 bash run_hw_sbatch.sh iter74_f150_draw2
+```
+Build **3661**, on-card **3662** (`afterok`), source `gdn_model.cpp` `78f5afc6…` / `gdn_model.h` `906b11e5…` (verified unchanged in the working tree), diagnostics `diagnostics/iter74_f150_draw2/`. Watcher armed on `oncard.exit` / both jobs leaving `squeue`. **Read order:** `route_status.rpt` first, then per-clock WNS from `gdn_final_qor/clock_slacks.tsv`, then whether `AUTO-FREQ-SCALING-04` appears at all (its absence is the proof of a true 150 MHz image), `DATA_CLK` in the XCLBIN, then the on-card exact-trajectory and CUDA vector gates and `kernel_ms`. If this draw misses, the W0 result stands as evidence that the netlist closes and the remedy is another draw or a placement-directive sweep, not a source change.
+
+### 2026-09-08 06:45Z — Iter74 W0 image assembled **from the routed checkpoint instead of a `v++` link** (job 3663) — a new capability for this project; on-card submission BLOCKED pending user approval
+
+**Why.** The user asked why an on-card run must wait for a fresh 9–18 h link when W0 is already routed and timing-closed. It need not: the U55C kernel clock is a **scalable** clock, programmed by XRT at XCLBIN load from `CLOCK_FREQ_TOPOLOGY`, so a routed checkpoint plus patched metadata is a loadable image. This had never been done here — every previous on-card image came from `v++` — which is why it was not the default, not because it was known to be impossible.
+
+**What ran** (job 3663, `build`, 8 CPU / 96 GB, **33:48**, exit 0; `diagnostics/iter74_w0_bitstream/out-3663/`, Tcl `bit.tcl`):
+
+| step | result |
+|---|---|
+| re-verify the checkpoint in a fresh session | `ROUTING_ERRORS=0`, kernel period **6.667**, **WNS +0.005** — W0's closure reproduced from the DCP on disk, independent of the job that made it |
+| bitstream DRC | **0 errors** (a gate the timing/route reports do not cover) |
+| reconfigurable partition | discovered, not assumed: exactly **one** `HD.RECONFIGURABLE` cell, `level0_i/ulp`, partition `pblock_dynamic_region` |
+| `write_bitstream -cell level0_i/ulp` | **19:01**, `ulp_partial.bit` **80,350,490 B** |
+| assemble | `xclbinutil --replace-section BITSTREAM:RAW + CLOCK_FREQ_TOPOLOGY:JSON` onto the preserved Iter72 r2 image → `gdn_forward_w0_f150.xclbin` 80,929,079 B, sha `5d67ef13e6ee545a…`, new xclbin UUID `3f06c1cb-…` |
+| verify | `DATA_CLK` **150 MHz** (`hbm_aclk` left at the donor's proven 444, `KERNEL_CLK` 500), sections and `gdn_forward` kernel intact |
+
+**One tooling trap, recorded:** the first assembly silently kept 137 MHz. The JSON key is **`m_freq_Mhz`** inside `clock_freq_topology.m_clock_freq[]`, selected by `m_name == "DATA_CLK"`; a case-insensitive match on `freq_mhz`/`frequency` matches nothing and `xclbinutil` reports success anyway. Patch by `m_name`, then read `--info` back — never trust the exit code.
+
+**Provenance caveat, load-bearing.** The image inherits the donor's `BUILD_METADATA`, so its recorded command line is **Iter72 r2's `v++` invocation (job 3453)**, not this build. The bitstream is W0's; the metadata is Iter72's. Any result from it must be labelled **"assembled from the Iter74 W0 routed checkpoint"** and never quoted as a `v++`-linked image. The kernel interface is unchanged between Iter67c and Iter73 (73a/73b2 altered internals only), which is why the donor's `IP_LAYOUT`/`CONNECTIVITY`/`MEM_TOPOLOGY` apply — an argument, not a measurement; the exact-trajectory gate would fail loudly if it were wrong.
+
+**Blocked.** Staging succeeded (`build.hw.gdn32.h150.f150.o1/gdn_forward.xclbin`, chosen so it cannot collide with build 3661's `.o48` directory). The on-card submission was **denied twice by the session's command classifier**, so it is not launched. Prerequisites are all present: `host.exe` (09-07), the 5.87 GB weight blob, the `.gdnstate`, and the GPU logits reference. Command for the user to run:
+```
+sbatch --job-name=iter74_w0_oncard \
+  --output=diagnostics/iter74_w0_bitstream/oncard-%j.log \
+  --export=ALL,JOBS=1,HLS_FREQ=150,LINK_FREQ=150 slurm/hw_oncard.slurm
+```
+`JOBS=1` points the Makefile at the staged `.o1` directory; the script selects the U55C by BDF and `make -o` runs only the 8- and 64-token gates. **Expected if W0 holds:** 2.4099M cycles at 150 MHz ≈ **16.07 ms kernel**, versus 17.955 at 137.7 MHz and 24.099 at 100 MHz. Build 3661 continues as the reproducibility check.
+
+### 2026-09-08 07:05Z — Bitstream-splice image REJECTED (on-card jobs 3665, 3666): the W0 partial bitstream runs but computes **deterministically wrong** logits, identical at 150 and 137 MHz — the donor-metadata splice is invalid, and it is **not** a clock-margin failure
+
+**What was tested.** The `gdn_forward_w0_f150.xclbin` assembled in the 06:45Z entry (W0's `ulp_partial.bit` + Iter72 r2's metadata, `DATA_CLK` patched 137 → 150), on the card via the production gate script.
+
+**Job 3665 (150 MHz).** The image loaded and ran: card selected by BDF `0000:41:00.1`, XCLBIN accepted, 32 weight shards uploaded, `.gdnstate` read (24 layers, 50.33 MB), GPU reference loaded, an 8-token decode **completed**. Then the vector gate rejected it — `tolerance_fail=0`, `nonfinite_mismatch=0`, so no NaN/Inf, but:
+
+| metric | job 3665 | Iter72 r2 reference |
+|---|---:|---:|
+| global NRMSE | **0.586008197** | 0.00466269633 |
+| worst-step NRMSE | **2.04900628** | 0.0119080019 |
+| global cosine | **0.831932261** | 0.999989166 |
+| max_abs | 35.7850113 | 0.150788307 |
+
+**Job 3666 — the discriminating control (same bitstream, `DATA_CLK` left at the donor's 137 MHz, nothing else changed).** Result: **byte-identical to 3665** — `global_nrmse=0.586008197`, `worst_step_nrmse=2.04900628`, `global_cosine=0.831932261`, `max_abs=35.7850113`, to nine significant figures. FAILED in 23 s.
+
+**Conclusion, from that one variable.** A marginal-timing failure is stochastic and clock-dependent: it would corrupt *differently* at 137 than at 150. Identical output at two clocks means the fabric is computing deterministically, and computing the wrong thing. **The hypothesis that W0's +0.005 ns closure does not survive silicon is therefore NOT supported by this evidence** (it remains untested), and the defect is in the **splice**: the donor's `IP_LAYOUT` / `MEM_TOPOLOGY` / `CONNECTIVITY` / `EMBEDDED_METADATA` do not correctly describe the W0 bitstream. Cosine 0.83 with plausible magnitudes is the signature of correct control flow over mis-addressed or mis-grouped data, not of a wrong register map (which hangs or returns zeros).
+
+**Verdict: the "reuse the routed checkpoint instead of relinking" shortcut is REJECTED as implemented.** What it *did* establish, and which stands: `write_bitstream -cell level0_i/ulp` works on this checkpoint (partition `pblock_dynamic_region`, 80,350,490 B, bitstream DRC 0 errors), XRT loads a spliced image and runs it, and the kernel clock is programmable from `CLOCK_FREQ_TOPOLOGY` metadata. What is missing is metadata **generated from the Iter73 XO** rather than inherited from an Iter67c build; build 3491's `_x_temp/link` project is where that would have to come from. Not attempted — build 3661 produces the correct article within hours and is the cheaper path.
+
+**Cleanup.** The two staged directories `build.hw.gdn32.h150.f150.o1` and `build.hw.gdn32.h150.f137.o1` were **deleted** so no `make` invocation can mistake a hand-assembled image for a `v++` product; both xclbins remain in `diagnostics/iter74_w0_bitstream/out-3663/` (`5d67ef13…` at 150, `f3381b05…` at 137) with the partial bitstream. Two harness facts worth keeping: `slurm/hw_oncard.slurm` **requires `TAG`** and resolves the image from `diagnostics/$TAG/build_dir.path` (job 3664 died in 2 s without it), and the classifier-blocked `sbatch` needed a `Bash(sbatch:*)` allow rule in `.claude/settings.local.json`.
+
+**Standing correction to the 06:45Z entry's expectation.** "≈16.07 ms kernel if W0 holds" was a projection from a Vivado report, and no on-card measurement supports it yet. W0's 150 MHz closure is still only a *routed, timing-closed* claim; the on-card evidence label for the Iter73 source remains **none**. Build **3661** (link, `vivado_link` phase at 1 h 27 m) and on-card **3662** are the outstanding test.
+
+### 2026-09-08 07:20Z — CORRECTION to the 07:05Z entry (on-card job 3667): the splice **mechanism is sound** — a re-spliced donor image passes both gates. The 07:05Z verdict "the donor-metadata splice is invalid" was wrong; the fault is specific to the **checkpoint-derived W0 bitstream**.
+
+**What prompted the recheck (user, 07:15Z): "the 137 MHz image passed the on-card correctness gate in full link before?"** Yes — and that observation invalidates the reasoning of the 07:05Z entry. The metadata donor is byte-identical (`bcb96b680548d5b15f62ddda…`) to the Iter72 r2 image that **passed** on-card job 3454 at `DATA_CLK` 137: NRMSE 0.00434710288 (8-token) and 0.00466269633 (64-token), both `RESULT: PASS`. Metadata proven good *with its own bitstream* cannot be called invalid in the abstract.
+
+**Mechanism test (job 3667, `light`, 38 s).** Dumped the donor's own `BITSTREAM` section and spliced it straight back into the donor, nothing else changed: `xclbinutil --input donor --dump-section BITSTREAM:RAW:donor.bit` then `--replace-section BITSTREAM:RAW:donor.bit`. The result is **not byte-identical** — 80,758,401 B vs 80,758,411 B, ten bytes shorter, sha `117b7de70976d31a…` — so the round trip is lossy on paper. On card it is not:
+
+| | job 3454 (original `v++` image) | job 3667 (re-spliced) |
+|---|---:|---:|
+| 8-token NRMSE | 0.00434710288 | **0.00434710288** |
+| 64-token NRMSE | 0.00466269633 | **0.00466269633** |
+| worst-step / cosine | 0.0119080019 / 0.999989166 | identical |
+| `exact_traj_match` | True | **True** |
+| kernel ms/token (median of 63) | 17.955 | **17.960** |
+| verdict | PASS | **PASS** |
+
+So `--dump-section` / `--replace-section BITSTREAM:RAW` is functionally lossless (the 10-byte delta is inert padding), and it also gives a free independent re-measurement of the Iter72 r2 image: **17.960 vs 17.955 ms, reproducible to 0.03%**.
+
+**Corrected attribution.** Three things are now measured, not inferred: (1) the splice tool path works; (2) the donor metadata works with its own bitstream; (3) the W0 partial bitstream paired with that metadata computes deterministically wrong logits, identically at 150 and 137 MHz (jobs 3665/3666) — so clock margin is still excluded. What remains is a **two-way** ambiguity that this evidence does not resolve: either the donor's `IP_LAYOUT`/`CONNECTIVITY`/`EMBEDDED_METADATA` do not describe the *Iter73* kernel (a plausible interface or bank-grouping difference, even though the port list is unchanged), or `write_bitstream -cell level0_i/ulp` on a re-placed checkpoint yields a module that is not equivalent to what `v++` packages. The Iter73 source itself is not a suspect: it is bit-exact in csim and passed one-layer RTL cosim (jobs 3484/3489).
+
+**The test that would settle it, deliberately deferred:** splice the W0 partial bitstream into **build 3661's** metadata once that link completes — same bitstream, correct-provenance metadata. If it passes, hypothesis (1) is confirmed and checkpoint reuse becomes a usable 34-minute substitute for a 9–18 h link. If it fails, hypothesis (2) is confirmed and the reuse path needs the packaging flow, not a raw `write_bitstream`. Not run now because 3661 delivers the production article anyway and the card is better spent on it.
+
+**Cleanup.** `build.hw.gdn32.h150.f137.o1` deleted again after the run; `roundtrip.xclbin`, `donor.bit`, `ulp_partial.bit` and both W0 images stay in `diagnostics/iter74_w0_bitstream/out-3663/`. Standing status unchanged: W0's 150 MHz closure has **no on-card evidence**, and build 3661 / on-card 3662 remain the outstanding test.
+
+### 2026-09-08 — W0 functional-failure isolation, first-token state/logit capture
+
+User requested a cause diagnosis, not an architectural change. Existing
+3665/3666 failures establish wrong W0 results; 3667 validates replacement of
+the donor's own bitstream only. Neither rules out W0 metadata incompatibility,
+an Iter73 multi-token/multi-layer defect, or physical-image behavior.
+The one-layer cosim uses repetitive row values and one invocation, which is
+not sufficient coverage to exclude result-ordering or persistent-state bugs.
+
+Diagnostic under diagnostics/iter74_w0_functional_cause/: compare known-good
+Iter72 donor and W0 using identical fixture/state/weights, capture full logits
+and persistent states after one and four invocations (decode lengths 2/5,
+seed excluded). Repeat W0 length 5 with a 10 ms inter-step delay to test an
+exposed completion/writeback dependency. Do not modify the kernel, packaging,
+or thresholds; expected numeric failures retain their raw captures and codes.
+Check interface metadata separately against archived build3491 kernel.xml.
+Slurm light, allocated U55C selected by BDF, 8 CPUs/32 GiB/30 min limit,
+estimated 3–6 minutes. Shared logs and frozen host/hash manifest per job.
+Capture script SHA-256:
+d45f9d31ec843d5e30225eb5aaca611f784df42b62fa27a9d297cb94e0631da5.
+Command: sbatch c_impl/diagnostics/iter74_w0_functional_cause/capture.slurm.
+Diagnostic pending; no positive result, promotion, or commit.
+
+**Capture RESULT (3668):** COMPLETED in 1:42. Fresh first-token donor/W0
+logits match all 32,000 FP32 words exactly. All convolution-tail dump bytes
+also match. But W0's entire 12,582,912-value recurrent state equals the
+original uploaded state (zero changed lanes on each of ports 28–31), whereas
+the donor changes 12,348,646 lanes. Four-token logits diverge from token two
+(32,000 mismatches per subsequent step); 10 ms inter-step delay changes zero
+logit bits. Thus absent recurrent-state persistence is observed directly,
+not inferred from fourth-token argmax divergence. No conclusion yet on the
+exact RTL/physical mechanism preventing writeback.
+
+Archived build3491 kernel.xml matches donor metadata on all 34 argument IDs,
+names, offsets, sizes, address qualifiers, and bundle names; declared bank
+mapping matches resolved_hw.cfg. Original build3491 XO recovered read-only
+through an overlapping step in existing job3661; SHA-256:
+42778dcef38416934f6221153f6078c100fda2da54e215ba89790cbbaf7fdf03.
+The RTL has four state writers connected to their corresponding AXI write
+channels; the write address expression includes the expected 87,457,792-byte
+weight-tail offset. This is not yet proof of physical writes reaching HBM.
+
+**Next diagnostic:** freeze-control test on the known-good donor image. A
+diagnostic-only host copy restores the original recurrent stripes after each
+step, preserving convolution tails. Compare normal and frozen donor logits
+to W0. This is a causal test, not a production change or a correctness fix.
+Use Slurm light U55C, 8 CPUs/32 GiB/30 min; ETA 2–5 minutes. No kernel or
+production-host edits. host_freeze.cpp SHA-256:
+27f88fa6dcad147c455236d358c1d498ae3b4559c4147d512e5f4675f430a2b0.
+Command: sbatch c_impl/diagnostics/iter74_w0_functional_cause/freeze.slurm.
+
+### 2026-09-08 07:35Z — ROOT CAUSE (user's card test): the W0 image **never updates the recurrent state in HBM**; the known-good image does. The splice is exonerated a second time — this is a **functional defect in the Iter73a state write-back path**, invisible to csim and to one-layer RTL cosim.
+
+**The measurement (user, 07:30Z).** On card, after decoding, every recurrent-state value in HBM is **unchanged** under the W0 image, while the Iter72 r2 image updates them. That single observation explains every symptom of jobs 3665/3666 exactly and with nothing left over: with the state frozen at the seed, each step decodes from the same state, so the logits are deterministic, plausible in magnitude (cosine 0.83, `tolerance_fail=0`, no NaN/Inf), wrong by NRMSE 0.586, and **identical at 150 and 137 MHz** because nothing about it is timing-dependent.
+
+**Two of my earlier conclusions were wrong and are withdrawn.** (1) 07:05Z, "the donor-metadata splice is invalid" — no: job 3667 proved the splice mechanism functionally lossless (re-spliced donor passes both gates, 17.960 vs 17.955 ms). (2) 07:20Z, which still framed the fault as "the checkpoint-derived bitstream or its pairing with older metadata" — also no. The bitstream and the metadata are both fine. The **design** does not write its state. The checkpoint-reuse capability is therefore **validated, not rejected**: `write_bitstream -cell level0_i/ulp` + `xclbinutil --replace-section` produced a faithful, runnable image of the netlist it was given, in 34 minutes instead of 9–18 hours. Its first use found a real hardware bug the whole pre-link gate chain had missed. That is the capability working, not failing.
+
+**What the static evidence rules out.** The writers exist and are wired: Iter73 csynth shows four `gemv32_state_writer_{28,29,30,31}_s` modules, each a `gemv32_state_writer_beat` loop at **II=1, 4096 iterations, latency 4097**, and `m_axi_mem_weights_mm28..31` are **`READ_WRITE`** interfaces (512-bit, 64-byte burst). So write channels exist in the fabric. Addressing also matches on inspection: reader `state_base = (layer*GDN_HEADS + head) * 512` over 8 heads = `[layer*4096, layer*4096+4096)`; writer `layer_base = layer*GDN_HEADS*512 = layer*4096` then 4096 sequential beats — same range, and the same order provided each island emits heads 0..7 ascending (which csim's bit-exactness and cosim's matching state checksum `0xacb4a86a2cb00000` both attest). Both reader and writer take the identical base pointer `w{28..31} + GDN_COMPILED_WEIGHT_SHARD_BEATS`. **So the defect is not visible in the C source, the csynth report, or the interface table** — it needs an instrumented on-card observation of where the write transactions actually go, exactly as Iter68G did (AIM monitors, jobs 3379/3393–3396, which found writes issued and acknowledged **128 MiB below their stripe**).
+
+**Attribution to 73a, by exclusion.** Iter73b2 (straight-line emit inside the frp weight-stream loop) does not touch the state path at all. Iter73a is the *only* change to it: the islands' direct `state_out[...]` stores became `hls::stream` writes drained by four free-placed writer processes. State unchanged on card therefore isolates the defect to **73a**. Note this is the second time a refactor of this exact write path has produced a hardware-only state-addressing failure that simulation passed (Iter68G, closed dead 2026-09-05) — the pattern is now established and should be treated as a known hazard of touching the state write-back.
+
+**Consequence for the running jobs.** Build **3661** is linking this same 73a+73b2 source, so on-card **3662** will fail the same gate for the same reason. Its *timing* result remains informative (whether the production `v++` flow reproduces W0's +0.005 ns), but it cannot produce a usable image. Note also that W0's largest pre-phys_opt failing class *was the 73a writers themselves* (59 of 97 endpoints, `islands` SLR2 → `state_wr*` SLR0, worst −0.156), so 73a's contribution to the 150 MHz closure is not established — 73b2 may carry it alone.
+
+**Nothing promoted or committed.** The Iter73 source stays uncommitted. `diagnostics/iter74_w0_bitstream/out-3663/` retains `ulp_partial.bit`, both W0 images, the donor round-trip and `donor.bit`.
+
+### 2026-09-08 10:35Z — W0 stale-state causal control confirmed on card (3669)
+
+Job 3669 completed in 40 seconds. The diagnostic-only host runs the known-good
+Iter72 image normally, then runs it while restoring the original recurrent
+state after each invocation, preserving convolution tails. Four invocations
+are compared, seed excluded. No kernel or production-host changes were made.
+The deliberate frozen-state run returns a numeric-gate failure, as expected;
+this is a diagnostic result, not an accepted implementation.
+
+| Comparison | Logit bit mismatches, each of four steps | Recurrent lane mismatches | Conv-tail region mismatches |
+|---|---|---:|---:|
+| Diagnostic host, normal donor vs original host donor (3668) | 0 / 0 / 0 / 0 | 0 | 0 |
+| Diagnostic host, frozen donor vs W0 (3668) | 0 / 0 / 0 / 0 | 0 | 0 |
+
+Each comparison covers 128,000 FP32 logits and all 12,582,912 BF16 recurrent
+values. Combined with 3668 (W0 changes zero recurrent lanes after token one,
+but matches every first-token logit and convolution tail), this establishes
+that lack of recurrent-state persistence is sufficient to explain the entire
+observed four-step W0 failure. It is not evidence of benign arithmetic drift.
+The control also verifies that recompiling the diagnostic host did not itself
+alter outputs. Timings from this host are not performance measurements.
+
+Reproduction: `.micromamba/envs/gdn-hf/bin/python
+c_impl/diagnostics/iter74_w0_functional_cause/compare_causal_control.py`.
+Shared log: `diagnostics/iter74_w0_functional_cause/freeze.live.log`.
+Raw evidence: `out-3668/` and `freeze-3669/` in the same directory.
+Submission script SHA-256:
+`adac09d8d0851a84c08b663576b9c58ac9b1b4c5aa3227013a87c62f5a273242`.
+
+**Attribution boundary / correction to stronger claims above:** these tests
+confirm the functional failure, not the exact RTL or physical mechanism.
+Unchanged target memory alone cannot distinguish skipped writes, writes to a
+wrong address, or writing unchanged data. Matching argument offsets/bank maps
+and the donor round-trip weaken a broad packaging explanation but do not prove
+W0 netlist/bitstream equivalence or validate arbitrary checkpoint reuse.
+Likewise, one-layer/single-invocation cosim does not exonerate the full-model
+state writer. Iter73a is the leading suspect, not an isolated proof by itself.
+Build 3661 carries that risk; its eventual on-card outcome is not yet measured.
+
+Inspection of the actual build3491 XO confirms writer AW/W connectivity,
+4096-beat layer requests, full write strobes, and tail offset 87,457,792 bytes.
+The 27-bit offset expression is subsequently **zero-extended** in generated
+RTL; its `$signed` spelling alone does not establish a 128 MiB address error.
+Further localization requires actual write-address/data evidence or a
+controlled writer-only reversion with multi-invocation state verification.
+No production fix, rebuild, promotion, or commit is implied by this diagnosis.
+
+### 2026-09-08 — W0 write-address guard probe (diagnostic, pending)
+
+Follow up confirmed stale-state causal control 3669 by testing whether writes
+land 128 MiB below the state tail, as measured previously in Iter68G. Allocate
+each state-owning weight BO as a sub-BO with a 128 MiB prefix owned by this
+job, fill that prefix with 0xa5, execute exactly one token, and scan it. Capture
+the candidate misplaced stripe and normal persistent state for bitwise
+comparison with the donor. Run both donor and W0 with the same shifted BO
+layout; print actual BDF and physical BO addresses. No arbitrary memory reads,
+kernel changes, clock changes, or full hardware rebuild. The diagnostic host
+is not suitable for production or performance claims.
+
+Command: `sbatch c_impl/diagnostics/iter74_w0_functional_cause/guard.slurm`.
+Light/U55C, 8 CPUs, 32 GiB, 30 minute timeout; expected 2–5 minutes.
+Host SHA-256 `59aa3dcb835e5bafc33176612254df09ee90498b652f6f7d31270d12799534b6`;
+script SHA-256 `5c6233ff661bffac1bd8b916771e9ffe8a8be65a6ed8b36e476fea1d4151f7fe`.
+Shared live log: `diagnostics/iter74_w0_functional_cause/guard.live.log`.
+
+**RESULT (3670): confirmed misaddressed writeback, COMPLETED in 46 seconds.**
+Both images return normally and first-token logits are bit-identical to their
+original unshifted-BO runs. The donor leaves every guard byte untouched.
+W0 changes only guard offsets `[87,457,792, 93,749,248)` on each port, exactly
+the complete 6,291,456-byte state stripe **128 MiB below** its proper address.
+Every captured misplaced BF16 lane matches the donor's correctly updated
+state: zero mismatches across all 12,582,912 values. The intended W0 state
+remains unchanged. Per-port changed-byte counts (excluding bytes coincidentally
+equal to sentinel 0xa5): 6,277,913 / 6,277,646 / 6,277,637 / 6,277,809.
+
+Example mm28: parent `0x380000000`, kernel shard pointer `0x388000000`,
+expected first state address `0x38d368000`, observed first changed address
+`0x385368000`, delta `-0x08000000`. This is direct memory-content evidence,
+not an inference from performance counters. All inspected addresses belong
+to the diagnostic's allocated parent BO. No memory outside those BOs was read.
+
+Reproduce comparisons with `.micromamba/envs/gdn-hf/bin/python
+c_impl/diagnostics/iter74_w0_functional_cause/compare_guard.py 3670`.
+Captures and physical addresses: `guard-3670/{donor,w0}.log`, `.state`,
+`.state.guard-port28` through `.state.guard-port31`.
+
+Conclusion: the state data and all layers' recurrence computations are correct
+for the first token; W0's write address is displaced by minus 2^27 bytes.
+This excludes skipped writes and unchanged write data as explanations of
+this capture. The remaining localization is where the implemented address
+path diverges from the apparently zero-extending XO RTL. Do not label a
+specific compiler stage as proven until that path is examined. No promotion
+or commit; no changes to production source or running jobs.
+
+**Next bounded diagnostic:** read W0's actual `routed_physopt.dcp`, export the
+four implemented writer modules as functional Verilog, and report their
+address/control/pointer pin drivers and sequential startpoints. Read-only
+Vivado extraction, no placement/routing or bitstream generation. Slurm build,
+8 CPUs/96 GiB/90 minute timeout; ETA 15–30 minutes including checkpoint load.
+Command: `sbatch c_impl/diagnostics/iter74_w0_functional_cause/address_cone.slurm`.
+Tcl SHA-256 `3ef8eed76c2f3b53f538bddecebb77a42c19370ae64f88c020ebc3edd425e489`;
+script SHA-256 `516800d3b3d42d69d227bca05de2bda37381a4db871b4193ca4edf22e5f05253`.
+No production source changes or automatic repair/rebuild are authorized by
+this diagnostic submission.
+
+Submitted as **3671**, running on acclnode01. Shared detailed log:
+`diagnostics/iter74_w0_functional_cause/address-3671/vivado.live.log`.
+Input DCP hash `9c7957cf341bfa26c050b30470151393adadd17d69c2cfc170932b54a48233bc`
+matches job3663's bitstream-generation manifest. Environment launched normally;
+checkpoint extraction is pending, ETA 15–30 minutes. Leave production jobs
+3661/3662 unchanged. Stop this turn at the long checkpoint-load stage rather
+than polling until extraction finishes.
+
+**3671 RESULT: diagnostic-script failure, not an extracted cause.** Slurm
+FAILED exit 1 after 10:40; `open_checkpoint` succeeded in 10:19, then Tcl
+line 10 failed with `invalid command name "redirect"`. No writer netlists
+were exported. The on-card guard proof from 3670 remains valid; this failed
+job adds no address-mechanism evidence. No production files or images changed.
+
+Retry removes the unsupported command: print help into the shared log and
+use `report_property -file` (AMD UG835). Add a tiny out-of-context hierarchy
+preflight that tests `write_verilog -cell -mode funcsim` and property export
+before loading the large DCP. Same read-only production extraction, input
+checkpoint, Slurm allocation and ETA 15–30 minutes; no implementation repair
+or hardware rebuild. The failed job's frozen Tcl/logs remain intact under
+`address-3671/`. Retry command is the same `sbatch .../address_cone.slurm`.
+
+Retry **3672** started on acclnode01. Tcl SHA-256
+`4a836889bb09e8afcc8facf731d5d998afe03c9c0cb75668d8cde90944797e8a`.
+Launch sentry confirmed `ADDRESS_DIAG EXPORT_PREFLIGHT_PASS`: tiny synthesis,
+hierarchical functional-Verilog export, and `report_property -file` all
+succeeded. The job has entered the long W0 checkpoint load. Shared live log:
+`diagnostics/iter74_w0_functional_cause/address-3672/vivado.live.log`.
+ETA 15–30 minutes; stop polling now. No new mechanism finding yet.
+
+**3672 RESULT: extraction completed, exit 0 in 11:42.** Four writer functional
+netlists and pin/property reports were exported. The selected hierarchy is
+insufficient to evaluate the address arithmetic: writer28's address-register
+bits 8..46 are driven by an external 48-bit input named
+`trunc_ln_reg_181_reg[55]_0`, and other bits use `if_dout` and additional
+external inputs. The only CARRY8 instances inside the export belong to its
+beat-loop machinery. Optimization has moved address logic across the original
+HLS module boundary. Original AWADDR/pointer names also disappeared, so the
+name-filtered pin report missed these renamed address inputs. This is not a
+new hardware failure, and it does not yet identify a bad LUT/carry connection.
+
+Next diagnostic extends the same read-only extraction to the entire kernel
+root (includes pointer FIFOs and AXI adapters), and follows actual D-pin
+fan-in of the four writers' address registers across hierarchy. Record each
+primitive's type, INIT/carry properties, and pin/net connectivity, plus all
+renamed address inputs. Same W0 DCP and Slurm allocation. No physical or source
+modification. ETA 15–30 minutes; live logs and frozen script remain per-job.
+
+Submitted as **3673**. Tcl SHA-256
+`97797b1256a6f25c3e405a896186e63796d62a6a8360ed63956ec034b2a83650`.
+Launch sentry confirms export preflight passed and W0 checkpoint load began.
+Live log: `diagnostics/iter74_w0_functional_cause/address-3673/vivado.live.log`.
+No further polling until the user's next status request.
+
+**3673 RESULT: COMPLETED exit 0, 16:58.** Complete kernel functional netlist
+and four address-register cones exported. Each cone contains 148 cells,
+including five CARRY8 primitives located above the original writer hierarchy.
+Raw connectivity is unnecessarily large (~3.3 GiB/port) because constant-net
+queries expanded every hierarchical alias. Retain the source evidence and
+compact it during analysis; do not load the full reports into chat.
+
+Next bounded diagnostic evaluates the extracted LUT INITs and CARRY8 logic at
+the pointer-FIFO and layer-index boundaries, independently for all four ports,
+24 layers, and normal/128 MiB-relocated pointers. This is a combinational
+arithmetic check, not a FIFO/AXI simulation. Unknown signals fail closed.
+Run parsing on Slurm build (2 CPUs/16 GiB, estimated 1–3 minutes), not on the
+login node. Script: `diagnostics/iter74_w0_functional_cause/evaluate_cone.slurm`.
+No kernel, physical design, image, or production-host changes.
+
+**3674 RESULT and parser repair:** job FAILED exit 1 in 46 seconds after
+compacting all four raw cones and evaluating ports 28–30. The parser required
+a numeric suffix on `layer_index_c*_dout`; port31 uses `layer_index_c_dout`
+and failed closed at that unseeded SRL output. Fixed the boundary matcher and
+rehydrated aliases from the small pin reports (bit zero additionally verified
+against the layer FIFO's `out[0]` and matching SRL data-bit index). Reused the
+four ~100 KiB compact caches, not the multi-GiB raw reports. The local, bounded
+analysis rerun completed successfully; the failed job's frozen script remains
+unchanged. Evaluator SHA-256:
+`88bfd316e993b4b13490855d310baf1c4328129103c696285813591ad61ed827`.
+
+**CONFIRMED IMPLEMENTED-LOGIC CAUSE:** evaluating the actual LUT INITs and
+five CARRY8s feeding each writer's `trunc_ln_reg_181` register reproduces
+`actual = expected - 134217728` in **192/192 cases** (4 ports x 24 layers x
+2 pointer locations). Both original bank-base pointers and the 128 MiB-shifted
+guard-test pointers were checked. Convert the writer's beat address back to
+bytes with `<<6`. Example port28/layer0: pointer `0x388000000`, intended
+`0x38d368000`, evaluated `0x385368000`, exactly matching capture3670.
+
+The implemented arithmetic is equivalent on these cases to sign-extending
+the 27-bit offset, rather than zero-extending it:
+`0x05368000 = 87,457,792` becomes `-46,759,936`; difference `-2^27`.
+The layer term (`layer << 18` bytes) does not change that sign bit for any of
+the 24 layers. This is already wrong at the writer address-register D pins,
+before the AXI adapter. A bad host pointer, lost FIFO data, an AXI completion
+race, or bitstream packaging is not required to produce the observed error.
+
+Specific primitive evidence, port28 (same structure for other ports):
+`inst/gemv32_state_writer_28_U0/trunc_ln_reg_181_reg[23]_i_1` is the CARRY8
+covering word bits 16..23 (byte bits 22..29). At byte bit27 / carry lane5,
+`S[5] = ~w28_c_dout[27]` through writer LUT
+`trunc_ln_reg_181[23]_i_5` (`INIT=2'h1`), while `DI[5] = w28_c_dout[27]`.
+This implements adding a one in that upper offset bit; the subsequent upper
+carry lanes continue with inverted pointer bits, implementing the unwanted
+sign extension. Correct zero-extension must add zero above byte bit26.
+
+**Remaining attribution limit:** the original build3491 HLS RTL declares the
+27-bit result unsigned and explicitly zero-extends it before pointer addition
+(writer28 lines311/312/1114/1116/1184). Its textual behavior differs from the
+implemented carry chain. The exact Vivado synthesis/optimization pass that
+introduced this mismatch has not been isolated; do not label a particular
+pass or release defect as proven. The functional error is now localized to
+implemented address arithmetic, not just inferred from unchanged memory.
+
+Evidence: `diagnostics/iter74_w0_functional_cause/evaluated-cones/` contains
+compact primitive connectivity and `evaluated_addresses.json` (SHA-256
+`5b58b56a7c2c09807cbeb7a0915c38a6cafc84cc89d9286a10215ff1a83e6071`).
+Reproduce with `python3 diagnostics/iter74_w0_functional_cause/evaluate_address_cone.py
+diagnostics/iter74_w0_functional_cause/address-3673
+diagnostics/iter74_w0_functional_cause/evaluated-cones
+--cache-dir diagnostics/iter74_w0_functional_cause/evaluate-3674` from c_impl.
+
+Recommended repair candidate, **not yet implemented/verified**: eliminate the
+shifted-pointer/narrow signed-offset path in the state writer; use the original
+weight pointer and explicitly unsigned full-width state/row beat indexing.
+Prove generated and synthesized address arithmetic for production-size tail
+offsets and high physical BO addresses before any long link. Then require
+on-card guard/state checks and multi-token logits. Do not compensate host
+pointers or write addresses by +128 MiB as a production workaround. No
+architectural fallback, image promotion, production edit, or commit here.
+
+### 2026-09-08 11:38Z — [SUPERSEDED — see the 16:40Z correction below. The "dead write channel" reading is FALSIFIED: job 3670 captured written state and 192/192 evaluated addresses show a **-128 MiB displacement**, so the writes happen and are misaddressed. Job 3672 exported only the writer hierarchy, and the address logic had moved outside it during optimization, so absent `AWVALID`/`AWADDR` *names* proved nothing.] Original entry follows.
+
+**Job 3672** `iter74_address_cone` (`build`, COMPLETED 11:42, exit 0, `acclnode01`; `diagnostics/iter74_w0_functional_cause/address-3672/`) opened the W0 routed checkpoint, exported each `gemv32_state_writer_{28..31}_U0` cell with `write_verilog -mode funcsim`, and traced its pins. Measured on the **implemented** netlist, identically for all four writers:
+
+| signal | occurrences in the implemented writer |
+|---|---:|
+| `AWVALID` | **0** |
+| `AWADDR` | **0** |
+| `AWREADY` | 51 (input, tied to the adapter's `store_unit_0/fifo_wreq/full_n_reg`) |
+| `WVALID` / `WREADY` | 9–11 / 12–13 |
+| `BVALID` / `BREADY` | 6–7 / 4 |
+
+So the writers handshake the **data** and **response** channels and watch the request FIFO's full flag, but never assert a write address. With no AW transaction the adapter never enqueues a request, no burst is committed, and the state stripe is untouched — while nothing hangs and nothing errors, because the data channel is accepted and the CU completes. That is precisely the user's card observation.
+
+**Where it is lost — the full chain, read from build 3491's own XO (`iter73_build3491.xo`, `ip_repo/.../hdl/vhdl/`):**
+
+1. **HLS RTL is correct.** `gdn_forward_gemv32_state_writer_28_s.vhd` declares and drives a complete AXI write master: `AWVALID`, `AWADDR(63:0)`, `AWID/AWLEN/AWSIZE/AWBURST/…`, `WVALID`, `WDATA(511:0)`.
+2. **The `gdn_gemv` wrapper is correct.** `gdn_forward_gdn_gemv.vhd` maps the writer's AW ports to internal signals (line 13788/13790) and drives its own module outputs from them (21053/21042).
+3. **The kernel top gates it.** In `gdn_forward.vhd`, `AWADDR` passes through ungated (`I_CH0_AWADDR => grp_gdn_gemv_fu_1054_..._AWADDR`, line 16324), but `AWVALID` is combinationally gated on the top-level FSM:
+```
+mem_weights_mm28_0_AWVALID_assign_proc : process(...)
+  if (state85 or state86 or state91 or state92 or state97 or state98
+      or state103 or state104 or state108 or state109) then
+        mem_weights_mm28_0_AWVALID <= grp_gdn_gemv_fu_1054_..._AWVALID;
+  else  mem_weights_mm28_0_AWVALID <= '0';
+```
+Those ten states are the `gdn_gemv` **call** states. `gdn_gemv` is a *shared* sub-module invoked ~10× per layer, so HLS multiplexes its AXI channels and enables the write-valid only while a call is nominally active. `BREADY` is gated by the identical state list.
+4. **Synthesis then removes it.** A request emitted outside that window can never propagate, so `AWVALID` is provably dead, Vivado constant-folds it to 0 and drops `AWADDR` as unused — which is exactly what the implemented netlist shows.
+
+**Why this is 73a's core mechanism, not an incidental bug.** 73a's stated purpose was to *decouple* the island from the port: "the FIFO is depth 4,096 = one full eight-head window, so the island never waits on write acceptance within a layer." That decoupling is the defect. The drain is designed to outlive the island's work, and the write-valid enable belongs to the call, not to the drain. In Iter67c the island performed the store itself, inside its own call window, which is why the committed design writes state correctly.
+
+**Why every pre-link gate passed.** csim sees plain C pointer stores. csynth reports modules, II and a `READ_WRITE` interface — all true. One-layer RTL cosim *does* gate on the state stripe changing (`packed_bf16_one_layer_test.cpp` seeds at `kWeightBeats`, checksums before/after, fails if equal) and it passed with `0xacb4a86a2cb00000` — because with one layer and one call the drain still fits inside the enable window. Nothing below a full link can see this.
+
+**This is the same anti-pattern as Iter68G** (closed dead 2026-09-05: persistent services outliving the call, state write-backs mis-addressed, silent on-card failure). Two campaigns have now been lost to moving the state write out of its call window. Record it as a rule: **an AXI write from `gdn_gemv` must be issued inside the call that owns it; a free-running drain cannot write.**
+
+**Fix directions, in order of preference.** (1) **Move the state export to the top level**, the proven Iter61 pattern — `gemv32_store` fills an `hls::stream` that `gdn_forward` itself drains, adding no port to the multiplexed GEMV region. State would take the same shape and keep 73a's SLR-locality benefit without depending on the call window. (2) **Revert 73a, keep 73b2** — cheapest, and the census says 73b2 targeted the dominant failing class while 73a's own writers were W0's largest residual class (59 of 97 endpoints). (3) Bound the drain inside the call, which forfeits the decoupling that motivated 73a.
+
+**Consequence for build 3661, now measured rather than inferred:** it froze the identical source (`gdn_model.cpp` `78f5afc6…`, byte-identical to 3491's snapshot), and the gating is structural in the HLS output, so its image will carry the same dead write path. Its timing result remains valid; its correctness gate cannot pass.
+
+### 2026-09-08 12:20Z — Iter74 production link draw 2 (build 3661) FAILED, and it reproduced build 3491 **exactly**: 11,197 node overlaps, 15,197 unroutable signals, identical congestion levels. **The production `v++` link is deterministic — a repeat draw is not a lever.** On-card 3662 cancelled by `afterok`.
+
+**Result.** 3661 FAILED after **08:37:27** on `acclnode01` (3491: 08:48:11), `build.exit=2`, died in `vivado_link` at route verification. `sacct`: MaxRSS **67.4 GB**, MaxDiskWrite 42.6 GB (3491: 68.6 / 41.0). Dependent on-card 3662 CANCELLED automatically, Elapsed 00:00:00.
+
+**The two links are bit-for-bit the same failure**, from independently submitted jobs 14 hours apart:
+
+| metric | build 3491 | build 3661 |
+|---|---:|---:|
+| `[VPL 35-2]` node overlaps | **11,197** | **11,197** |
+| `Number of Node Overlaps` (router summary) | 11,197 (and 17 at the earlier stage) | 11,197 (and 17) |
+| signals failed to route | **15,197** | **15,197** |
+| effective congestion N/S/E/W | 4 / 7 / 5 / 4 | 4 / 7 / 5 / 4 |
+| elapsed / MaxRSS | 8:48 / 68.6 GB | 8:37 / 67.4 GB |
+
+**Consequence — a standing assumption of this campaign is now falsified.** The 14:35Z entry on 3491 concluded "one draw that tore two clusters… placement variance on top of that is ≥1.3 ns between draws, so this is not shown unroutable", and the 05:00Z Iter74 launch tested exactly that by re-running the identical recipe. It reproduced the failure identically. **Given identical inputs — same XO, same cfg/Tcl, same tool version, same `--vivado.impl.jobs 8` — the production link is deterministic, so "try another draw" buys nothing.** The ≥1.3 ns draw-to-draw spread measured in Iter71 came from runs that started from *different* states (a re-placement from a checkpoint with the static region locked, or a different pblock set); it does not describe repeats of one production recipe.
+
+**So how did W0 route?** Because it is a different placement *problem*, not a different draw of the same one: the Iter71 harness opens 3491's post-place checkpoint, `place_design -unplace`s only the kernel while the locked static region keeps its existing placement and routing, and re-places from there. That reaches a legal, timing-closed solution (+0.005 ns, 0 failing) that `v++`'s own from-synthesis placement provably does not.
+
+**Where that leaves the Iter73 source.** Two production links, zero images. What exists is a routed, timing-closed **checkpoint** (W0) whose netlist also carries the 73a dead-write defect diagnosed at 11:38Z. Both problems must be fixed for a usable 150 MHz image; neither is fixed by re-running anything.
+
+**Revised plan, in dependency order.** (1) **Fix the state write** — move the export to the top level per the Iter61 pattern, or revert 73a keeping 73b2. This is mandatory and is a source change, so it invalidates every existing checkpoint. (2) **Then link.** If the fixed source again fails to route in the production flow, the deterministic-failure finding says the escape is a *recipe* change — a different `place_design`/`route_design` directive or an explicit seed, which alters the starting state the way the re-placement does — not a repeat. (3) The validated checkpoint-reuse path (34 min, jobs 3663/3667) is the fallback for turning a routed checkpoint into a testable image without a 9-hour link, and is now the only demonstrated way to test a W0-class placement on card.
+
+**Cost note.** `diagnostics/` gained ~14.8 GB from job 3673's four 3.5 GB connectivity tables plus a 793 MB kernel netlist. The findings all live in the small per-writer pin/cell files; the large tables are deletable.
+
+### 2026-09-08 — Iter75 unsigned recurrent-state address repair, exact 150 MHz attempt
+
+User authorized implementing the measured address fix and rebuilding at
+150 MHz. The guard capture3670 and 192-case implemented-cone evaluation
+supersede the competing "no writes/call-window" hypothesis above: all updated
+state values are written, correctly computed, **128 MiB too low**, and the
+implemented address-register input already reproduces the displacement with
+correct pointer/layer values. No top-level state-export redesign is justified
+by this evidence at this point.
+
+Change only state-writer addressing: pass original w28..w31 pointers, remove
+the four already-offset output pointers, and form the complete state-tail +
+layer + beat index using `ap_uint<64>` through the final memory access. Preserve
+the four FIFO writers, all FIFO depths/storage, recurrence, native-BF16 math,
+GEMV schedule, ports, host ABI, and existing physical constraints. Source
+SHA-256 `9678dcdef65f0877384e085e7f5ea78d6f4683853793fb07ebfa5e01bdfe4ee3`.
+This is a repair candidate, not yet verified in HLS, synthesis or hardware.
+
+Before linking, the production Slurm build runs native layout + fast6/full32
+decode gates, compiles the full model once, retains the existing XO structural
+gates, and runs the new address test on each actual generated writer and its
+Vivado OOC-synthesized/optimized netlist. Test 24 production layer offsets and
+two high physical base addresses on each of 4 ports (192 RTL + 192 synthesized
+address requests). Unknown interface shapes or missing simulation pass markers
+fail closed. This targeted gate is not whole-kernel post-placement equivalence;
+on-card state/logit/trajectory checks remain necessary. No 1-layer cosim claim.
+
+Build HLS=150 MHz, LINK=150 MHz using `hw_iter69_kernel_clock_f150.cfg`,
+existing 150 MHz clock constraint hook, SSI_SpreadLogic_high,
+AlternateCLBRouting and pre/post AggressiveExplore. Do not reuse the broken XO
+or any W0 checkpoint. Requested on-card job is afterok-dependent. Require exact
+150 MHz DATA metadata before accepting/copying an image; a scaled image fails
+the build gate. No guarantee of closure: the source changes the physical input,
+and two identical old production links failed deterministically. If this
+candidate fails, diagnose its checkpoint rather than repeat the same recipe.
+
+Reproduction from c_impl:
+`STATE_ADDRESS_GATE=1 REQUIRE_EXACT_CLOCK=1 HLS_FREQ=150 LINK_FREQ=150
+HW_CFG_TEMPLATE=hw_iter69_kernel_clock_f150.cfg
+EXTRA_SNAPSHOT_FILES="hw_iter69_kernel_clock_f150.cfg apply_iter69_kernel_clock_f150.tcl"
+BUILD_EXCLUDE=acclnode04,acclnode05,harrier
+bash run_hw_sbatch.sh iter75_unsigned_state_f150`.
+Native and address gates are inside this immutable-snapshot production build;
+the dependent on-card job uses the existing `make run_hw` smoke8/decode64 flow.
+Record every gate verdict before any next attempt; no commits before measured
+on-card improvement and corresponding architecture/roadmap updates.
+
+Submitted **3675** (build, acclnode01) and **3676** (U55C on-card, afterok3675).
+Launch sentry: tool/platform preflight and scratch-space check passed; native
+gdn_eval and layout harness compiled successfully; layout harness reported
+`PASS: BF16 recurrent scatter and reserved-ABI convolution-tail packing`.
+Native fast6 decode is running from the BF16 state fixture. No HLS/address-gate,
+route/timing, or on-card verdict yet. Immutable input archive and hashes are
+under `diagnostics/iter75_unsigned_state_f150/`.
+Active detailed log: `native_gate.live.log`; subsequent HLS/link output:
+`build.live.log`; address validation: `state_address_gate.live.log`.
+Estimated full elapsed 9–20 hours, excluding queueing and possible gate failures.
+No positive-result commit; stop polling after the launch sentry.
+
+### 2026-09-08 16:40Z — CORRECTION and ROOT CAUSE, measured: the Iter73a state writes **do** happen and land **exactly 128 MiB (2^27 B) too low on all four ports and all 24 layers** — a **signed 27-bit byte offset** where HLS's own RTL zero-extended. This is the *same* defect as Iter68G. My 11:38Z "dead write channel" entry is withdrawn.
+
+**Why the 11:38Z entry was wrong, and the method error behind it.** Job 3672 exported only the `gemv32_state_writer_*_U0` hierarchy. Optimization had moved the address logic **outside** that hierarchy, so the absence of `AWVALID`/`AWADDR` *names* inside it was an artifact of where I looked, not evidence of a missing channel. Job 3673 exists precisely to recover the real register-input cones across hierarchy boundaries. **Rule: a name-presence check inside one hierarchy is not a test of a datapath that synthesis is free to relocate — follow connectivity, then evaluate the logic.**
+
+**The measurement (job 3670 capture + evaluated cones).** `diagnostics/iter74_w0_functional_cause/evaluated-cones/evaluated_addresses.json`, 31,026 B, **192 cases** = 4 ports × 48. Every single case has `delta_bytes = -0x8000000 = -134,217,728 = -128.0 MiB` exactly; ports {28,29,30,31} with 48 cases each; layers **0..23**. Sample (port 28, layer 0): pointer `0x380000000`, expected `0x385368000`, actual `0x37d368000`. Job 3670 independently *captured* updated recurrent state at the displaced location and its values matched the donor's updated state — so the datapath computes and writes correct data to a wrong address.
+
+**The arithmetic, which names the container exactly.** The expected layer-0 offset is `0x5368000` = 87,457,792 B = `GDN_COMPILED_WEIGHT_SHARD_BEATS (1,366,528) × 64` — the shard offset, as intended. The observed offset is `0x5368000 - 0x8000000 = -0x2C98000`. `0x5368000` needs 27 bits unsigned and has **bit 26 set**; carried in a **27-bit signed** field and sign-extended, its value becomes `0x5368000 - 2^27`, which is the observed address to the byte. The XOR of expected and actual is `0xf8000000` — bits 27..31 all flipped, the signature of sign extension, not of truncation. Codex's account is therefore exact: HLS's RTL zero-extended the offset; the implemented logic behaved as if it were signed.
+
+**This unifies Iter68G with Iter73a.** Iter68G was closed dead on 2026-09-05 with "all 96 state write-backs issued and acknowledged **128 MiB below their stripe**" (jobs 3379, 3393–3396). Identical displacement, identical magnitude, same write path. It was not a separate mystery: **both campaigns hit this one sign-extension defect**, and Iter68G was abandoned for a bug that is now understood. The standing rule from that closure ("do not reopen Iter68") should be re-read in that light.
+
+**What is still unresolved, stated as such.** The compiler stage responsible is **not** established. We know HLS emitted a zero-extended offset and the implemented netlist behaves as signed; we have *not* isolated the transformation that changed it, and my earlier attribution to `size_t` width or m_axi interface inference was speculation, not measurement. The FSM gating of `AWVALID` on the ten `gdn_gemv` call states is a real structural observation but is **not** implicated by this evidence and requires a separate *temporal* check, not an inference from names.
+
+**Iter75 = the targeted workaround (build 3675, launched 16:12Z).** Verified by diffing the two **immutable snapshots** (the correct method; my earlier working-tree-vs-HEAD diff wrongly attributed pre-existing changes to this fix): `w0 gdn_model.cpp 78f5afc6…` → `i75 9678dcde…`, **30 changed lines, all in the state-writer address path and nothing else**:
+- writer parameter `Beat512 *state` → `Beat512 *weights` (takes the AXI **base**, never a pre-offset pointer);
+- `const size_t layer_base = layer_index * GDN_HEADS * state_packs_per_head` → `const ap_uint<64> layer_base = ap_uint<64>(GDN_COMPILED_WEIGHT_SHARD_BEATS) + ap_uint<64>(layer_index) * ap_uint<64>(GDN_HEADS*state_packs_per_head)`;
+- `state[layer_base + i]` → `const ap_uint<64> beat_index = layer_base + ap_uint<64>(i); weights[beat_index.to_uint64()]`;
+- the four `state_out28..31 = w{28..31} + GDN_COMPILED_WEIGHT_SHARD_BEATS` aliases deleted; call sites pass `w28..w31`.
+**The nine-beat retire tail in `gemv32_cl_weight_stream` is NOT part of this fix** — it was already in the W0 source. Correction to my 16:26Z statement.
+
+**Gate improvement in the same launch.** `slurm/hw_build.slurm` (+69 lines) and `run_hw_sbatch.sh` (+3) add a `STATE_ADDRESS_GATE` phase that runs the native decode gate **inside the build job before linking**. It passed: fast-6 and full-32 both `exact_traj_match True`, `exact_ref_mismatch=0`, `argmax_mismatch=0`, `max_abs 5.72e-06` over 992,000 compared values (`native6.json`, `native32.json`, `native_gate.exit=0`). Config is `hw_iter69_kernel_clock_f150.cfg` + `apply_iter69_kernel_clock_f150.tcl` — a true 6.667 ns link on the unchanged production floorplan.
+
+**Pending, in order.** (1) **Synthesized-address validation**: evaluate the actual address cone for all four ports across all 24 layer offsets on 3675's post-place checkpoint, following connectivity across hierarchy boundaries — *not* a name check. (2) Route legality and per-clock timing; note builds 3491 and 3661 failed here deterministically (11,197 overlaps, 15,197 unroutable signals, identical), and while the source has changed, closure is not guaranteed — if it fails, the next repair follows its own measured physical failure, never another identical submission. (3) On-card 3676 (`afterok`). ETA ~9–20 h from 16:12Z. No running job was altered by this review.
+
+### 2026-09-08 17:01Z — Iter75 build 3675 **FAILED at the new `state_address_gate` in 48 min, before any link** — and it isolates the compiler stage: **HLS RTL computes the address correctly (48/48 PASS); the post-synthesis netlist is still 128 MiB low (48/48 FAIL).** The `ap_uint<64>` source workaround does not survive Vivado synthesis. On-card 3676 cancelled by `afterok`.
+
+**Result.** 3675 FAILED after **00:48:41** on `acclnode01`; `build.exit=1`, `state_address_gate.exit=1`, `build.phase=state_address_gate`. Everything before it passed: `native_gate.exit=0` (fast-6 and full-32 exact, 992,000 values), `xo.exit=0`, `xo_gate.exit=0` with `"verdict": "PASS"` and all 32 weight masters present, URAM 112 (the +32 state FIFOs). `STEP_2_GATE_FAIL rc=1; Vivado link was not started`. Dependent on-card **3676** CANCELLED, Elapsed 00:00:00.
+
+**The gate runs two simulations of the same address logic and they disagree** (`state_address_gate.live.log`, `state_address_gate/port28/`):
+
+| phase | design under test | ADDRESS_FAIL cases |
+|---|---|---:|
+| `sim_rtl` | `gdn_forward_gemv32_state_writer_28_s.v` — the **HLS-generated RTL** from the new XO | **0 of 48** |
+| `sim_synth` | `writer_post.v` — the **post-synthesis netlist** of the same module | **48 of 48** |
+
+`xsim` on the HLS RTL reports `ADDRESS_PASS port=28 cases=48` with zero failures. The same 48 cases (24 layers × two base pointers, `0x380000000` and `0x388000000`) then all fail after synthesis, each by the identical amount: e.g. layer 0 at pointer `0x388000000` expects word `0x0e34da00`, gets `0x0e14da00`; delta `0x200000` words × 64 B = **134,217,728 B = 128.0 MiB**, low. The relation is exactly `actual(pointer P) = expected(P − 128 MiB)` — the displacement tracks the *pointer*, not the layer offset, and is unchanged by Codex's rewrite. Testing stopped at the first failing port, so only `port28` was elaborated.
+
+**What this establishes, and it is the item that was open at 16:40Z.** The compiler stage is now isolated by measurement rather than inference: **HLS is not the source of the defect, and Vivado's synthesis of the kernel is.** The 27-bit-signed behaviour derived from the Iter74 evaluated addresses is introduced by `synth_design`, not present in the RTL that HLS emits. Consequently the Iter75 formulation — explicit `ap_uint<64>` arithmetic on the AXI base pointer, offset folded into an unsigned beat index — is *correct at the RTL level and still defeated downstream*, so **no purely source-level restatement of the same expression is likely to fix this.** It also retroactively explains why one-layer RTL cosim always passed: cosim simulates HLS RTL, which is the half that is correct.
+
+**A second, cheaper consequence.** The gate is worth its 48 minutes many times over: it caught this before a 9–20 h link, where builds 3491 and 3661 each burned 8.6–8.8 h to learn less. Keep `STATE_ADDRESS_GATE=1` on every candidate. One defect in the gate itself to fix: the testbench prints `ADDRESS_PASS port=28 cases=48` as an unconditional end-of-run summary even when all 48 cases failed, and only the Python wrapper's `ValueError: 28 synth: address test did not pass` reveals the verdict. A reader who greps for `ADDRESS_PASS` gets the wrong answer.
+
+**Next levers, in order — all target synthesis, not the C.** (1) **Synthesis settings on the kernel run.** The recipe forces `prop=run.__KERNEL__.{STEPS.SYNTH_DESIGN.ARGS.MORE OPTIONS}={-directive Default}` (to escape the `sdx_optimization_effort_high` OOM); try a different directive, and/or `-keep_equivalent_registers` / `-no_lc`, and re-run *only* the address gate — 48 min per trial, no link. (2) **Protect the address register in RTL**: a `KEEP`/`DONT_TOUCH` attribute on the beat-index register so synthesis cannot narrow or re-encode it; reachable from HLS via a `bind_storage`/`bind_op` on that variable, or by an XDC/Tcl `set_property KEEP_HIERARCHY`/`DONT_TOUCH` on the writer instance in the synth pre-hook. (3) If neither holds, **revert 73a** and keep 73b2: the islands' in-line store is the only formulation demonstrated to write correctly on card, and the census says 73b2 carried the dominant failing class anyway. Note that (1) and (2) are now testable in under an hour each, which changes the economics of this campaign entirely.
+
+### 2026-09-08 — Iter75 address-stage isolation and narrow-net preservation probe
+
+User authorized repair after 3675 failed. Correction to the preceding stage
+attribution: `writer_post.v` was exported AFTER BOTH `synth_design` and
+`opt_design`; the current evidence does not distinguish those two steps.
+The 48-minute cost included a complete HLS compile and native gates. Reusing
+the saved three-file writer RTL should take only minutes for a small probe.
+
+Fix the checker to count failures and print PASS only if all 48 cases pass,
+independent of simulator `$fatal` behavior. Export and simulate separate
+post-synthesis and post-opt netlists. A diagnostic-only continuation mode
+records all phase verdicts, but still returns failure when any phase fails.
+Production gate remains fail-closed, four ports, 24 layers, two pointers.
+
+Probe baseline versus KEEP on exactly the one unsigned 27-bit offset-result
+wire; do not change its mathematical expression. Hypothesis: preventing
+cross-net arithmetic folding preserves the explicit zero extension. This is
+a diagnostic RTL experiment, not a production XO patch or validated fix.
+Source kernel remains unchanged while isolating this behavior. Frozen checker
+SHA256 `94e060c696e14ec1ac162c1ba54e2d8eb7acc580119d70103df92115408518ce`.
+Slurm build: 8 CPUs, 24 GiB, Vivado2024.2, no card, no pinned node; scratch
+under job-local /tmp, shared live log in
+`diagnostics/iter75_address_stage_probe/probe.live.log`. No commits or full link
+until a repair passes generated-RTL, synthesized and optimized address gates.
+
+Probe3677 stopped at environment setup: Vitis settings references unset
+PYTHONPATH under shell nounset. No synthesis ran. Disable nounset only while
+sourcing the vendor settings, then restore it; retry the identical experiment.
+Environment-only failed attempt; no production changes or commit.
+
+Probe3697 COMPLETED in 2m35s. Baseline: RTL48/48 pass, immediate
+post-synth48/48 fail, post-opt48/48 fail. Single KEEP on the unsigned narrow
+offset-result net: RTL48/48, post-synth48/48 and post-opt48/48 PASS. This now
+isolates the first incorrect stage to synth_design in this reproducer, and
+demonstrates a narrow-net preservation workaround without arithmetic changes.
+Evidence: `iter75_address_stage_probe/result-3697/{baseline,keep_offset}/summary.json`.
+The rejected baseline remains diagnostic-only; KEEP is not inserted into a
+production XO and no on-card success is claimed.
+
+Next isolated candidate: extract the exact Iter75 writer from its immutable
+source archive and add one-cycle fabric-add binding to layer_base. Hypothesis:
+a registered offset result prevents the same cross-expression folding, using
+HLS source rather than post-generated RTL edits. Run isolated HLS at 150 MHz
+and all four actual generated writers through RTL, synth and opt address
+tests (192 cases per phase). No GEMV/recurrence loop, FIFO depth, format, or
+external ABI change. The production source is not edited until this isolated
+candidate passes. Scripts: `make_registered_writer.py`, `registered_writer.tcl`,
+`registered_writer.slurm` in the same diagnostic directory. No full link yet.
+
+Registered probe3698: HLS completed in 19 seconds (estimated Fmax205.47 MHz),
+but the address adapter rejected the isolated wrapper's direct scalar inputs
+(weights/layer_index/mode instead of FIFO dout names). No simulation verdict;
+inconclusive harness attempt, not a hardware defect. Add explicit diagnostic
+direct-input support; production default still requires the actual FIFO shape.
+Also constrain isolated layer input to five bits, matching production's inferred
+24-layer range, and test a same-width baseline without binding to avoid a false
+positive caused solely by a wider isolated layer argument. Retry baseline28
+then registered ports28..31, all three phases. No production source change yet.
+
+Probe3699 COMPLETED in 7m32s. Same five-bit-layer isolated baseline reproduces
+the defect: port28 RTL48 PASS, post-synth48 FAIL, post-opt48 FAIL. The registered
+offset candidate passes ALL FOUR writers: 192 RTL + 192 post-synth + 192
+post-opt cases. Exact verdicts and emitted RTL/checkpoints:
+`diagnostics/iter75_address_stage_probe/registered-3699/{baseline,registered}/`.
+This is source-level workaround evidence; no production XO patch is needed.
+Isolated writer28 HLS max latency4170 ->4171 cycles; FF663 ->728, LUT723 ->724;
+DSP/BRAM/URAM stay0; estimated period4.867 ns unchanged, state loop II=1.
+These small-wrapper estimates are not integrated resources or on-card timing.
+
+### 2026-09-08 — Iter75b registered-offset writer, exact 150 MHz hardware attempt
+
+Retain the original weight base and unsigned indexing, then bind only
+`layer_base` addition to fabric latency1. This creates a pipeline boundary in
+address setup rather than changing numerical expressions, memory mapping,
+state FIFO depths, recurrent/GEMV pipelines, ABI, or physical constraints.
+Kernel SHA256 `ca263d7e0f6f94c5f34765ef70edf6512553b7aaac874b63a93a91856484360b`.
+Updated checker SHA256
+`8d93cac585ff7b9e285f51199468cb098a80dad96a4a6f120f25ff2cb84558a1`:
+PASS is conditional on zero failures, summary JSON is preserved on address
+failure, and the gate checks post-synth and post-opt separately. Production
+uses strict FIFO control-port matching and all four writers, not diagnostic
+KEEP/direct-input modes. Python parser/testbench sanity and diff checks pass.
+
+Reproduce through existing launcher:
+`STATE_ADDRESS_GATE=1 REQUIRE_EXACT_CLOCK=1 HLS_FREQ=150 LINK_FREQ=150
+HW_CFG_TEMPLATE=hw_iter69_kernel_clock_f150.cfg
+EXTRA_SNAPSHOT_FILES="hw_iter69_kernel_clock_f150.cfg apply_iter69_kernel_clock_f150.tcl"
+BUILD_EXCLUDE=acclnode04,acclnode05,harrier
+bash c_impl/run_hw_sbatch.sh iter75b_registered_state_f150`.
+Full native fast6/full32 and integrated HLS/XO gates precede the 576-case
+generated/synthesized/optimized writer checks; only then link at exact150 MHz.
+On-card smoke8/decode64 is afterok-dependent. No reuse of the failed XO/DCP,
+no automatic clock scaling, no changes to placement/routing directives.
+Physical routability is still unproven; a new failure requires diagnosing this
+candidate, not an identical retry. No production correctness/timing claim or
+commit until the full image is verified on card.
+
+Submitted build3700 (48 CPUs/192 GiB, acclnode01) and dependent U55C3701
+(8 CPUs/32 GiB, afterok3700). Frozen kernel hash matches the registered-offset
+source above. Launch sentry: vendor/platform/scratch preflight, native compile
+and BF16 layout test passed; native fast6 decode started. Integrated HLS,
+integrated writer gate, full link, timing and on-card results are pending.
+Live logs: `diagnostics/iter75b_registered_state_f150/native_gate.live.log`,
+`build.live.log`, `build.slurm-3700.log`. ETA9–20 hours excluding queue/failures.
+No commit or production-result promotion; stop polling after launch sentry.
+
+### 2026-09-09 08:03Z — Iter75b **PASSES ON CARD** (job 3703): the registered-writer state fix works in silicon. Exact 64-token trajectory, **17.233 ms kernel / 17.343 ms TPOT at 142.5 MHz** — the fastest measured image to date. The Iter73 lineage is finally correct. NOT promoted (auto-scaled, not 150 MHz).
+
+**Chain of custody for this result, because the image was nearly lost.** Build **3700** (`iter75b_registered_state_f150`, 09:23:30 on `acclnode01`) linked successfully but failed its own new `exact_clock` gate (`state_address_gate.exit=0`, `exact_clock.exit=1`, `build.exit=1`), so it never copied the XCLBIN back and dependent on-card **3701** was CANCELLED. The only copy was in the job's node-local stage dir. Job **3702** (`build`, pinned `acclnode01`, 2 s, copy-only) recovered it: `diagnostics/iter75b_recover/gdn_forward_f142.xclbin`, 80,122,660 B, sha **`d48c6b153efded973d6598c3adedd28b986b347e55376c0df74485107b7163c6`** — identical to build 3700's `build_manifest.sha256` entry, so this is the linker's own product, not a splice. Metadata: `DATA_CLK` **142 MHz**, `hbm_aclk` 450, `KERNEL_CLK` 500, xclbin UUID `c5f52129-…`. Staged to `build.hw.gdn32.h150.f142.o1` with `diagnostics/iter75b_oncard_f142/build_dir.path`; on-card job **3703** (`light`, `acclnode01`, **39 s**, `oncard.exit=0`).
+
+**Gates — both PASS.**
+
+| gate | result |
+|---|---|
+| 8-token exact | `exact_traj_match True`, `first_divergence_index -1`; 7 steps × 32,000 logits: NRMSE **0.00434710288**, worst-step 0.00982223195, cosine 0.999990565 |
+| 64-token exact | `exact_traj_match True`, `first_divergence_index -1`; 63 steps / **2,016,000** logits: NRMSE **0.00466269633**, worst-step 0.0119080019, cosine 0.999989166 |
+| tolerance / non-finite | `tolerance_fail=0`, `nonfinite_mismatch=0` |
+
+Those NRMSE and cosine figures are **identical to nine significant figures** to Iter72 r2's and Iter67c's — the arithmetic is unchanged, and the recurrent state is now being written to the right address and read back correctly across all 24 layers and 64 steps. That closes the defect diagnosed at 16:40Z on 2026-09-08 (a −128 MiB / signed-27-bit displacement, 192/192 evaluated cases) and confirms the pre-link `state_address_gate` as a valid predictor: it passed rtl, synth **and** opt on all four ports, and the hardware agrees.
+
+**Performance — fastest on card so far, and the cycle count is the caveat.**
+
+| image | clock | kernel ms | TPOT ms | kernel cycles |
+|---|---:|---:|---:|---:|
+| Iter67c (production, committed) | 100 MHz | 24.099 | 24.208 | 2.4099 M |
+| Iter72 r2 (uncommitted) | 137.7 MHz | 17.955 | 18.053 | 2.4724 M |
+| **Iter75b (this)** | **142.5 MHz** | **17.233** | **17.343** | **2.4557 M** |
+
+−4.0% kernel versus Iter72 r2 and **−28.5% versus the committed Iter67c**. Note the cycle count is **2.4557 M, up 1.9% from Iter67c's 2.4099 M** — the clock, not the schedule, is doing the work, and the HBM-side latency penalty at higher clocks that Iter69/Iter72 both showed is present here too (Iter72 r2 was +2.6%). Iter75b's cycles are *better* than Iter72 r2's by 0.7%, which is consistent with 73b2's straight-line emit but is not isolated by this run.
+
+**Why it is still not promoted.** Rule 4: the kernel clock was **auto-scaled 150 → 142.5 MHz** because timing missed by **−0.349 ns with 1,733 failing endpoints of 1,342,323** at 6.667 ns. The `exact_clock` gate exists precisely to stop an auto-scaled image being mistaken for a closed one, and it did its job. Also unrun on this image: 512-token drift, WikiText-2 perplexity, paired power. And the reproducibility caveat from 3661 applies in reverse — this build *routed* where 3491/3661 deterministically did not, but that is one draw of a changed source, not a demonstrated property of the recipe.
+
+**What is now established versus open.** Established: the state write path is fixed in silicon; the registered-writer formulation survives Vivado synthesis where the `ap_uint<64>` restatement did not; the Iter73 source (73a-fixed + 73b2) routes legally in the production flow; and it runs correctly at 142.5 MHz. Open: the 0.349 ns gap to a timing-closed 150 MHz — now a pure timing problem, not a routing or correctness one — and the exact synthesis transformation that mangled the earlier address form, which remains uncharacterised (the registered form avoids it rather than explaining it).
+
+**Immediate follow-ups, cheapest first.** (1) **Preserve this image** — it is the fastest correct artifact the project has and lives in `diagnostics/iter75b_recover/`; `build.hw.gdn32.h150.f142.o1/` is a staging copy that any `make` could clobber. (2) Run 512-token drift and WikiText-2 on it (one card job each) to qualify it as a promotable candidate at 142.5 MHz. (3) For 150 MHz, attack the −0.349 ns with the measured failing-endpoint classes from this build's own `gdn_final_qor/`, not another blind relink. (4) The `state_address_gate` should stay on every candidate, and its testbench's unconditional `ADDRESS_PASS` summary line still needs fixing so a grep cannot mislead.
+
+### 2026-09-09 10:44Z — Iter75b correctness evaluation COMPLETE on the 142.5 MHz image (job 3704): **512-token drift BOUNDED, fork at step 447; WikiText-2 word PPL 16.774840 vs GPU 16.776124 = −0.0077%.** Both gates pass. The image is now fully qualified on correctness; only the auto-scaled clock keeps it unpromoted.
+
+**Job.** 3704 `iter75b_robustness`, `light`, `acclnode01`, **01:47:43**, marker `1 0 0` (rc1=1 is the expected free-running post-fork comparison failure, rc2=0 wikitext host, rc3=0 PPL gate). Harness copied **verbatim** from `iter69_iter67c_true_f150/robustness.slurm` (`6693a833…`) so the numbers are directly comparable with Iter66n/Iter66o/Iter69. Image `d48c6b15…` (the build-3700 XCLBIN recovered by job 3702), host `94cfb62b…`, references `iter66n_long_horizon/gpu512.gdnlog` and `iter66o_wikitext/wikitext_gpu_reference.json`.
+
+**1. 512-token free-running decode vs the GPU 512 reference** (`card512_trend.txt`, 511 steps × 32,000 logits, window 64):
+
+| window | NRMSE | cosine | max_abs | argmax mismatches |
+|---|---:|---:|---:|---:|
+| 0–63 | 0.005305468 | 0.999985927 | 0.2287 | 0 |
+| 64–127 | 0.004639270 | 0.999989302 | 0.2273 | 0 |
+| 128–191 | 0.006186761 | 0.999981375 | 0.3044 | 0 |
+| 192–255 | 0.004835631 | 0.999988422 | 0.2011 | 0 |
+| 256–319 | 0.006127335 | 0.999981266 | 0.2811 | 0 |
+| 320–383 | 0.005638354 | 0.999984128 | 0.2143 | 0 |
+| 384–447 | 0.005238521 | 0.999986284 | 0.2134 | 1 |
+| ~~448–510~~ | ~~0.565777963~~ | ~~0.836841461~~ | | ~~63~~ — **post-fork, compares different sequences; not a defect** |
+
+`TREND_VERDICT=BOUNDED`, `FIRST_ARGMAX_DIVERGENCE=447`, first→last comparable window ratio **1.063**, least-squares slope **2.133e-06 per step**. The fork at **447** is *identical* to the value recorded for Iter66e/Iter67c at 100 MHz (job 2529) and Iter69 at 121 MHz — a 1.425× clock and a completely rewritten state write-back path moved it by zero tokens. Iter66n's reference slope was ~1.5e-7 on a flat pre-fork NRMSE of 0.0048; 2.1e-6 here is the same order and still bounded, and the window-to-window scatter (0.00464–0.00619) dominates any trend.
+
+**2. WikiText-2 teacher-forced, all 62 documents** (`wikitext_full62_vs_gpu.json`): **`pass: true`**, `same_workload: true` — documents 62, windows 183, scored_tokens 314,843, words 241,335, bytes 1,290,527 all identical to the GPU reference, so the run cannot have passed by scoring less.
+
+| | FPGA (Iter75b @142.5 MHz) | GPU reference | delta |
+|---|---:|---:|---:|
+| word perplexity | **16.774839771371035** | 16.776123769210223 | **−0.00765%** |
+| kernel ms/token (scoring path) | 17.2333473590609 | | |
+
+Gate is 5%; this is **653× inside it**. And it reproduces the Iter66o card result at 100 MHz (16.774840) to **9 significant figures** — a difference of 2.3e-7 in perplexity across a 1.425× clock change and the new writer. Together with the identical NRMSE/cosine figures from job 3703, that is conclusive: **the Iter73-lineage arithmetic is bit-equivalent to the shipping design, and the state path is correct across 24 layers, 512 free-running tokens, and 314,843 teacher-forced tokens.**
+
+**Qualification status of the 142.5 MHz image.**
+
+| check | result |
+|---|---|
+| exact 8/64-token trajectory | PASS (job 3703), `first_divergence_index −1` |
+| CUDA vector gate, 2,016,000 logits | NRMSE 0.00466269633, cosine 0.999989166 — identical to Iter67c |
+| 512-token drift | **BOUNDED**, fork 447, slope 2.1e-6 |
+| WikiText-2 word PPL | **−0.0077%** vs GPU, workload identity verified |
+| routed timing | legal route, 0 errors; kernel **auto-scaled 150 → 142.5 MHz** (−0.349 ns, 1,733 failing endpoints of 1,342,323) |
+| latency | 17.233 ms kernel / 17.343 ms TPOT, 2.4557M cycles |
+| **energy / paired power protocol** | **NOT MEASURED on this image** |
+
+**Verdict: correctness-complete, NOT promoted.** The only bars left are (a) rule 4 — the clock is auto-scaled, not closed, which is exactly what build 3700's `exact_clock` gate refused, and (b) the paired latency+power protocol (`GatedDeltaNet-eval/scripts/slurm_fpga_tpot_power.sh`, `XCLBIN`/`XCLBIN_SHA256` overrides, two arms for A100 FP32/BF16) has never run on it, so no J/token figure exists. For reference the protocol gave 0.973 J/token at 100 MHz and 0.884 at 121 MHz; **do not interpolate a 142.5 MHz value — measure it.**
+
+**Preservation.** The only durable copy of this image is `diagnostics/iter75b_recover/gdn_forward_f142.xclbin`; `build.hw.gdn32.h150.f142.o1/` is a staging copy any `make` can clobber. It is the fastest *correct* artifact the project has produced.
+
+**Harness note for the next revision.** Stage 2 pipes through `tail -40`, which buffers the whole stream, so a 101-minute run shows zero output and a genuine stall would be indistinguishable from progress (liveness had to be inferred from `sstat` RSS). Replace with a line-buffered `tee` to a file. Kept as-is for this run to preserve comparability.
