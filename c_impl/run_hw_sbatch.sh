@@ -118,6 +118,9 @@ snapshot_files=(
     apply_iter23_dma_fanout.tcl check_f150_physical_islands.tcl
     report_final_qor.tcl check_native_bf16_xo.py
 )
+if [ "${STATE_ADDRESS_GATE:-0}" = 1 ]; then
+    snapshot_files+=(gdn_eval.cpp all_bf16_layout_test.cpp check_state_writer_addresses.py)
+fi
 # A variant build (HW_CFG_TEMPLATE=... and/or extra hook Tcl) must freeze its
 # extra inputs too: EXTRA_SNAPSHOT_FILES="fileA fileB" appends to the list.
 if [ -n "${EXTRA_SNAPSHOT_FILES:-}" ]; then

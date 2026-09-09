@@ -47,6 +47,12 @@ test -s "${SNAPSHOT_PATH}" || {
 }
 
 STAGE_ROOT="/tmp/${USER}-${SLURM_JOB_ID}"
+df -h /tmp
+available_kb="$(df -Pk /tmp | awk 'NR==2 {print $4}')"
+if [ "$available_kb" -lt 62914560 ]; then
+    echo "FATAL: less than 60 GiB available in /tmp; refusing a production link"
+    exit 2
+fi
 STAGE_C_IMPL="${STAGE_ROOT}/c_impl"
 SHARED_DIAG="${SUBMIT_C_IMPL}/diagnostics/${TAG}"
 mkdir -p "${STAGE_C_IMPL}" "${SHARED_DIAG}"
@@ -72,6 +78,36 @@ STAGE_BUILD="${STAGE_C_IMPL}/${BUILD_DIR}"
 SHARED_BUILD="${SUBMIT_C_IMPL}/${BUILD_DIR}"
 echo "  build dir  : ${BUILD_DIR}"
 printf '%s\n' "${BUILD_DIR}" > "${SHARED_DIAG}/build_dir.path"
+
+# Address-fix candidates must pass native and generated/synthesized address
+# checks before linking. The source snapshot contains the exact gate script.
+if [ "${STATE_ADDRESS_GATE:-0}" = 1 ]; then
+    printf '%s\n' "native_gate" > "${SHARED_DIAG}/build.phase"
+    set +e
+    (
+        set -e
+        make -C "${STAGE_C_IMPL}" gdn_eval all_bf16_layout_test
+        "${STAGE_C_IMPL}/all_bf16_layout_test"
+        for steps in 6 32; do
+            "${STAGE_C_IMPL}/gdn_eval" \
+                "${SUBMIT_C_IMPL}/${WEIGHTS}" \
+                "${SUBMIT_C_IMPL}/fixtures_decode/decode.gdnreq" \
+                "${SHARED_DIAG}/native${steps}.json" --decode \
+                --decode-from-state "${SUBMIT_C_IMPL}/${DECODE_STATE}" \
+                --decode-len "${steps}"
+            python3 "${SUBMIT_C_IMPL}/../scripts/check_gdn_c_parity.py" \
+                --decode --golden "${SUBMIT_C_IMPL}/${DECODE_GOLDEN}" \
+                --c "${SHARED_DIAG}/native${steps}.json"
+        done
+    ) 2>&1 | tee "${SHARED_DIAG}/native_gate.live.log"
+    native_rc="${PIPESTATUS[0]}"
+    set -e
+    printf '%s\n' "$native_rc" > "${SHARED_DIAG}/native_gate.exit"
+    if [ "$native_rc" -ne 0 ]; then
+        printf '%s\n' "$native_rc" > "${SHARED_DIAG}/build.exit"
+        exit "$native_rc"
+    fi
+fi
 
 # Compile the production XO once, inspect that exact HLS result, and only then
 # authorize the long Vivado link.  `make xclbin` reuses the up-to-date XO, so
@@ -104,6 +140,20 @@ if [ "${xo_rc}" -eq 0 ]; then
     set -e
 fi
 printf '%s\n' "${gate_rc}" > "${SHARED_DIAG}/xo_gate.exit"
+
+if [ "$xo_rc" -eq 0 ] && [ "$gate_rc" -eq 0 ] && [ "${STATE_ADDRESS_GATE:-0}" = 1 ]; then
+    printf '%s\n' "state_address_gate" > "${SHARED_DIAG}/build.phase"
+    set +u
+    source "/tools/Xilinx/Vitis/${VITIS_VERSION}/settings64.sh"
+    set -u
+    set +e
+    python3 "${STAGE_C_IMPL}/check_state_writer_addresses.py" \
+        "${STAGE_BUILD}/gdn_forward.xo" "${SHARED_DIAG}/state_address_gate" \
+        2>&1 | tee "${SHARED_DIAG}/state_address_gate.live.log"
+    gate_rc="${PIPESTATUS[0]}"
+    set -e
+    printf '%s\n' "$gate_rc" > "${SHARED_DIAG}/state_address_gate.exit"
+fi
 
 if [ "${xo_rc}" -ne 0 ]; then
     rc="${xo_rc}"
@@ -184,6 +234,25 @@ fi
 if [ "${rc}" -eq 0 ]; then
     test -s "${STAGE_BUILD}/gdn_forward.xclbin" || rc=3
     test -x "${STAGE_C_IMPL}/host.exe" || rc=3
+fi
+if [ "$rc" -eq 0 ] && [ "${REQUIRE_EXACT_CLOCK:-0}" = 1 ]; then
+    set +e
+    /opt/xilinx/xrt/bin/xclbinutil --input "${STAGE_BUILD}/gdn_forward.xclbin" \
+        --dump-section "CLOCK_FREQ_TOPOLOGY:JSON:${SHARED_DIAG}/clock_freq_topology.json" --force
+    clock_rc=$?
+    if [ "$clock_rc" -eq 0 ]; then
+        python3 - "${SHARED_DIAG}/clock_freq_topology.json" "$LINK_FREQ" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))['clock_freq_topology']['m_clock_freq']
+clocks = [float(c['m_freq_Mhz']) for c in data if c['m_type'] == 'DATA']
+assert clocks == [float(sys.argv[2])], f"EXACT_CLOCK_FAIL: DATA={clocks}, requested={sys.argv[2]}"
+print('EXACT_CLOCK_PASS', clocks)
+PY
+        clock_rc=$?
+    fi
+    set -e
+    printf '%s\n' "$clock_rc" > "${SHARED_DIAG}/exact_clock.exit"
+    if [ "$clock_rc" -ne 0 ]; then rc=$clock_rc; fi
 fi
 if [ "${rc}" -eq 0 ]; then
     mkdir -p "${SHARED_BUILD}"
