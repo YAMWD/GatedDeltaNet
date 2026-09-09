@@ -13618,3 +13618,103 @@ Aggregated by driver: **`top_fsm->*` 542 endpoints** (worst −0.341), `gemv_lau
 **Levers this census actually supports, cheapest first.** (a) **Reset fanout repair** — it holds the WNS with only 51 endpoints, and this repo already has the tooling lineage (`apply_iter23/35/54_dma_*` fanout repairs, `apply_iter43_reset_fanout.tcl`) plus `reset_driver_properties.rpt` from this run naming the `reset_kernel_slr*` drivers. Smallest possible change for the WNS. (b) **Top-FSM control replication/localisation** — the largest slice at 542 endpoints and −33.6 ns TNS on the `gemv_other` family alone; this is Codex's item 1, now measured on a legally routed 150 MHz design rather than inferred from an unrouted estimate. (c) `rmsnorm->rmsnorm` (179 at −0.343) and the cluster-internal families are genuinely diffuse and argue for placement work, not source work. **What this census rules out:** a single structural fix. Recovering 0.349 ns needs the WNS holder *and* a dent in the TNS mass, so expect two or three combined changes, each verifiable by whether its family disappears from `failing_endpoints.tsv`.
 
 **Nothing promoted, nothing changed.** Iter67c remains HEAD and the `run_hw` default; Iter75b at 142.5 MHz remains the fastest correct image, unpromoted pending a timing-closed clock and a J/token measurement.
+
+### 2026-09-09 — Iter75c-R1: targeted post-route replication experiment
+
+3705 completed in26m08s, exit0; all1733 endpoint paths reconciled. The
+checkpoint is constrained at6.667ns (not142.5MHz), with legal routing and
+kernel setup/hold=-0.349/0.000ns; DMA=+0.003/+0.008ns and HBM=+0.061/+0.009ns.
+Measurement-only census is complete. No source changes are needed to run this
+first physical experiment; the registered state-writer fix remains intact.
+
+Clarifications to the preceding interpretation: the three worst paths are
+wire-dominated, but that does not establish that *every* path is. Cluster13's
+-0.316ns path has3.203ns logic and4.071ns routing, so arithmetic feedback still
+needs tracking. Additional registers can shorten wire paths, but inserting
+latency into control/reset blindly is unsafe; this first experiment is
+cycle-neutral. Quality/trajectory agreement does not itself establish exact
+arithmetic bit-equivalence. Existing on-card results belong to the scaled image.
+
+The reset FDRE and its existing replicas carry `PBLOCK=pblock_dynamic_SLR0`.
+The worst load is a K-stream BRAM inSLR2; the original output has192 load pins
+(193 flat pins including its driver). Its path has98% routed delay. Existing
+clock-region fanout properties therefore do not prove reset replicas reached
+remote loads. Do not relax the complete platform pblock or insert reset delay.
+
+R1 applies only `phys_opt_design -force_replication_on_nets` to eight exact,
+count-checked, distinct FDRE drivers identified in3705: reset, GEMV launch,
+top FSM state92, RMS weight-loader address bits7/8, output-normalization
+weight-loader address bits7/8, and GEMV store state5. Pins counts are
+193/31/22/153/153/153/153/744, respectively. These are not blanket max-fanout
+constraints. Respect existing placement restrictions, then complete routing
+with `route_design -preserve`. This is a bounded locality experiment, not an
+assertion that eight nets cover every failing endpoint. Reset may remain
+constrained inSLR0, requiring a separately verified follow-up.
+
+Record per-clock setup/hold, all failing endpoint families, and actual drivers,
+LOC/SLR/clock-region/pblock for the original load pins before/after replication
+and after routing. Save separate checkpoints; final reports include route
+status, detailed failing paths, per-SLR utilization/SLL, congestion, bus skew
+and DRC. Tool completion alone is not timing/route acceptance. No bitstream,
+auto-scaling, arithmetic changes, source rebuild, or production hook changes.
+Review remaining families and legality before packaging or making a next repair.
+
+Input DCP SHA256 remains
+`3dd12e18f6c6f1dc998dcf4385a26bd8b7b76113d1f22f095e98047775eff98c`;
+input XO `e80b1f2a1518fa3bafcaae6853e619ae07e19fefb7d9e8454ddb720afd39c7e1`.
+Scripts `diagnostics/iter75c_f150_locality/repair.{tcl,slurm}`. Shell syntax and
+Tcl structural-completeness checks pass; Vivado execution pending. Slurm build,
+8 CPUs/128GiB/6h cap, no node pin or accelerator; exclude harrier for its
+recorded scratch-space issue, check>=60GiB free at allocation. This standalone
+DCP repair needs Vivado2024.2 but not the U55C platform files. Source DCP and
+correct142.5MHz XCLBIN are preserved. ETA1–3h after allocation; no commit or
+retention decision until measured improvement and required validation.
+
+Submitted R1 as Slurm3706. Repair Tcl SHA256
+`dbe1855567789cbc0ee9b025819fd8834ec7c3dfe92869d0e7c462308a04ff10`;
+Slurm script SHA256
+`53222712c0d9488e9ede036e96fbaaf148097aaa0f919885e865f48f97df3812`.
+Shared logs: `iter75c_f150_locality/repair.live.log`,
+`iter75c_f150_locality/repair-vivado.live.log`, and `repair-slurm-3706.log`.
+Verdict pending; job exit0 means experiment completed, not timing closure.
+
+### 2026-09-09 12:08Z — Iter75c-r1 repair attempt (job 3706) **FAILED on a tool-option error, not a design result**: `phys_opt_design -force_replication_on_nets` is **not supported in post-route** physical synthesis. No design change; the baseline was reconfirmed on the way in. STOPPED, retry with the option moved pre-route.
+
+**Job.** 3706 `iter75c_r1_f150_repair`, `build`, `acclnode01`, 8 CPU / 128 GB / 6 h limit, **FAILED after 00:15:52**, `repair.exit=1`. Script `diagnostics/iter75c_f150_locality/repair.slurm` → `repair.tcl`, operating on a node-local copy of the immutable 142.5 MHz checkpoint (`REPAIR_DCP=$WORK/input.dcp`).
+
+**The error, verbatim:**
+```
+ERROR: [Vivado_Tcl 4-265] Option -force_replication_on_nets is specified but not
+supported yet for post-route physical synthesis. Please remove the option and rerun
+ERROR: [Common 17-39] 'phys_opt_design' failed due to earlier errors.
+```
+`repair.tcl:131` is a bare `phys_opt_design -force_replication_on_nets $targets` applied to an already-routed checkpoint. Vivado 2024.2 accepts that option only in the **pre-route** pass. Nothing was modified — the run died before any optimisation, and no `routed*`/`clock_slacks`/`route_status` artifacts were produced (`repair-reports-3706/` holds only `before/` and `targets.tsv`).
+
+**What it did establish before failing — the baseline reproduces exactly** on a fresh open of the checkpoint, which is worth having as an independent confirmation of the census:
+
+| clock | period | setup | hold |
+|---|---:|---:|---:|
+| `clk_kernel_00_unbuffered_net` | 6.667 | **−0.349** | 0.000 |
+| `dma_ip_axi_aclk_1` | 4.000 | +0.003 | +0.008 |
+| `hbm_aclk` | 2.222 | +0.061 | +0.009 |
+
+`before failing_endpoints=1733 timing_ok=0` — identical to job 3705's census. Checkpoint open cost 13.5 min of the 16.
+
+**The eight drivers it had selected** (`targets.tsv`), which remain the right target list for a corrected attempt:
+
+| target | flat pins | what it is |
+|---|---:|---|
+| `reset` | **193** | `proc_sys_reset_kernel_slr0/U0/ACTIVE_LOW…` → `k_stream_U` FIFO RAM `lopt` — the WNS holder's driver |
+| `store_state5` | **744** | `gemv32_store` FSM state 5 — the largest fanout in the set |
+| `rms_addr7` / `rms_addr8` | 153 each | `rmsnorm` `rms_load_w` address bits — the 179-endpoint `rmsnorm->rmsnorm` family |
+| `onorm_addr7` / `onorm_addr8` | 153 each | `output_norm_and_gate` `onorm_load_w` address bits, same shape |
+| `gemv_launch` | 31 | `grp_gdn_gemv_fu_1054_ap_start_reg` |
+| `top_state92` | 22 | `ap_CS_fsm_state92` — top-FSM control |
+
+That selection is well matched to the census: it hits the reset net that holds the WNS, the two `*_load_w` address-bit families that account for the diffuse `rmsnorm`/`auxiliary` mass, and two top-FSM/launch control nets. The *targets* are not in question; only the pass they were applied in.
+
+**Corrected options, in order of preference.** (1) **Replicate pre-route**: apply `-force_replication_on_nets` in the pre-route `phys_opt_design`, then re-run `route_design` — this is the supported use and matches how the existing `apply_iter23/35/54_dma_*` and `apply_iter43_reset_fanout.tcl` repairs work (they set `FORCE_MAX_FANOUT`/`MAX_FANOUT` properties *before* placement, not after routing). Cost: a full re-route, ~3–6 h, versus the ~16 min this attempt hoped for. (2) **Property-based, pre-place**: set `FORCE_MAX_FANOUT` on the eight drivers in a `PLACE_DESIGN.PRE` hook and take the whole implementation from placement — the repo's proven pattern. (3) A post-route pass restricted to supported directives (`-directive AggressiveExplore`, already in the recipe) cannot do targeted replication and is not a substitute.
+
+**Standing caution from the Iter66 campaign, now relevant again.** Checkpoint route-repair on a dense placement was measured *seven times* across two failure classes and made things worse every time (16→51, 5→22, 3→42 overlaps) because pin conflicts cannot be re-permuted per-net. This design routes legally, so the situation is not identical, but the lesson stands: a post-route surgical fix on a 97.8%-CLB SLR0 is the least promising of the three options even once the option error is fixed. Prefer (1) or (2).
+
+**Nothing promoted, nothing changed.** Iter67c remains HEAD and the `run_hw` default; Iter75b at 142.5 MHz remains the fastest correct image.
