@@ -13898,3 +13898,109 @@ Cumulative: **2 h 10 m 38 s** of build-partition time to produce zero data about
 **RECOMMENDATION, stated plainly: stop the checkpoint-surgery path.** Use `FORCE_MAX_FANOUT` on the eight drivers in a `PLACE_DESIGN.PRE` hook and implement from placement through the normal `run_hw` flow. It is this repo's proven pattern (`apply_iter23/35/43/54_*` all set fanout properties pre-placement), it needs **no** fixed-route audit, no unroute, and no post-route option, so it cannot hit any of the three faults above. It costs one full build (~9 h) instead of the ~1 h the checkpoint path promised — but that path has now spent 2 h 10 m for nothing, and the Iter66 campaign separately measured checkpoint route-repair worsening overlaps in **all seven** attempts on a dense placement. The expected-value comparison is no longer close.
 
 **Nothing promoted, nothing changed.** Iter67c remains HEAD and the `run_hw` default; Iter75b at 142.5 MHz remains the fastest correct image, now with measured energy (0.798 J/token gross, 46.1 W active).
+
+### 2026-09-09 — Iter75d: fresh150MHz link, targeted pre-placement replication
+
+User authorized the next clean implementation attempt. R3/3735 is rejected:
+disk-full during the fixed-route audit, before any repair. Its diagnostic
+scripts remain excluded from production. No checkpoint surgery is used here.
+
+Reuse only job3700's verified XO and original HLS reports. Every original
+source/config snapshot hash was checked against the working files and matches.
+Kernel SHA256 `ca263d7e0f6f94c5f34765ef70edf6512553b7aaac874b63a93a91856484360b`;
+XO `e80b1f2a1518fa3bafcaae6853e619ae07e19fefb7d9e8454ddb720afd39c7e1`.
+The registered state-address fix and arithmetic are unchanged. Fresh Vivado
+synthesis, placement, route and post-route optimization; no implementation DCP,
+unroute, bulk ROUTE query, or previous IP/placement cache is imported.
+
+Hypothesis: shorten the eight control/address driver families measured in
+3705's full timing census by setting FORCE_MAX_FANOUT before placement.
+Fanout limits: reset=32, GEMV launch=8, top state92=8, two RMSNorm address
+bits=32 each, two output-norm address bits=32 each, GEMV store state5=128. Exact selectors
+must resolve eight distinct FDRE drivers; record canonical nets and fanout.
+The reset uses its primitive Q rather than the post-route lopt alias.
+The existing reset pblock, DMA repairs, cluster floorplan, unpairing,
+SSI_SpreadLogic_high, AlternateCLBRouting and AggressiveExplore stay unchanged.
+Replication inside the existing reset pblock may not remove its cross-SLR
+delay; this is an experiment, not a timing-closure guarantee. Arithmetic paths
+also fail in the reference, so these eight controls need not explain all WNS.
+
+New config `hw_iter75d_control_f150.cfg` retains Iter69's actual150MHz clock
+repair. Its pre-place hook chains the original unpair/DMA hook. Its final hook
+captures existing QoR evidence and explicitly checks kernel150, DMA250 and
+HBM450MHz setup/hold; a miss aborts before accepting clock scaling.
+REQUIRE_EXACT_CLOCK=1 remains enabled for final XCLBIN metadata validation.
+
+Launcher gains optional identity-checked REUSE_XO; source/header/HLS Tcl/XO
+hashes, original three passing gates, and HLS frequency must match. Restore
+reports only and rerun the existing architecture checker. Local report staging
+test PASS (3080 reports), architecture gate PASS, wrong-frequency rejection
+PASS, shell syntax/Tcl completeness/diff-whitespace checks PASS. Reference HLS:
+16 clusters,32 masters, II1, estimated4.867ns, LUT820707, FF887528,
+DSP3453, BRAM18 1995, URAM112. These are reused measurements, not new synthesis.
+Repeat native6/32-step and generated/synthesized state-address checks inside
+Slurm before the clean link. Dependent on-card validation only after success.
+
+Request build48CPUs/192GiB, synthesis16 workers/implementation8, Vitis2024.2,
+HLS150/link150, no GRES or node pin. Exclude nodes04/05 (platform gaps),
+harrier (recorded scratch issue), and node03 (3735 disk-full); retain60GiB
+scratch preflight. ETA8–12h after allocation including gates, not a guarantee.
+Submission snapshot/hash manifests and live logs are under
+`diagnostics/iter75d_clean_control_f150/`. Verdict pending; no commit or
+production-default promotion until timing and on-card improvement are proven.
+
+Submitted build **3751**, dependent hardware test **3752** (`afterok:3751`).
+Scheduler selected acclnode01; allocation confirms48CPUs/192GiB. Platform and
+scratch preflight passed; native correctness gate entered. Live startup log:
+`diagnostics/iter75d_clean_control_f150/native_gate.live.log`; full wrapper:
+`build.slurm-3751.log`; link stdout later uses `build.live.log`.
+
+### 2026-09-10 02:58Z — Iter75d (build 3751) came **0.013 ns short of a timing-closed 150 MHz**: final kernel WNS **−0.013 ns**, TNS −0.393, DMA +0.003, HBM +0.052, route legal with **0 overlaps**. The `exact_clock` gate rejected it by design (`build.exit=2`) and cancelled on-card 3752. Closest attempt by 27×; NOT closed, NOT promoted.
+
+**Job.** 3751 `iter75d_clean_control_f150`, `build`, `acclnode01`, **09:24:23**, `build.exit=2`, died in `vivado_link` at `_full_post_route_phys_opt_post.tcl`. All pre-link gates passed (`native_gate.exit=0`, `xo.exit=0`, `xo_gate.exit=0`, `state_address_gate.exit=0` — the address gate now runs as standard). Dependent on-card **3752** CANCELLED by `afterok`, Elapsed 00:00:00.
+
+**Source is unchanged from the 142.5 MHz image** — `gdn_model.cpp` `ca263d7e…`, a byte-identical snapshot diff against `iter75b_registered_state_f150`. So this iteration changed only the *physical* recipe ("clean control"), not the kernel, and the entire 0.336 ns improvement over Iter75b's −0.349 is physical.
+
+**Final per-clock, from the gate's own report (`impl_1.runme.log:4739`):**
+
+| clock | period | setup | hold |
+|---|---:|---:|---:|
+| `clk_kernel_00_unbuffered_net` | 6.667 ns | **−0.013** | +0.001 |
+| `dma_ip_axi_aclk_1` | 4.000 ns | +0.003 | +0.009 |
+| `hbm_aclk` | 2.222 ns | +0.052 | +0.010 |
+
+```
+ITER75D_CLOCK clock=clk_kernel_00_unbuffered_net period=6.667 setup=-0.013 hold=0.001
+ERROR: [VPL_TCL 101-2] ITER75D: exact-clock timing failed: clk_kernel_00_unbuffered_net; scaling is not accepted
+```
+Route: **1,592,221 fully routed, 0 routing errors, 0 node overlaps.**
+
+**The post-route physical-synthesis trajectory is the story.** Routing ended at −0.089 / TNS −7.575, and `phys_opt -directive AggressiveExplore` then ground it down net by net (`[Physopt 32-952] Improved path group WNS = …` repeatedly) to:
+
+| stage | WNS | TNS |
+|---|---:|---:|
+| end of routing | −0.089 | −7.575 |
+| | −0.084 | −5.765 |
+| | −0.067 | −3.906 |
+| **final** | **−0.013** | **−0.393** |
+
+TNS fell 19× and WNS 7×. The nets it improved are exactly the census's families: `gemv32_cluster2*`, `mem_weights_mm0` load/store units, `p_read*_c_U`, `state_stream0`, `ap_sync_reg_*` — control and adapter paths, not datapath. **This settles the open question of whether the residual is phys-opt-addressable: it is, almost entirely.** The W1 precedent (−0.029 → −0.029, zero gain) does not generalise.
+
+**Progress of the 150 MHz campaign, all on legally routed designs:**
+
+| attempt | netlist | final kernel WNS | failing endpoints |
+|---|---|---:|---:|
+| Iter69 (3371) | Iter67c | −1.594 | 25,528 |
+| Iter71 V0 (3432) | Iter67c | −0.675 | 13,836 |
+| Iter72 r2 (3453) | Iter67c | −0.592 | 5,568 |
+| Iter75b (3700) | Iter73+fix | −0.349 | 1,733 |
+| **Iter75d (3751)** | same source | **−0.013** | ~**30** (TNS −0.393) |
+| Iter74 W0 (3557) | Iter73 | **+0.005** | 0 — *re-placement, not a `v++` link* |
+
+Two independent facts now stand: a re-placement of this netlist closes 150 MHz (W0), and the production flow has come within 0.013 ns of it. The gap between them is 0.018 ns.
+
+**No image exists.** Bitstream generation is task 6 of 6 and the build stopped after task 5 (routing), so there is no XCLBIN to recover — unlike build 3700, where the failure came after packaging. What is preserved: `post_place.dcp` (603 MB), the full `impl_1.runme.log`, and `gdn_final_qor/`. The routed checkpoint itself is in `/tmp/yaoz0b-3751` on `acclnode01` until that node is reused.
+
+**Assessment and next step.** −0.013 ns on 6.667 ns is 0.2% of the period, and about 30 endpoints. Three cheap, independent levers each plausibly worth more than that, in order: (1) **re-run the identical recipe** — normally futile because the link is deterministic, but post-route phys_opt's net-by-net search is the one stage whose outcome is sensitive to its starting state, and this is the first attempt whose residual is within a single phys_opt increment; (2) **`-directive Explore` or `ExploreWithAggressiveHoldFix`** on the post-route pass instead of `AggressiveExplore`, one variable, same cost; (3) the **`FORCE_MAX_FANOUT` placement hook** on the eight census drivers, which is still unattempted and now has only 30 endpoints to fix rather than 1,733. Do **not** resume checkpoint surgery — three attempts, three infrastructure faults, zero data.
+
+**Nothing promoted.** Iter67c remains HEAD and the `run_hw` default. Iter75b at 142.5 MHz remains the fastest *correct* image: 17.32 ms TPOT, 0.798 J/token gross, 2.02× and 4.03× against the A100 FP32 baseline (median of four paired runs).
