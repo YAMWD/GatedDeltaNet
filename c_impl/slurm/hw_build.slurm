@@ -112,6 +112,18 @@ fi
 # Compile the production XO once, inspect that exact HLS result, and only then
 # authorize the long Vivado link.  `make xclbin` reuses the up-to-date XO, so
 # this is a gate inside one build rather than a duplicate HLS synthesis.
+if [ -n "${REUSE_XO:-}" ]; then
+    printf '%s\n' "reuse_xo_identity" > "${SHARED_DIAG}/build.phase"
+    python3 "${STAGE_C_IMPL}/prepare_reused_xo.py" "$REUSE_XO" \
+        "${REUSE_XO_REFERENCE:?REUSE_XO_REFERENCE required}" \
+        "$STAGE_C_IMPL" "$STAGE_BUILD" "$HLS_FREQ" \
+        > "${SHARED_DIAG}/xo_reuse.log" 2>&1 || {
+        cat "${SHARED_DIAG}/xo_reuse.log"
+        echo 2 > "${SHARED_DIAG}/build.exit"
+        exit 2
+    }
+    cp "$STAGE_BUILD/xo_reuse.json" "$SHARED_DIAG/"
+fi
 printf '%s\n' "xo" > "${SHARED_DIAG}/build.phase"
 echo "=== STEP 2: full-model XO / integrated HLS ===" \
     | tee "${SHARED_DIAG}/build.live.log"
@@ -165,6 +177,12 @@ elif [ "${gate_rc}" -ne 0 ]; then
         | tee -a "${SHARED_DIAG}/build.live.log"
 else
     printf '%s\n' "vivado_link" > "${SHARED_DIAG}/build.phase"
+    # Follow the tool's own live log through a symlink, without a polling
+    # supervisor. The fresh project/run directory contains no cached design.
+    live_impl="${STAGE_BUILD}/_x_temp/link/vivado/vpl/prj/prj.runs/impl_1"
+    mkdir -p "$live_impl"
+    touch "${SHARED_DIAG}/impl_1.live.log"
+    ln -s "${SHARED_DIAG}/impl_1.live.log" "$live_impl/runme.log"
     echo "=== STEP 3: full Vivado implementation / XCLBIN ===" \
         | tee -a "${SHARED_DIAG}/build.live.log"
     set +e
