@@ -14286,3 +14286,43 @@ No false paths, no relaxed clock uncertainty, no multicycle exceptions were used
 **Next, in order.** (1) **Package `closed_f150.dcp`** into an XCLBIN. The validated route is `write_bitstream -cell level0_i/ulp` plus `xclbinutil --replace-section BITSTREAM:RAW` with `CLOCK_FREQ_TOPOLOGY` patched to 150 — proven lossless by job 3667 and proven to produce a runnable image by jobs 3663/3703. Metadata must come from an image built from **this same source**, i.e. Iter75b's `d48c6b15…`, not an Iter67c-era donor. (2) On card: 8-token smoke, then the 64-token exact-trajectory and CUDA vector gates, then `kernel_ms`. (3) Only then 512-token drift, WikiText-2, and the paired power protocol. (4) Separately, a production link with `-directive Explore` post-route remains worth running, since it is the only way to learn whether the production flow reaches this state unaided.
 
 **Nothing promoted.** Iter67c remains HEAD and the `run_hw` default; Iter75b at 142.5 MHz remains the fastest *verified* image.
+
+### 2026-09-10 15:20Z — **150 MHz VERIFIED ON CARD** (jobs 3956 + 3957): timing-closed, not auto-scaled. Both gates PASS with an exact 64-token trajectory and NRMSE identical to every prior image. **16.131 ms kernel / 16.256 ms production TPOT — the fastest measured image, 1.49× the committed Iter67c.** NOT yet promoted: drift, WikiText-2 and power are unrun.
+
+**Packaging (job 3956, `build`, 32:36, exit 0).** Fail-closed by construction: it re-opened `closed_f150.dcp` and refused to write anything unless the closure held. It did — on a fresh open, in a new Vivado session:
+
+| clock | period | setup | hold |
+|---|---:|---:|---:|
+| `clk_kernel_00_unbuffered_net` | **6.667 ns** | **0.000** | +0.002 |
+| `dma_ip_axi_aclk_1` | 4.000 | +0.003 | +0.009 |
+| `hbm_aclk` | 2.222 | +0.052 | +0.010 |
+
+`CLOSURE_REVERIFIED: three clocks pass at 6.667 ns, route legal`. Exactly one `HD.RECONFIGURABLE` cell (`level0_i/ulp`, found by property, not by assumed name). `write_bitstream -cell` → **79,604,106 B** partial. Metadata donor is **Iter75b's `d48c6b15…`** — built from the *identical* source `ca263d7e`, which is what makes its `IP_LAYOUT`/`CONNECTIVITY`/`MEM_TOPOLOGY` genuinely applicable, unlike the Iter74 splice that used an Iter67c-era donor and produced deterministically wrong logits. `DATA_CLK` patched 142 → 150 and **read back as 150** (the first attempt at this trick silently failed to patch while reporting success). Image: **`82aa21e8b73935455ef59082…`, 80,091,663 B**.
+
+**On card (job 3957, `light`, 41 s, `oncard.exit=0`) — both gates PASS.**
+
+| gate | result |
+|---|---|
+| 8-token exact | `exact_traj_match True`, `first_divergence_index -1`; 7 steps × 32,000 logits: NRMSE **0.00434710288**, worst-step 0.00982223195, cosine 0.999990565 |
+| 64-token exact | `exact_traj_match True`, `first_divergence_index -1`; 63 steps / **2,016,000** logits: NRMSE **0.00466269633**, worst-step 0.0119080019, cosine 0.999989166 |
+| tolerance / non-finite | `tolerance_fail=0`, `nonfinite_mismatch=0` |
+
+Those figures are **bit-identical to Iter67c at 100 MHz, Iter72 r2 at 137.7 and Iter75b at 142.5**. A 1.5× clock change and a fully closed 6.667 ns constraint moved the numerics by nothing.
+
+**Latency — the fastest measured image, and the ladder is now complete:**
+
+| image | clock | kernel ms | TPOT ms | Mcycles | vs Iter67c |
+|---|---:|---:|---:|---:|---:|
+| Iter67c (committed) | 100 | 24.099 | 24.208 | 2.4099 | 1.00× |
+| Iter69 | 121 | 20.103 | 20.188 | 2.4325 | 1.20× |
+| Iter72 r2 | 137.7 | 17.955 | 18.053 | 2.4724 | 1.34× |
+| Iter75b | 142.5 | 17.233 | 17.343 | 2.4557 | 1.40× |
+| **Iter75f (this)** | **150** | **16.131** | **16.256** | **2.4197** | **1.49×** |
+
+Note the cycle count **fell** to 2.4197 M, 1.5% below Iter75b's 2.4557 M and only 0.4% above Iter67c's 2.4099 M — reversing the monotonic rise seen at 121/137.7/142.5 MHz. The focused critical-cell pass evidently shortened paths rather than merely meeting the constraint. The projection made before the run was 16.4 ms; the measurement is **16.131**, i.e. better than projected.
+
+**Why this one is different from every prior fast image.** Iter69, Iter72 r2 and Iter75b were all **auto-scaled** — the toolchain lowered the clock until the routed design passed, which `run_hw`'s `exact_clock` gate exists to refuse. This image met the requested 6.667 ns with non-negative setup *and* hold on all three clocks, no false paths, no relaxed uncertainty, no multicycle exceptions, and the arithmetic unchanged from the source verified on card at 142.5 MHz.
+
+**Still required before promotion (rule 4).** 512-token drift, WikiText-2 perplexity, and the paired latency+power protocol — all three ran on Iter75b and none has run here. Expected total ~2 h 20 m sequentially (drift+PPL 1 h 50 m per job 3704, power two arms ~30 m). Also outstanding: a **production `v++` link with `-directive Explore` post-route**, which is the only way to learn whether the production flow reaches this state unaided rather than through a checkpoint pass; the current image came from a checkpoint, so the committed recipe does not yet reproduce it.
+
+**Artifacts.** `diagnostics/iter75f_package/out-3956/gdn_forward_f150.xclbin` (`82aa21e8…`) and `diagnostics/iter75f_ce_locality/reports-3955/closed_f150.dcp` (`67d56aa7…`). Both live under gitignored `diagnostics/`; the staged copy at `build.hw.gdn32.h150.f150.o1/` is clobberable by any `make`.
