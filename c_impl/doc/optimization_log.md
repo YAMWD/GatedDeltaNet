@@ -14326,3 +14326,46 @@ Note the cycle count **fell** to 2.4197 M, 1.5% below Iter75b's 2.4557 M and onl
 **Still required before promotion (rule 4).** 512-token drift, WikiText-2 perplexity, and the paired latency+power protocol — all three ran on Iter75b and none has run here. Expected total ~2 h 20 m sequentially (drift+PPL 1 h 50 m per job 3704, power two arms ~30 m). Also outstanding: a **production `v++` link with `-directive Explore` post-route**, which is the only way to learn whether the production flow reaches this state unaided rather than through a checkpoint pass; the current image came from a checkpoint, so the committed recipe does not yet reproduce it.
 
 **Artifacts.** `diagnostics/iter75f_package/out-3956/gdn_forward_f150.xclbin` (`82aa21e8…`) and `diagnostics/iter75f_ce_locality/reports-3955/closed_f150.dcp` (`67d56aa7…`). Both live under gitignored `diagnostics/`; the staged copy at `build.hw.gdn32.h150.f150.o1/` is clobberable by any `make`.
+
+### 2026-09-10 17:15Z — 150 MHz **fully qualified**: energy **0.779 J/token gross at 48.0 W**, drift **BOUNDED** (fork 447), WikiText-2 **−0.0077%**. All gates pass. Jobs 3958/3959 (power, both arms) and 3960 (drift+PPL). Promotable on evidence; the committed *recipe* still does not reproduce the image.
+
+**Jobs.** 3958 `gdn-power-f150-fp32` 13:23, 3959 `gdn-power-f150-bf16` 11:43, 3960 `iter75f_robustness` 1:41:06 — all COMPLETED. Image `82aa21e8…` (sha-verified by the power script), host unchanged. Robustness harness is the Iter69/Iter75b script with only the image path substituted, so the numbers are directly comparable.
+
+**Paired latency + power, 4,096-token context, 3 × 60 s intervals, `boundary_clamps=[]` on both arms:**
+
+| | U55C @150 MHz | A100 FP32 | A100 BF16 |
+|---|---:|---:|---:|
+| production TPOT (ms) | **16.245** | 31.519 | 31.575 |
+| device time (ms) | 16.129 | 31.442 | 31.501 |
+| idle / active (W) | 26.0 / **48.0** | 69.9 / 95.8 | 68.6 / 86.1 |
+| gross J/token | **0.7792** | 3.0243 | 2.7180 |
+| idle-subtracted J/token | **0.3566** | 0.8209 | 0.5520 |
+| speedup | — | **1.94×** | 1.95× |
+| gross energy efficiency | — | **3.88×** | 3.49× |
+| idle-subtracted efficiency | — | 2.30× | 1.55× |
+
+**Both GPU arms landed in the fast mode this time** — per-interval medians 31.44/31.41/31.32 (FP32) and 31.52/31.47/31.46 (BF16), against the pooled 12-interval FP32 median of 35.67 established earlier. So these are the **most conservative** ratios yet measured: the GPU was at its best in both arms. Against the earlier pooled medians the same FPGA figures would give 2.15×/2.22×. The bimodality remains the dominant uncertainty in any speedup claim, and this run happens to sit on the flattering-to-GPU side.
+
+**Energy across the three measured clocks — the clock keeps paying for itself, but the return is flattening:**
+
+| clock | TPOT | active W | gross J/token | idle-subtracted |
+|---|---:|---:|---:|---:|
+| 100 MHz (Iter67c) | 24.166 | 40.2 | 0.9730 | 0.3780 |
+| 142.5 MHz (Iter75b) | 17.326 | 46.1 | 0.7980 | 0.3530 |
+| **150 MHz (Iter75f)** | **16.245** | **48.0** | **0.7792** | 0.3566 |
+
+100 → 142.5 MHz bought −18.0% gross energy; 142.5 → 150 bought a further **−2.4%** for +1.9 W. Note the **idle-subtracted figure rose slightly** (0.3530 → 0.3566): the incremental clock costs more dynamic energy than it saves in time, and only the fixed 26 W idle draw keeps the gross number improving. That is the first sign of diminishing energy return from frequency on this design, and it is worth stating rather than burying — a further clock increase would likely worsen J/token on the strict measure.
+
+**Correctness at 150 MHz — unchanged from every prior image:**
+
+| check | result |
+|---|---|
+| 512-token drift | `TREND_VERDICT=BOUNDED`, `FIRST_ARGMAX_DIVERGENCE=447`, first→last window ratio 1.063, slope 2.133e-06/step |
+| WikiText-2, 62 docs | `pass: true`, `same_workload: true`; word PPL **16.774839771371035** vs GPU 16.776123769210223 = **−0.00765%**, gate 5% |
+| 8/64-token exact (job 3957) | PASS, `first_divergence_index −1`, NRMSE 0.00466269633 over 2,016,000 logits |
+
+The drift trend and the perplexity are **numerically identical** to the 142.5 MHz run — same fork step 447, same slope 2.133e-06, same PPL to 15 digits — which is what a pure clock change with unchanged arithmetic should produce, and is now demonstrated across 100, 142.5 and 150 MHz.
+
+**Promotion status.** On evidence this image clears every bar rule 4 sets: timing-closed at the requested constraint on all three clocks with no exceptions, exact trajectories, bounded long-run drift, task quality within 0.008% of GPU, and measured energy. **What is still missing is reproducibility of the recipe**, and it is the only thing blocking promotion: the image came from a checkpoint-level focused `phys_opt` pass (job 3955) applied to build 3751's routed design, so `make run_hw` as committed does *not* produce it. Two paths, both worth doing: (1) a production link with `-directive Explore` post-route — the change job 3953 measured as 13× better than `AggressiveExplore` — to see whether the flow reaches closure unaided; (2) failing that, fold the focused kernel-path-group pass into the recipe as a `POST_ROUTE_PHYS_OPT_DESIGN.TCL.POST` hook so the flow reproduces it deterministically.
+
+**Headline, for the paper.** A timing-closed 150 MHz U55C decode accelerator at **16.245 ms/token and 0.779 J/token**, **1.94× faster and 3.88× more energy-efficient** than an A100 80GB PCIe running stock PyTorch + fla at batch one in FP32 — with the GPU measured in its *fast* dispatch mode in both arms, exact 64-token trajectories, bounded 512-token drift, and WikiText-2 word perplexity within 0.0077% of the GPU on identical windows.
