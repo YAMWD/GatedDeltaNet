@@ -14158,3 +14158,131 @@ So it is the **`gdn_gemv` `ap_start` enable replica** driving a `p_read` address
 **Next steps, in the order the evidence supports.** (1) **Production link with `-directive Explore`** post-route — one variable against build 3751, ~9 h, and it is the only path to a testable image. (2) **In the same build, add `FORCE_MAX_FANOUT` on `grp_gdn_gemv_fu_1054_ap_start_reg`** in the `PLACE_DESIGN.PRE` hook: the surviving net is a fanout/locality problem at 91% route across two SLRs, another replica placed in SLR2 removes the crossing, and this is the long-recommended placement-hook lever now aimed at *one* named net instead of 1,733 endpoints. (3) Only if both fail, revisit the source.
 
 **Nothing promoted.** Iter67c remains HEAD and the `run_hw` default; Iter75b at 142.5 MHz remains the fastest *correct* image (17.32 ms TPOT, 0.798 J/token, 2.02×/4.03× vs A100 FP32).
+
+#### Codex completion check3953 — evidence and attribution correction
+
+Slurm confirms FAILED1:0 after04:18:23, peak43160900KiB (~41.2GiB).
+This was the intentional final timing rejection, not an infrastructure fault.
+Final route1592228/1592228, errors0; DRC errors0. Kernel setup−.001ns,
+hold+.002ns; DMA+.003/+.009ns and HBM+.052/+.010ns setup/hold. Exactly two
+failing endpoints, uncapped census. `after_explore.dcp` and
+`restored_aggressive.dcp` are preserved in shared reports-3953. No XCLBIN,
+on-card result, commit or production-default change.
+
+Important correction to the preceding interpretation: these were SEQUENTIAL
+passes, not two alternative directives applied to an identical starting
+checkpoint. AggressiveExplore first reproduced−.013ns; Explore then consumed
+that optimized result and improved it to−.001ns. This supports the sequence
+AggressiveExplore→Explore, not replacing AggressiveExplore with Explore or
+claiming a controlled13x superiority of one directive. A fresh link is not
+intrinsically required to package a correctly closed checkpoint, but this
+checkpoint is still timing-negative and cannot yet be accepted.
+
+Both failing paths share the GEMV launch replica→p_read25 address-CE control
+cone, but traverse multiple nets and six LUT levels. Actual launch replica
+output fanout is2, delay.614ns; a downstream mode-write net drives1187loads
+with1.676ns delay, and the final CE net has4loads/1.427ns. Therefore another
+constraint on the original launch source alone is not a demonstrated fix;
+that source already received FORCE_MAX_FANOUT=8 in3751. Any targeted repair
+must inspect the final combinational drivers/local placement. The negative
+result is preserved as diagnostic evidence only. No new job in this check.
+
+### 2026-09-10 — Iter75f: focused post-route CE-path repair, sequence step1
+
+User authorized the sequence: focused physical optimization, conditional
+CE-locality repair if necessary, then packaging/on-card only after closure.
+Iter75e result recorded above: legal route,−.001ns kernel WNS,two endpoints;
+not accepted or committed. This follow-up starts from its actual improved
+`reports-3953/after_explore.dcp`, not the earlier routed or AggressiveExplore
+checkpoint. SHA256:
+`ee44dbecbb8d71675dfed80cc2a7c9ffd7c8b6b1d17ce462984271ea1f582f2e`.
+
+Hypothesis: localized post-route movement/replication can shorten the final
+CE cone's SLR2→SLR1→SLR2 detour. The intermediate LUT
+`p_read25_c_U/addr[4]_i_1__7` is atSLICE_X133Y431 while destination bits1/2
+are atSLICE_X136Y500. Its mode-control input has1187loads/1.676ns; its output
+has4loads/1.427ns. These are not a single direct ap_start net, and duplicating
+the initial two-load launch replica is not assumed sufficient.
+
+Run exactly one `phys_opt_design -placement_opt -routing_opt
+-critical_cell_opt -path_groups <kernel group>` from the identity-checked DCP.
+These are documented2024.2 UltraScale+ post-route operations; no directive
+combination, unroute, retiming, clock optimization, constraints change, global
+fanout limit, or source modification. This restricts the path group, not a
+guarantee that only the two failing endpoints' cells will be changed.
+
+Before optimization, verify input route legality and−.001ns kernel timing,
+record exact CE LUT inputs/immediate drivers plus all output loads (cap16),
+their placement/SLR and min/max timing. Afterward preserve `after_focused.dcp`
+even if negative and repeat capped256-path timing and route checks. Final
+reports include DATA150/DMA250/HBM450 setup/hold, DRC, bus skew, congestion/SLL
+and per-SLR utilization. Preserve the baseline separately. A passing DCP still
+requires bus-skew review, normal packaging and on-card validation; otherwise
+the measured connectivity will guide the conditional step2 movement/duplication.
+No blind automatic manual ECO or production link launched on failure.
+
+Build partition8CPUs/192GiB,8h limit,Vitis2024.2,no GRES or node pin. Shared
+input needs no installed U55C platform for checkpoint physical optimization;
+exclude only recorded disk-full node03/harrier and require60GiB scratch.
+Immutable hashed scripts snapshot and direct shared tool/Slurm logs under
+`diagnostics/iter75f_ce_locality/`. Shell syntax/Tcl completeness/route parser
+and missing-field rejection tests PASS. ETA1–3h excluding queueing; no polling
+beyond startup sentry. Pending experiment, no commit or production promotion.
+
+Submitted **3955**; scheduler choseacclnode01,8CPUs/192GiB. Scratch425GiB
+free at startup. Scripts snapshot SHA256
+`a1d0f77ef07cdb1f9530d8739f45f050e115b3d1d638afdabae5a47b02b4f21d`;
+repair Tcl `36c650e3e002f774db7a8c8b8b4e715f9aa3c3489dff12f326712a9202bf18d6`.
+Shared logs: `iter75f_ce_locality/vivado.live.log`, `repair.live.log`,
+`slurm-3955.log`; verdict `repair.exit`, stage `repair.phase`. No dependent
+card job until a closed checkpoint is reviewed and packaged.
+
+### 2026-09-10 14:20Z — **150 MHz TIMING CLOSED** (job 3955, Iter75f): one focused kernel-path-group post-route pass took the residual **−0.001 → 0.000 ns with zero failing endpoints**. All three clocks meet setup and hold, route legal, DRC clean, bus skew met. Checkpoint only — packaging and on-card validation still required. NOT promoted.
+
+**Job.** 3955 `iter75f_ce_locality`, `build`, `acclnode01`, 8 CPU / 192 GB, **01:06:04**, `repair.exit=0`. Followed the user's proposed sequence (2026-09-10) exactly: step 1 was a single focused pass from the preserved Iter75e checkpoint, restricted to the kernel path group, with the baseline kept separately.
+
+```
+phys_opt_design -placement_opt -routing_opt -critical_cell_opt -path_groups <clk_kernel_00_unbuffered_net>
+```
+
+**Options were qualified first** (job 3954, 20 min, `QUALIFY_PASS`) against `help phys_opt_design` — the lesson of job 3706, which was lost to an option Vivado accepts in one pass and rejects in another. Seven of eight present; **`-rewire` does not exist** on `phys_opt_design` in Vivado 2024.2, so that route into step 2 is unavailable. `-critical_pin_opt` and `-slr_crossing_opt` are supported and remain untried.
+
+**Result.**
+
+| stage | kernel setup / hold | DMA | HBM | failing endpoints | route |
+|---|---:|---:|---:|---:|---|
+| input (Iter75e `Explore`) | −0.001 / +0.002 | +0.003 / +0.009 | +0.052 / +0.010 | 2 | legal, 0 errors |
+| **after focused pass** | **0.000 / +0.002** | +0.003 / +0.009 | +0.052 / +0.010 | **0** | legal, 0 errors |
+
+`Post Physical Optimization Timing Summary | WNS=0.000 | TNS=0.000 | WHS=0.002 | THS=0.000`. Verdict file: `route_legal 1`, `clocks_and_route_pass 1`, `reported_failing_endpoints 0`. Route: 1,592,228 fully routed, **0 routing errors**.
+
+**Verification, per the user's step 3 — four of six items done in this job:**
+- **setup and hold on all three clocks**: PASS (table above; every clock non-negative on both).
+- **route legality**: PASS, 0 errors.
+- **DRC**: `drc_errors.txt` is empty (1 byte), `drc.rpt` 32 MB with no ERROR or CRITICAL WARNING lines.
+- **bus skew**: `Slack (MET) : 19.564 ns` against requirement.
+- still outstanding: **packaging** to an XCLBIN, then the **8-token smoke and 64-token correctness/performance** gates on card.
+
+The gate wrote its own honest summary rather than overclaiming: `Three-clock setup/hold,route,DRC PASS; bus-skew review and packaging/on-card still required`.
+
+**Artifacts.** `reports-3955/closed_f150.dcp` — **737,071,308 B, sha `67d56aa7ff2d6ceb…`** — is the timing-closed routed design. `after_focused.dcp` is the same pass's output before final reporting. Both are in `diagnostics/`, which is gitignored, and this checkpoint is the single most valuable artifact the campaign has produced: it is the only design that has ever met a true 6.667 ns constraint through the production implementation chain.
+
+**How the campaign got here — the whole 150 MHz ladder, all on legally routed designs:**
+
+| step | change | kernel WNS | failing |
+|---|---|---:|---:|
+| Iter69 (3371) | Iter67c at a true 6.667 ns | −1.594 | 25,528 |
+| Iter71 V0 (3432) | re-placement, unchanged pblocks | −0.675 | 13,836 |
+| Iter72 r2 (3453) | seven-cluster SLR1 re-pin | −0.592 | 5,568 |
+| Iter75b (3700) | Iter73 source + registered state writer | −0.349 | 1,733 |
+| Iter75d (3751) | "clean control" physical recipe | −0.013 | ~30 |
+| Iter75e (3953) | post-route `Explore` instead of `AggressiveExplore` | −0.001 | 2 |
+| **Iter75f (3955)** | **focused kernel-group placement/routing/critical-cell pass** | **0.000** | **0** |
+
+No false paths, no relaxed clock uncertainty, no multicycle exceptions were used at any step — the constraint is the same 6.667 ns throughout, and the arithmetic is unchanged from the on-card-verified Iter75b source (`gdn_model.cpp` `ca263d7e…`).
+
+**What this is not, stated plainly.** A timing-closed checkpoint is not an image and not a measured result. The evidence label is **routed, timing-closed** — the same label Iter74 W0 earned before its spliced image failed on card for an unrelated reason. Nothing may be quoted as a 150 MHz on-card figure until the smoke and 64-token gates pass. Expected kernel time if the cycle count holds is ~2.456 M / 150 MHz ≈ **16.4 ms**, against 17.23 ms measured at 142.5 MHz; that is a projection, not a measurement.
+
+**Next, in order.** (1) **Package `closed_f150.dcp`** into an XCLBIN. The validated route is `write_bitstream -cell level0_i/ulp` plus `xclbinutil --replace-section BITSTREAM:RAW` with `CLOCK_FREQ_TOPOLOGY` patched to 150 — proven lossless by job 3667 and proven to produce a runnable image by jobs 3663/3703. Metadata must come from an image built from **this same source**, i.e. Iter75b's `d48c6b15…`, not an Iter67c-era donor. (2) On card: 8-token smoke, then the 64-token exact-trajectory and CUDA vector gates, then `kernel_ms`. (3) Only then 512-token drift, WikiText-2, and the paired power protocol. (4) Separately, a production link with `-directive Explore` post-route remains worth running, since it is the only way to learn whether the production flow reaches this state unaided.
+
+**Nothing promoted.** Iter67c remains HEAD and the `run_hw` default; Iter75b at 142.5 MHz remains the fastest *verified* image.
