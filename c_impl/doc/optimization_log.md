@@ -14004,3 +14004,157 @@ Two independent facts now stand: a re-placement of this netlist closes 150 MHz (
 **Assessment and next step.** −0.013 ns on 6.667 ns is 0.2% of the period, and about 30 endpoints. Three cheap, independent levers each plausibly worth more than that, in order: (1) **re-run the identical recipe** — normally futile because the link is deterministic, but post-route phys_opt's net-by-net search is the one stage whose outcome is sensitive to its starting state, and this is the first attempt whose residual is within a single phys_opt increment; (2) **`-directive Explore` or `ExploreWithAggressiveHoldFix`** on the post-route pass instead of `AggressiveExplore`, one variable, same cost; (3) the **`FORCE_MAX_FANOUT` placement hook** on the eight census drivers, which is still unattempted and now has only 30 endpoints to fix rather than 1,733. Do **not** resume checkpoint surgery — three attempts, three infrastructure faults, zero data.
 
 **Nothing promoted.** Iter67c remains HEAD and the `run_hw` default. Iter75b at 142.5 MHz remains the fastest *correct* image: 17.32 ms TPOT, 0.798 J/token gross, 2.02× and 4.03× against the A100 FP32 baseline (median of four paired runs).
+
+#### 2026-09-10 — Codex verified3751 diagnosis and corrections
+
+Read Slurm accounting, immutable snapshot identity, all gate markers, final
+route/timing reports, and the actual implementation log. Job3751 FAILED2:0
+after09:24:23; MaxRSS61263264KiB (about58.4GiB), not OOM. Job3752 CANCELLED
+without execution. Native/XO/state-address gates all PASS. Final exact-clock
+hook correctly rejected kernel setup−0.013ns; no new image/on-card result.
+All1592221 routable nets fully routed, zero routing errors. Kernel hold+.001,
+DMA setup/hold+.003/+.009, HBM+.052/+.010ns. TNS−.393ns and **56** failing
+endpoints, directly from timing_summary.rpt:142, not the approximate30 above.
+
+The claim above that the eight-driver FORCE_MAX_FANOUT hook was unattempted is
+incorrect: impl_1.runme.log:2661–2669 records all eight distinct FDRE selectors
+and ITER75D_CONTROL_FANOUT_DONE targets=8; subsequent messages record physical
+replication. The observed−.349→−.013ns improvement is a physical-recipe result,
+not proof of the contribution of each individual net constraint. Repeating
+identical inputs is not a justified new experiment just because the miss is
+small. W0 also predates the corrected state-writer netlist; its closure is
+not proof that this exact corrected netlist has previously closed150MHz.
+
+Worst20 paths available in the saved final summary (not a full56 census):
+- top FSM bit108 through integer dimension multiply to mul_loc_c60/c72 FIFOs,
+  worst−.013ns; worst path73.31% routed delay;
+- output-norm pipeline enable to HBM0 fifo_rreq SRL CE, worst−.013ns,
+  95.938% routed delay; final fifo_rreq/push fo195,2.489ns;
+- GEMV launch replicas through p_read address/CE and ap_ready feedback,
+  worst−.012ns; a downstream mode-control net has fo1184;
+- state_stream2 dout-valid/full feedback,−.011ns;
+- cluster4 initialization to result-register resets,−.011ns;
+  final ap_loop_init net fo2359,5.615ns net delay. Target final fanout cone,
+  not merely its upstream low-fanout register, if replicating this family.
+
+Post-route AggressiveExplore improved−.067/−3.906 to−.013/−.393ns in1h53m.
+The−.089 figure above precedes physical synthesis inside the router, which
+already improved it to−.067 before the standalone post-route pass. Final
+QoR suggestion table is empty, not evidence recommending extra global
+replication or MERGE. The earlier `Invalid part string Project` message did
+not stop implementation; the terminal failure was the exact-clock timing gate.
+
+Proposed, NOT executed: inventory/preserve the existing routed checkpoint;
+obtain a bounded full56-endpoint report (cap256, no whole-device ROUTE audit).
+If continuing a routed design, use only supported post-route physical
+optimization, with a single additional Explore pass after the existing
+AggressiveExplore and save checkpoints before/after; no unroute, forced
+post-route replication command, frequency change, or relaxed timing exception.
+AMD2024.2 UG835 documents iterative phys_opt_design and its post-route use.
+The log confirms level0_wrapper_routed.dcp was written BEFORE the standalone
+pass; it does not confirm a saved−.013ns checkpoint. Verify checkpoint timing
+before claiming continuation from that result; if necessary replay the normal
+post-route pass from the−.067ns routed checkpoint first.
+
+If that bounded repair stalls, next fresh-link experiment should localize the
+measured cluster4 initialization and HBM0 push cones, after resolving their
+actual final LUT/register drivers, and inspect the other families from all56
+paths. Do not blindly decrease the original eight fanout limits, widen pblocks,
+change BF16 arithmetic, or rerun unchanged. Recheck route legality, bus skew,
+all three clock setup/hold constraints (kernel hold margin only1ps), then
+package and perform on-card validation. No implementation edits, new jobs,
+commit, or production promotion in this diagnosis-only turn.
+
+### 2026-09-10 — Iter75e: bounded post-route Explore continuation of3751
+
+User authorized the proposed repair. Iter75d is recorded as a legal route but
+failed exact150MHz setup (−.013ns,56 endpoints,TNS−.393), no XCLBIN or on-card
+result. No production promotion; kernel and the eight-driver physical recipe
+remain unchanged for this follow-up diagnostic experiment.
+
+Hypothesis: one further supported post-route physical optimization pass may
+recover the remaining13ps without disturbing the legal placement/route. The
+prior standalone AggressiveExplore recovered54ps. This is not evidence that
+another pass will recover the remainder; preserve every intermediate result.
+
+Submit8CPUs/192GiB/12h to build, Vitis2024.2, no accelerator GRES. Exceptional
+node01 pin is required solely because the only3751 routed DCP is still in that
+node's `/tmp/yaoz0b-3751`. First verify staged source/config hashes and XO
+`e80b1f2a1518fa3bafcaae6853e619ae07e19fefb7d9e8454ddb720afd39c7e1`, inventory
+only that impl_1 directory, and copy/hash the exact routed and post-route DCPs
+if present into shared `diagnostics/iter75e_postroute_explore/artifacts/`.
+Never overwrite a previously preserved artifact.
+
+Open the newest of the two explicitly named3751 stages, not an arbitrary DCP.
+Require legal route and original150/250/450MHz periods. Validate input kernel
+WNS against its recorded stage:−.067ns routed, or−.013ns postroute, ±.002ns.
+If only the routed DCP exists, replay one normal AggressiveExplore pass and
+save `restored_aggressive.dcp` before proceeding. If that already passes all
+three clocks and route, skip further optimization. Otherwise run exactly one
+`phys_opt_design -directive Explore`, then save `after_explore.dcp` even on a
+timing regression. No unroute, route_design, forced post-route replication,
+clock changes, reset rewiring, or bulk ROUTE serialization.
+
+At input/baseline/candidate, report three-clock setup/hold, route counts,
+and at most256 failing endpoint paths with locations and detailed delay.
+Explicitly flag a possibly truncated census; only claim all56 when recovered
+baseline produces an uncapped count. Final reports include per-SLR utilization,
+congestion/SLL, bus skew and DRC. Only create `closed_f150.dcp` after legal
+route, zero DRC errors and nonnegative three-clock setup/hold. Bus-skew review,
+normal packaging and on-card testing remain required before any promotion;
+the repair job does not load a card or equate a DCP with a passing XCLBIN.
+
+Shell syntax and Tcl route-parser tests PASS: expected counts, missing-field
+rejection and nonzero-error detection. Freeze scripts in a hashed snapshot;
+record DCP/script hashes, direct shared Vivado/Slurm logs and exit marker.
+ETA4–6h after allocation if the previous AggressiveExplore must be replayed.
+Verdict pending. No source/config changes or commits for this attempt.
+
+Submitted **3953**, running onacclnode01. Script snapshot SHA256
+`fd3999f00e7c8284c387256a0eaca1f8b7a3bebc7874b62508397d80cd6a0f11`;
+repair Tcl `88bf1fac75763712f2ae390348f5438ff8be42be2dfa98cfd4eb217e24fff6ea`.
+Live logs: `iter75e_postroute_explore/vivado.live.log`, `repair.live.log`,
+`slurm-3953.log`; result marker `repair.exit`. No dependent on-card job yet:
+this job produces and validates a DCP, not a packaged XCLBIN.
+
+Launch sentry: original snapshot hashes and XO identity passed; parser test
+passed. Only `level0_wrapper_routed.dcp` exists (722619052bytes); no saved
+postroute-physopt checkpoint. Preserved in shared artifacts with SHA256
+`7c3cb477375bef3089d1747658c741e48bda0aa806cd3da103d6820944154404`.
+Vivado entered open_checkpoint without a startup error. Baseline timing still
+must be verified after opening; the job will replay AggressiveExplore before
+the one new Explore pass if the expected routed-stage timing is confirmed.
+
+### 2026-09-10 15:54Z — Iter75e (job 3953): the **`Explore` post-route directive beats `AggressiveExplore` by 13×** on this design — kernel WNS **−0.013 → −0.001 ns**, failing endpoints **56 → 2**. One picosecond short of a closed 150 MHz. Both remaining endpoints are the *same net*. MEASUREMENT ONLY, no design change.
+
+**Job.** 3953 `iter75e_postroute_explore`, `build`, `acclnode01`, 8 CPU / 192 GB, **04:18:23**, `REPAIR_NOT_CLOSED` (correctly — the bar is non-negative). One `open_checkpoint` of build 3751's routed design, then two post-route passes compared against that single starting state.
+
+**The control validates the harness.** Restoring `AggressiveExplore` from the input checkpoint reproduced build 3751's production result **exactly** — `WNS=-0.013 | TNS=-0.393 | WHS=0.001`. So the two arms differ only in the directive, and the improvement is attributable to it and to nothing else.
+
+| stage | kernel setup | kernel hold | DMA | HBM | failing endpoints | route |
+|---|---:|---:|---:|---:|---:|---|
+| input (3751 routed) | −0.067 | +0.001 | +0.003 | +0.052 | 139 | legal, 0 errors |
+| `AggressiveExplore` (control = 3751 final) | −0.013 | +0.001 | +0.003 | +0.052 | 56 | legal, 0 errors |
+| **`Explore`** | **−0.001** | **+0.002** | +0.003 | +0.052 | **2** | legal, 0 errors |
+
+TNS went −0.393 → **−0.001**. Hold improved too (+0.001 → +0.002). `drc_errors=0`. Checkpoints kept: `after_explore.dcp`, `restored_aggressive.dcp`.
+
+**The residual is now a single net, and it is fully characterised.** Both failing endpoints share one source and differ only in the destination bit:
+
+| | |
+|---|---|
+| source | `gdn_forward_1/inst/grp_gdn_gemv_fu_1054_ap_start_reg_reg_replica_1/C` at `SLICE_X122Y326` (**SLR1**) |
+| destinations | `grp_gdn_gemv_fu_1054/p_read25_c_U/addr_reg[1]/CE` and `addr_reg[2]/CE` at `SLICE_X136Y500` (**SLR2**) |
+| delay | 6.227 / 6.228 ns — **logic 0.542 ns (8.7%), route 5.685 ns (91.3%)** |
+| depth | 6 logic levels (LUT2×2, LUT4×3, LUT5) |
+| span | SLR1 → SLR2, 174 slice rows |
+
+So it is the **`gdn_gemv` `ap_start` enable replica** driving a `p_read` address register's clock enable across an SLR boundary — a control-distribution path, the same class the locality census (job 3705) named as the largest slice, and one already on the list of eight `FORCE_MAX_FANOUT` candidates.
+
+**Two conclusions worth carrying forward.** (1) **`Explore` should replace `AggressiveExplore` in the post-route step of the production recipe** — 13× better WNS and 28× fewer failing endpoints from the identical starting design, at comparable cost. This is a one-line change to `hw_iter69_kernel_clock_f150.cfg`'s `POST_ROUTE_PHYS_OPT_DESIGN.ARGS.DIRECTIVE`. (2) The Iter74 W1 worry — that a small residual might be phys-opt-immune — is now conclusively dead: phys_opt moved this design 0.066 ns across two directives.
+
+**What this does *not* give us: an image.** The result lives on a checkpoint; bitstream generation never ran. A production link with `Explore` substituted is the step that would produce one, and per the deterministic-link finding it is also the only way to know whether the production flow reproduces this.
+
+**Next steps, in the order the evidence supports.** (1) **Production link with `-directive Explore`** post-route — one variable against build 3751, ~9 h, and it is the only path to a testable image. (2) **In the same build, add `FORCE_MAX_FANOUT` on `grp_gdn_gemv_fu_1054_ap_start_reg`** in the `PLACE_DESIGN.PRE` hook: the surviving net is a fanout/locality problem at 91% route across two SLRs, another replica placed in SLR2 removes the crossing, and this is the long-recommended placement-hook lever now aimed at *one* named net instead of 1,733 endpoints. (3) Only if both fail, revisit the source.
+
+**Nothing promoted.** Iter67c remains HEAD and the `run_hw` default; Iter75b at 142.5 MHz remains the fastest *correct* image (17.32 ms TPOT, 0.798 J/token, 2.02×/4.03× vs A100 FP32).
