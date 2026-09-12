@@ -2,9 +2,11 @@
 
 Loads only when working under `c_impl/`. Project-wide guidance (the real-data principle, build
 commands, the iteration workflow, commit discipline, current status) stays in the root `CLAUDE.md`.
-`doc/architecture.md` is the authoritative spec (currently **Iter67c**: all-BF16 weights and state, a
-native `ap_float<16,8>` product, free-running cluster pipelines, on-chip strict argmax, five-phase II=1
-recurrent read; 24.208 ms/token production TPOT / 24.099 ms kernel on card at 100 MHz). `README.md`
+`doc/architecture.md` is the authoritative spec (currently the **150 MHz production image of the Iter76
+flow**: the Iter67c datapath — all-BF16 weights and state, a native `ap_float<16,8>` product,
+free-running cluster pipelines, on-chip strict argmax, five-phase II=1 recurrent read — plus the Iter73b2/75b
+state-writer and cluster-emit changes, timing-closed at 150 MHz; 16.255 ms/token production TPOT /
+16.131 ms kernel on card. Iter67c, 24.208 / 24.099 ms at 100 MHz, is the predecessor). `README.md`
 in this directory is current — it was rewritten for the decode-only design; the earlier note calling it
 stale was wrong.
 
@@ -57,7 +59,7 @@ stale was wrong.
   emitting the same JSON schema as `gdn_eval`. **`kSyncChunk` is 8 MiB**: a 16 MiB `bo.sync()` at a
   nonzero workspace offset returns `EINVAL` on this XRT — a host-only bug that looked like a kernel
   failure.
-- **`hw_iter*.cfg`, `apply_iter*.tcl`, `check_*.tcl`** (there is no `hw.cfg`; the link template is `HW_CFG_TEMPLATE` in the Makefile, default `hw_iter66e_frp_unpair_f100.cfg`. Untracked `build_iter*.sh`/`hw_iter*.cfg` in the tree are in-flight or rejected experiments — check the log before reusing one)
+- **`hw_iter*.cfg`, `apply_iter*.tcl`, `check_*.tcl`** (there is no `hw.cfg`; the link template is `HW_CFG_TEMPLATE` in the Makefile, default `hw_f150.cfg`; `hw_iter66e_frp_unpair_f100.cfg` is the 100 MHz predecessor. Untracked `build_iter*.sh`/`hw_iter*.cfg` in the tree are in-flight or rejected experiments — check the log before reusing one)
   — the per-iteration build bundle; see the root `CLAUDE.md` for how they fit together.
   `hls_gdn_forward.tcl` is the HLS pre-TCL shared by `test.tcl` and `v++ -c`.
   `pblock_pe_split.tcl` is the disabled prefill floorplan, kept for reference.

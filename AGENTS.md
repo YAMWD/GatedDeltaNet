@@ -10,7 +10,7 @@
 - `make -C c_impl` builds the native `gdn_eval` testbench with C++14. It requires Vitis HLS 2022.1 headers (`XILINX_HLS_INC`).
 - `bash scripts/decode_correctness_check.sh --fast` runs the short exact-match decode gate; omit `--fast` for the full 32-step check.
 - `cd c_impl && vitis_hls -f test.tcl` runs decode-kernel csim/csynth/cosim.
-- `make -C c_impl run_hw` builds and runs the U55C hardware flow. Bitstream linking can take several hours and requires Vitis/XRT plus a board.
+- `make -C c_impl run_hw` submits the U55C hardware flow as two chained Slurm jobs (build, then card test); it never runs Vitis on the login node. A 150 MHz link takes about 12.5 h; see `c_impl/doc/reproduce_f150.md`.
 - For long-running builds, detach the build with a persistent PID, log,
   exit-code marker, and artifact paths so it survives chat interruption. If a
   build or validation gate is expected to need more than 10 minutes to finish,
