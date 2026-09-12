@@ -29,10 +29,24 @@ set -euo pipefail
 C_IMPL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$C_IMPL"
 
-TAG="${1:-hw_$(date +%Y%m%d_%H%M%S)}"
+if [ "$(hostname -s)" != acclhead1 ]; then
+    echo "FATAL: submit this command on acclhead1 (the accl Slurm controller)." >&2
+    exit 2
+fi
+
+TAG="${1:-hw_$(date +%Y%m%d_%H%M%S)_$$}"
+[[ "$TAG" =~ ^[A-Za-z0-9_-]+$ ]] || { echo 'FATAL: invalid job tag'; exit 2; }
 JOBS="${JOBS:-48}"
 HLS_FREQ="${HLS_FREQ:-150}"
-LINK_FREQ="${LINK_FREQ:-100}"
+LINK_FREQ="${LINK_FREQ:-150}"
+HW_CFG_TEMPLATE="${HW_CFG_TEMPLATE:-hw_f150.cfg}"
+STATE_ADDRESS_GATE="${STATE_ADDRESS_GATE:-1}"
+REQUIRE_EXACT_CLOCK="${REQUIRE_EXACT_CLOCK:-1}"
+if [ "$HW_CFG_TEMPLATE" = hw_f150.cfg ] && [ "$LINK_FREQ" != 150 ]; then
+    echo 'FATAL: hw_f150.cfg contains exact 150 MHz constraints; select a matching config for another clock.' >&2
+    exit 2
+fi
+export HW_CFG_TEMPLATE STATE_ADDRESS_GATE REQUIRE_EXACT_CLOCK
 VIVADO_SYNTH_JOBS="${VIVADO_SYNTH_JOBS:-16}"
 VIVADO_IMPL_JOBS="${VIVADO_IMPL_JOBS:-8}"
 BUILD_CONSTRAINT="${BUILD_CONSTRAINT:-vivado2024.2}"
@@ -43,10 +57,19 @@ BUILD_CONSTRAINT="${BUILD_CONSTRAINT:-vivado2024.2}"
 # cluster change.
 BUILD_EXCLUDE="${BUILD_EXCLUDE-acclnode04,acclnode05}"
 BUILD_NODE="${BUILD_NODE:-}"
+# BUILD_EXCLUSIVE=user passes --exclusive=user: no other user's jobs on the build
+# node for the whole link. Iter76: four identical-input links, the three with a
+# quiet node reproduced each other checksum for checksum (3751, 3963, 3987) and
+# closed 150 MHz; the one sharing its node with foreign jobs (3968) diverged
+# inside the placer's physical synthesis and missed by 0.045 ns. Full
+# --exclusive is not possible under the build QoS (it would allocate all 128 CPUs
+# against the 48-CPU per-job cap); =user was accepted at 48.
+BUILD_EXCLUSIVE="${BUILD_EXCLUSIVE:-}"
 BUILD_MEM="${BUILD_MEM:-192G}"
 BUILD_TIME="${BUILD_TIME:-2-00:00:00}"
 ONCARD_TIME="${ONCARD_TIME:-4:00:00}"
 WEIGHTS="${WEIGHTS:-artifacts/gdn-1.3b-bf16w.gdnw}"
+DECODE_FIXTURE="${DECODE_FIXTURE:-fixtures_decode/decode.gdnreq}"
 DECODE_STATE="${DECODE_STATE:-fixtures_decode/decode_ex0_native_bf16_product.gdnstate}"
 DECODE_GOLDEN="${DECODE_GOLDEN:-results_decode_golden/decode_native_bf16_product.decode.json}"
 # Diagnostic only, off by default: hardware/native bit-exactness is not
@@ -54,11 +77,12 @@ DECODE_GOLDEN="${DECODE_GOLDEN:-results_decode_golden/decode_native_bf16_product
 # re-enable the comparison when localizing an arithmetic change.
 LOGITS_REFERENCE="${LOGITS_REFERENCE:-}"
 GPU_LOGITS_REFERENCE="${GPU_LOGITS_REFERENCE:-artifacts/decode_native_bf16_product_64.gdnlog}"
-export VIVADO_SYNTH_JOBS VIVADO_IMPL_JOBS WEIGHTS DECODE_STATE DECODE_GOLDEN
+export VIVADO_SYNTH_JOBS VIVADO_IMPL_JOBS WEIGHTS DECODE_STATE DECODE_GOLDEN DECODE_FIXTURE
 export LOGITS_REFERENCE GPU_LOGITS_REFERENCE
 
 DIAG="diagnostics/${TAG}"
-mkdir -p "$DIAG"
+mkdir -p diagnostics
+mkdir "$DIAG"
 printf '%s\n' "PENDING: Slurm build has not started; live tool output will replace this line after allocation." > "${DIAG}/build.live.log"
 
 echo "tag        : ${TAG}"
@@ -67,6 +91,7 @@ echo "vivado     : SYNTH_JOBS=${VIVADO_SYNTH_JOBS} IMPL_JOBS=${VIVADO_IMPL_JOBS}
 echo "constraint : ${BUILD_CONSTRAINT:-<none>}"
 echo "exclude    : ${BUILD_EXCLUDE:-<none>}"
 echo "build node : ${BUILD_NODE:-scheduler-selected}"
+echo "exclusive  : ${BUILD_EXCLUSIVE:-<shared node>}"
 echo "weights    : ${WEIGHTS}"
 echo "state      : ${DECODE_STATE}"
 echo "golden     : ${DECODE_GOLDEN}"
@@ -80,7 +105,7 @@ if [ "${JOBS}" -gt 48 ]; then
 fi
 # LOGITS_REFERENCE is intentionally excluded from the required set: it is a
 # diagnostic and defaults to empty. It is still checked when explicitly set.
-for required in "${WEIGHTS}" "${DECODE_STATE}" "${DECODE_GOLDEN}" \
+for required in "${WEIGHTS}" "${DECODE_STATE}" "${DECODE_GOLDEN}" "${DECODE_FIXTURE}" \
                 "${GPU_LOGITS_REFERENCE}"; do
     if [ ! -s "${required}" ]; then
         echo "FATAL: required all-BF16 validation artifact missing: ${required}" >&2
@@ -116,7 +141,10 @@ snapshot_files=(
     hw_f150_physical_islands.cfg apply_f150_physical_islands.tcl
     apply_iter54_dma_timing.tcl apply_iter35_dma_w15_fifoaddr_fanout.tcl
     apply_iter23_dma_fanout.tcl check_f150_physical_islands.tcl
-    report_final_qor.tcl check_native_bf16_xo.py
+    report_final_qor.tcl check_native_bf16_xo.py reconcile_exact_clock.py
+    hw_f150.cfg apply_iter69_kernel_clock_f150.tcl
+    apply_iter75d_control_fanout.tcl check_iter75d_final_timing.tcl
+    finish_f150_timing.tcl run_hw_sbatch.sh slurm/hw_build.slurm slurm/hw_oncard.slurm
 )
 if [ -n "${REUSE_XO:-}" ]; then
     test -s "$REUSE_XO" && test -d "${REUSE_XO_REFERENCE:-}" || {
@@ -135,7 +163,8 @@ if [ -n "${EXTRA_SNAPSHOT_FILES:-}" ]; then
         snapshot_files+=("${extra}")
     done
 fi
-echo "cfg tmpl   : ${HW_CFG_TEMPLATE:-hw_iter66e_frp_unpair_f100.cfg (default)}"
+snapshot_files+=("${HW_CFG_TEMPLATE}")
+echo "cfg tmpl   : ${HW_CFG_TEMPLATE}"
 for snapshot_file in "${snapshot_files[@]}"; do
     test -s "${snapshot_file}" || {
         echo "FATAL: source/config file missing: ${snapshot_file}" >&2
@@ -146,6 +175,10 @@ SNAPSHOT_PATH="${C_IMPL}/${DIAG}/source_snapshot.tar"
 tar -cf "${SNAPSHOT_PATH}" "${snapshot_files[@]}"
 sha256sum "${snapshot_files[@]}" > "${DIAG}/source_hashes.txt"
 sha256sum "${SNAPSHOT_PATH}" > "${DIAG}/source_snapshot.sha256"
+# Freeze job scripts as well: sbatch captures each script when submitted.
+cp slurm/hw_build.slurm slurm/hw_oncard.slurm "$DIAG/"
+cp ../scripts/check_gdn_c_parity.py "$DIAG/check_gdn_c_parity.py"
+sha256sum "$DIAG/check_gdn_c_parity.py" >> "$DIAG/source_hashes.txt"
 export SNAPSHOT_PATH
 
 build_placement_args=()
@@ -158,6 +191,9 @@ fi
 if [ -n "${BUILD_NODE}" ]; then
     build_placement_args+=(--nodelist="${BUILD_NODE}")
 fi
+if [ -n "${BUILD_EXCLUSIVE}" ]; then
+    build_placement_args+=(--exclusive="${BUILD_EXCLUSIVE}")
+fi
 
 build_id="$(/opt/slurm/current/bin/sbatch --parsable \
     --job-name="${TAG}_build" \
@@ -168,7 +204,8 @@ build_id="$(/opt/slurm/current/bin/sbatch --parsable \
     --time="$BUILD_TIME" \
     --output="${C_IMPL}/${DIAG}/build.slurm-%j.log" \
     --export=ALL,TAG="$TAG",JOBS="$JOBS",HLS_FREQ="$HLS_FREQ",LINK_FREQ="$LINK_FREQ",SUBMIT_C_IMPL="$C_IMPL",SNAPSHOT_PATH="$SNAPSHOT_PATH" \
-    slurm/hw_build.slurm)"
+    "$DIAG/hw_build.slurm")"
+printf '%s\n' "$build_id" > "$DIAG/build.job_id"
 echo
 echo "build  job ${build_id}  -> ${DIAG}/build.slurm-${build_id}.log"
 echo "detail log              -> ${DIAG}/build.live.log"
@@ -184,7 +221,8 @@ else
         --kill-on-invalid-dep=yes \
         --output="${C_IMPL}/${DIAG}/oncard.slurm-%j.log" \
         --export=ALL,TAG="$TAG",JOBS="$JOBS",HLS_FREQ="$HLS_FREQ",LINK_FREQ="$LINK_FREQ" \
-        slurm/hw_oncard.slurm)"
+        "$DIAG/hw_oncard.slurm")"
+    printf '%s\n' "$oncard_id" > "$DIAG/oncard.job_id"
     echo "oncard job ${oncard_id}  -> ${DIAG}/oncard.slurm-${oncard_id}.log   (afterok:${build_id})"
 fi
 

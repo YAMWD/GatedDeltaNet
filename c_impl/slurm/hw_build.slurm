@@ -15,7 +15,7 @@ set -uo pipefail
 
 JOBS="${JOBS:-48}"
 HLS_FREQ="${HLS_FREQ:-150}"
-LINK_FREQ="${LINK_FREQ:-100}"
+LINK_FREQ="${LINK_FREQ:-150}"
 VIVADO_SYNTH_JOBS="${VIVADO_SYNTH_JOBS:-16}"
 VIVADO_IMPL_JOBS="${VIVADO_IMPL_JOBS:-8}"
 TAG="${TAG:?TAG must be set by the submitter}"
@@ -55,6 +55,7 @@ if [ "$available_kb" -lt 62914560 ]; then
 fi
 STAGE_C_IMPL="${STAGE_ROOT}/c_impl"
 SHARED_DIAG="${SUBMIT_C_IMPL}/diagnostics/${TAG}"
+export GDN_SHARED_LOG_DIR="$SHARED_DIAG"
 mkdir -p "${STAGE_C_IMPL}" "${SHARED_DIAG}"
 tar -xf "${SNAPSHOT_PATH}" -C "${STAGE_C_IMPL}"
 
@@ -75,7 +76,7 @@ BUILD_DIR="$(make -s -C "${STAGE_C_IMPL}" \
     --eval='__p:;@echo $(BUILD_DIR)' __p JOBS="${JOBS}" \
     HLS_FREQ="${HLS_FREQ}" LINK_FREQ="${LINK_FREQ}" 2>/dev/null | tail -1)"
 STAGE_BUILD="${STAGE_C_IMPL}/${BUILD_DIR}"
-SHARED_BUILD="${SUBMIT_C_IMPL}/${BUILD_DIR}"
+SHARED_BUILD="${SHARED_DIAG}/artifacts/${BUILD_DIR}"
 echo "  build dir  : ${BUILD_DIR}"
 printf '%s\n' "${BUILD_DIR}" > "${SHARED_DIAG}/build_dir.path"
 
@@ -88,15 +89,17 @@ if [ "${STATE_ADDRESS_GATE:-0}" = 1 ]; then
         set -e
         make -C "${STAGE_C_IMPL}" gdn_eval all_bf16_layout_test
         "${STAGE_C_IMPL}/all_bf16_layout_test"
+        # Dataset overrides can be either repository-relative or absolute.
+        cd "$SUBMIT_C_IMPL"
         for steps in 6 32; do
             "${STAGE_C_IMPL}/gdn_eval" \
-                "${SUBMIT_C_IMPL}/${WEIGHTS}" \
-                "${SUBMIT_C_IMPL}/fixtures_decode/decode.gdnreq" \
+                "${WEIGHTS}" \
+                "${DECODE_FIXTURE:-fixtures_decode/decode.gdnreq}" \
                 "${SHARED_DIAG}/native${steps}.json" --decode \
-                --decode-from-state "${SUBMIT_C_IMPL}/${DECODE_STATE}" \
+                --decode-from-state "${DECODE_STATE}" \
                 --decode-len "${steps}"
-            python3 "${SUBMIT_C_IMPL}/../scripts/check_gdn_c_parity.py" \
-                --decode --golden "${SUBMIT_C_IMPL}/${DECODE_GOLDEN}" \
+            python3 "${SHARED_DIAG}/check_gdn_c_parity.py" \
+                --decode --golden "${DECODE_GOLDEN}" \
                 --c "${SHARED_DIAG}/native${steps}.json"
         done
     ) 2>&1 | tee "${SHARED_DIAG}/native_gate.live.log"
@@ -177,12 +180,8 @@ elif [ "${gate_rc}" -ne 0 ]; then
         | tee -a "${SHARED_DIAG}/build.live.log"
 else
     printf '%s\n' "vivado_link" > "${SHARED_DIAG}/build.phase"
-    # Follow the tool's own live log through a symlink, without a polling
-    # supervisor. The fresh project/run directory contains no cached design.
-    live_impl="${STAGE_BUILD}/_x_temp/link/vivado/vpl/prj/prj.runs/impl_1"
-    mkdir -p "$live_impl"
-    touch "${SHARED_DIAG}/impl_1.live.log"
-    ln -s "${SHARED_DIAG}/impl_1.live.log" "$live_impl/runme.log"
+    # v++ stdout goes directly to NFS. The finishing Tcl independently writes
+    # physical_finish.live.log there; Vitis removes pre-created runme symlinks.
     echo "=== STEP 3: full Vivado implementation / XCLBIN ===" \
         | tee -a "${SHARED_DIAG}/build.live.log"
     set +e
@@ -214,6 +213,10 @@ if [ -d "${STAGE_BUILD}" ]; then
     if [ -n "${impl_log}" ]; then
         cp -f "${impl_log}" "${SHARED_DIAG}/impl_1.runme.log"
     fi
+    while IFS= read -r -d '' checkpoint; do
+        mkdir -p "${SHARED_DIAG}/checkpoints"
+        cp "$checkpoint" "${SHARED_DIAG}/checkpoints/"
+    done < <(find "$STAGE_BUILD" -type f -name 'gdn_f150_*.dcp' -print0)
     final_qor="$(find "${STAGE_BUILD}" -type d -name gdn_final_qor \
         -print -quit 2>/dev/null)"
     if [ -n "${final_qor}" ]; then
@@ -254,20 +257,19 @@ if [ "${rc}" -eq 0 ]; then
     test -x "${STAGE_C_IMPL}/host.exe" || rc=3
 fi
 if [ "$rc" -eq 0 ] && [ "${REQUIRE_EXACT_CLOCK:-0}" = 1 ]; then
+    # vpl's AUTO-FREQ-SCALING reads the timing report it wrote BEFORE the
+    # post-route TCL.POST hook closed the design, so a closed image can still
+    # carry a scaled DATA_CLK (build 3987: design at 6.667 ns, metadata 149).
+    # Reconcile the metadata with the hook's own gate evidence; the tool patches
+    # only when every clock is non-negative at the requested period, never
+    # touches the bitstream, and fails closed otherwise.
     set +e
-    /opt/xilinx/xrt/bin/xclbinutil --input "${STAGE_BUILD}/gdn_forward.xclbin" \
-        --dump-section "CLOCK_FREQ_TOPOLOGY:JSON:${SHARED_DIAG}/clock_freq_topology.json" --force
-    clock_rc=$?
-    if [ "$clock_rc" -eq 0 ]; then
-        python3 - "${SHARED_DIAG}/clock_freq_topology.json" "$LINK_FREQ" <<'PY'
-import json, sys
-data = json.load(open(sys.argv[1]))['clock_freq_topology']['m_clock_freq']
-clocks = [float(c['m_freq_Mhz']) for c in data if c['m_type'] == 'DATA']
-assert clocks == [float(sys.argv[2])], f"EXACT_CLOCK_FAIL: DATA={clocks}, requested={sys.argv[2]}"
-print('EXACT_CLOCK_PASS', clocks)
-PY
-        clock_rc=$?
-    fi
+    gate_tsv="$(find "${STAGE_BUILD}" -path '*/gdn_final_qor/exact_clock_gate.tsv' \
+        -print -quit 2>/dev/null)"
+    python3 "${STAGE_C_IMPL}/reconcile_exact_clock.py" \
+        "${STAGE_BUILD}/gdn_forward.xclbin" "${gate_tsv:-/nonexistent}" "$LINK_FREQ" \
+        "${SHARED_DIAG}" 2>&1 | tee "${SHARED_DIAG}/exact_clock.log"
+    clock_rc="${PIPESTATUS[0]}"
     set -e
     printf '%s\n' "$clock_rc" > "${SHARED_DIAG}/exact_clock.exit"
     if [ "$clock_rc" -ne 0 ]; then rc=$clock_rc; fi
@@ -281,9 +283,12 @@ if [ "${rc}" -eq 0 ]; then
             cp -f "${STAGE_BUILD}/${manifest}" "${SHARED_BUILD}/${manifest}"
         fi
     done
-    cp -f "${STAGE_C_IMPL}/host.exe" "${SUBMIT_C_IMPL}/host.exe"
+    cp -f "${STAGE_C_IMPL}/host.exe" "${SHARED_BUILD}/host.exe"
+    cp "${STAGE_C_IMPL}/Makefile" "${SHARED_DIAG}/reproduction.Makefile"
+    printf '%s\n' "$SHARED_BUILD/gdn_forward.xclbin" > "$SHARED_DIAG/xclbin.path"
+    printf '%s\n' "$SHARED_BUILD/host.exe" > "$SHARED_DIAG/host.path"
     sha256sum "${SHARED_BUILD}/gdn_forward.xclbin" \
-              "${SUBMIT_C_IMPL}/host.exe" > \
+              "${SHARED_BUILD}/host.exe" > \
               "${SHARED_DIAG}/copied_artifacts.sha256"
     ls -lh "${SHARED_BUILD}/gdn_forward.xclbin" | sed 's/^/  image: /'
 fi

@@ -25,7 +25,7 @@ set -o pipefail
 
 JOBS="${JOBS:-48}"
 HLS_FREQ="${HLS_FREQ:-150}"
-LINK_FREQ="${LINK_FREQ:-100}"
+LINK_FREQ="${LINK_FREQ:-150}"
 TAG="${TAG:?TAG must be set by the submitter}"
 
 echo "=== gdn on-card validation ==="
@@ -62,6 +62,7 @@ if [ "${#u55c_bdfs[@]}" -ne 1 ]; then
     exit 2
 fi
 HW_DEVICE="${u55c_bdfs[0]}"
+xbutil examine --device "$HW_DEVICE" || exit 2
 
 # JOBS only names the build directory here -- nothing is compiled in this job,
 # which has 8 cores. It MUST match the build job's JOBS or make would look in
@@ -69,10 +70,15 @@ HW_DEVICE="${u55c_bdfs[0]}"
 BUILD_DIR="$(cat "diagnostics/${TAG}/build_dir.path" 2>/dev/null \
              || make -s --eval='__p:;@echo $(BUILD_DIR)' __p JOBS="$JOBS" \
                   HLS_FREQ="$HLS_FREQ" LINK_FREQ="$LINK_FREQ" 2>/dev/null | tail -1)"
-XCLBIN="${BUILD_DIR}/gdn_forward.xclbin"
+DIAG="$(pwd)/diagnostics/${TAG}"
+XCLBIN="$(cat "$DIAG/xclbin.path")" || exit 2
+HOST_BIN="$(cat "$DIAG/host.path")" || exit 2
+FROZEN_MAKEFILE="$DIAG/reproduction.Makefile"
 echo "  image   : ${XCLBIN}"
 test -s "$XCLBIN" || { echo "FATAL: no image at ${XCLBIN}" >&2; exit 2; }
-test -x ./host.exe || { echo "FATAL: host.exe missing" >&2; exit 2; }
+test -x "$HOST_BIN" || { echo "FATAL: matching host executable missing" >&2; exit 2; }
+test -s "$FROZEN_MAKEFILE" || exit 2
+sha256sum -c "$DIAG/copied_artifacts.sha256" || exit 2
 
 # Data knobs are forwarded explicitly rather than left to the Makefile default.
 # They matter: a kernel built for packed BF16 weights rejects the FP32 blob
@@ -92,9 +98,11 @@ for knob in WEIGHTS DECODE_STATE DECODE_FIXTURE DECODE_GOLDEN \
     fi
 done
 
-# -o marks the image and host as up to date, so make runs only the gates and
-# can never start a 32-core link inside this 8-core, 32 GB allocation.
-make -o "$XCLBIN" -o host.exe run_hw "${mk_args[@]}"
+# This mode has no compile/link prerequisites. Use the submission's Makefile,
+# host, image and checker even if the shared working tree has since changed.
+make -f "$FROZEN_MAKEFILE" run_hw GDN_ONCARD=1 \
+    XCLBIN="$XCLBIN" HOST_BIN="$HOST_BIN" ONCARD_DIR="$DIAG/on_card" \
+    PARITY_CHECKER="$DIAG/check_gdn_c_parity.py" "${mk_args[@]}"
 rc=$?
 
 echo "EXIT_CODE=${rc} end=$(date --iso-8601=seconds)"
