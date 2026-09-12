@@ -61,6 +61,20 @@ that turns a routed checkpoint into a testable image in ~34 minutes. Both change
 the cost of attempting the stages below, which is why they are recorded here and
 not only in the log.
 
+**Iter76 (2026-09-10 to 2026-09-12) closed no stage in this roadmap either.**
+It bought reproducibility, not cycles: the consolidated `make run_hw` recipe now
+reproduces the timing-closed 150 MHz design from source (builds 3987 and 4022,
+checksum-identical to build 3751 through routing and to the job-3955 closure)
+and validates it on card at 16.131 ms kernel. The cycle reference above stays
+Iter67c's 2.4099M because the entire gain is clock (2.4197M cycles at 150 MHz).
+Two method contributions belong here: the in-link finishing hook with a
+fail-closed exact-clock gate and metadata reconciliation, which turns a closed
+placement into a shippable image with no manual step; and the observation that
+one of four identical-input links diverged inside the placer's physical
+synthesis while other users' jobs shared its node. Every remaining stage should
+therefore be built with `BUILD_EXCLUSIVE=user` and judged against Vivado's
+phase checksums, not only against WNS.
+
 ## 0. The one thing that changed how levers must be costed
 
 **At the retained 100 MHz, the design is no longer HBM-bandwidth-bound, so a
