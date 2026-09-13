@@ -1,21 +1,36 @@
 # GatedDeltaNet Decode Accelerator Architecture
 
-**Status:** Current production architecture (**Iter67c**), routed,
-timing-closed, and validated on an Alveo U55C on 2026-09-01. It is
-HLS-synthesized at 150 MHz under **Vitis 2024.2** and links at the requested
-**100 MHz** without automatic clock scaling. The 64-token run measures
-**24.208 ms/token production TPOT / 24.099 ms kernel = 2.4099M cycles** by
-median over 63 generated tokens, with an exact token trajectory and a clean
-scale-aware quality gate over 2,016,000 logits.
+**Status:** Current production architecture: the **150 MHz image reproduced
+from source by the Iter76 `make run_hw` flow**, routed, timing-closed at the
+true 6.667 ns constraint, and validated on an Alveo U55C (2026-09-10 to
+2026-09-12). It is HLS-synthesized and linked at **150 MHz** under **Vitis
+2024.2** with no false paths, relaxed clock uncertainty, multicycle exceptions
+or automatic clock scaling. The 64-token run measures **16.255 ms/token
+production TPOT / 16.131 ms kernel = 2.4197M cycles** by median over 63
+generated tokens, with an exact token trajectory and a clean scale-aware
+quality gate over 2,016,000 logits; paired power is 48.0 W, **0.779 J/token**
+gross and 0.357 J idle-subtracted.
 
-Iter66e was the first all-BF16 image to route. Iter67c retains that datapath,
-fuses strict argmax into natural-order logit emission, changes the recurrent
-read schedule from four to five phases to reach II=1, and banks the convolution
-window to match its 16-lane access. Evidence: build job 2993 (`harrier`,
-12:08:59), on-card job 2994, and production-TPOT audit job 3101. XCLBIN SHA-256
-`fb4fc63f76bc1ee485665f21102596270930d6d39643b8eb5ae7d4f899d289ab` from
-`gdn_model.cpp`
-`2bc240e6a5cf24b23bd83aa3ad518552bd475e72c8ac5c54a6cdf8bc991ad020`.
+The datapath is Iter67c's — Iter66e's all-BF16 arithmetic plus fused strict
+argmax, the five-phase II=1 recurrent read and the 16-bank convolution window —
+with two source changes from the Iter73/75 campaign: the recurrent islands'
+state write-back goes through URAM FIFOs to a registered, free-placed writer
+(Iter73a, with the Iter75b registered beat index that survives Vivado's kernel
+synthesis), and cluster result emission is straight-line (Iter73b2). Everything
+above 100 MHz is physical: the Iter69 true-150 MHz clock override, Iter75d's
+eight pre-place control-fanout repairs, and the in-link closure sequence
+AggressiveExplore → Explore → focused kernel-path-group pass, measured at
+−0.013 → −0.001 → 0.000 ns on every build of this netlist that reached it.
+Evidence: build 4022 and on-card job 4023 (the committed flow, 2026-09-12;
+build 3987 / job 4021 reproduced it checksum for checksum), closure jobs
+3953/3955 and image 3956 with on-card job 3957 and qualification jobs
+3958–3960 (power, 512-token drift, WikiText-2). Production XCLBIN SHA-256
+`b2a0a478e1e274c9905d4d1c95e37f227a83d35f04194a0194d22fa3bfd1f9a4` (build 4022) from `gdn_model.cpp`
+`ca263d7e0f6f94c5f34765ef70edf6512553b7aaac874b63a93a91856484360b`; the qualification image
+`82aa21e8b73935455ef59082294ecdc97e2d2d63830b3daf4e46b562f7971713` (job 3956) is a
+checksum-identical implementation of the same design. Iter67c
+(`fb4fc63f…`, 24.208 ms/token at 100 MHz) is the recorded predecessor in
+§ *Correctness and On-Card Performance*.
 
 **Read § *Arithmetic contract and what "correct" means* before treating any
 hardware/native mismatch as a defect.** With BF16 the end-to-end bit-exact
@@ -60,12 +75,14 @@ token per `gdn_forward` invocation. The successful design combines:
 - on-chip LM-head argmax, plus (Iter61) the full GDN_VOCAB logit vector
   streamed out to the workspace for benchmark scoring.
 
-The architecture routes all 1,749,053 routable nets with zero routing errors
-and preserves the exact 64-token trajectory. Post-route physical optimization
-closes the 100 MHz kernel clock at **+0.153 ns WNS / +0.007 ns WHS** and the
-fixed 250 MHz DMA clock at **+0.003 ns WNS / +0.009 ns WHS**. Iter67c uses
-5.95% fewer measured kernel cycles than Iter66e and is 5.04x faster than the
-121.4 ms eight-port baseline by kernel median.
+The architecture routes all 1,592,229 routable nets with zero routing errors
+and preserves the exact 64-token trajectory. The in-link closure sequence
+closes the 150 MHz kernel clock at **0.000 ns WNS / +0.002 ns WHS**, the fixed
+250 MHz DMA clock at **+0.003 / +0.009 ns** and the 450 MHz HBM clock at
+**+0.052 / +0.010 ns**, with 0 failing of 2,039,265 setup and 2,036,610 hold
+endpoints. The production image spends 0.4% more kernel cycles than Iter67c
+and is 1.494x faster by kernel median (16.131 vs 24.099 ms), or **7.53x** the
+121.4 ms eight-port baseline.
 
 ## Fixed Model Shape
 
@@ -160,9 +177,17 @@ The host-side exact shard validator compares every copied FP32 weight against
 the source blob before native decode, rather than relying only on token parity.
 
 One weight shard is **1,366,528 beats = 87,457,792 bytes (83.4 MiB)** of packed
-BF16, 32 values per 512-bit beat; the 32 shards allocate 2.799 GB and carry
-1,298,661,376 dense parameters, so a token reads **2.597 GB of real weight
-bytes** (it was 5.195 GB in FP32). Ports 28--31 append one 3,145,728-value
+BF16, 32 values per 512-bit beat; the 32 shards hold exactly
+1,399,324,672 dense parameters with no padding, so a token reads **2.799 GB of
+weight bytes** (it was 5.598 GB in FP32).  That count is the five hidden-size
+projections per layer (`q/k/v/g/o_proj`) plus `gate/up/down_proj`, times 24,
+plus `lm_head`; the embedding table stays on the host.  It is confirmed twice
+over: from the checkpoint tensor shapes, and from the reader's own bound
+`total_weight_beats = rows_per_ch * k_packs` summed over the 97 GEMV calls,
+which totals 1,366,528 beats per port and equals
+`GDN_COMPILED_WEIGHT_SHARD_BEATS`.  (Earlier revisions of this document said
+1,298,661,376 parameters / 2.597 GB / 1,268,224 beats; that omitted one
+2048x2048 projection per layer, 98,304 beats per port.) Ports 28--31 append one 3,145,728-value
 BF16 state stripe (**6 MiB**) after that fixed boundary. The small norms, A/B
 projections, convolution kernels, and final norm are packed into
 `aux_weights`.
@@ -172,7 +197,7 @@ still a **5.87 GB FP32-container** blob whose values are required to be
 BF16-exact — `gdn_validate_bf16_exact_weights()` rejects a non-conforming blob
 before decode. The *device* image is the packed-BF16 shard set above. Neither
 is "the weights are 5.6 GB" in the bandwidth sense; per-token traffic is
-2.597 GB.
+2.799 GB.
 
 Port 0 is special. Its loader first copies the local GEMV activation into the
 cluster ripple and then streams shard-0 weights. This gives the dataflow region
@@ -539,9 +564,9 @@ Five changes separate Iter66e from Iter61, and the order matters because only
 the last one made the design routable.
 
 **1. Packed BF16 weights.** Each 512-bit beat carries 32 BF16 values instead of
-16 FP32. Per-token weight traffic halves to 2.597 GB. This alone did *not*
-halve the token: the measured gain is **1.582x**, because at 2.597 GB the 32
-ports are busy only 49.5% of the token and the design is no longer
+16 FP32. Per-token weight traffic halves to 2.799 GB. This alone did *not*
+halve the token: the measured gain is **1.582x**, because at 2.799 GB the 32
+ports are busy only 53.3% of the token and the design is no longer
 bandwidth-bound.
 
 **2. A native `ap_float<16,8>` multiplier.** `gemv32_four_dots` now emits 64
@@ -648,35 +673,55 @@ which itself forks from the GPU at step 83 — see the drift measurement under
 
 ## Physical Implementation
 
-The reproducible Iter66e build compiles HLS at 150 MHz under Vitis 2024.2 and
-links at 100 MHz. All hardware work goes through Slurm as two chained jobs:
+The production build compiles HLS at 150 MHz under Vitis 2024.2 and links at
+a true 150 MHz. All hardware work goes through Slurm as two chained jobs, and
+`make run_hw` on the login node is the submission:
 
 ```bash
 cd c_impl
-bash run_hw_sbatch.sh <tag>
+BUILD_EXCLUSIVE=user BUILD_NODE=acclnode01 BUILD_EXCLUDE=acclnode04,acclnode05,harrier make run_hw
 ```
 
-Every knob this needs is already the default: the Iter66e config template and
-its un-pairing hook, the BF16 weight blob, the native-product `.gdnstate` and
-golden, and the GPU reference logits. `LOGITS_REFERENCE` defaults to empty
-because the hardware/native comparison is a diagnostic, not a gate.
+Every knob the design needs is already the default: `HW_CFG_TEMPLATE=hw_f150.cfg`,
+HLS and link at 150 MHz, the BF16 weight blob, the native-product `.gdnstate`
+and golden, and the GPU reference logits. `LOGITS_REFERENCE` defaults to empty
+because the hardware/native comparison is a diagnostic, not a gate. The three
+scheduling knobs are what the two demonstrated runs used: `BUILD_EXCLUSIVE=user`
+keeps other users' jobs off the node for the whole link (of four identical-input
+links, the three with a quiet node reproduced each other at every Vivado phase
+checksum and closed; the one sharing its node diverged inside the placer's
+physical synthesis and missed by 0.045 ns — one divergent sample, so a grounded
+recommendation rather than a proven mechanism), and the node choice reflects
+the cluster's disk state (`harrier` and `acclnode03` fail the 60 GiB node-local
+preflight). `hw_iter66e_frp_unpair_f100.cfg` (the 100 MHz Iter66e/67c recipe)
+and `hw_f150_physical_islands.cfg` (pre-Iter66) are retained for A/B comparison.
 
-`HW_CFG_TEMPLATE` defaults to `hw_iter66e_frp_unpair_f100.cfg`, so no config
-override is needed to reproduce this image; `hw_f150_physical_islands.cfg` is
-retained for A/B comparison. `make -C c_impl run_hw` is still the inner
-build-and-run recipe, but it can only be invoked whole outside Slurm — under
-Slurm the on-card job calls it with `-o` on the finished image so an 8-core job
-can never start a link. Historical iteration-specific Make targets are not part
-of the production interface.
+The build job freezes a source snapshot, stages it on node-local disk, and runs
+the native trajectory gate, the XO architecture gate and the synthesized
+state-address gate before the link. The link runs the in-link closure hook and
+its fail-closed exact-clock gate; then `reconcile_exact_clock.py` patches the
+XCLBIN's `DATA_CLK` to the requested 150 MHz — Vitis derives `AUTO-FREQ-SCALING`
+from the timing report it writes *before* the hook runs, so a closed design
+otherwise ships labelled 149 MHz — but only when the hook's gate file proves
+every clock non-negative at the requested period, never touching the bitstream.
+The `afterok` card job selects the U55C by BDF, verifies the copied image and
+host by hash, and runs the 8- and 64-token gates with the submission's frozen
+`reproduction.Makefile` (`GDN_ONCARD=1`, no build prerequisites), so an 8-core
+job can never start a link. Usage, outputs and the evidence boundary are in
+[reproduce_f150.md](reproduce_f150.md).
 
 The launcher freezes the complete chain into its submission snapshot:
-`Makefile`, `gdn_model.{cpp,h}`, `host.cpp`, `hls_gdn_forward.tcl`, both link
-configs, `apply_iter66e_unpair.tcl`, `apply_f150_physical_islands.tcl`, the
-three chained DMA hooks, `check_f150_physical_islands.tcl`,
-`report_final_qor.tcl`, and `check_native_bf16_xo.py`. Four inputs are
-gitignored and must be regenerated first — the weight blob, the GPU reference
-logits, the `.gdnstate` handoff, and (optionally) the native reference. See
-the root `CLAUDE.md` § *Reproducing a hardware build from a clean clone*.
+`Makefile`, `gdn_model.{cpp,h}`, `host.cpp`, `hls_gdn_forward.tcl`, the three
+link configs, `apply_iter69_kernel_clock_f150.tcl`,
+`apply_iter75d_control_fanout.tcl`, `apply_iter66e_unpair.tcl`,
+`apply_f150_physical_islands.tcl`, the three chained DMA hooks,
+`check_f150_physical_islands.tcl`, `finish_f150_timing.tcl`,
+`check_iter75d_final_timing.tcl`, `report_final_qor.tcl`,
+`check_native_bf16_xo.py`, `check_state_writer_addresses.py` and
+`reconcile_exact_clock.py`. Four inputs are gitignored and must be regenerated
+first — the weight blob, the GPU reference logits, the `.gdnstate` handoff, and
+(optionally) the native reference. See the root `CLAUDE.md` § *Reproducing a
+hardware build from a clean clone*.
 
 Its physical recipe uses:
 
@@ -699,11 +744,41 @@ Its physical recipe uses:
   pin-assignment freedom (113,648 soft plus 15,360 hard pairings cleared);
 - a post-place structural gate that verifies all four pblocks and reports SLR,
   SLL, CLB, and BRAM pressure without prematurely rejecting a routable design;
-- `SSI_SpreadSLLs` placement;
-- `NoTimingRelaxation` routing; and
-- pre-route and post-route `AggressiveExplore` physical optimization.
+- the Iter69 override of vpl's `_user_impl_clk.xdc` at OPT_DESIGN.PRE, without
+  which Vitis 2024.2 implements the kernel clock at 10.000 ns regardless of
+  `--kernel_frequency`;
+- Iter75d's eight measured pre-place control-fanout repairs (`FORCE_MAX_FANOUT`
+  32 on the SLR0 kernel reset, 8 on `gdn_gemv`'s `ap_start`,
+  `ap_CS_fsm_reg[91]`, two RMSNorm and two output-norm address truncations and
+  a `gemv32_store` state bit), the families a locality census measured as the
+  largest slice of the 150 MHz residual;
+- `SSI_SpreadLogic_high` placement and `AlternateCLBRouting` routing (the
+  100 MHz recipe used `SSI_SpreadSLLs` and `NoTimingRelaxation`);
+- pre-route and post-route `AggressiveExplore` physical optimization; and
+- the in-link finishing hook (`finish_f150_timing.tcl`): if kernel setup is
+  still negative after post-route `AggressiveExplore`, one `Explore` pass, then
+  one focused kernel-path-group pass (`phys_opt_design -placement_opt
+  -routing_opt -critical_cell_opt -path_groups clk_kernel_00_unbuffered_net`),
+  then the exact-clock gate on all three clocks, route status, DRC and bus
+  skew, each of which aborts the link on failure.
 
-Final implementation result:
+Final implementation result of the production image (build 4022; build 3987
+and closure jobs 3953/3955 are checksum-identical at every phase):
+
+| Metric | 150 MHz production (build 4022) |
+|---|---:|
+| Requested / encoded kernel clock | **150 / 150 MHz** (metadata reconciled from vpl's 149) |
+| Failed / unrouted nets | 0 / 0 of 1,592,229 |
+| Setup WNS / TNS (design-wide) | **0.000 ns / 0.000**, 0 failing of 2,039,265 endpoints |
+| Hold WHS / THS | **+0.002 ns / 0.000**, 0 failing of 2,036,610 |
+| Setup / hold, **kernel clock** at 6.667 ns | **0.000 / +0.002 ns** |
+| Setup / hold, fixed 250 MHz DMA | +0.003 / +0.009 ns |
+| Setup / hold, fixed 450 MHz HBM | +0.052 / +0.010 ns |
+| Closure ladder inside the link | −0.013 (AggressiveExplore) → −0.001 (Explore) → **0.000** (focused pass) |
+| Automatic clock scaling | **none** (the gate aborts the link on any negative slack) |
+| Total build, 48 CPUs on `acclnode01` | **12:23:54** (fresh XO ≈ 0:40, link ≈ 11:00 including 3:40 of closure passes and reports) |
+
+The 100 MHz predecessor, for comparison:
 
 | Metric | Iter66e |
 |---|---:|
@@ -723,44 +798,46 @@ Raw post-route setup was WNS -0.017 / TNS -0.132; post-route
 `AggressiveExplore` recovered it to the values above. Both the kernel and the
 fixed 250 MHz DMA clock domains are clean.
 
-**Read the per-clock rows, not the design-wide one — this design's headroom is
-where it is not obvious.** The design-wide +0.003 ns belongs to the *fixed*
-250 MHz `dma_ip_axi_aclk_1`, a shell clock the kernel frequency does not
-directly load. The scalable kernel clock has **+0.195 ns**, a 9.805 ns
-critical path, and `report_qor_suggestions` on the routed checkpoint returns
-nothing because the design "is assessed to easily meet timing." Frequency is
-consequently an open lever for the first time since the design became
-compute-bound: port occupancy is frequency-invariant at 49.5%, so a faster
-clock scales the token directly instead of walking into an HBM wall. Treat the
-2% implied by 9.805 ns as a floor rather than a ceiling — the tools stopped
-optimizing the kernel path once the 100 MHz constraint was met, and the last
-frequency attempt (Iter36, 130 MHz auto-scaled to 115.7) predates both frp and
-the removal of the clock-enable cones.
+**Read the per-clock rows, not the design-wide one.** At 100 MHz the
+design-wide +0.003 ns belonged to the *fixed* 250 MHz `dma_ip_axi_aclk_1`
+while the kernel clock had +0.195 ns, which is why frequency was pursued. That
+headroom is now spent: at 150 MHz the kernel clock closes with **0.000 ns** to
+spare, so any change to the netlist is a timing miss until it re-closes, and
+the Iter69–75 campaign measured the wall as wire and SLL congestion, not logic
+(the unchanged Iter67c netlist at 6.667 ns missed by −1.594 ns; source-side
+locality work and the closure passes bought the rest). Port occupancy is not
+invariant with clock either: one HBM pseudo-channel peaks at 14.4 GB/s, a busy
+512-bit port draws 9.6 GB/s at 150 MHz (66.7% of peak), 12.8 GB/s at 200 MHz
+and 16.0 GB/s at 250 MHz, and the last cannot sustain one Beat per cycle. The
+full floor model is in [frequency_250mhz_roadmap.md](frequency_250mhz_roadmap.md).
 
-Routed whole-device usage and its per-SLR distribution:
+Routed whole-device usage and its per-SLR distribution (build 4022,
+`report_utilization -slr` on the closed design):
 
 | | SLR0 | SLR1 | SLR2 | device |
 |---|---:|---:|---:|---:|
-| CLB sites occupied | **96.53%** | **94.68%** | 76.09% | 145,267 |
-| CLB LUTs | 262,817 (59.77%) | 280,999 (65.05%) | 194,542 (45.03%) | 738,358 |
-| CLB registers | 377,434 | 338,969 | 230,437 | 946,840 |
-| Block RAM tiles | 527.5 (78.50%) | 472.5 (70.31%) | 389 (57.89%) | 1,389 |
-| URAM | 0 | 32 (10%) | 48 (15%) | **80 of 960** |
-| DSPs | 2,087 (72.47%) | 1,956 (63.67%) | 1,358 (44.21%) | 5,401 |
+| CLB sites occupied | **97.12%** | 75.77% | 77.78% | 136,294 |
+| CLB LUTs | 266,530 (60.62%) | 205,786 (47.64%) | 210,884 (48.82%) | 683,200 |
+| CLB registers | 363,058 | 227,627 | 239,356 | 830,041 |
+| Block RAM tiles | 554.5 (82.51%) | 461 (68.60%) | 357.5 (53.20%) | 1,373 |
+| URAM | 0 | 34 (10.63%) | 78 (24.38%) | **112 of 960** |
+| DSPs | 2,378 (82.57%) | 1,681 (54.72%) | 1,486 (48.37%) | 5,545 |
 
-SLL usage is **SLR1<->SLR0 20,637 of 23,040 (89.57%)** and SLR2->SLR1 6,346
-(27.54%), 33,779 total. The asymmetry matters for planning: the SLR0/SLR1
-crossing is nearly exhausted while the SLR2 side has room.
+SLL usage is **SLR1<->SLR0 19,749 of 23,040 (85.72%)** and SLR2<->SLR1 13,216
+(57.36%), 32,965 total. Against Iter66e (96.53 / 94.68 / 76.09% CLB sites,
+SLL 89.57%) the Iter73/75 source changes moved logic out of SLR1 and onto the
+SLR2 side, which is where the recurrent islands and their new state-writer
+FIFOs live; SLR0 remains the full SLR.
 
-**Two numbers to treat carefully.** URAM is the one abundant resource — 880
+**Two numbers to treat carefully.** URAM is the one abundant resource — 848
 free — but it is 320 per SLR, and the recurrent islands are pinned to SLR2,
 so device-wide headroom is not usable headroom. And the routed DSP total of
-5,401 is **2,076 above the 3,325 csynth estimate**, where Iter57's routed total
-exceeded its estimate by only 10; the gap is measured but not explained here,
-and DSP columns were reported at 94--100% saturation inside every level-7
-congestion window during the failed attempts. Any additional storage,
-arithmetic, or cross-SLR control still requires a new full route rather than
-inference from HLS resources.
+5,545 is **2,092 above the 3,453 csynth estimate** (Iter66e: 5,401 vs 3,325),
+where Iter57's routed total exceeded its estimate by only 10; the gap is
+measured but not explained here, and DSP columns were reported at 94--100%
+saturation inside every level-7 congestion window during the failed attempts.
+Any additional storage, arithmetic, or cross-SLR control still requires a new
+full route rather than inference from HLS resources.
 
 ### Previous Iter36 frequency result
 
@@ -779,7 +856,38 @@ on-card-validated 115.7 MHz result, not a 130 MHz closure result.
 
 ## Correctness and On-Card Performance
 
-### Iter67c (current)
+### Iter76 flow, 150 MHz (current)
+
+The production image passed, in order: the native 6- and 32-step trajectory
+gates and BF16 layout check; the XO architecture gate; the synthesized
+state-address gate (the failure class that lost Iter68G and Iter73a on card is
+now caught before the link); the in-link exact-clock, route, DRC and bus-skew
+gates; the post-link clock-metadata check; and the 8- and 64-token card gates
+through the production on-card half. Three images of the checksum-identical
+closed design have run on card:
+
+| Metric | build 4022, job 4023 (production) | build 3987, job 4021 | image 3956, job 3957 |
+|---|---:|---:|---:|
+| Production TPOT | **16.255 ms/token** | 16.238 ms/token | 16.256 ms/token |
+| Kernel execution | **16.131 ms/token** | 16.129 ms/token | 16.131 ms/token |
+| Production host/XRT/PCIe overhead | 0.124 ms/token | 0.109 ms/token | 0.125 ms/token |
+| Effective kernel cycles at 150 MHz | **2.4197M** | 2.4194M | 2.4197M |
+| 64-token trajectory | exact | exact | exact |
+| CUDA vector gate, 2,016,000 logits | NRMSE 0.00466269633, cosine 0.999989, top-5 5/5, argmax mismatches 0 | identical | identical |
+
+The vector-gate figures are bit-identical across the three images and equal to
+Iter67c's, as expected for the same arithmetic. Qualification ran on the 3956
+image (jobs 3958–3960): 512-token drift **BOUNDED** with the trajectory fork at
+step 447, the same step as every prior image; WikiText-2 teacher-forced word
+perplexity **16.774839771** against GPU **16.776123769** on a verified-identical
+workload, −0.0077%; paired power at a matched 1 s sampling period **48.0 W**
+active and 26.0 W idle, **0.7792 J/token** gross and 0.3566 J idle-subtracted,
+against the paired A100 FP32 run's 31.519 ms / 95.8 W / 3.0243 J (1.94x faster,
+3.88x gross and 2.30x idle-subtracted efficiency; the pooled A100 medians used
+in the paper are 34.98 ms FP32 and 36.04 ms BF16). Relative to Iter67c the
+kernel is 1.494x faster on 0.4% more cycles: the whole gain is clock.
+
+### Iter67c (predecessor, 100 MHz)
 
 Iter67c retains Iter66e's all-BF16 physical architecture and changes three
 bounded datapaths: argmax is fused into the existing logit-emission traversal,
@@ -995,7 +1103,7 @@ integrated csynth, full implementation, and on-card measurement:
 10. Treat the Iter35/54 DMA hooks, recurrent-SLR2 assignment, cluster 8/10
     placement, and registered collector boundary placement as part of the
     successful physical architecture.
-11. Judge changes against both 100 MHz timing and zero-conflict routing; HLS
+11. Judge changes against both 150 MHz timing and zero-conflict routing; HLS
     resource savings alone do not predict routability.
 12. Preserve the head-serial/all-port QKVG and pair-interleaved GU layouts,
     including the full-byte host validation, until a replacement proves
@@ -1013,7 +1121,8 @@ integrated csynth, full implementation, and on-card measurement:
     and a better routed result.
 16. Keep the two concurrent 16-column recurrent islands and deterministic
     half-head merge until a replacement proves equal correctness, lower cycles,
-    and at least the current 100 MHz timing margin.
+    and timing closure at the current 150 MHz constraint, whose kernel-clock
+    margin is 0.000 ns, so any regression is a miss until it re-closes.
 17. Keep native full-logits comparison enabled as a pre-hardware correctness
     gate; token parity alone cannot detect non-argmax numerical regressions.
 18. Keep `style=frp` on the cluster weight stream. It is what made this design

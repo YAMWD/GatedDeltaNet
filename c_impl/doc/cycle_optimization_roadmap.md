@@ -1,10 +1,44 @@
 # Cycle-First Optimization Roadmap After Iter67c
 
-**Current cycle reference (rebased 2026-09-01):** **Iter67c**, all-BF16,
-**2.4099M cycles/token = 24.099 ms kernel median / 24.208 ms production TPOT**
-at a true 100 MHz, WNS +0.003 / WHS +0.007 ns design-wide, zero routing errors,
-and an exact 64-token trajectory. This supersedes Iter66e's 2.5625M / 25.625 ms
-as the number every remaining stage is costed against.
+**Current cycle reference (unchanged, reaffirmed 2026-09-09):** **Iter67c**,
+all-BF16, **2.4099M cycles/token = 24.099 ms kernel median / 24.208 ms
+production TPOT** at a true 100 MHz, WNS +0.003 / WHS +0.007 ns design-wide,
+zero routing errors, and an exact 64-token trajectory. This supersedes Iter66e's
+2.5625M / 25.625 ms as the number every remaining stage is costed against.
+
+**Iter67c is still the cycle reference after Iter73--75b, deliberately.** The
+fastest *correct* image the project has is now Iter75b at 142.5 MHz
+(17.233 ms kernel / 17.343 ms production TPOT, on-card jobs 3703/3704), but its
+**cycle count is 2.4557M -- 1.9% worse than Iter67c's 2.4099M**. Every
+millisecond it gains comes from the 1.425x clock, none from the schedule, so
+rebasing onto it would silently inflate the denominator every remaining stage
+is costed against. The same holds for Iter69 (2.4324M at 121 MHz) and Iter72 r2
+(2.4724M at 137.7 MHz). Cycle counts rising with clock is itself a measurement:
+HBM-side latency is not fully hidden above 100 MHz, and it is the reason the
+frequency lever and the cycle levers in this roadmap are **not additive** --
+see §10.
+
+**What Iter73--75b did contribute to this roadmap's premises.** 73b2's
+straight-line emit inside the frp weight-stream loop cut csynth FF ~11% and LUT
+~11% versus Iter67c at identical latency, and Iter75b's cycles are 0.7% better
+than Iter72 r2's at a higher clock, which is consistent with that but is not
+isolated by any single run. Neither is a cycle stage; both are physical-design
+headroom, which is what made the 142.5 MHz route legal where 3491/3661 were
+deterministically unroutable.
+
+**Current priority (2026-09-09):** the Iter68 frequency-locality redesign is
+closed as stopped/inconclusive and 250 MHz is no longer a target (see
+[frequency_250mhz_roadmap.md](frequency_250mhz_roadmap.md) for its record and
+`optimization_log.md` for the verdict). Iter70a's 125 MHz relink was rejected.
+The frequency lever has since been measured properly and its status is now
+specific: **the Iter73/75b netlist routes legally and runs correctly on card at
+142.5 MHz, and misses a timing-closed 150 MHz by -0.349 ns with 1,733 failing
+endpoints of 1,342,323.** That is a timing gap, not the SLL-congestion wall the
+earlier note described -- the Iter74 re-placement control closed 150 MHz outright
+at +0.005 ns / 0 failing on the same netlist family. Iter67c remains the
+**retained and committed** architecture; Iter75b is correctness-complete but
+unpromoted because its clock is auto-scaled (rule 4) and no J/token has been
+measured on it.
 
 **Status of the original stages.** Iter57 completed the recurrent-head portion
 of Stage 4 and the physical decomposition. Iter66e then delivered the "Beyond
@@ -16,14 +50,50 @@ reduced the measured token by another 152,600 cycles without reassociation.
 Output-projection head-chunk accumulation and chunk-streamed MLP remain open
 and remain percent-level.
 
+**Iter73--75b closed no stage in this roadmap.** It fixed a functional defect
+(the recurrent state write-back landed 128 MiB below its stripe, introduced by
+Vivado kernel synthesis sign-extending a 27-bit byte offset; see
+`optimization_log.md` 2026-09-08/09) and it bought clock, not cycles. It also
+produced two durable pieces of *method* that every remaining stage should use:
+a pre-link synthesized-address gate that localises a defect to a compiler stage
+in ~48 minutes instead of a 9--20 h link, and a validated checkpoint-reuse path
+that turns a routed checkpoint into a testable image in ~34 minutes. Both change
+the cost of attempting the stages below, which is why they are recorded here and
+not only in the log.
+
+**Iter76 (2026-09-10 to 2026-09-12) closed no stage in this roadmap either.**
+It bought reproducibility, not cycles: the consolidated `make run_hw` recipe now
+reproduces the timing-closed 150 MHz design from source (builds 3987 and 4022,
+checksum-identical to build 3751 through routing and to the job-3955 closure)
+and validates it on card at 16.131 ms kernel. The cycle reference above stays
+Iter67c's 2.4099M because the entire gain is clock (2.4197M cycles at 150 MHz).
+Two method contributions belong here: the in-link finishing hook with a
+fail-closed exact-clock gate and metadata reconciliation, which turns a closed
+placement into a shippable image with no manual step; and the observation that
+one of four identical-input links diverged inside the placer's physical
+synthesis while other users' jobs shared its node. Every remaining stage should
+therefore be built with `BUILD_EXCLUSIVE=user` and judged against Vivado's
+phase checksums, not only against WNS.
+
 ## 0. The one thing that changed how levers must be costed
 
-**The design is no longer HBM-bandwidth-bound, so a lever's share of bytes no
-longer predicts its share of time.** At 2.597 GB of BF16 weights per token,
-32 ports x 64 B x 100 MHz gives **1,268,224 beat-cycles per port against a
-measured 2,409,900 — 52.6% port occupancy**. The standalone microbenchmark
-sustains 98.353% of clock-rate ceiling on this exact port structure, so the
-idle half is scheduling, not memory.
+**The design is not HBM-bandwidth-bound at either the 100 MHz reference or
+the 150 MHz production clock, so a lever's share of bytes does not predict its
+share of time.** At 2.799 GB of BF16 weights per token (1,399,324,672
+parameters; the 2.597 GB / 1,268,224-beat figure used before 2026-09-08 dropped
+one 2048x2048 projection per layer), each port reads **1,366,528 Beats per
+token against Iter67c's measured 2,409,900 cycles — 56.7% port occupancy at
+100 MHz**, and against the production image's 2,419,650 cycles — 56.5% at
+150 MHz, where a busy port draws 9.6 GB/s, 66.7% of its pseudo-channel peak.
+The standalone microbenchmark sustains 98.353% of clock-rate ceiling on this
+exact port structure, so the idle 43% is scheduling, not memory.
+
+This conclusion is clock-scoped. A pseudo-channel peaks at 14.4 GB/s, while a
+512-bit port requests 12.8 GB/s at 200 MHz and 16.0 GB/s at 250 MHz. The design
+therefore approaches the HBM wall near 200 MHz and cannot sustain one Beat per
+cycle at 250 MHz. See
+[frequency_250mhz_roadmap.md](frequency_250mhz_roadmap.md) for the HBM-aware
+latency floor and measurement gate.
 
 Two consequences, both already paid for:
 
@@ -38,7 +108,7 @@ Rank remaining levers by measured share of the token:
 
 | Lever | Measured basis | Upper bound | Physical risk |
 |---|---|---:|---|
-| Sub-byte weights (INT4) | weight beats 1,268,224 -> ~317,056/port | **37%** (-> ~16.1 ms) | new datapath, retires the current quality baseline |
+| Sub-byte weights (INT4) | weight beats **1,366,528** -> ~341,632/port | **needs re-deriving** (the old **37% / ~16.1 ms** came from a wrong 1,268,224 beat figure) | new datapath, retires the current quality baseline |
 | Recurrent state fully on chip | `load_state`+`update`, 395,904 cyc | 16.4% (realistically 8--12%) | **blocked** — see below |
 | Partial state residency, SLR2-local | 9 of 24 layers x 16.4% | 6.2% | low — no new cross-SLR path |
 | Head-chunked output projection | roadmap Stage 4 remainder | percent-level | moderate |
@@ -406,7 +476,16 @@ Every sub-variant must pass the evidence level appropriate to its size:
 6. resource comparison against Iter57, Iter54c, and the timing-closed Iter39C
    reference;
    and
-7. optimization-log entry whether retained or rejected.
+7. optimization-log entry whether retained or rejected;
+8. **(added 2026-09-09) if the change touches an `m_axi` address or a memory
+   write path, the pre-link synthesized-address gate**
+   (`check_state_writer_addresses.py`, `STATE_ADDRESS_GATE=1`). Gates 1--4 above
+   all operate on C or on HLS RTL, and the Iter73a defect was invisible to every
+   one of them: the address was correct in HLS RTL (48/48 pass) and wrong after
+   Vivado kernel synthesis (48/48 fail, all displaced by exactly 128 MiB). One
+   layer of RTL cosim passed while seeding, checksumming and gating on the state
+   stripe, because cosim simulates the half of the toolchain that was correct.
+   Two campaigns (Iter68G, Iter73a) were lost to this before the gate existed.
 
 For the major attention and MLP milestones, additionally require:
 

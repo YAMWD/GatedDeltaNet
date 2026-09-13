@@ -10,7 +10,7 @@
 - `make -C c_impl` builds the native `gdn_eval` testbench with C++14. It requires Vitis HLS 2022.1 headers (`XILINX_HLS_INC`).
 - `bash scripts/decode_correctness_check.sh --fast` runs the short exact-match decode gate; omit `--fast` for the full 32-step check.
 - `cd c_impl && vitis_hls -f test.tcl` runs decode-kernel csim/csynth/cosim.
-- `make -C c_impl run_hw` builds and runs the U55C hardware flow. Bitstream linking can take several hours and requires Vitis/XRT plus a board.
+- `make -C c_impl run_hw` submits the U55C hardware flow as two chained Slurm jobs (build, then card test); it never runs Vitis on the login node. A 150 MHz link takes about 12.5 h; see `c_impl/doc/reproduce_f150.md`.
 - For long-running builds, detach the build with a persistent PID, log,
   exit-code marker, and artifact paths so it survives chat interruption. If a
   build or validation gate is expected to need more than 10 minutes to finish,
@@ -58,31 +58,45 @@ explicitly asks otherwise.
   shared directly. Continue staging heavy Vitis/Vivado working trees under
   `/tmp/$USER-$SLURM_JOB_ID` because NFS builds are slower.
 - Submit compute-only HLS, RTL cosim, synthesis, and linking to `build`, request
-  no accelerator GRES, and stay within 48 CPUs and 192 GiB. **Do not pin a
-  build node by default.** Request the required Vitis/Vivado feature (for
+  no accelerator GRES, and stay within 48 CPUs and 192 GiB per job and the
+  per-user `build` cap of **96 CPUs / 393,600 MB** across running build jobs
+  (two full links fit; a third queues). Set `--time` explicitly — the 12 h
+  default kills a 150 MHz link (measured 8–18 h; Vivado peaks at 64–69 GB).
+  **Do not pin a build node by default.** Request the required Vitis/Vivado feature (for
   example `vivado2024.2`) and let Slurm select any eligible node; use
   `--nodelist` only when the user requests a particular host or a measured
   node-specific requirement leaves no alternative. Do not force these jobs
   onto `harrier`. Verify the required toolchain and U55C platform after
-  allocation and before a production link. As of 2026-08-24, `acclnode01` and
-  `acclnode03` advertise Vitis/Vivado 2022.2; `acclnode02` is not registered.
-  A measured missing dependency may be handled with `--exclude` without
-  pinning a replacement node. As of 2026-08-28, `acclnode05` advertises
-  `vivado2024.2` but lacks the U55C platform, so exclude it from U55C builds.
+  allocation and before a production link. As of 2026-09-07 every node
+  advertises `vivado2020.2`–`vivado2024.2`; XRT is per node (`xrt2.14.354`
+  harrier, `xrt2.13.479` acclnode01/03, `xrt2.13.0` acclnode05, none on
+  acclnode04) and the U55C platform exists only on `acclnode01`, `acclnode03`
+  and `harrier`, so a U55C link carries `--exclude=acclnode04,acclnode05`.
+  `harrier`'s node-local `/tmp` was 100% full on 2026-09-06 and killed build
+  3449 inside synthesis (a v++ link writes 41–47 GB and our stage dirs are
+  never cleaned), so links since then also exclude `harrier`
+  (`BUILD_EXCLUDE=acclnode04,acclnode05,harrier`); check `df -h /tmp` at job
+  start and re-include the node once its scratch is cleaned.
 - Submit hardware execution as a separate `light` job with
   `--gres=fpga:u55c:1`, at most 8 CPUs and 32 GiB. Do not assume the request
   routes to `harrier`: inspect the allocated node and XRT version, then confirm
   the expected U55C with `xbutil examine`. Make it `afterok`-dependent on the
   build job when both are submitted together.
-- A card is usable only inside the job that requested it. Confirm
-  `xbutil examine` shows exactly the allocated card before loading the XCLBIN.
-  Do not infer allocation from `/dev/dri`.
+- A card is usable only inside the job that requested it. Select it by PCIe
+  BDF (`host.cpp` accepts a BDF wherever a device index goes) and re-verify with
+  `xbutil examine --device <bdf>`. Do **not** gate on "exactly one card": on
+  `acclnode01` an inaccessible U280 is listed beside the allocated U55C, and
+  that guard killed jobs 1354 and 2504. The `[XRT] WARNING: dev_init failed`
+  / `Operation not permitted Device index 0` lines there are benign. Do not
+  infer allocation from `/dev/dri`. `jq` is not installed on the compute nodes.
 - Source `/tools/Xilinx/Vitis/2024.2/settings64.sh` for builds (the version is
   pinned once as `VITIS_VERSION` in `c_impl/Makefile` — follow that knob if it
   moves) and `/opt/xilinx/xrt/setup.sh` for card runs. Keep the U55C platform
   at `xilinx_u55c_gen3x16_xdma_3_202210_1`.
-- Treat `QOSMaxJobsPerUserLimit` as normal queueing when one job of that class
-  already exists. For failures, start with `scontrol show job` and `sacct`, then
+- Treat `QOSMaxJobsPerUserLimit` (`light`/`vnc`, or a 25th build job) and the
+  per-user CPU/memory reasons on `build` (`QOSMaxCpuPerUserLimit`,
+  `QOSMaxMemoryPerUser` — hit when two 48-core links already run) as normal
+  queueing, not failures. For failures, start with `scontrol show job` and `sacct`, then
   inspect the Slurm output and detailed Vitis/Vivado log.
 - Use persistent Slurm output, detailed live logs, status, and exit-code files
   in the shared workspace. Do not add a separate polling/mirroring supervisor
@@ -131,6 +145,19 @@ after synthesis. Before starting the next iteration:
    `c_impl/doc/cycle_optimization_roadmap.md`: mark the completed stage, replace
    estimates with measured evidence, rebase the current cycle reference when
    applicable, and revise the remaining targets or dependencies.
+3b. **If the change touches an `m_axi` address or any memory write path, run
+   the pre-link synthesized-address gate** (`c_impl/check_state_writer_addresses.py`,
+   enabled by `STATE_ADDRESS_GATE=1` in `run_hw_sbatch.sh`) and record its
+   verdict. csim, csynth and RTL cosim are all blind to this failure class:
+   Vivado's *kernel synthesis* can transform an address that HLS emitted
+   correctly, and cosim simulates the HLS RTL. Measured twice, a year of
+   campaign time apart in effect: Iter68G and Iter73a both wrote recurrent state
+   exactly 128 MiB below its stripe on hardware while passing every pre-link
+   gate, including a one-layer cosim that seeded, checksummed and gated on the
+   state stripe. The gate simulates the same address stimulus at HLS-RTL,
+   post-synthesis and post-opt, so it both catches the defect and localises it
+   to a compiler stage, in ~48 minutes rather than a 9--20 h link.
+
 4. After that improvement is demonstrated and documented, commit the retained
    source architecture changes, necessary build/config/Tcl or launcher files,
    the positive result, and all accumulated optimization-log entries in focused
@@ -141,6 +168,30 @@ after synthesis. Before starting the next iteration:
 Do not move on to the next optimization iteration with an unrecorded result.
 Never commit an architectural or build change whose measured result is negative
 or neutral; commits mark demonstrated improvements only.
+
+**Two evidence rules learned the hard way (2026-09-08/09); both produced wrong
+published conclusions before they were adopted.**
+
+- **A name-presence check inside one hierarchy is not a test of a datapath.**
+  Synthesis may relocate logic out of the module you exported, so "signal X does
+  not appear in cell Y" proves nothing about whether X's function happens.
+  Follow connectivity across hierarchy boundaries and *evaluate the logic*
+  (the Iter73a write-address channel appeared absent from the writer cell and
+  was in fact present and computing a displaced address).
+- **Diff immutable build snapshots, never the working tree against HEAD.** Every
+  build writes `diagnostics/<tag>/source_snapshot.tar` and
+  `source_hashes.txt`; comparing two of those is the only way to attribute a
+  change to one iteration. A working-tree-vs-HEAD diff silently credits an
+  iteration with everything uncommitted, which is normal in this repo.
+
+**Reproducibility notes that cost jobs.** A `v++` link is *deterministic* for
+identical inputs: builds 3491 and 3661, submitted 14 hours apart, failed with
+byte-identical overlap and unrouted-net counts, so re-running an unchanged
+recipe is never a lever. Placement variance (>=1.3 ns) only appears between runs
+that start from *different* states, such as a re-placement from a checkpoint. And
+when a build fails a late policy gate (for example `exact_clock` on an
+auto-scaled clock) it never copies its XCLBIN back, so a usable image can exist
+only in the job's node-local stage dir -- recover it before that node is reused.
 
 ## Generated Artifacts
 
