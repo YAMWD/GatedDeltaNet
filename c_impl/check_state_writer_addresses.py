@@ -32,7 +32,7 @@ def testbench(top, ports, port, allow_direct=False):
     mode = one(r"qkvg_recurrent_mode" + suffix)
     addr = one(r"m_axi_.*_AWADDR")
     valid = one(r"m_axi_.*_AWVALID")
-    declarations = [f"{'reg' if d == 'input' else 'wire'} {w} {n};" for d, w, n in ports]
+    declarations = [f"{'reg' if d == 'input' else 'wire'} {w + ' ' if w else ''}{n};" for d, w, n in ports]
     initialize = []
     for direction, _, name in ports:
         if direction != "input" or name == "ap_clk":
