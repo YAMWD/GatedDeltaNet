@@ -112,22 +112,27 @@ supply one 512-bit Beat per kernel cycle. Each U55C HBM AXI pseudo-channel is
 | 225 MHz | 14.4 GB/s | 100% |
 | 250 MHz | 16.0 GB/s | 111.1%; cannot be sustained |
 
-Each port reads 1,268,224 weight Beats, or 81,166,336 bytes, per token. Its
-absolute transfer floor is therefore 5.6366 ms at 14.4 GB/s and an estimated
-6.4052 ms at 88% efficiency. Iter67c's derived exposed non-weight/stall
-remainder is:
+Each port reads 1,366,528 weight Beats, or 87,457,792 bytes, per token
+(corrected 2026-09-13 from the retired 1,268,224-Beat / 81,166,336-byte
+figure, which dropped one 2048x2048 projection per layer; the milestone table
+below already used the correct value). Its absolute transfer floor is therefore
+6.0735 ms at 14.4 GB/s and an estimated 6.9017 ms at 88% efficiency. Iter67c's
+derived exposed non-weight/stall remainder is:
 
 ```text
-2,409,900 - 1,268,224 = 1,141,676 cycles
+2,409,900 - 1,366,528 = 1,043,372 cycles
 ```
 
-At 250 MHz that remainder takes 4.5667 ms. Adding the measured 0.124 ms host
+At 250 MHz that remainder takes 4.1735 ms. Adding the measured 0.124 ms host
 boundary gives:
 
-- **10.33 ms production lower bound** at impossible-to-exceed peak HBM rate;
-- approximately **11.10 ms production** at the explicitly estimated 88% rate;
-- about **2.55M kernel cycles** at the absolute HBM floor; and
-- about **2.74M kernel cycles** at 88% efficiency.
+- **10.37 ms production lower bound** at impossible-to-exceed peak HBM rate;
+- approximately **11.20 ms production** at the explicitly estimated 88% rate;
+- about **2.56M kernel cycles** at the absolute HBM floor; and
+- about **2.77M kernel cycles** at 88% efficiency.
+
+(The corrected figures move each bound by less than 1%, so the conclusions
+below are unchanged.)
 
 This additive estimate assumes the frequency campaign preserves Iter67c's
 exposed phase structure; it is not a theorem about a future overlap redesign.

@@ -93,9 +93,9 @@ bash run_hw_sbatch.sh
 source snapshot and submits the build and FPGA test as separate jobs, chaining
 the test with `afterok`. The card job runs the submission's frozen
 `reproduction.Makefile` with `GDN_ONCARD=1`, so it can never start a link. The
-demonstrated launch is `BUILD_EXCLUSIVE=user BUILD_NODE=acclnode01
-BUILD_EXCLUDE=acclnode04,acclnode05,harrier make run_hw`; see
-`doc/reproduce_f150.md`.
+demonstrated launch, from `c_impl/`, is `BUILD_EXCLUSIVE=user BUILD_NODE=acclnode01
+BUILD_EXCLUDE=acclnode04,acclnode05,harrier make run_hw` (from the repository
+root, `make -C c_impl run_hw`); see `doc/reproduce_f150.md`.
 
 Use `make -C c_impl help` to display the configurable weights, state, fixture,
 reference, frequency, device, and output paths.

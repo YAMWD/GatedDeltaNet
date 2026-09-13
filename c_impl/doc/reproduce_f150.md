@@ -1,13 +1,16 @@
 # Clean 150 MHz build and on-card validation
 
-On `acclhead1`, from the repository root or `c_impl/`:
+From any host with the Slurm client (normally `acclhead1`; a running job may
+submit too), from the repository root (there is no root Makefile; the target
+lives in `c_impl/Makefile`):
 
 ```bash
-BUILD_EXCLUSIVE=user BUILD_NODE=acclnode01 BUILD_EXCLUDE=acclnode04,acclnode05,harrier make run_hw
+BUILD_EXCLUSIVE=user BUILD_NODE=acclnode01 BUILD_EXCLUDE=acclnode04,acclnode05,harrier make -C c_impl run_hw
 ```
 
-Equivalently, from any directory use `make -C /path/to/GatedDeltaNet/c_impl run_hw`.
-This submits work and returns; it does not run Vitis on the login node. The
+From inside `c_impl/` the same command is `make run_hw`, and from any directory
+`make -C /path/to/GatedDeltaNet/c_impl run_hw`. This submits work and returns;
+it does not run Vitis on the login node. The
 three environment knobs are what the two demonstrated runs used (see *Evidence
 boundary*): `BUILD_EXCLUSIVE=user` keeps other users' jobs off the build node
 for the whole link, and the node choice reflects the cluster's disk state at the
@@ -78,7 +81,9 @@ The submitter prints both job IDs and an absolute shared diagnostics directory:
 - `source_snapshot.tar`, `source_hashes.txt`: frozen reproduction inputs.
 - `checkpoints/`, `gdn_final_qor/`: saved physical evidence.
 - `xclbin.path`, `host.path`: exact successful artifact locations in this tag's
-  `artifacts/` directory, isolated from other submissions.
+  `artifacts/` directory, isolated from other submissions. There,
+  `build_manifest.sha256` describes the shipped (reconciled) image and
+  `build_manifest.pre_reconcile.txt` keeps the digest of the vpl-written file.
 - `on_card/`: smoke/full-run JSON, logits-gate and trajectory reports, timings.
 
 Measured wall time for the two passing runs: **12 h 24 min** (build 4022) and

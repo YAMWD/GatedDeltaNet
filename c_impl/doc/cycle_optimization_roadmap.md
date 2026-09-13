@@ -77,13 +77,16 @@ phase checksums, not only against WNS.
 
 ## 0. The one thing that changed how levers must be costed
 
-**At the retained 100 MHz, the design is no longer HBM-bandwidth-bound, so a
-lever's share of bytes does not predict its current share of time.** At 2.597
-GB of BF16 weights per token,
-32 ports x 64 B x 100 MHz gives **1,268,224 beat-cycles per port against a
-measured 2,409,900 — 52.6% port occupancy**. The standalone microbenchmark
-sustains 98.353% of clock-rate ceiling on this exact port structure, so the
-idle half is scheduling, not memory.
+**The design is not HBM-bandwidth-bound at either the 100 MHz reference or
+the 150 MHz production clock, so a lever's share of bytes does not predict its
+share of time.** At 2.799 GB of BF16 weights per token (1,399,324,672
+parameters; the 2.597 GB / 1,268,224-beat figure used before 2026-09-08 dropped
+one 2048x2048 projection per layer), each port reads **1,366,528 Beats per
+token against Iter67c's measured 2,409,900 cycles — 56.7% port occupancy at
+100 MHz**, and against the production image's 2,419,650 cycles — 56.5% at
+150 MHz, where a busy port draws 9.6 GB/s, 66.7% of its pseudo-channel peak.
+The standalone microbenchmark sustains 98.353% of clock-rate ceiling on this
+exact port structure, so the idle 43% is scheduling, not memory.
 
 This conclusion is clock-scoped. A pseudo-channel peaks at 14.4 GB/s, while a
 512-bit port requests 12.8 GB/s at 200 MHz and 16.0 GB/s at 250 MHz. The design

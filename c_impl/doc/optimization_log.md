@@ -14809,3 +14809,90 @@ recommendation rather than a proof: the load hypothesis itself (one divergent
 sample). Not yet promoted in the docs pending the user's decision; the
 Makefile/launcher defaults already target this recipe (Codex's 2026-09-10
 change, now demonstrated).
+
+### 2026-09-13 — PR #10 review response (Copilot, 21 findings): fixes, tests, and two rebuttals with evidence
+
+No kernel change. Every fix below is script- or doc-level and was tested
+offline against the real Iter76 artifacts where a test was possible; the one
+gate change is additionally re-simulated on a compute node (below).
+
+*Accepted and fixed.*
+- `reconcile_exact_clock.py`: closure evidence is now required even when the
+  image already reports the requested frequency; every required clock (kernel,
+  `dma_ip_axi_aclk_1` at 4.000, `hbm_aclk` at 2.222) must be present exactly
+  once at its expected period; non-finite or non-numeric fields fail. Seven
+  offline cases on the real 3987 image and 4022 gate TSV: 149→150 reconciled;
+  already-150 OK; already-150 with missing TSV **FAIL** (was OK); `nan` FAIL;
+  kernel-only TSV FAIL; DMA period 4.500 FAIL; −0.001 FAIL; the image is never
+  touched on failure.
+- `hw_build.slurm`: `SHARED_DIAG`, a `build.phase=preflight` marker and an
+  EXIT trap that writes `build.exit` now precede every preflight exit (builds
+  3961/3986 died in the disk check with no marker). After a reconciliation the
+  XCLBIN line of `build_manifest.sha256` is rewritten and the manifest
+  re-verified with `sha256sum -c`; the vpl-written digest is kept in
+  `build_manifest.pre_reconcile.txt`. Offline on draw 5's manifest: the entry
+  moved from `532e388e…` (the 149-labelled file) to `b2a0a478…` (the shipped
+  image), 18 lines before and after.
+- `run_hw_sbatch.sh`: the `acclhead1`-only check is replaced by a check that
+  the Slurm client exists — `scripts/run_all_bf16_native_reference.slurm`
+  submits from `acclnode03` after its native gate and was broken by it; that
+  caller now also passes `HW_CFG_TEMPLATE=hw_iter66e_frp_unpair_f100.cfg` with
+  its `LINK_FREQ=100`, which the cfg/frequency consistency check requires.
+  Default `BUILD_EXCLUDE` adds `harrier` and `acclnode03` (both fail the
+  60 GiB preflight; dated in the comment; `BUILD_EXCLUDE=` re-probes).
+- `package_closed_f150.tcl`: route must be complete (fully routed == routable)
+  as well as error-free; all three clock periods are checked (6.667 / 4.000 /
+  2.222); a missing setup or hold path aborts instead of counting as slack 99.
+  Stubbed-Vivado mock: good → `PACKAGE_DONE` exit 0; unrouted, missing hold
+  path and DMA period 4.500 → `ABORT` exit 3.
+- `package_closed_f150.slurm`: inputs `PK_DCP`/`PK_DONOR` via `--export`
+  instead of hard-coded Iter75f paths; the Tcl is taken from `c_impl/`; the
+  log directory is documented as a pre-`sbatch` `mkdir -p`; the assembled
+  image's `CLOCK_FREQ_TOPOLOGY` is read back and the job fails unless DATA is
+  exactly 150; xclbinutil exit codes are checked.
+- `close_f150_kernel_group.slurm`: self-contained — stages the three Tcl
+  files from `c_impl/`, takes `CLOSE_INPUT_DCP` (+ optional
+  `CLOSE_INPUT_SHA256`) via `--export`, falls back to shared storage when
+  `/tmp` is full, and runs the new in-repo `close_f150_parser_test.tcl`
+  (route-parser unit test + syntax check; passes in `tclsh`).
+- Docs: `cycle_optimization_roadmap.md` §0 and `frequency_250mhz_roadmap.md`
+  re-derived on 1,366,528 Beats / 87,457,792 B (2.799 GB): transfer floor
+  6.0735 ms at peak / 6.9017 ms at 88%, Iter67c remainder 1,043,372 cycles,
+  bounds 10.37 / 11.20 ms, 2.56M / 2.77M cycles — all conclusions unchanged
+  (<1% shifts). `reproduce_f150.md`, `CLAUDE.md`, `c_impl/README.md`: the
+  launch command is `make -C c_impl run_hw` (there is no root Makefile).
+
+*Rebutted with evidence (no change).*
+- "`reg None ap_clk;` breaks xvlog": `re.findall` returns `''`, not `None`,
+  for an unmatched optional group, so the old f-string emitted `reg  ap_clk;`
+  — valid Verilog, and the gate compiled and passed 48/48 in builds 3963,
+  3968, 3987 and 4022. The user had already accepted Copilot's cosmetic
+  autofix (`75ace496d`); harmless.
+- "`prepare_reused_xo.py` always fails because `gdn_forward_csynth.xml` is
+  only under `reports_compile`": build 3751 used exactly this path and
+  recorded `REUSE_XO_IDENTITY_PASS` with 3,080 restored report files; the
+  XML also lives under `_x_compile/…/solution/syn/report/`, which the filter
+  keeps.
+
+*Accepted in substance, premise corrected.* "The testbench validates only the
+base address and never the remaining 4,095 writes": at this module boundary
+the writer issues its 4,096-beat layer stripe as **one request**
+(`AWLEN = 4096` in the RTL); the per-beat AXI addresses are formed by the
+top-level `m_axi` adapter outside the DUT, so there were no further addresses
+to sample. What the gate did not check was the request *length* and the data
+*count*. `check_state_writer_addresses.py` now samples until the stripe is
+complete: every request must land at `expected + beats already requested`,
+requests must cover exactly 4,096 beats, and 4,096 W-channel beats must be
+handed over (`LENGTH_FAIL` otherwise); the pass line records both counts.
+Self-test on draw 5's kept writer RTL (job 4051, `light`, xsim at RTL /
+post-synthesis / post-opt): result recorded below.
+Self-test result (job 4051, `acclnode01`, 1:51 wall): the strengthened gate
+**passes on the real writer RTL at all three stages** — RTL, post-synthesis
+and post-opt — `ADDRESS_PASS port=28 cases=48 requested_beats_per_case=4096
+data_beats_per_case=4096`, `STATE_ADDRESS_GATE_PASS rtl_cases=48
+synthesized_cases=48 optimized_cases=48`; each xsim run took 10–23 s, so the
+in-build cost of the fuller check is negligible. (A first submission, 4050,
+died in 0 s with `source: not found`: `sbatch --wrap` runs under `/bin/sh`;
+resubmitted as a bash script.) Verdict: review response **complete**; all
+script changes committed; no hardware rebuilt — the demonstrated Iter76 flow
+is unchanged in what it builds, and stricter in what it accepts.
