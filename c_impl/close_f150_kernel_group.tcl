@@ -51,7 +51,7 @@ proc inspect_ce_cone {stage required} {
     note "$stage CE LUT and all[llength $loads] loads recorded"
 }
 
-note "open verified Iter75e after_explore checkpoint"
+note "open input checkpoint $::env(REPAIR_DCP)"
 open_checkpoint $::env(REPAIR_DCP)
 set baseline [inspect input]
 if {![dict get $baseline legal] || abs([dict get $baseline wns]+0.001)>0.0005} {

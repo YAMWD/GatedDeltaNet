@@ -22,6 +22,14 @@ TAG="${TAG:?TAG must be set by the submitter}"
 SUBMIT_C_IMPL="${SUBMIT_C_IMPL:?SUBMIT_C_IMPL must be set by the submitter}"
 SNAPSHOT_PATH="${SNAPSHOT_PATH:?SNAPSHOT_PATH must be set by the submitter}"
 
+# Shared diagnostics first, so every early exit below still leaves the
+# build.exit / build.phase markers the watchers and the on-card chain rely on
+# (builds 3961 and 3986 died in the disk preflight with no marker at all).
+SHARED_DIAG="${SUBMIT_C_IMPL}/diagnostics/${TAG}"
+mkdir -p "${SHARED_DIAG}"
+printf '%s\n' "preflight" > "${SHARED_DIAG}/build.phase"
+trap 'rc=$?; test -s "${SHARED_DIAG}/build.exit" || printf "%s\n" "$rc" > "${SHARED_DIAG}/build.exit"' EXIT
+
 if [ "${SLURM_CPUS_PER_TASK:-0}" -lt 48 ] || [ "${JOBS}" -gt 48 ]; then
     echo "FATAL: production build requires 48 allocated CPUs and JOBS<=48" >&2
     exit 2
@@ -54,9 +62,8 @@ if [ "$available_kb" -lt 62914560 ]; then
     exit 2
 fi
 STAGE_C_IMPL="${STAGE_ROOT}/c_impl"
-SHARED_DIAG="${SUBMIT_C_IMPL}/diagnostics/${TAG}"
 export GDN_SHARED_LOG_DIR="$SHARED_DIAG"
-mkdir -p "${STAGE_C_IMPL}" "${SHARED_DIAG}"
+mkdir -p "${STAGE_C_IMPL}"
 tar -xf "${SNAPSHOT_PATH}" -C "${STAGE_C_IMPL}"
 
 echo "=== gdn hardware build ==="
@@ -270,6 +277,26 @@ if [ "$rc" -eq 0 ] && [ "${REQUIRE_EXACT_CLOCK:-0}" = 1 ]; then
         "${STAGE_BUILD}/gdn_forward.xclbin" "${gate_tsv:-/nonexistent}" "$LINK_FREQ" \
         "${SHARED_DIAG}" 2>&1 | tee "${SHARED_DIAG}/exact_clock.log"
     clock_rc="${PIPESTATUS[0]}"
+    if [ "$clock_rc" -eq 0 ] && grep -q '^EXACT_CLOCK_RECONCILED' "${SHARED_DIAG}/exact_clock.log"; then
+        # The reconciled image replaces the one Make hashed into
+        # build_manifest.sha256; rewrite that entry and re-verify the whole
+        # manifest so the published digests describe the shipped file. The
+        # vpl-written original's digest stays on record beside it.
+        (
+            cd "${STAGE_C_IMPL}" || exit 1
+            manifest="${BUILD_DIR}/build_manifest.sha256"
+            new_line="$(sha256sum "${BUILD_DIR}/gdn_forward.xclbin")"
+            old_line="$(grep -E " ${BUILD_DIR}/gdn_forward.xclbin\$" "$manifest")"
+            printf '%s\n' "$old_line" | sed 's/$/  (vpl-written metadata, before reconciliation)/' \
+                > "${BUILD_DIR}/build_manifest.pre_reconcile.txt"
+            grep -vE " ${BUILD_DIR}/gdn_forward.xclbin\$" "$manifest" > "${manifest}.tmp"
+            printf '%s\n' "$new_line" >> "${manifest}.tmp"
+            mv "${manifest}.tmp" "$manifest"
+            sha256sum -c --quiet "$manifest"
+        ) 2>&1 | tee -a "${SHARED_DIAG}/exact_clock.log"
+        clock_rc="${PIPESTATUS[0]}"
+        [ "$clock_rc" -eq 0 ] && echo "BUILD_MANIFEST_UPDATED for the reconciled image" | tee -a "${SHARED_DIAG}/exact_clock.log"
+    fi
     set -e
     printf '%s\n' "$clock_rc" > "${SHARED_DIAG}/exact_clock.exit"
     if [ "$clock_rc" -ne 0 ]; then rc=$clock_rc; fi
@@ -278,7 +305,7 @@ if [ "${rc}" -eq 0 ]; then
     mkdir -p "${SHARED_BUILD}"
     cp -f "${STAGE_BUILD}/gdn_forward.xclbin" \
           "${SHARED_BUILD}/gdn_forward.xclbin"
-    for manifest in xo_manifest.sha256 build_manifest.sha256 resolved_hw.cfg; do
+    for manifest in xo_manifest.sha256 build_manifest.sha256 build_manifest.pre_reconcile.txt resolved_hw.cfg; do
         if [ -f "${STAGE_BUILD}/${manifest}" ]; then
             cp -f "${STAGE_BUILD}/${manifest}" "${SHARED_BUILD}/${manifest}"
         fi

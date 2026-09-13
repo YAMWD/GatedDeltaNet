@@ -29,10 +29,11 @@ set -euo pipefail
 C_IMPL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$C_IMPL"
 
-if [ "$(hostname -s)" != acclhead1 ]; then
-    echo "FATAL: submit this command on acclhead1 (the accl Slurm controller)." >&2
-    exit 2
-fi
+# Submission works from any host with the Slurm client, including a running job
+# (scripts/run_all_bf16_native_reference.slurm submits from acclnode03 after its
+# native gate). Nothing here runs Vitis; that only ever happens inside the jobs.
+SBATCH_BIN=/opt/slurm/current/bin/sbatch
+test -x "$SBATCH_BIN" || { echo "FATAL: ${SBATCH_BIN} not found; submit from a host with the Slurm client" >&2; exit 2; }
 
 TAG="${1:-hw_$(date +%Y%m%d_%H%M%S)_$$}"
 [[ "$TAG" =~ ^[A-Za-z0-9_-]+$ ]] || { echo 'FATAL: invalid job tag'; exit 2; }
@@ -53,9 +54,12 @@ BUILD_CONSTRAINT="${BUILD_CONSTRAINT:-vivado2024.2}"
 # Measured platform gaps: acclnode04 lacks the U55C platform and XRT;
 # acclnode05 advertises vivado2024.2 but lacks the U55C platform (probes
 # 2026-08-22 / 2026-08-28; re-confirmed by 2-second preflight FATALs on jobs
-# 2255, 2448/2450, and 2452/2454). BUILD_EXCLUDE= (empty) re-probes after a
-# cluster change.
-BUILD_EXCLUDE="${BUILD_EXCLUDE-acclnode04,acclnode05}"
+# 2255, 2448/2450, and 2452/2454). harrier's and acclnode03's node-local /tmp
+# were 100% full on 2026-09-10/11 (builds 3961 and 3986 died in hw_build's
+# 60 GiB preflight in 1-2 s), which leaves acclnode01 as the only node that
+# can currently host a link. BUILD_EXCLUDE= (empty) re-probes after a cluster
+# change; BUILD_EXCLUDE=acclnode04,acclnode05 restores the pre-2026-09-13 list.
+BUILD_EXCLUDE="${BUILD_EXCLUDE-acclnode04,acclnode05,harrier,acclnode03}"
 BUILD_NODE="${BUILD_NODE:-}"
 # BUILD_EXCLUSIVE=user passes --exclusive=user: no other user's jobs on the build
 # node for the whole link. Iter76: four identical-input links, the three with a
@@ -195,7 +199,7 @@ if [ -n "${BUILD_EXCLUSIVE}" ]; then
     build_placement_args+=(--exclusive="${BUILD_EXCLUSIVE}")
 fi
 
-build_id="$(/opt/slurm/current/bin/sbatch --parsable \
+build_id="$("$SBATCH_BIN" --parsable \
     --job-name="${TAG}_build" \
     --chdir="$C_IMPL" \
     "${build_placement_args[@]}" \
@@ -213,7 +217,7 @@ echo "detail log              -> ${DIAG}/build.live.log"
 if [ "${SKIP_ONCARD:-0}" = "1" ]; then
     echo "on-card    : skipped (SKIP_ONCARD=1)"
 else
-    oncard_id="$(/opt/slurm/current/bin/sbatch --parsable \
+    oncard_id="$("$SBATCH_BIN" --parsable \
         --job-name="${TAG}_oncard" \
         --chdir="$C_IMPL" \
         --time="$ONCARD_TIME" \

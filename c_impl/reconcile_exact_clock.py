@@ -16,10 +16,13 @@ usage: reconcile_exact_clock.py <xclbin> <exact_clock_gate.tsv> <link_freq_mhz> 
 exit 0  EXACT_CLOCK_OK (already correct) or EXACT_CLOCK_RECONCILED (patched, re-read)
 exit 1  EXACT_CLOCK_FAIL (no/negative gate evidence, or metadata still wrong)
 """
-import json, os, shutil, subprocess, sys
+import json, math, os, shutil, subprocess, sys
 
 XCLBINUTIL = os.environ.get("XCLBINUTIL", "/opt/xilinx/xrt/bin/xclbinutil")
 KERNEL_CLOCK = "clk_kernel_00_unbuffered_net"
+# Every clock the finishing hook gates, with its fixed period where the shell
+# owns it. The kernel period comes from the requested frequency.
+FIXED_CLOCKS = {"dma_ip_axi_aclk_1": 4.000, "hbm_aclk": 2.222}
 
 
 def fail(msg):
@@ -40,25 +43,41 @@ def data_clocks(topology):
 
 
 def gate_proves_closure(tsv_path, link_freq):
-    """True only if the hook's TSV exists, names the kernel clock at the requested
-    period, and every clock row has setup >= 0 and hold >= 0."""
+    """True only if the hook's TSV exists, contains every required clock exactly
+    once at its expected period, and every field is finite with setup >= 0 and
+    hold >= 0. Anything malformed, missing or non-finite is a failure."""
     if not os.path.isfile(tsv_path):
         return False, f"gate evidence missing: {tsv_path}"
     rows = [l.rstrip("\n").split("\t") for l in open(tsv_path) if l.strip()]
     if not rows or rows[0][:4] != ["clock", "period_ns", "setup_wns_ns", "hold_whs_ns"]:
         return False, f"unexpected TSV header in {tsv_path}"
-    seen_kernel = False
-    for name, period, setup, hold in (r[:4] for r in rows[1:]):
-        period, setup, hold = float(period), float(setup), float(hold)
+    expected = dict(FIXED_CLOCKS, **{KERNEL_CLOCK: 1000.0 / link_freq})
+    seen = {}
+    for r in rows[1:]:
+        if len(r) < 4:
+            return False, f"malformed row {r!r} in {tsv_path}"
+        name = r[0]
+        try:
+            period, setup, hold = (float(x) for x in r[1:4])
+        except ValueError:
+            return False, f"non-numeric field in row {r!r}"
+        if not all(math.isfinite(v) for v in (period, setup, hold)):
+            return False, f"non-finite field in row {r!r}"
+        if name not in expected:
+            return False, f"unexpected clock {name} in {tsv_path}"
+        if name in seen:
+            return False, f"duplicate row for {name}"
+        if abs(period - expected[name]) > 0.002:
+            return False, f"{name} period {period} ns is not {expected[name]:.3f} ns"
         if setup < 0 or hold < 0:
             return False, f"{name} setup={setup} hold={hold} at {period} ns is negative"
-        if name == KERNEL_CLOCK:
-            seen_kernel = True
-            if abs(period - 1000.0 / link_freq) > 0.002:
-                return False, f"{name} period {period} ns is not {1000.0/link_freq:.3f} ns ({link_freq} MHz)"
-    if not seen_kernel:
-        return False, f"{KERNEL_CLOCK} not in {tsv_path}"
-    return True, f"gate: {len(rows)-1} clocks non-negative, kernel at {1000.0/link_freq:.3f} ns"
+        seen[name] = (setup, hold)
+    missing = sorted(set(expected) - set(seen))
+    if missing:
+        return False, f"required clock(s) missing from {tsv_path}: {missing}"
+    return True, (f"gate: {len(seen)} clocks non-negative -- "
+                  + ", ".join(f"{n} {s:+.3f}/{h:+.3f}" for n, (s, h) in sorted(seen.items()))
+                  + f"; kernel at {expected[KERNEL_CLOCK]:.3f} ns")
 
 
 def main():
@@ -69,13 +88,15 @@ def main():
     before = dump_topology(xclbin, os.path.join(work, "clock_freq_topology.json"))
     clocks = data_clocks(before)
     print(f"image DATA clocks: {clocks}  requested: {link_freq}")
-    if clocks == [link_freq]:
-        print(f"EXACT_CLOCK_OK {clocks}")
-        return
+    # Closure evidence is required in every case: an image whose metadata already
+    # says the requested frequency is only acceptable if the hook proved timing.
     ok, why = gate_proves_closure(tsv, link_freq)
     print(why)
     if not ok:
-        fail(f"DATA={clocks}, requested={link_freq}, and closure is not proven -- not patching")
+        fail(f"DATA={clocks}, requested={link_freq}, and closure is not proven -- not accepting")
+    if clocks == [link_freq]:
+        print(f"EXACT_CLOCK_OK {clocks} (closure proven by the hook gate)")
+        return
     entries = [c for c in before["clock_freq_topology"]["m_clock_freq"] if c["m_type"] == "DATA"]
     if len(entries) != 1:
         fail(f"expected one DATA clock entry, found {len(entries)}")

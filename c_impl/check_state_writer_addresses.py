@@ -32,6 +32,10 @@ def testbench(top, ports, port, allow_direct=False):
     mode = one(r"qkvg_recurrent_mode" + suffix)
     addr = one(r"m_axi_.*_AWADDR")
     valid = one(r"m_axi_.*_AWVALID")
+    awready = one(r"m_axi_.*_AWREADY")
+    awlen = one(r"m_axi_.*_AWLEN")
+    wvalid = one(r"m_axi_.*_WVALID")
+    wready = one(r"m_axi_.*_WREADY")
     declarations = [f"{'reg' if d == 'input' else 'wire'} {w + ' ' if w else ''}{n};" for d, w, n in ports]
     initialize = []
     for direction, _, name in ports:
@@ -43,7 +47,8 @@ def testbench(top, ports, port, allow_direct=False):
         initialize.append(f"{name} = {value};")
     return "\n".join([
         "`timescale 1ns/1ps", "module address_tb;", *declarations,
-        "integer li, relocation, cycles, checks, failures; reg seen; reg [63:0] expected;",
+        "integer li, relocation, cycles, checks, failures, requests; reg seen;",
+        "reg [63:0] expected, req_beats, data_beats;",
         "initial ap_clk=0; always #3.333 ap_clk=~ap_clk;",
         top + " dut(" + ",".join(f".{n}({n})" for _, _, n in ports) + ");",
         "initial begin", *initialize, "checks=0; failures=0;",
@@ -56,17 +61,29 @@ def testbench(top, ports, port, allow_direct=False):
         f"{pointer}=64'h{port * 0x20000000:x} + (relocation ? 64'h8000000 : 0);",
         f"{layer}=li; {mode}=1;",
         f"expected=({pointer}+64'd87457792+64'd262144*li)>>6;",
-        "ap_rst=0; ap_start=1; seen=0;",
+        "ap_rst=0; ap_start=1; seen=0; requests=0; req_beats=0; data_beats=0;",
+        # At this module boundary the writer issues its whole 4,096-beat layer
+        # stripe as one or more contiguous requests (the RTL emits a single
+        # AWLEN=4096 request); the per-beat AXI addresses are formed by the
+        # top-level m_axi adapter, outside this DUT. So the checkable contract
+        # is: every request lands at expected + beats already requested, the
+        # requests cover exactly 4,096 beats, and 4,096 data beats are handed
+        # over. Sample until the stripe is complete, not just the first request.
         "begin : await_address",
-        "for(cycles=0; cycles<512; cycles=cycles+1) begin",
+        "for(cycles=0; cycles<24576; cycles=cycles+1) begin",
         "@(posedge ap_clk);",
-        f"if({valid}) begin",
-        f'if({addr} !== expected) begin $display("ADDRESS_FAIL port={port} layer=%0d pointer=%h expected_word=%h actual_word=%h",li,{pointer},expected,{addr}); failures=failures+1; end',
-        "seen=1; checks=checks+1; disable await_address; end",
+        f"if({valid} && {awready}) begin",
+        f'if({addr} !== expected + req_beats) begin $display("ADDRESS_FAIL port={port} layer=%0d pointer=%h request=%0d expected_word=%h actual_word=%h",li,{pointer},requests,expected+req_beats,{addr}); failures=failures+1; end',
+        f"req_beats = req_beats + {awlen}; requests = requests + 1; seen=1; end",
+        f"if({wvalid} && {wready}) data_beats = data_beats + 1;",
+        "if(seen && req_beats >= 4096 && data_beats >= 4096) disable await_address;",
         "end end",
-        'if(!seen) begin $display("ADDRESS_TIMEOUT"); failures=failures+1; end',
+        f'if(!seen) begin $display("ADDRESS_TIMEOUT port={port} layer=%0d",li); failures=failures+1; end',
+        "else begin",
+        f'if(req_beats !== 4096 || data_beats !== 4096) begin $display("LENGTH_FAIL port={port} layer=%0d requests=%0d requested_beats=%0d data_beats=%0d",li,requests,req_beats,data_beats); failures=failures+1; end',
+        "checks=checks+1; end",
         "end end",
-        f'if(failures==0 && checks==48) $display("ADDRESS_PASS port={port} cases=%0d",checks);',
+        f'if(failures==0 && checks==48) $display("ADDRESS_PASS port={port} cases=%0d requested_beats_per_case=4096 data_beats_per_case=4096",checks);',
         f'else $display("ADDRESS_FAILED_SUMMARY port={port} cases=%0d failures=%0d",checks,failures);',
         "$finish;",
         "end", "endmodule", "",
@@ -146,7 +163,8 @@ def main():
             command(["xsim", f"sim_{phase}", "-runall", "-log", f"sim_{phase}.log"], work)
             log = (work / f"sim_{phase}.log").read_text()
             passed = (f"ADDRESS_PASS port={port} cases=48" in log and
-                      "ADDRESS_FAIL" not in log and "ADDRESS_TIMEOUT" not in log)
+                      "ADDRESS_FAIL" not in log and "ADDRESS_TIMEOUT" not in log
+                      and "LENGTH_FAIL" not in log)
             results.append(dict(port=port, phase=phase, cases=48, passed=passed))
             (out / "summary.json").write_text(json.dumps(results, indent=2))
             if not passed and not args.diagnostic_continue:

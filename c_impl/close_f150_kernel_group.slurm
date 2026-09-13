@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=iter75f_ce_locality
+#SBATCH --job-name=close_f150_kernel_group
 #SBATCH --partition=build
 #SBATCH --constraint=vivado2024.2
 #SBATCH --exclude=acclnode03,harrier
@@ -7,29 +7,42 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=192G
 #SBATCH --time=08:00:00
-#SBATCH --output=/home/yaoz0b/GatedDeltaNet/c_impl/diagnostics/iter75f_ce_locality/slurm-%j.log
-# Shared checkpoint: no node pin or U55C platform/GRES needed for this repair.
-# Exclude the two recorded disk-full nodes; retain an explicit scratch check.
+#SBATCH --output=/home/yaoz0b/GatedDeltaNet/c_impl/diagnostics/close_f150_kernel_group/slurm-%j.log
+# One focused post-route pass on a routed checkpoint, confined to the kernel
+# clock's path group (job 3955 took the -0.001 ns checkpoint to 0.000 this way).
+#   inputs (--export): CLOSE_INPUT_DCP     routed checkpoint to close (required)
+#                      CLOSE_INPUT_SHA256  its expected digest (optional; verified when set)
+#   Everything else is staged from the repository. Slurm opens --output before
+#   the script runs, so create the log directory first:
+#     mkdir -p c_impl/diagnostics/close_f150_kernel_group && \
+#     sbatch --export=ALL,CLOSE_INPUT_DCP=/abs/after_explore.dcp c_impl/close_f150_kernel_group.slurm
+#   Outputs: reports-<job>/ (per-stage route/timing/CE evidence, after_focused.dcp,
+#   closed_f150.dcp + physical_gate.pass on success), manifest-<job>.sha256,
+#   vivado-<job>.log, repair-<job>.{phase,exit}.
 set -eo pipefail
-ROOT=/home/yaoz0b/GatedDeltaNet/c_impl/diagnostics/iter75f_ce_locality
-INPUT=/home/yaoz0b/GatedDeltaNet/c_impl/diagnostics/iter75e_postroute_explore/reports-3953/after_explore.dcp
-WORK="/tmp/${USER}-${SLURM_JOB_ID}/ce_locality"
-exec > >(tee "$ROOT/repair.live.log") 2>&1
-trap 'rc=$?; printf "%s\n" "$rc" > "$ROOT/repair.exit"; echo "REPAIR_EXIT=$rc"' EXIT
-echo "node=$(hostname) job=$SLURM_JOB_ID start=$(date -u +%FT%TZ)"
+C=/home/yaoz0b/GatedDeltaNet/c_impl
+ROOT=$C/diagnostics/close_f150_kernel_group
+INPUT="${CLOSE_INPUT_DCP:?set CLOSE_INPUT_DCP to the routed checkpoint to close}"
+trap 'rc=$?; printf "%s\n" "$rc" > "$ROOT/repair-$SLURM_JOB_ID.exit"; echo "REPAIR_EXIT=$rc end=$(date -u +%FT%TZ)"' EXIT
+echo "node=$(hostname) job=$SLURM_JOB_ID start=$(date -u +%FT%TZ) input=$INPUT"
+test -s "$INPUT" || { echo "FATAL: checkpoint missing: $INPUT"; exit 2; }
+if [ -n "${CLOSE_INPUT_SHA256:-}" ]; then
+    test "$(sha256sum "$INPUT" | awk '{print $1}')" = "$CLOSE_INPUT_SHA256" || { echo "FATAL: input digest mismatch"; exit 2; }
+fi
+# Two checkpoints (~1.5 GB) are written; use node-local disk when it has room,
+# otherwise shared storage (harrier's and acclnode03's /tmp were full 2026-09-10/11).
 df -h /tmp
-available_kib=$(df -Pk /tmp | awk 'NR==2 {print $4}')
-test "$available_kib" -ge 62914560 || { echo 'FATAL: less than60GiB scratch'; exit 2; }
-test "$(sha256sum "$INPUT" | awk '{print $1}')" = ee44dbecbb8d71675dfed80cc2a7c9ffd7c8b6b1d17ce462984271ea1f582f2e
-test "$(sha256sum "$ROOT/scripts_snapshot.tar" | awk '{print $1}')" = "${REPAIR_SNAPSHOT_SHA256:?missing snapshot hash}"
+if [ "$(df -Pk /tmp | awk 'NR==2 {print $4}')" -ge 20971520 ]; then
+    WORK=/tmp/$USER-$SLURM_JOB_ID/close_f150
+else
+    WORK=$ROOT/work-$SLURM_JOB_ID; echo "NOTE: /tmp has <20 GiB; working on shared storage at $WORK"
+fi
 mkdir -p "$WORK"
 cp "$INPUT" "$WORK/input.dcp"
-test "$(sha256sum "$WORK/input.dcp" | awk '{print $1}')" = ee44dbecbb8d71675dfed80cc2a7c9ffd7c8b6b1d17ce462984271ea1f582f2e
-tar -xf "$ROOT/scripts_snapshot.tar" -C "$WORK"
-sha256sum "$WORK/input.dcp" "$WORK/close_f150_common.tcl" "$WORK/close_f150_kernel_group.tcl" "$WORK/close_f150_kernel_group.slurm" | tee "$ROOT/manifest-$SLURM_JOB_ID.sha256"
-export REPAIR_DCP="$WORK/input.dcp" REPAIR_OUT="$ROOT/reports-$SLURM_JOB_ID"
-export REPAIR_STATUS="$ROOT/repair.phase"
+cp "$C/close_f150_common.tcl" "$C/close_f150_kernel_group.tcl" "$C/close_f150_parser_test.tcl" "$WORK/"
+sha256sum "$WORK/input.dcp" "$WORK"/close_f150_*.tcl | tee "$ROOT/manifest-$SLURM_JOB_ID.sha256"
+export REPAIR_DCP="$WORK/input.dcp" REPAIR_OUT="$ROOT/reports-$SLURM_JOB_ID" REPAIR_STATUS="$ROOT/repair-$SLURM_JOB_ID.phase"
 cd "$WORK"
-tclsh parser_test.tcl
+tclsh close_f150_parser_test.tcl
 source /tools/Xilinx/Vitis/2024.2/settings64.sh
-vivado -mode batch -nojournal -log "$ROOT/vivado.live.log" -source close_f150_kernel_group.tcl
+vivado -mode batch -nojournal -log "$ROOT/vivado-$SLURM_JOB_ID.log" -source close_f150_kernel_group.tcl
