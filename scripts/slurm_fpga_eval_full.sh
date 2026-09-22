@@ -123,22 +123,29 @@ finish_host() {
 
 case "$EVAL_TABLE" in
     2)
-        echo "[full] Table 2 S1/S2"
-        start_host table2_s12 "$RAW/s12/raw"
-        MODEL_ID="$MODEL" OUTPUT_DIR="$RAW/s12/results" \
-            REQUEST_PREFIX=full-t2-s12 \
-            TASKS=gdn_niah_single_1,gdn_niah_single_2 \
-            SEQ_LENGTHS='[1024,2048,4096,8192]' PYTHON_BIN="$PY" \
-            scripts/run_fpga_table2_eval.sh --log_samples
-        finish_host
+        # Stage selection and per-stage overrides. Defaults reproduce the
+        # original behaviour exactly; set T2_RUN_S12=0 / T2_S3_SEQ_LENGTHS to
+        # re-run a single missing cell without redoing the whole table.
+        if [[ "${T2_RUN_S12:-1}" == 1 ]]; then
+            echo "[full] Table 2 S1/S2"
+            start_host table2_s12 "$RAW/s12/raw"
+            MODEL_ID="$MODEL" OUTPUT_DIR="$RAW/s12/results" \
+                REQUEST_PREFIX=full-t2-s12 \
+                TASKS=gdn_niah_single_1,gdn_niah_single_2 \
+                SEQ_LENGTHS="${T2_S12_SEQ_LENGTHS:-[1024,2048,4096,8192]}" PYTHON_BIN="$PY" \
+                scripts/run_fpga_table2_eval.sh --log_samples
+            finish_host
+        fi
 
-        echo "[full] Table 2 S3"
-        start_host table2_s3 "$RAW/s3/raw"
-        MODEL_ID="$MODEL" OUTPUT_DIR="$RAW/s3/results" \
-            REQUEST_PREFIX=full-t2-s3 TASKS=gdn_niah_single_3 \
-            SEQ_LENGTHS='[1024,2048,4096]' PYTHON_BIN="$PY" \
-            scripts/run_fpga_table2_eval.sh --log_samples
-        finish_host
+        if [[ "${T2_RUN_S3:-1}" == 1 ]]; then
+            echo "[full] Table 2 S3"
+            start_host "${T2_S3_PHASE:-table2_s3}" "${T2_S3_RAW:-$RAW/s3/raw}"
+            MODEL_ID="$MODEL" OUTPUT_DIR="${T2_S3_OUTPUT_DIR:-$RAW/s3/results}" \
+                REQUEST_PREFIX="${T2_S3_PREFIX:-full-t2-s3}" TASKS=gdn_niah_single_3 \
+                SEQ_LENGTHS="${T2_S3_SEQ_LENGTHS:-[1024,2048,4096]}" PYTHON_BIN="$PY" \
+                scripts/run_fpga_table2_eval.sh --log_samples
+            finish_host
+        fi
         ;;
     3)
         echo "[full] Table 3"

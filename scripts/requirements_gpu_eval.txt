@@ -1,0 +1,15 @@
+# Linux x86_64, Python 3.11. Numerical stack from the existing evaluation env.
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.7.1+cu126
+triton==3.3.1
+flash-linear-attention==0.4.2
+fla-core==0.4.2
+transformers==4.51.3
+tokenizers==0.21.4
+accelerate==1.13.0
+huggingface-hub==0.36.2
+safetensors==0.7.0
+einops==0.8.2
+numpy==2.4.4
+sentencepiece==0.2.1
+nvidia-ml-py==13.610.43

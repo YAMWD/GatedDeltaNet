@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Write timestamped A100 or U55C board-power samples as JSON Lines."""
+"""Write timestamped NVIDIA GPU or U55C board-power samples as JSON Lines."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
+
+from gpu_power import NvmlDevice, cuda_uuid
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,7 +22,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--stop-file", type=Path, required=True)
     parser.add_argument("--period", type=float)
-    parser.add_argument("--gpu-index", type=int)
+    selector = parser.add_mutually_exclusive_group()
+    selector.add_argument("--gpu-index", type=int, help="explicit physical NVML index")
+    selector.add_argument("--gpu-uuid")
+    parser.add_argument("--cuda-device", default="cuda:0")
+    parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--fpga-bdf")
     return parser.parse_args()
 
@@ -64,33 +71,15 @@ def find_electrical_power(value: Any, path: str = "") -> tuple[float, str] | Non
     return None
 
 
-def make_gpu_reader(index_arg: int | None) -> tuple[Callable[[], float], dict[str, Any]]:
-    try:
-        import pynvml
-    except ImportError as error:  # pragma: no cover - allocation environment
-        raise RuntimeError("pynvml is required for GPU energy evaluation") from error
-    pynvml.nvmlInit()
-    index = index_arg
-    if index is None:
-        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
-        index = int(visible) if visible.isdigit() else 0
-    handle = pynvml.nvmlDeviceGetHandleByIndex(index)
-    uuid = pynvml.nvmlDeviceGetUUID(handle)
-    name = pynvml.nvmlDeviceGetName(handle)
-    if isinstance(uuid, bytes):
-        uuid = uuid.decode()
-    if isinstance(name, bytes):
-        name = name.decode()
+def make_gpu_reader(
+    index_arg: int | None, gpu_uuid: str | None = None, device: str = "cuda:0"
+) -> tuple[Callable[[], float], dict[str, Any]]:
+    if index_arg is None and gpu_uuid is None:
+        import torch
 
-    def read() -> float:
-        return float(pynvml.nvmlDeviceGetPowerUsage(handle)) / 1000.0
-
-    return read, {
-        "source": "nvml",
-        "gpu_index": index,
-        "gpu_uuid": uuid,
-        "gpu_name": name,
-    }
+        gpu_uuid = cuda_uuid(torch, torch.device(device))
+    gpu = NvmlDevice(gpu_uuid=gpu_uuid, index=index_arg)
+    return gpu.watts, gpu.identity()
 
 
 def xbutil_power(bdf: str) -> tuple[float, str]:
@@ -160,15 +149,17 @@ def make_fpga_reader(bdf: str | None) -> tuple[Callable[[], float], dict[str, An
 def main() -> None:
     args = parse_args()
     if args.device == "gpu":
-        reader, identity = make_gpu_reader(args.gpu_index)
+        reader, identity = make_gpu_reader(args.gpu_index, args.gpu_uuid, args.cuda_device)
         period = args.period if args.period is not None else 0.1
     else:
         reader, identity = make_fpga_reader(args.fpga_bdf)
         period = args.period if args.period is not None else 1.0
-    if period <= 0:
+    if not math.isfinite(period) or period <= 0:
         raise ValueError("sample period must be positive")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    if args.ready_file:
+        args.ready_file.unlink(missing_ok=True)
     args.stop_file.unlink(missing_ok=True)
     values: list[float] = []
     with args.output.open("w", encoding="utf-8") as output:
@@ -183,7 +174,7 @@ def main() -> None:
             started = time.monotonic()
             try:
                 watts = reader()
-                if watts <= 0:
+                if not math.isfinite(watts) or watts <= 0:
                     raise RuntimeError(f"non-positive power reading {watts}")
                 values.append(watts)
                 record = {
@@ -200,9 +191,33 @@ def main() -> None:
                 }
             output.write(json.dumps(record, sort_keys=True) + "\n")
             output.flush()
+            if args.ready_file and record["kind"] == "sample" and not args.ready_file.exists():
+                temporary = args.ready_file.with_suffix(args.ready_file.suffix + ".tmp")
+                temporary.write_text(json.dumps(identity) + "\n")
+                os.replace(temporary, args.ready_file)
             remaining = period - (time.monotonic() - started)
             if remaining > 0:
                 time.sleep(remaining)
+        # One closing sample after the stop request, so the trace always
+        # extends past the benchmark's last timing boundary. Without it the
+        # final boundary can fall inside the last sleep (job 3389: the last
+        # sample landed 0.19 s before interval 2 ended and aggregation failed).
+        try:
+            watts = reader()
+            if not math.isfinite(watts) or watts <= 0:
+                raise RuntimeError(f"non-positive power reading {watts}")
+            values.append(watts)
+            record = {
+                "kind": "sample",
+                "unix_seconds": time.time(),
+                "monotonic_seconds": time.monotonic(),
+                "watts": watts,
+                "closing": True,
+            }
+        except Exception as error:
+            record = {"kind": "error", "unix_seconds": time.time(), "error": str(error)}
+        output.write(json.dumps(record, sort_keys=True) + "\n")
+        output.flush()
         output.write(json.dumps({
             "kind": "summary",
             "samples": len(values),
@@ -214,4 +229,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

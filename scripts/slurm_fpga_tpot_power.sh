@@ -12,10 +12,17 @@ set -o pipefail
 
 REPO=/home/yaoz0b/GatedDeltaNet-eval
 DIAG="$REPO/c_impl/diagnostics/fpga_eval_power"
-RAW=/home/yaoz0b/gdn_fpga_eval/full/performance
+# GPU_DTYPE selects the baseline precision (float32 default preserves the
+# original behaviour); PERF_ROOT keeps a second precision run from
+# overwriting the first.
+RAW="${PERF_ROOT:-/home/yaoz0b/gdn_fpga_eval/full/performance}"
+GPU_DTYPE="${GPU_DTYPE:-float32}"
 PY=/home/yaoz0b/GatedDeltaNet/.micromamba/envs/gdn-hf/bin/python
 MODEL=/home/yaoz0b/.cache/huggingface/hub/models--m-a-p--1.3B-100B-GatedDeltaNet-pure/snapshots/930ed6ae4ac629c86cb9855bb3dcb0a0974a29aa
-XCLBIN=/home/yaoz0b/gdn_fpga_eval/artifacts/iter67c/gdn_forward.xclbin
+# XCLBIN / XCLBIN_SHA256 select the image under test (default: the Iter67c
+# 100 MHz image the first runs used; Iter69 = same source at 121 MHz).
+XCLBIN="${XCLBIN:-/home/yaoz0b/gdn_fpga_eval/artifacts/iter67c/gdn_forward.xclbin}"
+XCLBIN_SHA256="${XCLBIN_SHA256:-fb4fc63f76bc1ee485665f21102596270930d6d39643b8eb5ae7d4f899d289ab}"
 WEIGHTS=/home/yaoz0b/gdn_fpga_eval/artifacts/model/gdn-1.3b-bf16w.gdnw
 WIKITEXT=/home/yaoz0b/GatedDeltaNet/c_impl/fixtures_full/wikitext.gdnreq
 LIVE="$DIAG/power-${SLURM_JOB_ID}.live.log"
@@ -66,8 +73,8 @@ fi
 BDF="${u55c_cards[0]}"
 echo "fpga_bdf=$BDF"
 
-test "$(sha256sum "$XCLBIN" | awk '{print $1}')" = \
-    fb4fc63f76bc1ee485665f21102596270930d6d39643b8eb5ae7d4f899d289ab
+test "$(sha256sum "$XCLBIN" | awk '{print $1}')" = "$XCLBIN_SHA256"
+echo "xclbin=$XCLBIN sha256=$XCLBIN_SHA256 gpu_dtype=$GPU_DTYPE perf_root=$RAW"
 test "$(sha256sum "$WEIGHTS" | awk '{print $1}')" = \
     ba81d3536e868e1057b81cc71354060cfba968c1b356b2fa70add3b83a84c298
 test "$(sha256sum c_impl/gdn_model.cpp | awk '{print $1}')" = \
@@ -85,6 +92,7 @@ echo "[fixture] deterministic 4K prompt and teacher stream"
 echo "[benchmark] U55C idle, warmup, and three active intervals"
 rm -f "$RAW/fpga_power.stop"
 "$PY" scripts/sample_device_power.py --device fpga --fpga-bdf "$BDF" \
+    --period 1.0 \
     --output "$RAW/fpga_power.jsonl" --stop-file "$RAW/fpga_power.stop" &
 fpga_sampler=$!
 c_impl/host.exe "$XCLBIN" "$WEIGHTS" c_impl/fixtures_decode/decode.gdnreq \
@@ -96,10 +104,13 @@ c_impl/host.exe "$XCLBIN" "$WEIGHTS" c_impl/fixtures_decode/decode.gdnreq \
 touch "$RAW/fpga_power.stop"
 wait "$fpga_sampler"
 fpga_sampler=""
+echo "[clock] programmed kernel clock, read back from the card"
+xbutil examine --device "$BDF" --report platform 2>/dev/null | grep -A4 "^Clocks" | tee "$RAW/fpga_clocks.txt"
 
-echo "[benchmark] A100 FP32 eager idle, warmup, and three active intervals"
+echo "[benchmark] A100 ${GPU_DTYPE} eager idle, warmup, and three active intervals"
 rm -f "$RAW/gpu_power.stop"
 "$PY" scripts/sample_device_power.py --device gpu \
+    --period 1.0 \
     --output "$RAW/gpu_power.jsonl" --stop-file "$RAW/gpu_power.stop" &
 gpu_sampler=$!
 "$PY" scripts/benchmark_gpu_fp32.py \
@@ -107,6 +118,7 @@ gpu_sampler=$!
     --prompt-tokens "$RAW/fixture/prompt_4096.tokens" \
     --teacher-tokens "$RAW/fixture/teacher_4096.tokens" \
     --output "$RAW/gpu_timing.json" \
+    --dtype "$GPU_DTYPE" \
     --idle-seconds 60 --warmup-seconds 30 \
     --interval-seconds 60 --intervals 3
 touch "$RAW/gpu_power.stop"

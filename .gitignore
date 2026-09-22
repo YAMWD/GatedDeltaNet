@@ -48,6 +48,11 @@ c_impl/results_decode_hw/
 c_impl/device_trace_*.csv
 c_impl/summary.csv
 c_impl/xrt.run_summary
+# XRT writes its profile summary to the process working directory, which
+# is the repository root whenever host.exe is launched from there.
+/device_trace_*.csv
+/summary.csv
+/xrt.run_summary
 c_impl/xclbin_*.log
 __pycache__/
 *.pyc
