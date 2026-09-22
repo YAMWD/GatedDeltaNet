@@ -1788,8 +1788,8 @@ static void gdn_recurrent_attention_island(
     hls::stream<Beat512> &state_low_stream,
     hls::stream<Beat512> &state_high_stream,
     hls::stream<Beat512> &out_stream,
-    Beat512 *recurrent_state_low,
-    Beat512 *recurrent_state_high,
+    hls::stream<Beat512> &state_low_out,
+    hls::stream<Beat512> &state_high_out,
     const float *a,
     const float *b,
     const float *layer_a_log,
@@ -1802,8 +1802,7 @@ static void gdn_recurrent_attention_island(
 #pragma HLS bind_storage variable=state_pair type=RAM_2P impl=URAM
 #pragma HLS array_partition variable=state_pair dim=2 cyclic factor=GDN_RECURRENT_ISLAND_LANES
 
-    Beat512 *state_out_low = recurrent_state_low;
-    Beat512 *state_out_high = recurrent_state_high;
+    (void)layer_index;
     const float q_scale = 1.0f / sqrtf((float)GDN_DK);
 
 recur_island_head: for (uint32_t head_index = 0;
@@ -1824,10 +1823,6 @@ recur_island_head: for (uint32_t head_index = 0;
             k_head[p] = k_stream.read();
             v_head[p] = v_stream.read();
         }
-
-        const size_t head_state_base_bf16 =
-            ((size_t)layer_index * GDN_HEADS + head_index) *
-            GDN_DK * (GDN_DV / 32) / GDN_RECURRENT_STATE_PORTS;
 
         /* One BF16 state Beat contains the two 16-column chunks that used to
          * arrive as two FP32 Beats.  A nested 512-Beat/2-half loop looked
@@ -2130,10 +2125,14 @@ recur_island_head: for (uint32_t head_index = 0;
                 state_low_half[subhalf] = packed_low;
                 state_high_half[subhalf] = packed_high;
             }
-            state_out_low[head_state_base_bf16 + packed_index] =
-                join_bf16_halves(state_low_half);
-            state_out_high[head_state_base_bf16 + packed_index] =
-                join_bf16_halves(state_high_half);
+            /* Iter73: hand the updated Beat to a FIFO instead of the m_axi
+             * port.  Writing state_out[...] here made the SLR0 adapter's
+             * write-buffer full flag the stall condition of this whole
+             * pipeline -- a two-SLR net into a 5,204-load clock-enable cone,
+             * V0's largest failing class at 6.667 ns.  gemv32_state_writer
+             * drains the FIFO into the port outside the SLR2 island pblock. */
+            state_low_out.write(join_bf16_halves(state_low_half));
+            state_high_out.write(join_bf16_halves(state_high_half));
         }
     }
 }
@@ -2178,10 +2177,10 @@ static void gdn_recurrent_attention_islands_dataflow(
     hls::stream<Beat512> &state_stream2,
     hls::stream<Beat512> &state_stream3,
     Beat512 *attn_out,
-    Beat512 *recurrent_state0,
-    Beat512 *recurrent_state1,
-    Beat512 *recurrent_state2,
-    Beat512 *recurrent_state3,
+    hls::stream<Beat512> &state_wr0,
+    hls::stream<Beat512> &state_wr1,
+    hls::stream<Beat512> &state_wr2,
+    hls::stream<Beat512> &state_wr3,
     const float *a,
     const float *b,
     const float *layer_a_log,
@@ -2218,11 +2217,11 @@ static void gdn_recurrent_attention_islands_dataflow(
                                 q0, k0, v0, q1, k1, v1);
     gdn_recurrent_attention_island<0>(
         q0, k0, v0, state_stream0, state_stream2, out0,
-        recurrent_state0, recurrent_state2,
+        state_wr0, state_wr2,
         a, b, layer_a_log, layer_dt_bias, layer_index);
     gdn_recurrent_attention_island<1>(
         q1, k1, v1, state_stream1, state_stream3, out1,
-        recurrent_state1, recurrent_state3,
+        state_wr1, state_wr3,
         a, b, layer_a_log, layer_dt_bias, layer_index);
     gdn_recurrent_merge_islands(out0, out1, attn_out);
 }
@@ -2236,10 +2235,10 @@ static void gdn_recurrent_attention_islands(
     hls::stream<Beat512> &state_stream2,
     hls::stream<Beat512> &state_stream3,
     Beat512 *attn_out,
-    Beat512 *recurrent_state0,
-    Beat512 *recurrent_state1,
-    Beat512 *recurrent_state2,
-    Beat512 *recurrent_state3,
+    hls::stream<Beat512> &state_wr0,
+    hls::stream<Beat512> &state_wr1,
+    hls::stream<Beat512> &state_wr2,
+    hls::stream<Beat512> &state_wr3,
     const float *a,
     const float *b,
     const float *layer_a_log,
@@ -2254,8 +2253,7 @@ static void gdn_recurrent_attention_islands(
         q_stream, k_stream, v_stream,
         state_stream0, state_stream1, state_stream2, state_stream3,
         attn_out,
-        recurrent_state0, recurrent_state1,
-        recurrent_state2, recurrent_state3,
+        state_wr0, state_wr1, state_wr2, state_wr3,
         a, b, layer_a_log, layer_dt_bias, layer_index);
 }
 
@@ -3236,6 +3234,50 @@ gemv32_state_owner_head: for (uint32_t head = 0;
     }
 }
 
+/* Iter73: the write-side twin of gemv32_mm2s_with_state.  The recurrent
+ * islands used to store the updated BF16 state straight into ports 28..31 from
+ * inside the SLR2 pblock, so every store handshake was a two-SLR round trip to
+ * the SLR0 adapter and the adapter's write-buffer full flag gated the update
+ * pipeline's 5,204-load clock-enable cone (Iter71 V0, 5,263 failing endpoints
+ * at 6.667 ns).  Now each island fills a per-port FIFO and this free (un-pinned)
+ * sink drains it: the island stalls only on a local FIFO flag and the port
+ * handshake terminates in a ~600-register loop the placer can put beside the
+ * adapter.  Same Iter61 rule as the logit export -- the FIFO sits between the
+ * block and the memory port.  Addressing is identical to the removed direct
+ * store: layer_index * 8 heads * 512 Beats, heads consecutive. */
+template <int CHANNEL>
+static void gemv32_state_writer(
+    hls::stream<Beat512> &state_wr,
+    Beat512 *weights,
+    uint32_t layer_index,
+    bool qkvg_recurrent_mode
+) {
+#pragma HLS inline off
+    (void)CHANNEL;
+    if (!qkvg_recurrent_mode)
+        return;
+    const uint32_t state_packs_per_head =
+        GDN_DK * (GDN_DV / 32) / GDN_RECURRENT_STATE_PORTS;
+    // Use the original AXI base and a complete unsigned beat index. Explicit
+    // width alone is insufficient: Vivado folded the narrow offset sum into
+    // pointer addition incorrectly in Iter75 (128 MiB-low state writes).
+    // Register the offset add before pointer addition to prevent that folding.
+    // This is once per layer, outside the II=1 state-write loop. Keep the
+    // generated-RTL/post-synth/post-opt address gates in the build flow.
+    const ap_uint<64> layer_base =
+        ap_uint<64>(GDN_COMPILED_WEIGHT_SHARD_BEATS) +
+        ap_uint<64>(layer_index) *
+        ap_uint<64>(GDN_HEADS * state_packs_per_head);
+#pragma HLS bind_op variable=layer_base op=add impl=fabric latency=1
+gemv32_state_writer_beat: for (uint32_t i = 0;
+                                i < GDN_HEADS * state_packs_per_head; ++i) {
+#pragma HLS loop_tripcount min=4096 max=4096
+#pragma HLS pipeline II=1
+        const ap_uint<64> beat_index = layer_base + ap_uint<64>(i);
+        weights[beat_index.to_uint64()] = state_wr.read();
+    }
+}
+
 static void gemv32_drain_x(hls::stream<Beat512> &xr, uint32_t k_packs) {
 #pragma HLS inline off
 gemv32_dx: for (uint32_t kp = 0; kp < k_packs; ++kp) {
@@ -3296,10 +3338,19 @@ gemv32_cl_init_contexts: for (int slot = 0; slot < 8; ++slot) {
     uint32_t group = 0;
     uint32_t wb = 0;
     uint32_t context = 0;
+    /* Iter73b: the final group is retired inside the free-running loop.
+     * Nine trailing iterations run the same body with the weight reads
+     * suppressed -- eight with wb == 0 retire the last group's contexts
+     * (group == row_groups) and the ninth (wb == 1, context == 0) emits the
+     * port-one word.  Nothing the loop carries is read after it, so the ring
+     * and packer state never leaves the pipeline: the separate flush stage,
+     * the cluster-level yp registers and the 1K--2K-load hand-over nets
+     * between them (census 3482) have no source left to exist. */
+    const uint32_t retire_beats = 9;
+    const uint32_t loop_beats = total_weight_beats + retire_beats;
 
-gemv32_cl_weight_stream: for (uint32_t flat = 0;
-                               flat < total_weight_beats; ++flat) {
-#pragma HLS loop_tripcount min=4096 max=64000
+gemv32_cl_weight_stream: for (uint32_t flat = 0; flat < loop_beats; ++flat) {
+#pragma HLS loop_tripcount min=4105 max=64009
 /* Iter66e probe: free-running pipeline. The per-stage clock-enable network
  * HLS generates for a standard pipeline reaches 5.1K-9.3K loads per cluster
  * (measured, diagnosis 1164) and its cones sat in every routing-failure
@@ -3307,43 +3358,58 @@ gemv32_cl_weight_stream: for (uint32_t flat = 0;
  * always running with a valid pipeline instead, removing that CE network at
  * the source. Native semantics are unchanged; csynth decides eligibility. */
 #pragma HLS pipeline II=1 style=frp
+        const bool draining = flat >= total_weight_beats;
         const Beat512 activation = x_bf16[wb];
-        bool emit_result = false;
-        Beat512 emitted_word = 0;
+        /* An odd number of eight-row groups leaves only eight valid rows in
+         * the last logical output Beat; the shift-in packer holds them in
+         * lanes 8--15, so the emitted copy is moved down and zero padded. */
+        const bool half_pack = group == row_groups && (row_groups & 1) != 0;
 
         /* Retire the previous group before slot zero is reset for the current
          * row.  Shift-and-insert packs sequential rows without a variable
-         * 512-bit lane mux. */
-        if (group != 0 && wb == 0) {
-            if (context == 0 && ((group - 1) & 1) == 0) {
-                yp0 = 0;
-                yp1 = 0;
-            }
-            const float result0 = gemv32_reduce_parts(
-                p00[0], p01[0], p02[0], p03[0]);
-            const float result1 = gemv32_reduce_parts(
-                p10[0], p11[0], p12[0], p13[0]);
-            yp0 >>= 32;
-            yp1 >>= 32;
-            set_fp32_lane(yp0, 15, result0);
-            set_fp32_lane(yp1, 15, result1);
-            /* A cluster emits port-zero then port-one for each output pack.
-             * Use the otherwise idle following weight cycle for the second
-             * write so the steady loop still requests only one AXIS write. */
-            if (context == 7 && (group & 1) == 0) {
-                emit_result = true;
-                emitted_word = yp0;
-            }
+         * 512-bit lane mux.  Sixteen inserts overwrite every lane, so the
+         * packers need no per-pair clear.
+         *
+         * Iter73b2: everything here is straight-line.  The retired words and
+         * the emitted word are computed unconditionally and only the final
+         * assignment and the stream write are predicated, so no 512-bit
+         * value is merged from two basic blocks.  Iter73b left the port-one
+         * emit as a real branch and HLS carried its 512-bit phi through 29
+         * pipeline stages (14,848 FF per cluster, probe 3483). */
+        const bool retire = group != 0 && wb == 0;
+        const float result0 = gemv32_reduce_parts(
+            p00[0], p01[0], p02[0], p03[0]);
+        const float result1 = gemv32_reduce_parts(
+            p10[0], p11[0], p12[0], p13[0]);
+        Beat512 yp0_next = yp0 >> 32;
+        Beat512 yp1_next = yp1 >> 32;
+        set_fp32_lane(yp0_next, 15, result0);
+        set_fp32_lane(yp1_next, 15, result1);
+        if (retire) {
+            yp0 = yp0_next;
+            yp1 = yp1_next;
         }
-        if (group >= 2 && (group & 1) == 0 && wb == 1 && context == 0) {
-            emit_result = true;
-            emitted_word = yp1;
-        }
-        if (emit_result)
+        /* A cluster emits port-zero then port-one for each output pack.
+         * Use the otherwise idle following weight cycle for the second
+         * write so the steady loop still requests only one AXIS write.
+         * emit0 needs wb == 0 and emit1 needs wb == 1, so at most one of
+         * them holds in any iteration. */
+        const bool emit0 = retire && context == 7 &&
+                           ((group & 1) == 0 || half_pack);
+        const bool emit1 = wb == 1 && context == 0 &&
+                           ((group >= 2 && (group & 1) == 0) || half_pack);
+        const Beat512 emit_src = wb == 1 ? yp1 : yp0;
+        const Beat512 emitted_word =
+            half_pack ? Beat512(emit_src >> 256) : emit_src;
+        if (emit0 || emit1)
             ys.write(emitted_word);
 
-        const Beat512 weight0 = ws0.read();
-        const Beat512 weight1 = ws1.read();
+        Beat512 weight0 = 0;
+        Beat512 weight1 = 0;
+        if (!draining) {
+            weight0 = ws0.read();
+            weight1 = ws1.read();
+        }
         float d0_lo, d0_hi, d1_lo, d1_hi;
         gemv32_four_dots(weight0, weight1, activation,
                          d0_lo, d0_hi, d1_lo, d1_hi);
@@ -3385,39 +3451,6 @@ gemv32_cl_weight_stream: for (uint32_t flat = 0;
         }
     }
 
-    const uint32_t final_group = row_groups - 1;
-    if ((final_group & 1) == 0) {
-        yp0 = 0;
-        yp1 = 0;
-    }
-gemv32_cl_flush: for (uint32_t context = 0; context < 8; ++context) {
-#pragma HLS loop_tripcount min=8 max=8
-        const float result0 = gemv32_reduce_parts(
-            p00[0], p01[0], p02[0], p03[0]);
-        const float result1 = gemv32_reduce_parts(
-            p10[0], p11[0], p12[0], p13[0]);
-        yp0 >>= 32;
-        yp1 >>= 32;
-        set_fp32_lane(yp0, 15, result0);
-        set_fp32_lane(yp1, 15, result1);
-        gemv32_rotate_context(p00, p00[0]);
-        gemv32_rotate_context(p01, p01[0]);
-        gemv32_rotate_context(p02, p02[0]);
-        gemv32_rotate_context(p03, p03[0]);
-        gemv32_rotate_context(p10, p10[0]);
-        gemv32_rotate_context(p11, p11[0]);
-        gemv32_rotate_context(p12, p12[0]);
-        gemv32_rotate_context(p13, p13[0]);
-    }
-    if ((final_group & 1) == 0) {
-        /* An odd number of eight-row groups leaves only lanes 0--7 valid in
-         * the final logical output Beat.  The shift-in packer temporarily
-         * holds those values in lanes 8--15; move them down before padding. */
-        yp0 >>= 256;
-        yp1 >>= 256;
-    }
-    ys.write(yp0);
-    ys.write(yp1);
 }
 
 #ifdef GDN_CLUSTER_HLS_TEST
@@ -3911,10 +3944,6 @@ static void gdn_gemv(
     const Beat512 *state_in29 = w29 + GDN_COMPILED_WEIGHT_SHARD_BEATS;
     const Beat512 *state_in30 = w30 + GDN_COMPILED_WEIGHT_SHARD_BEATS;
     const Beat512 *state_in31 = w31 + GDN_COMPILED_WEIGHT_SHARD_BEATS;
-    Beat512 *state_out28 = w28 + GDN_COMPILED_WEIGHT_SHARD_BEATS;
-    Beat512 *state_out29 = w29 + GDN_COMPILED_WEIGHT_SHARD_BEATS;
-    Beat512 *state_out30 = w30 + GDN_COMPILED_WEIGHT_SHARD_BEATS;
-    Beat512 *state_out31 = w31 + GDN_COMPILED_WEIGHT_SHARD_BEATS;
 
     /* BF16 activations: one 32-lane beat per weight beat, so the activation
      * stream is in_dim/32 beats -- half what the FP32 pair needed. */
@@ -3932,6 +3961,7 @@ static void gdn_gemv(
     hls::stream<Beat512> q_stream, k_stream, v_stream;
     hls::stream<Beat512> state_stream0, state_stream1;
     hls::stream<Beat512> state_stream2, state_stream3;
+    hls::stream<Beat512> state_wr0, state_wr1, state_wr2, state_wr3;
     #pragma HLS array_partition variable=ws complete
     #pragma HLS array_partition variable=xr complete
     #pragma HLS array_partition variable=ys complete
@@ -3996,6 +4026,18 @@ static void gdn_gemv(
     #pragma HLS bind_storage variable=state_stream1 type=fifo impl=uram
     #pragma HLS bind_storage variable=state_stream2 type=fifo impl=uram
     #pragma HLS bind_storage variable=state_stream3 type=fifo impl=uram
+    /* Iter73 state write-back queues: the mirror image of state_stream0..3.
+     * A full eight-head window (4,096 Beats) lets the island finish a layer
+     * without ever waiting on HBM write acceptance, and URAM keeps the queue
+     * out of the SLR0/SLR2 BRAM columns; 8 URAM each, 32 of 880 free. */
+    #pragma HLS stream variable=state_wr0 depth=4096
+    #pragma HLS stream variable=state_wr1 depth=4096
+    #pragma HLS stream variable=state_wr2 depth=4096
+    #pragma HLS stream variable=state_wr3 depth=4096
+    #pragma HLS bind_storage variable=state_wr0 type=fifo impl=uram
+    #pragma HLS bind_storage variable=state_wr1 type=fifo impl=uram
+    #pragma HLS bind_storage variable=state_wr2 type=fifo impl=uram
+    #pragma HLS bind_storage variable=state_wr3 type=fifo impl=uram
 
     #pragma HLS dataflow disable_start_propagation
     gemv32_load_x_and_w0(in, sh0, shard_off, xr[0], ws[0],
@@ -4083,7 +4125,15 @@ static void gdn_gemv(
         q_stream, k_stream, v_stream,
         state_stream0, state_stream1, state_stream2, state_stream3,
         attn_out,
-        state_out28, state_out29, state_out30, state_out31,
+        state_wr0, state_wr1, state_wr2, state_wr3,
         a, b, layer_a_log, layer_dt_bias,
         layer_index, qkvg_recurrent_mode);
+    gemv32_state_writer<28>(state_wr0, w28,
+                            layer_index, qkvg_recurrent_mode);
+    gemv32_state_writer<29>(state_wr1, w29,
+                            layer_index, qkvg_recurrent_mode);
+    gemv32_state_writer<30>(state_wr2, w30,
+                            layer_index, qkvg_recurrent_mode);
+    gemv32_state_writer<31>(state_wr3, w31,
+                            layer_index, qkvg_recurrent_mode);
 }

@@ -69,11 +69,12 @@ cd c_impl
 bash run_hw_sbatch.sh
 ```
 
-The wrapper creates separate build and FPGA jobs and chains the test with
-`afterok`. `make -C c_impl run_hw` is the inner production flow used by
-those jobs, not the cluster submission command. Run `make -C c_impl help`
-for the current weight, state, logit-reference, clock, device, and output
-options.
+The wrapper freezes a source snapshot, creates separate build and FPGA jobs
+and chains the test with `afterok`; `make -C c_impl run_hw` on the login node
+invokes the same wrapper. The flow builds and closes the kernel at 150 MHz and
+validates the image on the card (see `c_impl/doc/reproduce_f150.md`). Run
+`make -C c_impl help` for the current weight, state, logit-reference, clock,
+device, and output options.
 
 Weights, exported recurrent state, logit dumps, XOs, XCLBINs, build trees, and
 diagnostic reports are generated artifacts and are intentionally not committed.

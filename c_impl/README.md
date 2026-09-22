@@ -45,7 +45,8 @@ clone*.
 | `Makefile` | Native, XO, XCLBIN, host, and complete `run_hw` flow |
 | `test.tcl` | Integrated HLS synthesis entry point |
 | `hls_gdn_forward.tcl` | HLS interface and RTL configuration |
-| `hw_f150_physical_islands.cfg` | Production connectivity and physical hooks |
+| `hw_f150.cfg` | Production 150 MHz connectivity and physical hooks (`finish_f150_timing.tcl`, `check_iter75d_final_timing.tcl`, `apply_iter75d_control_fanout.tcl`, `apply_iter69_kernel_clock_f150.tcl`) |
+| `reconcile_exact_clock.py` | Fail-closed DATA_CLK metadata reconciliation after the link |
 | `run_hw_sbatch.sh` | Slurm build/test submission wrapper |
 | `slurm/` | Build and U55C test job definitions |
 
@@ -88,9 +89,13 @@ cd c_impl
 bash run_hw_sbatch.sh
 ```
 
-`run_hw_sbatch.sh` submits the build and FPGA test as separate jobs and chains
-the test with `afterok`. The jobs use `make -C c_impl run_hw` as their inner
-production flow; do not invoke that target directly for a cluster hardware run.
+`make run_hw` on the login node runs `run_hw_sbatch.sh`, which freezes a
+source snapshot and submits the build and FPGA test as separate jobs, chaining
+the test with `afterok`. The card job runs the submission's frozen
+`reproduction.Makefile` with `GDN_ONCARD=1`, so it can never start a link. The
+demonstrated launch, from `c_impl/`, is `BUILD_EXCLUSIVE=user BUILD_NODE=acclnode01
+BUILD_EXCLUDE=acclnode04,acclnode05,harrier make run_hw` (from the repository
+root, `make -C c_impl run_hw`); see `doc/reproduce_f150.md`.
 
 Use `make -C c_impl help` to display the configurable weights, state, fixture,
 reference, frequency, device, and output paths.

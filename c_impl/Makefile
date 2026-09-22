@@ -50,13 +50,15 @@ VITIS_SETTINGS := $(XILINX_VITIS)/settings64.sh
 # ----------------------------------------------------------------------------
 # TARGET: sw_emu | hw_emu | hw
 # The retained timing-friendly island design is synthesized at 150 MHz so HLS
-# inserts the required pipeline boundaries, then linked at its demonstrated
-# timing-closed 100 MHz operating point. HLS and link clocks remain independently
+# inserts the required pipeline boundaries, then links at 150 MHz. The physical
+# sequence produced the validated Iter75f image; a fresh end-to-end build with
+# this consolidated recipe remains to be verified.
+# HLS and link clocks remain independently
 # overridable so an experiment cannot silently reuse an XO synthesized for a
 # different schedule.
 PLATFORM       ?= xilinx_u55c_gen3x16_xdma_3_202210_1
 TARGET         ?= hw
-FREQ           ?= 100
+FREQ           ?= 150
 HLS_FREQ       ?= 150
 LINK_FREQ      ?= $(FREQ)
 JOBS           ?= 48
@@ -78,10 +80,16 @@ HLS_PRE_TCL    := $(abspath ./hls_gdn_forward.tcl)
 BUILD_DIR      := build.$(TARGET).gdn32.h$(HLS_FREQ).f$(LINK_FREQ).o$(JOBS)
 XO             := $(BUILD_DIR)/$(KERNEL).xo
 XCLBIN         := $(BUILD_DIR)/$(KERNEL).xclbin
-# The shipping physical configuration is Iter66e: the base island floorplan
-# plus the SLR0 LUT un-pairing hook. hw_f150_physical_islands.cfg remains the
-# pre-Iter66 recipe and is kept for A/B comparison.
-HW_CFG_TEMPLATE ?= hw_iter66e_frp_unpair_f100.cfg
+# Exact 150 MHz recipe: pre-place control replication, then post-route
+# AggressiveExplore -> Explore -> focused kernel physical optimization.
+HW_CFG_TEMPLATE ?= hw_f150.cfg
+HW_RECIPE_FILES := $(HW_CFG_TEMPLATE) apply_iter69_kernel_clock_f150.tcl \
+    apply_iter75d_control_fanout.tcl apply_iter66e_unpair.tcl \
+    apply_f150_physical_islands.tcl apply_iter54_dma_timing.tcl \
+    apply_iter35_dma_w15_fifoaddr_fanout.tcl apply_iter23_dma_fanout.tcl \
+    check_f150_physical_islands.tcl finish_f150_timing.tcl \
+    check_iter75d_final_timing.tcl report_final_qor.tcl
+GDN_ONCARD     ?= 0
 RESOLVED_HW_CFG := $(BUILD_DIR)/resolved_hw.cfg
 HW_CFG          ?= $(RESOLVED_HW_CFG)
 
@@ -95,7 +103,7 @@ endif
 VPP_FLAGS      += --hls.jobs $(JOBS)
 # Compile and link clocks are deliberately separate. The routed decode designs
 # synthesize HLS at 150 MHz, then request the independently chosen physical
-# DATA_CLK during link (100 MHz for the retained Iter57 image).
+# DATA_CLK during link (150 MHz by default).
 VPP_COMPILE_FLAGS := $(VPP_FLAGS) --kernel_frequency $(HLS_FREQ)
 VPP_LINK_FLAGS    := $(VPP_FLAGS) --kernel_frequency $(LINK_FREQ)
 
@@ -148,6 +156,7 @@ LOGITS_REFERENCE ?=
 GPU_LOGITS_REFERENCE ?= artifacts/decode_native_bf16_product_64.gdnlog
 RUN_HW_DIR     ?= diagnostics/run_hw_h$(HLS_FREQ)_f$(LINK_FREQ)
 ONCARD_DIR     ?= $(RUN_HW_DIR)/on_card
+PARITY_CHECKER ?= ../scripts/check_gdn_c_parity.py
 
 
 # ----------------------------------------------------------------------------
@@ -163,7 +172,8 @@ help:
 	@echo "  xo          v++ compile  → $(XO)"
 	@echo "  xclbin      v++ link     → $(XCLBIN)"
 	@echo "  host        XRT host    → $(HOST_BIN)"
-	@echo "  run_hw      build the current 100 MHz candidate, then run exact 8/64-token validation"
+	@echo "  run_hw      submit a fresh 150 MHz Slurm build and dependent 8/64-token card tests"
+	@echo "              run on acclhead1; no DCP, XO or RQS input is required"
 	@echo "  clean       remove host-tb binaries"
 	@echo "  clean_hw    remove build.\$$(TARGET), _x/, v++ logs"
 	@echo "  distclean   clean + clean_hw + remove host.exe"
@@ -213,12 +223,7 @@ all_bf16_layout_test: all_bf16_layout_test.cpp gdn_model.cpp gdn_model.h
 # ----------------------------------------------------------------------------
 xo: $(XO)
 
-$(RESOLVED_HW_CFG): $(HW_CFG_TEMPLATE) \
-                    apply_f150_physical_islands.tcl \
-                    apply_iter54_dma_timing.tcl \
-                    apply_iter35_dma_w15_fifoaddr_fanout.tcl \
-                    check_f150_physical_islands.tcl \
-                    report_final_qor.tcl
+$(RESOLVED_HW_CFG): $(HW_RECIPE_FILES)
 	@mkdir -p $(@D)
 	@sed 's|@C_IMPL_DIR@|$(CURDIR)|g' $< > $@
 	@if grep -q '@C_IMPL_DIR@' $@; then \
@@ -257,9 +262,7 @@ $(XCLBIN): $(XO) $(HW_CFG)
 	    2>&1 | tee $(KERNEL)_link.log
 	@test -s '$@'
 	@sha256sum $(KERNEL_SRC) $(HLS_PRE_TCL) '$(HW_CFG)' \
-	    '$(HW_CFG_TEMPLATE)' apply_f150_physical_islands.tcl \
-	    apply_iter54_dma_timing.tcl apply_iter35_dma_w15_fifoaddr_fanout.tcl \
-	    check_f150_physical_islands.tcl report_final_qor.tcl \
+	    $(HW_RECIPE_FILES) \
 	    '$(XO)' '$@' > '$(BUILD_DIR)/build_manifest.sha256'
 
 
@@ -279,12 +282,14 @@ $(HOST_BIN): $(HOST_SRC) gdn_model.cpp gdn_model.h
 # ----------------------------------------------------------------------------
 # End-to-end hardware run
 # ----------------------------------------------------------------------------
-# Builds the .xo (if missing), links the .xclbin (if missing), builds the host
-# program, then runs the exact 8-token smoke and 64-token measurement on the
-# Alveo card. Make's normal prerequisites reuse a current bitstream; changing
-# the kernel, physical configuration, or Tcl hooks rebuilds it automatically.
-run_hw: $(XCLBIN) $(HOST_BIN)
+# Outside the card runner, submit two Slurm jobs using a new immutable snapshot
+# and fresh scratch directory. There are deliberately no local prerequisites:
+# `make run_hw` must never start Vitis on the login node.
+ifeq ($(GDN_ONCARD),1)
+run_hw:
 	@set -euo pipefail; \
+	test -n "$${SLURM_JOB_ID:-}" && test "$${SLURM_JOB_PARTITION:-}" = light || \
+	    { echo 'run_hw: card execution requires a Slurm light allocation'; exit 2; }; \
 	test -s '$(XCLBIN)'; \
 	mkdir -p '$(ONCARD_DIR)'; \
 	for spec in '8 smoke8' '64 decode64'; do \
@@ -308,9 +313,9 @@ run_hw: $(XCLBIN) $(HOST_BIN)
 	        test -s '$(GPU_LOGITS_REFERENCE)'; \
 	        host_args+=(--gpu-logits-reference '$(GPU_LOGITS_REFERENCE)'); \
 	    fi; \
-	    stdbuf -oL -eL ./$(HOST_BIN) "$${host_args[@]}" \
+	    stdbuf -oL -eL '$(abspath $(HOST_BIN))' "$${host_args[@]}" \
 	        2>&1 | tee "$$log"; \
-	    python3 ../scripts/check_gdn_c_parity.py \
+	    python3 '$(PARITY_CHECKER)' \
 	        --decode --golden '$(DECODE_GOLDEN)' --c "$$output" \
 	        2>&1 | tee "$$parity"; \
 	done; \
@@ -329,6 +334,17 @@ run_hw: $(XCLBIN) $(HOST_BIN)
 	    '$(ONCARD_DIR)/performance_summary.json' >/dev/null; \
 	sha256sum $(HOST_BIN) '$(XCLBIN)' \
 	    > '$(ONCARD_DIR)/artifact_hashes.txt'
+else
+run_hw:
+	@env -u MAKEFLAGS -u MFLAGS -u MAKEOVERRIDES -u REUSE_XO -u REUSE_XO_REFERENCE \
+	    JOBS='$(JOBS)' HLS_FREQ='$(HLS_FREQ)' LINK_FREQ='$(LINK_FREQ)' \
+	    VIVADO_SYNTH_JOBS='$(VIVADO_SYNTH_JOBS)' VIVADO_IMPL_JOBS='$(VIVADO_IMPL_JOBS)' \
+	    VITIS_VERSION='$(VITIS_VERSION)' HW_CFG_TEMPLATE='$(HW_CFG_TEMPLATE)' \
+	    WEIGHTS='$(WEIGHTS)' DECODE_FIXTURE='$(DECODE_FIXTURE)' \
+	    DECODE_STATE='$(DECODE_STATE)' DECODE_GOLDEN='$(DECODE_GOLDEN)' \
+	    LOGITS_REFERENCE='$(LOGITS_REFERENCE)' GPU_LOGITS_REFERENCE='$(GPU_LOGITS_REFERENCE)' \
+	    STATE_ADDRESS_GATE=1 REQUIRE_EXACT_CLOCK=1 bash ./run_hw_sbatch.sh
+endif
 
 
 # ----------------------------------------------------------------------------

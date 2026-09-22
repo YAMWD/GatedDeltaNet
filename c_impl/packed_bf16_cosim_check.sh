@@ -43,7 +43,7 @@ require_count 1 'depth=2000000' "${c_impl_dir}/gdn_model.cpp"
 require_count 28 'depth=1366528' "${c_impl_dir}/gdn_model.cpp"
 require_count 4 'depth=1464832' "${c_impl_dir}/gdn_model.cpp"
 require_count 1 'depth=817810' "${c_impl_dir}/gdn_model.cpp"
-require_count 4 'depth=4096' "${c_impl_dir}/gdn_model.cpp"
+require_count 8 'depth=4096' "${c_impl_dir}/gdn_model.cpp"   # 4 state_stream + 4 Iter73 state_wr
 
 sed \
     -e 's/#define GDN_WSF_STATE   12582912u.*/#define GDN_WSF_STATE   524288u      \/* cosim: 1*8*256*256 *\//' \

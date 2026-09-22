@@ -134,6 +134,7 @@ if [ "${LAUNCH_HW}" = "1" ]; then
     (
         cd "${C_IMPL}"
         JOBS=48 HLS_FREQ=150 LINK_FREQ=100 \
+        HW_CFG_TEMPLATE=hw_iter66e_frp_unpair_f100.cfg \
         VIVADO_SYNTH_JOBS=16 VIVADO_IMPL_JOBS=8 \
         BUILD_NODE=acclnode03 BUILD_MEM=192G \
         WEIGHTS="${WEIGHTS}" \
