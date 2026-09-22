@@ -31,6 +31,9 @@ qualification 3958–3960); reproduction builds 3987/4022 with on-card
 
 ## Current References
 
+- [gpu_latency_energy_evaluation.md](gpu_latency_energy_evaluation.md):
+  standalone H100/A100 eager latency and energy measurement from a fresh clone,
+  pinned dependencies, Slurm submission and CPU validation scope.
 - [architecture.md](architecture.md): authoritative top-level data flow,
   arithmetic contract, activation residency, 32-port GEMV topology, interfaces,
   state handling, HBM map, physical design, and measured result of the 150 MHz

@@ -4,6 +4,7 @@
 #include "experimental/xrt_kernel.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -12,10 +13,12 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -30,6 +33,10 @@ constexpr const char *kDefaultXrt = "/opt/xilinx/xrt";
 constexpr uint32_t kReqKindLL = 2;
 constexpr uint32_t kReqKindRolling = 3;
 constexpr size_t kWeightHeaderBytes = 60;
+constexpr uint32_t kEvalRequestVersion = 1;
+constexpr uint32_t kEvalModeGenerate = 1;
+constexpr uint32_t kEvalModeScore = 2;
+constexpr uint32_t kEvalFlagBlankState = 1u << 0;
 
 struct LogitsDumpHeader {
     char magic[8];
@@ -183,6 +190,21 @@ struct Options {
      * --score; the fixture must be kind=3. */
     bool score_mode = false;
     uint32_t score_doc_limit = 0;      // 0 => all documents
+    /* Persistent file-queue service used by the GPU-prefill/FPGA-decode
+     * evaluation harness. The producer atomically publishes *.req.ready files
+     * and creates producer.done after the final request. */
+    std::string eval_queue_dir;
+    std::string eval_results_dir;
+    std::string eval_producer_done;
+    uint32_t eval_idle_timeout_seconds = 600;
+    /* Steady-state, token-only timing mode. The token file is a whitespace-
+     * separated deterministic teacher-forced stream; persistent state comes
+     * from --decode-from-state. */
+    std::string benchmark_token_path;
+    uint32_t benchmark_idle_seconds = 60;
+    uint32_t benchmark_warmup_seconds = 30;
+    uint32_t benchmark_interval_seconds = 60;
+    uint32_t benchmark_intervals = 3;
 };
 
 static void usage(const char *argv0) {
@@ -206,6 +228,16 @@ static void usage(const char *argv0) {
         << "                               differences. Not a gate -- see Iter66m;\n"
         << "                               +-1 ULP differences here are expected.\n"
         << "  --gpu-logits-reference <file> run the BF16-aware independent-GPU full-vector gate\n";
+    std::cerr
+        << "  --eval-queue <dir>          serve GDNEVQ1 requests until producer.done\n"
+        << "  --eval-results <dir>        atomic per-request JSON results\n"
+        << "  --eval-producer-done <file> producer completion marker\n"
+        << "  --eval-idle-timeout N       fail after N idle seconds (default 600)\n"
+        << "  --benchmark-tokens <file>   steady-state teacher-forced token stream\n"
+        << "  --benchmark-idle-seconds N  loaded-idle power window (default 60)\n"
+        << "  --benchmark-warmup-seconds N warmup duration (default 30)\n"
+        << "  --benchmark-interval-seconds N measured interval (default 60)\n"
+        << "  --benchmark-intervals N     measured interval count (default 3)\n";
 }
 
 static uint32_t parse_u32(const char *text, const char *name) {
@@ -263,6 +295,62 @@ static Options parse_options(int argc, char **argv) {
             }
             opts.score_doc_limit =
                 parse_u32(argv[++arg_index], "score_doc_limit");
+        } else if (arg == "--eval-queue") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error("--eval-queue requires a directory");
+            }
+            opts.eval_queue_dir = argv[++arg_index];
+        } else if (arg == "--eval-results") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error("--eval-results requires a directory");
+            }
+            opts.eval_results_dir = argv[++arg_index];
+        } else if (arg == "--eval-producer-done") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error(
+                    "--eval-producer-done requires a path");
+            }
+            opts.eval_producer_done = argv[++arg_index];
+        } else if (arg == "--eval-idle-timeout") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error(
+                    "--eval-idle-timeout requires a value");
+            }
+            opts.eval_idle_timeout_seconds =
+                parse_u32(argv[++arg_index], "eval_idle_timeout");
+        } else if (arg == "--benchmark-tokens") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error("--benchmark-tokens requires a path");
+            }
+            opts.benchmark_token_path = argv[++arg_index];
+        } else if (arg == "--benchmark-idle-seconds") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error(
+                    "--benchmark-idle-seconds requires a value");
+            }
+            opts.benchmark_idle_seconds =
+                parse_u32(argv[++arg_index], "benchmark_idle_seconds");
+        } else if (arg == "--benchmark-warmup-seconds") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error(
+                    "--benchmark-warmup-seconds requires a value");
+            }
+            opts.benchmark_warmup_seconds =
+                parse_u32(argv[++arg_index], "benchmark_warmup_seconds");
+        } else if (arg == "--benchmark-interval-seconds") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error(
+                    "--benchmark-interval-seconds requires a value");
+            }
+            opts.benchmark_interval_seconds =
+                parse_u32(argv[++arg_index], "benchmark_interval_seconds");
+        } else if (arg == "--benchmark-intervals") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error(
+                    "--benchmark-intervals requires a value");
+            }
+            opts.benchmark_intervals =
+                parse_u32(argv[++arg_index], "benchmark_intervals");
         } else if (arg == "--logits-dump") {
             if (arg_index + 1 >= argc) {
                 throw std::runtime_error("--logits-dump requires a path");
@@ -292,6 +380,26 @@ static Options parse_options(int argc, char **argv) {
             opts.device_bdf = positional[4];
         } else {
             opts.device_index = parse_u32(positional[4].c_str(), "device_index");
+        }
+    }
+    if (!opts.eval_queue_dir.empty()) {
+        if (opts.eval_results_dir.empty() || opts.eval_producer_done.empty()) {
+            throw std::runtime_error(
+                "--eval-queue requires --eval-results and --eval-producer-done");
+        }
+        if (opts.eval_idle_timeout_seconds == 0) {
+            throw std::runtime_error("--eval-idle-timeout must be nonzero");
+        }
+    }
+    if (!opts.benchmark_token_path.empty()) {
+        if (opts.state_path.empty()) {
+            throw std::runtime_error(
+                "--benchmark-tokens requires --decode-from-state");
+        }
+        if (opts.benchmark_interval_seconds == 0 ||
+            opts.benchmark_intervals == 0) {
+            throw std::runtime_error(
+                "benchmark interval duration/count must be nonzero");
         }
     }
     return opts;
@@ -546,6 +654,74 @@ static ModelData load_model(const std::string &path) {
     return model;
 }
 
+struct DecodeStateData {
+    int32_t seed_token = -1;
+    std::vector<int32_t> prompt_tokens;
+    std::vector<float> recurrent;
+    std::vector<float> conv;
+};
+
+static DecodeStateData load_decode_state_file(
+    const std::string &path,
+    const GDNWeightHeader &config
+) {
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    if (!stream) {
+        throw std::runtime_error("cannot open .gdnstate: " + path);
+    }
+    const std::streamsize file_size = stream.tellg();
+    stream.seekg(0, std::ios::beg);
+    char magic[8];
+    stream.read(magic, sizeof(magic));
+    if (!stream || std::memcmp(magic, "GDNSTAT1", sizeof(magic)) != 0) {
+        throw std::runtime_error(".gdnstate: bad magic (expected GDNSTAT1)");
+    }
+    uint32_t values[9];
+    stream.read(reinterpret_cast<char *>(values), sizeof(values));
+    if (!stream || values[0] != 1) {
+        throw std::runtime_error(".gdnstate: unsupported version");
+    }
+    const uint32_t num_layers = values[1];
+    const uint32_t heads = values[2];
+    const uint32_t key_dim = values[3];
+    const uint32_t value_dim = values[4];
+    const uint32_t hidden = values[5];
+    const uint32_t conv_width = values[6];
+    const uint32_t prompt_len = values[7];
+    if (num_layers != config.num_layers || heads != config.num_heads ||
+        key_dim != config.head_dim ||
+        value_dim != config.hidden_size / config.num_heads ||
+        hidden != config.hidden_size || conv_width != config.conv_size) {
+        throw std::runtime_error(".gdnstate: dims do not match loaded model");
+    }
+
+    DecodeStateData state;
+    state.seed_token = static_cast<int32_t>(values[8]);
+    state.prompt_tokens.resize(prompt_len);
+    if (prompt_len != 0) {
+        stream.read(reinterpret_cast<char *>(state.prompt_tokens.data()),
+                    static_cast<std::streamsize>(prompt_len) * sizeof(int32_t));
+    }
+    const size_t recurrent_count =
+        static_cast<size_t>(num_layers) * heads * key_dim * value_dim;
+    const size_t conv_count = static_cast<size_t>(num_layers) * 3u *
+                              (conv_width - 1u) * hidden;
+    state.recurrent.resize(recurrent_count);
+    state.conv.resize(conv_count);
+    stream.read(reinterpret_cast<char *>(state.recurrent.data()),
+                static_cast<std::streamsize>(recurrent_count * sizeof(float)));
+    stream.read(reinterpret_cast<char *>(state.conv.data()),
+                static_cast<std::streamsize>(conv_count * sizeof(float)));
+    if (!stream) {
+        throw std::runtime_error(".gdnstate: truncated");
+    }
+    const std::streamoff consumed = stream.tellg();
+    if (file_size < 0 || consumed != file_size) {
+        throw std::runtime_error(".gdnstate: unexpected trailing data");
+    }
+    return state;
+}
+
 static xrt::kernel open_gdn_kernel(xrt::device &device, const xrt::uuid &uuid) {
     try {
         return xrt::kernel(device, uuid, "gdn_forward:{gdn_forward_1}");
@@ -612,6 +788,22 @@ public:
         }
         workspace_bo_ = xrt::bo(device,
             static_cast<size_t>(GDN_WS_FLOATS) * sizeof(float), kernel_.group_id(1));
+
+        /* Evaluation-only branch snapshots. Keep each backup beside the
+         * corresponding live state allocation so xrt::bo::copy can use the
+         * platform's memory-to-memory path without crossing HBM banks. The
+         * host-backed fallback is populated only if the runtime rejects D2D
+         * subrange copies. */
+        snapshot_state_bytes_ = state_stripe_bytes;
+        snapshot_conv_bytes_ =
+            static_cast<size_t>(GDN_WSF_HEADBUF / 16u) * sizeof(Beat512);
+        for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
+            const int port = GDN_RECURRENT_STATE_FIRST_PORT + p;
+            snapshot_state_bos_[p] = xrt::bo(
+                device, snapshot_state_bytes_, kernel_.group_id(2 + port));
+        }
+        snapshot_conv_bo_ = xrt::bo(
+            device, snapshot_conv_bytes_, kernel_.group_id(1));
 
         std::cerr << "[progress] upload weights to device\n";
         // Each shard BO occupies one HBM bank. The compact auxiliary weights use
@@ -752,6 +944,7 @@ public:
     // and saves the update at layer end, so they persist across token calls.
     void upload_decode_state(const std::vector<float> &recurrent,
                              const std::vector<float> &conv) {
+        snapshot_valid_ = false;
         size_t rbytes = recurrent.size() * sizeof(float);
         size_t cbytes = conv.size() * sizeof(float);
         const size_t hb_off  = GDN_WS_OFF_HEAD_BUF * sizeof(float);
@@ -797,6 +990,88 @@ public:
         static const std::vector<float> zero_recurrent(GDN_WSF_STATE, 0.0f);
         static const std::vector<float> zero_conv(GDN_WSF_HEADBUF, 0.0f);
         upload_decode_state(zero_recurrent, zero_conv);
+    }
+
+    void capture_persistent_state() {
+        const size_t shard_bytes = GDN_COMPILED_WEIGHT_SHARD_BYTES;
+        const size_t hb_off = GDN_WS_OFF_HEAD_BUF * sizeof(float);
+        if (!snapshot_d2d_rejected_) {
+            try {
+                for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
+                    const int port = GDN_RECURRENT_STATE_FIRST_PORT + p;
+                    snapshot_state_bos_[p].copy(
+                        weight_bos_[port], snapshot_state_bytes_,
+                        shard_bytes, 0);
+                }
+                snapshot_conv_bo_.copy(
+                    workspace_bo_, snapshot_conv_bytes_, hb_off, 0);
+                snapshot_on_device_ = true;
+                snapshot_valid_ = true;
+                return;
+            } catch (const std::exception &ex) {
+                snapshot_d2d_rejected_ = true;
+                std::cerr << "[eval] D2D state snapshot unavailable: "
+                          << ex.what() << "; using host-backed snapshot\n";
+            }
+        }
+
+        snapshot_state_host_.resize(
+            static_cast<size_t>(GDN_RECURRENT_STATE_PORTS) *
+            snapshot_state_bytes_);
+        for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
+            const int port = GDN_RECURRENT_STATE_FIRST_PORT + p;
+            sync_bo_chunked(weight_bos_[port], XCL_BO_SYNC_BO_FROM_DEVICE,
+                            snapshot_state_bytes_, shard_bytes);
+            weight_bos_[port].read(
+                snapshot_state_host_.data() +
+                    static_cast<size_t>(p) * snapshot_state_bytes_,
+                snapshot_state_bytes_, shard_bytes);
+        }
+        snapshot_conv_host_.resize(snapshot_conv_bytes_);
+        sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_FROM_DEVICE,
+                        snapshot_conv_bytes_, hb_off);
+        workspace_bo_.read(snapshot_conv_host_.data(), snapshot_conv_bytes_,
+                           hb_off);
+        snapshot_on_device_ = false;
+        snapshot_valid_ = true;
+    }
+
+    void restore_persistent_state() {
+        if (!snapshot_valid_) {
+            throw std::runtime_error("state restore requested before capture");
+        }
+        const size_t shard_bytes = GDN_COMPILED_WEIGHT_SHARD_BYTES;
+        const size_t hb_off = GDN_WS_OFF_HEAD_BUF * sizeof(float);
+        if (snapshot_on_device_) {
+            for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
+                const int port = GDN_RECURRENT_STATE_FIRST_PORT + p;
+                weight_bos_[port].copy(
+                    snapshot_state_bos_[p], snapshot_state_bytes_,
+                    0, shard_bytes);
+            }
+            workspace_bo_.copy(
+                snapshot_conv_bo_, snapshot_conv_bytes_, 0, hb_off);
+            return;
+        }
+
+        for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
+            const int port = GDN_RECURRENT_STATE_FIRST_PORT + p;
+            weight_bos_[port].write(
+                snapshot_state_host_.data() +
+                    static_cast<size_t>(p) * snapshot_state_bytes_,
+                snapshot_state_bytes_, shard_bytes);
+            sync_bo_chunked(weight_bos_[port], XCL_BO_SYNC_BO_TO_DEVICE,
+                            snapshot_state_bytes_, shard_bytes);
+        }
+        workspace_bo_.write(snapshot_conv_host_.data(), snapshot_conv_bytes_,
+                            hb_off);
+        sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_TO_DEVICE,
+                        snapshot_conv_bytes_, hb_off);
+    }
+
+    const char *snapshot_mode() const {
+        if (!snapshot_valid_) return "unused";
+        return snapshot_on_device_ ? "device_copy" : "host_copy";
     }
 
     /* Iter66g probe: read the persistent state back from the device at rest
@@ -889,6 +1164,15 @@ private:
     bool logits_valid_ = false;
     double total_kernel_seconds_ = 0.0;
     uint64_t kernel_runs_ = 0;
+    std::array<xrt::bo, GDN_RECURRENT_STATE_PORTS> snapshot_state_bos_;
+    xrt::bo snapshot_conv_bo_;
+    size_t snapshot_state_bytes_ = 0;
+    size_t snapshot_conv_bytes_ = 0;
+    bool snapshot_valid_ = false;
+    bool snapshot_on_device_ = false;
+    bool snapshot_d2d_rejected_ = false;
+    std::vector<char> snapshot_state_host_;
+    std::vector<char> snapshot_conv_host_;
 };
 
 // Per-example results of the on-card decode benchmark. Mirrors the native
@@ -1073,34 +1357,17 @@ static std::vector<DecodeExample> run_decode_hw(
     const std::string &logits_dump_path
 ) {
     // ---- Read the GPU-exported .gdnstate blob ----
-    std::ifstream f(state_path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open .gdnstate: " + state_path);
-    char magic[8];
-    f.read(magic, 8);
-    if (std::memcmp(magic, "GDNSTAT1", 8) != 0)
-        throw std::runtime_error(".gdnstate: bad magic (expected GDNSTAT1)");
-    uint32_t v[9];
-    f.read(reinterpret_cast<char *>(v), sizeof(v));
-    // v = {version, num_layers, H, K, V, hidden, W, prompt_len, seed_token}
-    uint32_t num_layers = v[1], H = v[2], Kk = v[3], Vv = v[4];
-    uint32_t hidden = v[5], W = v[6], prompt_len = v[7];
-    int32_t seed = static_cast<int32_t>(v[8]);
-    if (num_layers != model.config.num_layers || hidden != model.config.hidden_size ||
-        W != model.config.conv_size)
-        throw std::runtime_error(".gdnstate: dims do not match the loaded model");
-    f.seekg(static_cast<std::streamoff>(prompt_len) * sizeof(int32_t), std::ios::cur);
-    size_t rec_count  = (size_t)num_layers * H * Kk * Vv;
-    size_t conv_count = (size_t)num_layers * 3u * (W - 1u) * hidden;
-    std::vector<float> rec(rec_count), conv(conv_count);
-    f.read(reinterpret_cast<char *>(rec.data()),  rec_count  * sizeof(float));
-    f.read(reinterpret_cast<char *>(conv.data()), conv_count * sizeof(float));
-    if (!f) throw std::runtime_error(".gdnstate: truncated");
-    std::cerr << "[progress] loaded .gdnstate: layers=" << num_layers
-              << " hidden=" << hidden << " W=" << W << " seed=" << seed
-              << " (recurrent=" << (rec_count * sizeof(float) / 1e6) << " MB)\n";
+    DecodeStateData state = load_decode_state_file(state_path, model.config);
+    const int32_t seed = state.seed_token;
+    std::cerr << "[progress] loaded .gdnstate: layers="
+              << model.config.num_layers
+              << " hidden=" << model.config.hidden_size
+              << " W=" << model.config.conv_size << " seed=" << seed
+              << " (recurrent="
+              << (state.recurrent.size() * sizeof(float) / 1e6) << " MB)\n";
 
     // ---- Upload the post-prompt state to the resident BOs (once) ----
-    runner.upload_decode_state(rec, conv);
+    runner.upload_decode_state(state.recurrent, state.conv);
 
     // ---- Decode length from the fixture's golden continuation (example 0) ----
     if (fixture.num_examples == 0 || fixture.examples.empty())
@@ -1556,6 +1823,542 @@ static int run_score_hw(const Options &opts, const ModelData &model,
     return 0;
 }
 
+struct TimingSummary {
+    double mean = 0.0;
+    double median = 0.0;
+    double p95 = 0.0;
+    double minimum = 0.0;
+    double maximum = 0.0;
+};
+
+struct BenchmarkInterval {
+    double start_unix = 0.0;
+    double end_unix = 0.0;
+    std::vector<ForwardTiming> timings;
+};
+
+static double unix_seconds_now() {
+    return std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static TimingSummary summarize_seconds(std::vector<double> values) {
+    if (values.empty()) {
+        throw std::runtime_error("cannot summarize an empty timing series");
+    }
+    double total = 0.0;
+    for (double value : values) total += value;
+    std::sort(values.begin(), values.end());
+    const size_t middle = values.size() / 2;
+    const double median = values.size() % 2 != 0
+        ? values[middle]
+        : 0.5 * (values[middle - 1] + values[middle]);
+    const size_t p95_index = static_cast<size_t>(
+        std::ceil(0.95 * static_cast<double>(values.size()))) - 1u;
+    TimingSummary summary;
+    summary.mean = total / static_cast<double>(values.size());
+    summary.median = median;
+    summary.p95 = values[std::min(p95_index, values.size() - 1)];
+    summary.minimum = values.front();
+    summary.maximum = values.back();
+    return summary;
+}
+
+static std::vector<int32_t> load_benchmark_tokens(
+    const std::string &path, uint32_t vocab_size
+) {
+    std::ifstream stream(path);
+    if (!stream) {
+        throw std::runtime_error("cannot open benchmark token file: " + path);
+    }
+    std::vector<int32_t> tokens;
+    int64_t value = 0;
+    while (stream >> value) {
+        if (value < 0 || static_cast<uint64_t>(value) >= vocab_size) {
+            throw std::runtime_error("benchmark token out of vocabulary range");
+        }
+        tokens.push_back(static_cast<int32_t>(value));
+    }
+    if (!stream.eof()) {
+        throw std::runtime_error(
+            "benchmark token file must contain whitespace-separated integers");
+    }
+    if (tokens.empty()) {
+        throw std::runtime_error("benchmark token stream is empty");
+    }
+    return tokens;
+}
+
+static void write_timing_summary(std::ostream &out,
+                                 const TimingSummary &summary) {
+    out << "{\"mean_ms\":" << summary.mean * 1000.0
+        << ",\"median_ms\":" << summary.median * 1000.0
+        << ",\"p95_ms\":" << summary.p95 * 1000.0
+        << ",\"min_ms\":" << summary.minimum * 1000.0
+        << ",\"max_ms\":" << summary.maximum * 1000.0 << "}";
+}
+
+static int run_benchmark_hw(const Options &opts, const ModelData &model,
+                            HwRunner &runner) {
+    const std::vector<int32_t> tokens = load_benchmark_tokens(
+        opts.benchmark_token_path, model.config.vocab_size);
+    DecodeStateData state = load_decode_state_file(
+        opts.state_path, model.config);
+    runner.upload_decode_state(state.recurrent, state.conv);
+    size_t token_index = 0;
+    auto run_one = [&](ForwardTiming *timing) {
+        runner.run_forward(tokens[token_index], false, timing);
+        token_index = (token_index + 1) % tokens.size();
+    };
+
+    const double idle_start_unix = unix_seconds_now();
+    std::cerr << "[benchmark] loaded-idle window "
+              << opts.benchmark_idle_seconds << "s\n";
+    std::this_thread::sleep_for(
+        std::chrono::seconds(opts.benchmark_idle_seconds));
+    const double warmup_start_unix = unix_seconds_now();
+    const auto warmup_deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(opts.benchmark_warmup_seconds);
+    uint64_t warmup_steps = 0;
+    while (std::chrono::steady_clock::now() < warmup_deadline) {
+        run_one(nullptr);
+        ++warmup_steps;
+    }
+    const double warmup_end_unix = unix_seconds_now();
+    std::cerr << "[benchmark] warmup complete steps=" << warmup_steps << "\n";
+
+    std::vector<BenchmarkInterval> intervals(opts.benchmark_intervals);
+    for (uint32_t interval_index = 0;
+         interval_index < opts.benchmark_intervals; ++interval_index) {
+        BenchmarkInterval &interval = intervals[interval_index];
+        interval.start_unix = unix_seconds_now();
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::seconds(opts.benchmark_interval_seconds);
+        while (std::chrono::steady_clock::now() < deadline) {
+            ForwardTiming timing;
+            run_one(&timing);
+            interval.timings.push_back(timing);
+        }
+        interval.end_unix = unix_seconds_now();
+        std::cerr << "[benchmark] interval " << (interval_index + 1)
+                  << "/" << opts.benchmark_intervals
+                  << " steps=" << interval.timings.size() << "\n";
+    }
+
+    std::ofstream out(opts.output);
+    if (!out) {
+        throw std::runtime_error("failed to open benchmark output: " +
+                                 opts.output);
+    }
+    out << std::setprecision(17)
+        << "{\n  \"schema\": \"gdn-steady-tpot-v1\",\n"
+        << "  \"xclbin\": \"" << opts.xclbin << "\",\n"
+        << "  \"weights\": \"" << opts.weights << "\",\n"
+        << "  \"state\": \"" << opts.state_path << "\",\n"
+        << "  \"token_file\": \"" << opts.benchmark_token_path << "\",\n"
+        << "  \"token_stream_length\": " << tokens.size() << ",\n"
+        << "  \"teacher_forced\": true,\n"
+        << "  \"full_lm_head\": true,\n"
+        << "  \"onchip_argmax\": true,\n"
+        << "  \"full_logits_readback\": false,\n"
+        << "  \"idle_start_unix\": " << idle_start_unix << ",\n"
+        << "  \"warmup_start_unix\": " << warmup_start_unix << ",\n"
+        << "  \"warmup_end_unix\": " << warmup_end_unix << ",\n"
+        << "  \"warmup_steps\": " << warmup_steps << ",\n"
+        << "  \"intervals\": [";
+    for (size_t interval_index = 0;
+         interval_index < intervals.size(); ++interval_index) {
+        const BenchmarkInterval &interval = intervals[interval_index];
+        std::vector<double> production, kernel, embedding_write,
+                            embedding_h2d, launch, token_d2h;
+        for (const ForwardTiming &timing : interval.timings) {
+            production.push_back(timing.tpot_seconds);
+            kernel.push_back(timing.kernel_seconds);
+            embedding_write.push_back(timing.embedding_write_seconds);
+            embedding_h2d.push_back(timing.embedding_h2d_seconds);
+            launch.push_back(timing.launch_seconds);
+            token_d2h.push_back(timing.token_d2h_seconds);
+        }
+        out << (interval_index ? "," : "")
+            << "\n    {\"index\":" << interval_index
+            << ",\"start_unix\":" << interval.start_unix
+            << ",\"end_unix\":" << interval.end_unix
+            << ",\"steps\":" << interval.timings.size()
+            << ",\"tokens_per_second\":"
+            << static_cast<double>(interval.timings.size()) /
+               (interval.end_unix - interval.start_unix)
+            << ",\"production_tpot\":";
+        write_timing_summary(out, summarize_seconds(production));
+        out << ",\"kernel\":";
+        write_timing_summary(out, summarize_seconds(kernel));
+        out << ",\"embedding_write\":";
+        write_timing_summary(out, summarize_seconds(embedding_write));
+        out << ",\"embedding_h2d\":";
+        write_timing_summary(out, summarize_seconds(embedding_h2d));
+        out << ",\"launch\":";
+        write_timing_summary(out, summarize_seconds(launch));
+        out << ",\"token_d2h\":";
+        write_timing_summary(out, summarize_seconds(token_d2h));
+        out << "}";
+    }
+    out << "\n  ]\n}\n";
+    std::cerr << "[benchmark] wrote " << opts.output << "\n";
+    return 0;
+}
+
+struct EvalRequest {
+    uint32_t mode = 0;
+    uint32_t flags = 0;
+    int32_t boundary_token = -1;
+    uint32_t max_new_tokens = 0;
+    std::vector<std::vector<int32_t>> stop_sequences;
+    std::vector<std::vector<int32_t>> choices;
+};
+
+struct EvalStats {
+    uint64_t steps = 0;
+    double kernel_seconds = 0.0;
+    double production_seconds = 0.0;
+
+    void add(const ForwardTiming &timing) {
+        ++steps;
+        kernel_seconds += timing.kernel_seconds;
+        production_seconds += timing.tpot_seconds;
+    }
+};
+
+static bool safe_eval_id(const std::string &id) {
+    if (id.empty() || id.size() > 128) return false;
+    for (char value : id) {
+        const bool alpha = (value >= 'a' && value <= 'z') ||
+                           (value >= 'A' && value <= 'Z');
+        const bool digit = value >= '0' && value <= '9';
+        if (!alpha && !digit && value != '-' && value != '_') return false;
+    }
+    return true;
+}
+
+static EvalRequest load_eval_request(const std::string &path) {
+    const std::vector<uint8_t> blob = read_binary_file(path);
+    static const char magic[8] = {'G', 'D', 'N', 'E', 'V', 'Q', '1', '\0'};
+    if (blob.size() < 8 + 6 * sizeof(uint32_t) ||
+        std::memcmp(blob.data(), magic, sizeof(magic)) != 0) {
+        throw std::runtime_error("invalid GDNEVQ1 request: " + path);
+    }
+    size_t offset = 8;
+    const uint32_t version = read_u32(blob, offset);
+    if (version != kEvalRequestVersion) {
+        throw std::runtime_error("unsupported GDNEVQ1 request version");
+    }
+    EvalRequest request;
+    request.mode = read_u32(blob, offset);
+    request.flags = read_u32(blob, offset);
+    request.boundary_token =
+        static_cast<int32_t>(read_u32(blob, offset));
+    const uint32_t primary_count = read_u32(blob, offset);
+    const uint32_t stop_count = read_u32(blob, offset);
+    if ((request.flags & ~kEvalFlagBlankState) != 0) {
+        throw std::runtime_error("GDNEVQ1 request has unknown flags");
+    }
+    if (request.mode == kEvalModeGenerate) {
+        if (primary_count == 0 || primary_count > 4096 || stop_count > 64) {
+            throw std::runtime_error("invalid generation request dimensions");
+        }
+        request.max_new_tokens = primary_count;
+        request.stop_sequences.reserve(stop_count);
+        for (uint32_t stop = 0; stop < stop_count; ++stop) {
+            const uint32_t token_count = read_u32(blob, offset);
+            if (token_count == 0 || token_count > 32) {
+                throw std::runtime_error("invalid generation stop sequence");
+            }
+            request.stop_sequences.push_back(
+                read_i32_array(blob, offset, token_count));
+        }
+    } else if (request.mode == kEvalModeScore) {
+        if (primary_count == 0 || primary_count > 64 || stop_count != 0) {
+            throw std::runtime_error("invalid scoring request dimensions");
+        }
+        request.choices.reserve(primary_count);
+        for (uint32_t choice = 0; choice < primary_count; ++choice) {
+            const uint32_t token_count = read_u32(blob, offset);
+            if (token_count == 0 || token_count > 8192) {
+                throw std::runtime_error("invalid scoring continuation length");
+            }
+            request.choices.push_back(
+                read_i32_array(blob, offset, token_count));
+        }
+    } else {
+        throw std::runtime_error("unknown GDNEVQ1 request mode");
+    }
+    if (offset != blob.size()) {
+        throw std::runtime_error("GDNEVQ1 request has trailing data");
+    }
+    return request;
+}
+
+static uint32_t strict_argmax(const std::vector<float> &logits) {
+    if (logits.empty()) throw std::runtime_error("empty logit vector");
+    uint32_t best_index = 0;
+    float best = logits[0];
+    for (uint32_t index = 1; index < logits.size(); ++index) {
+        if (logits[index] > best) {
+            best = logits[index];
+            best_index = index;
+        }
+    }
+    return best_index;
+}
+
+static double token_logprob(const std::vector<float> &logits,
+                            int32_t target) {
+    if (target < 0 || static_cast<size_t>(target) >= logits.size()) {
+        throw std::runtime_error("evaluation target token out of range");
+    }
+    double maximum = logits[0];
+    if (!std::isfinite(maximum)) {
+        throw std::runtime_error("non-finite FPGA logit");
+    }
+    for (size_t index = 1; index < logits.size(); ++index) {
+        if (!std::isfinite(logits[index])) {
+            throw std::runtime_error("non-finite FPGA logit");
+        }
+        maximum = std::max(maximum, static_cast<double>(logits[index]));
+    }
+    double sum = 0.0;
+    for (float logit : logits) {
+        sum += std::exp(static_cast<double>(logit) - maximum);
+    }
+    return (static_cast<double>(logits[static_cast<size_t>(target)]) - maximum)
+           - std::log(sum);
+}
+
+static void load_eval_state(const std::filesystem::path &queue,
+                            const std::string &id,
+                            const EvalRequest &request,
+                            const ModelData &model,
+                            HwRunner &runner) {
+    if ((request.flags & kEvalFlagBlankState) != 0) {
+        runner.reset_decode_state();
+        return;
+    }
+    const std::filesystem::path state_path = queue / (id + ".gdnstate");
+    DecodeStateData state =
+        load_decode_state_file(state_path.string(), model.config);
+    runner.upload_decode_state(state.recurrent, state.conv);
+}
+
+static std::string eval_generate_json(const std::string &id,
+                                      const EvalRequest &request,
+                                      HwRunner &runner,
+                                      EvalStats *stats) {
+    std::vector<int32_t> generated;
+    generated.reserve(request.max_new_tokens);
+    int32_t token = request.boundary_token;
+    bool stop_hit = false;
+    for (uint32_t step = 0; step < request.max_new_tokens; ++step) {
+        ForwardTiming timing;
+        runner.run_forward(token, false, &timing);
+        stats->add(timing);
+        token = runner.device_token();
+        generated.push_back(token);
+        for (const std::vector<int32_t> &stop : request.stop_sequences) {
+            if (generated.size() >= stop.size() &&
+                std::equal(stop.rbegin(), stop.rend(), generated.rbegin())) {
+                stop_hit = true;
+                break;
+            }
+        }
+        if (stop_hit) break;
+    }
+
+    std::ostringstream json;
+    json << std::setprecision(17)
+         << "{\"id\":\"" << id << "\",\"mode\":\"generate\","
+         << "\"tokens\":[";
+    for (size_t index = 0; index < generated.size(); ++index) {
+        json << (index ? "," : "") << generated[index];
+    }
+    json << "],\"stop_hit\":" << (stop_hit ? "true" : "false")
+         << ",\"steps\":" << stats->steps
+         << ",\"kernel_seconds\":" << stats->kernel_seconds
+         << ",\"production_seconds\":" << stats->production_seconds
+         << "}\n";
+    return json.str();
+}
+
+static std::string eval_score_json(const std::string &id,
+                                   const EvalRequest &request,
+                                   uint32_t vocab_size,
+                                   HwRunner &runner,
+                                   EvalStats *stats) {
+    ForwardTiming timing;
+    runner.run_forward(request.boundary_token, true, &timing);
+    stats->add(timing);
+    std::vector<float> boundary_logits(
+        runner.device_logits(), runner.device_logits() + vocab_size);
+    if (request.choices.size() > 1) {
+        runner.capture_persistent_state();
+    }
+
+    std::ostringstream json;
+    json << std::setprecision(17)
+         << "{\"id\":\"" << id << "\",\"mode\":\"score\","
+         << "\"choices\":[";
+    for (size_t choice_index = 0;
+         choice_index < request.choices.size(); ++choice_index) {
+        if (choice_index > 0) {
+            runner.restore_persistent_state();
+        }
+        const std::vector<int32_t> &choice = request.choices[choice_index];
+        double logprob = token_logprob(boundary_logits, choice[0]);
+        bool greedy = strict_argmax(boundary_logits) ==
+                      static_cast<uint32_t>(choice[0]);
+        for (size_t token_index = 1; token_index < choice.size(); ++token_index) {
+            ForwardTiming step_timing;
+            runner.run_forward(choice[token_index - 1], true, &step_timing);
+            stats->add(step_timing);
+            std::vector<float> logits(
+                runner.device_logits(), runner.device_logits() + vocab_size);
+            logprob += token_logprob(logits, choice[token_index]);
+            greedy = greedy &&
+                strict_argmax(logits) ==
+                    static_cast<uint32_t>(choice[token_index]);
+        }
+        json << (choice_index ? "," : "")
+             << "{\"logprob\":" << logprob
+             << ",\"is_greedy\":" << (greedy ? "true" : "false")
+             << ",\"token_count\":" << choice.size() << "}";
+    }
+    json << "],\"steps\":" << stats->steps
+         << ",\"kernel_seconds\":" << stats->kernel_seconds
+         << ",\"production_seconds\":" << stats->production_seconds
+         << ",\"snapshot_mode\":\"" << runner.snapshot_mode()
+         << "\"}\n";
+    return json.str();
+}
+
+static void write_atomic_text(const std::filesystem::path &path,
+                              const std::string &contents) {
+    const std::filesystem::path temporary = path.string() + ".tmp";
+    {
+        std::ofstream stream(temporary);
+        if (!stream) {
+            throw std::runtime_error("cannot create result: " +
+                                     temporary.string());
+        }
+        stream << contents;
+        stream.flush();
+        if (!stream) {
+            throw std::runtime_error("cannot write result: " +
+                                     temporary.string());
+        }
+    }
+    std::filesystem::rename(temporary, path);
+}
+
+static std::string eval_id_from_path(const std::filesystem::path &path) {
+    const std::string filename = path.filename().string();
+    const std::string suffix = ".req.ready";
+    if (filename.size() <= suffix.size() ||
+        filename.compare(filename.size() - suffix.size(), suffix.size(),
+                         suffix) != 0) {
+        throw std::runtime_error("invalid evaluation request filename");
+    }
+    const std::string id = filename.substr(0, filename.size() - suffix.size());
+    if (!safe_eval_id(id)) {
+        throw std::runtime_error("unsafe evaluation request id: " + id);
+    }
+    return id;
+}
+
+static int run_eval_queue(const Options &opts, const ModelData &model,
+                          HwRunner &runner) {
+    const std::filesystem::path queue(opts.eval_queue_dir);
+    const std::filesystem::path results(opts.eval_results_dir);
+    std::filesystem::create_directories(queue);
+    std::filesystem::create_directories(results);
+    auto last_activity = std::chrono::steady_clock::now();
+    uint64_t completed = 0;
+    std::cerr << "[eval] serving queue=" << queue
+              << " results=" << results << "\n";
+
+    for (;;) {
+        std::vector<std::filesystem::path> ready;
+        for (const auto &entry : std::filesystem::directory_iterator(queue)) {
+            if (!entry.is_regular_file()) continue;
+            const std::string name = entry.path().filename().string();
+            if (name.size() > 10 &&
+                name.compare(name.size() - 10, 10, ".req.ready") == 0) {
+                ready.push_back(entry.path());
+            }
+        }
+        std::sort(ready.begin(), ready.end());
+        if (ready.empty()) {
+            if (std::filesystem::exists(opts.eval_producer_done)) break;
+            const auto idle = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - last_activity).count();
+            if (idle > opts.eval_idle_timeout_seconds) {
+                throw std::runtime_error("evaluation queue idle timeout");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        for (const std::filesystem::path &request_path : ready) {
+            const std::string id = eval_id_from_path(request_path);
+            const std::filesystem::path result_path = results / (id + ".json");
+            const std::filesystem::path done_path = results / (id + ".done");
+            const std::filesystem::path state_path = queue / (id + ".gdnstate");
+            if (std::filesystem::exists(result_path)) {
+                std::filesystem::remove(request_path);
+                std::filesystem::remove(state_path);
+                continue;
+            }
+            try {
+                const EvalRequest request =
+                    load_eval_request(request_path.string());
+                load_eval_state(queue, id, request, model, runner);
+                EvalStats stats;
+                std::string result;
+                if (request.mode == kEvalModeGenerate) {
+                    result = eval_generate_json(id, request, runner, &stats);
+                } else {
+                    result = eval_score_json(id, request,
+                                             model.config.vocab_size,
+                                             runner, &stats);
+                }
+                write_atomic_text(result_path, result);
+                write_atomic_text(done_path, "done\n");
+                std::filesystem::remove(request_path);
+                std::filesystem::remove(state_path);
+                ++completed;
+                last_activity = std::chrono::steady_clock::now();
+                std::cerr << "[eval] completed id=" << id
+                          << " mode=" << request.mode
+                          << " steps=" << stats.steps
+                          << " total=" << completed << "\n";
+            } catch (const std::exception &ex) {
+                std::ostringstream error;
+                error << "{\"id\":\"" << id << "\",\"error\":\"";
+                for (char value : std::string(ex.what())) {
+                    if (value == '\\' || value == '\"') error << '\\';
+                    if (value == '\n' || value == '\r') {
+                        error << ' ';
+                    } else {
+                        error << value;
+                    }
+                }
+                error << "\"}\n";
+                write_atomic_text(results / (id + ".error.json"),
+                                  error.str());
+                throw;
+            }
+        }
+    }
+    std::cerr << "[eval] producer complete; processed=" << completed << "\n";
+    return 0;
+}
+
 int main(int argc, char **argv) {
     try {
         Options opts = parse_options(argc, argv);
@@ -1578,6 +2381,16 @@ int main(int argc, char **argv) {
                   << " layers=" << model.config.num_layers
                   << " max_seq_len=" << model.config.max_seq_len
                   << " vocab=" << model.config.vocab_size << "\n";
+
+        if (!opts.eval_queue_dir.empty()) {
+            HwRunner runner(device, uuid, model);
+            return run_eval_queue(opts, model, runner);
+        }
+
+        if (!opts.benchmark_token_path.empty()) {
+            HwRunner runner(device, uuid, model);
+            return run_benchmark_hw(opts, model, runner);
+        }
 
         if (opts.score_mode) {
             HwRunner runner(device, uuid, model);
