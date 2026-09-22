@@ -39,6 +39,131 @@ The synthesized kernel is specialized for one model shape:
 The external kernel ABI, workspace offsets, weight-port ordering, and recurrent
 state layout are documented in `c_impl/doc/architecture.md`.
 
+## Evaluation
+
+Three measurements support this accelerator's claims: decode **latency**,
+decode **energy**, and **task quality**. Each is collected independently, on
+its own hardware, and reported on its own terms. They are comparable only
+because they share one workload definition and one pair of measurement
+boundaries, which the rest of this section states explicitly. A number
+collected under any other protocol is not part of this evaluation.
+
+### The three arms
+
+| Arm | Hardware | Reports | Entry point |
+|---|---|---|---|
+| Accelerator decode | one Alveo U55C | ms/token, J/token | `c_impl/run_hw_sbatch.sh`, then the power/quality launchers |
+| GPU decode | one NVIDIA H100 or A100 | ms/token, J/token | `scripts/run_gpu_power_eval.py` |
+| Task quality | GPU prefill, then either decoder | WikiText-2 word perplexity | `scripts/fpga_lm_eval.py`, `scripts/fla_lm_eval.py` |
+
+The two decode arms run in separate jobs, on separate machines, at separate
+times. Do not require them to run together: collect each one, verify that both
+used the same workload and boundaries, then compare the saved results.
+
+### One workload
+
+Every decode measurement uses batch 1, one token per step, and teacher forcing.
+The tracked fixture `c_impl/fixtures_full/wikitext.gdnreq` generates a fixed
+4,096-token prompt and a fixed 4,096-token teacher stream;
+`scripts/prepare_steady_decode_fixture.py` derives both and records their
+hashes. The prompt is prefilled once, then the teacher stream is consumed
+cyclically, with recurrent state continuing across wraps. This is sustained
+teacher-forced decode, not free-running generation: it fixes the token
+sequence so that two implementations do the same work, and it keeps a
+trajectory fork from changing what is being timed.
+
+Batch 1 is the point of the design, not a limitation of the harness. The
+architectural claim is flat per-token latency with constant memory and no KV
+cache, which is a single-stream property.
+
+### Two boundaries, and which one to quote
+
+Both decoders report an inner and an outer time, defined to be analogous:
+
+| Boundary | Accelerator | GPU |
+|---|---|---|
+| Inner | `kernel_ms`, kernel launch to completion | `device_time_ms`, CUDA events around forward plus argmax |
+| Outer | `per_step_tpot_ms`, embedding lookup, upload, launch and wait, on-chip argmax, token read-back | `production_tpot_ms`, input construction and transfer, dispatch, LM head, argmax, token returned to the host |
+
+**Quote the outer boundary when comparing to a GPU.** Emitting a token includes
+selecting it, and the GPU reference includes its own argmax inside its timed
+window. The inner boundary is for attributing a change to the kernel itself.
+Never compare one arm's inner time against the other's outer time.
+
+### Energy
+
+Energy is measured over sustained windows after warmup, never per token.
+Report gross joules per token, and idle-subtracted joules per token beside it,
+with the idle power that was subtracted. Prefill and warmup are excluded from
+the active window.
+
+On the GPU, the runner prefers NVML total-energy-counter differences and falls
+back to integrating the sampled power trace, recording per interval which
+method was used. Sampling at 0.2 s does not give 0.2 s of sensor resolution:
+the standard NVML power query returns a one-second average, which is why the
+windows are tens of seconds. The sampler binds to the allocated device by CUDA
+UUID rather than by ordinal, so a scheduler or container remapping cannot
+silently meter a different card. Board energy needs an exclusively allocated
+whole GPU; MIG instances are rejected.
+
+### Running the GPU arm
+
+```bash
+python -m pip install -r scripts/requirements_gpu_eval.txt
+python scripts/run_gpu_power_eval.py --require-gpu-name H100 \
+    --output-dir c_impl/diagnostics/gpu_power/h100-bf16-r1
+```
+
+This needs no FPGA, no XRT, and no exported hardware weights. It downloads the
+pinned checkpoint unless `--model` names a local one, and refuses to start if
+the allocated GPU does not match `--require-gpu-name`. On a cluster, submit
+`scripts/slurm_gpu_power_eval.sh` instead of running on a login node. BF16 is
+the default; run FP32 as a control into its own output directory. Each run
+writes a manifest with the source commit, script hashes, model identity and
+resolved environment, so a result can be traced back to what produced it.
+
+The full protocol, the smoke test, the output-file reference and the
+validation limits are in
+[the GPU evaluation guide](c_impl/doc/gpu_latency_energy_evaluation.md).
+
+### Running the accelerator arm
+
+Build and validate the image first (see *Build and verification* below), then
+run the power and quality launchers against that exact image. The historical
+FPGA launchers pin a frozen artifact and source pair and will reject a newer
+kernel; reproduce them in the original checkout rather than relaxing their
+identity gates.
+
+### Comparing the arms
+
+```bash
+python scripts/aggregate_power_eval.py \
+    --gpu-timing  <gpu>/gpu_timing.json  --gpu-power  <gpu>/gpu_power.jsonl \
+    --fpga-timing <fpga>/fpga_timing.json --fpga-power <fpga>/fpga_power.jsonl \
+    --output-json comparison.json --output-csv comparison.csv
+```
+
+Before running it, confirm both sides used the same fixture hashes and the
+same boundary. The aggregator combines results; it does not verify that they
+were comparable.
+
+### What these numbers do not claim
+
+The GPU arm measures **eager** PyTorch and FLA decode, which is the
+configuration a user gets by default. It is not an optimized GPU baseline: a
+CUDA-graph capture of the same step reached roughly 4.2 ms/token on an A100 in
+a separate experiment on `worktree-gpu-decode-opt`, verified token-identical to
+eager, and that work is deliberately not part of this workflow. Do not present
+the eager figure as the best a GPU can do, and do not describe the accelerator
+as faster in raw latency than a GPU can be made to go. The durable claims are
+flat per-token latency, constant memory with no KV cache, and performance per
+watt.
+
+Quality is evaluated with teacher forcing and the decoder's own exported
+log-probabilities, because free-running trajectories fork between any two
+independent implementations of this model. A fork is not an error; see the
+arithmetic-contract discussion in `c_impl/doc/architecture.md`.
+
 ## Build and verification
 
 Build the native decode driver:
@@ -83,7 +208,10 @@ diagnostic reports are generated artifacts and are intentionally not committed.
 
 - `c_impl/doc/README.md` — **start here**; says which document is current.
 - `c_impl/doc/architecture.md` — current top-level architecture and ABI
-  (Iter66e: all-BF16, 26.654 ms/token on card).
+  (the 150 MHz production image: 16.255 ms/token production TPOT and
+  16.131 ms kernel on card, 0.779 J/token gross).
+- `c_impl/doc/gpu_latency_energy_evaluation.md` — the GPU latency and energy
+  arm, from a fresh clone.
 - `c_impl/doc/decode_disaggregated_gemv.md` — 32-port GEMV engine.
 - `c_impl/doc/recurrent_attention.md` — recurrent-state implementation.
 - `c_impl/doc/cycle_optimization_roadmap.md` — measured cycle roadmap.
