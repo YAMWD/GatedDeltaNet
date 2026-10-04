@@ -7,6 +7,14 @@ set), then validate architecture, II, timing, arithmetic structure, and the
 pre-registered local-resource comparison.  This intentionally has no global
 LUT-percentage gate; physical feasibility is judged later from the routed
 candidate.
+
+Iter79 (2026-10-04): the production image is three kernels compiled from one
+source -- gdn_forward_p (control, ports 0/1/18-23), gdn_k_slr0 (ports 2-17) and
+gdn_k_slr2 (ports 24-31, recurrence, state writers).  The gate selects one report
+directory per kernel and applies the structural checks to their union: 32 masters
+across the three tops, one GEMV region instance per kernel, 16 clusters, 27
+ordinary readers, four state owners.  A build tree that holds only the retired
+monolith (gdn_forward) is still accepted, for A/B builds.
 """
 
 from __future__ import annotations
@@ -39,7 +47,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("--json-out", type=Path)
+    parser.add_argument("--target-mhz", type=float, default=200.0,
+                        help="HLS clock target the kernels must have been synthesized for")
     return parser.parse_args()
+
+
+PARTITION_TOPS = ("gdn_forward_p", "gdn_k_slr0", "gdn_k_slr2")
+REGION_MODULE = {
+    "gdn_forward_p": "gdn_gemv_part_ctrl",
+    "gdn_k_slr0": "gdn_gemv_part_slr0",
+    "gdn_k_slr2": "gdn_gemv_part_slr2",
+    "gdn_forward": "gdn_gemv",
+}
 
 
 def xml_text(root: ET.Element, path: str) -> str:
@@ -63,23 +82,46 @@ def resources(path: Path) -> Dict[str, int]:
     return result
 
 
-def select_report_dir(build_dir: Path) -> Path:
+def select_report_dir_for(build_dir: Path, top: str) -> Path:
     candidates: List[Tuple[int, int, Path]] = []
-    for top in build_dir.rglob("gdn_forward_csynth.xml"):
-        parent = top.parent
+    for xml in build_dir.rglob(f"{top}_csynth.xml"):
+        parent = xml.parent
         count = len(list(parent.glob("*_csynth.xml")))
         candidates.append((count, -len(str(parent)), parent))
     if not candidates:
-        raise ValueError(f"no gdn_forward_csynth.xml below {build_dir}")
+        raise ValueError(f"no {top}_csynth.xml below {build_dir}")
     return max(candidates)[2]
 
 
-def reports(report_dir: Path, pattern: str) -> List[Path]:
+def select_report_dirs(build_dir: Path) -> Dict[str, Path]:
+    """One complete report directory per kernel of the three-kernel image, or the
+    retired monolith's single directory when that is all the tree holds."""
+    found: Dict[str, Path] = {}
+    for top in PARTITION_TOPS:
+        try:
+            found[top] = select_report_dir_for(build_dir, top)
+        except ValueError:
+            pass
+    if len(found) == len(PARTITION_TOPS):
+        return found
+    if found:
+        raise ValueError(
+            f"incomplete three-kernel build: found reports for {sorted(found)} only"
+        )
+    return {"gdn_forward": select_report_dir_for(build_dir, "gdn_forward")}
+
+
+def reports(report_dirs: Iterable[Path], pattern: str) -> List[Path]:
+    """Every report whose file name matches, across all selected directories.
+    Instance-numbered names repeat between kernels (each kernel has its own
+    gemv32_cluster2_1); those are distinct modules and are all counted."""
     regex = re.compile(pattern)
-    return sorted(
-        (path for path in report_dir.glob("*_csynth.xml") if regex.fullmatch(path.name)),
-        key=lambda path: path.name,
-    )
+    result: List[Path] = []
+    for report_dir in report_dirs:
+        result.extend(
+            path for path in report_dir.glob("*_csynth.xml") if regex.fullmatch(path.name)
+        )
+    return sorted(result, key=lambda path: (path.name, str(path)))
 
 
 def pipeline_iis(path: Path) -> List[int]:
@@ -102,23 +144,53 @@ def main() -> int:
     notes: List[str] = []
 
     try:
-        report_dir = select_report_dir(args.build_dir.resolve())
+        report_dirs = select_report_dirs(args.build_dir.resolve())
     except (OSError, ValueError) as error:
         print(f"XO_GATE_FAIL: {error}", file=sys.stderr)
         return 2
+    tops = sorted(report_dirs)
+    dirs = [report_dirs[top] for top in tops]
+    partitioned = set(tops) == set(PARTITION_TOPS)
 
-    top_xml = report_dir / "gdn_forward_csynth.xml"
-    top_rpt = report_dir / "gdn_forward_csynth.rpt"
-    four_xml = report_dir / "gemv32_four_dots_csynth.xml"
-    four_rpt = report_dir / "gemv32_four_dots_csynth.rpt"
-    required_files = (top_xml, top_rpt, four_xml, four_rpt)
+    four_xml = None
+    for report_dir in dirs:
+        candidate = report_dir / "gemv32_four_dots_csynth.xml"
+        if candidate.is_file():
+            four_xml = candidate
+            break
+    if four_xml is None:
+        # Iter78 step 1b: gemv32_four_dots is inlined into the free-running
+        # weight loop, so its II, multiplier and resource checks read that
+        # loop's report instead (the unsuffixed cluster's; all sixteen are
+        # the same module body).
+        loop_reports = reports(
+            dirs, r"gemv32_cluster2_Pipeline_gemv32_cl_weight_stream_csynth\.xml")
+        if not loop_reports:
+            loop_reports = reports(
+                dirs, r"gemv32_cluster2_\d+_Pipeline_gemv32_cl_weight_stream_csynth\.xml")
+        if loop_reports:
+            four_xml = loop_reports[0]
+            notes.append(
+                "gemv32_four_dots is inlined into the cluster weight loop "
+                f"(Iter78 step 1b); its checks were applied to {four_xml.name}"
+            )
+    if four_xml is None:
+        failures.append("no gemv32_four_dots or cluster weight-loop report found")
+        four_xml = dirs[0] / "gemv32_four_dots_csynth.xml"
+    four_rpt = four_xml.with_suffix(".rpt")
+    required_files = [four_xml, four_rpt]
+    for top in tops:
+        required_files += [report_dirs[top] / f"{top}_csynth.xml",
+                           report_dirs[top] / f"{top}_csynth.rpt"]
     for path in required_files:
         if not path.is_file():
             failures.append(f"required report missing: {path}")
 
     summary: Dict[str, object] = {
         "build_dir": str(args.build_dir.resolve()),
-        "report_dir": str(report_dir),
+        "tops": tops,
+        "partitioned": partitioned,
+        "report_dirs": {top: str(path) for top, path in report_dirs.items()},
         "reference": REFERENCE,
     }
     if failures:
@@ -126,65 +198,78 @@ def main() -> int:
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 2
 
-    top_root = ET.parse(top_xml).getroot()
-    version = xml_text(top_root, "ReportVersion/Version")
-    target_ns = float(xml_text(top_root, "UserAssignments/TargetClockPeriod"))
-    estimated_ns = float(
-        xml_text(
-            top_root,
-            "PerformanceEstimates/SummaryOfTimingAnalysis/EstimatedClockPeriod",
+    target_limit_ns = 1000.0 / args.target_mhz + 0.01
+    per_top: Dict[str, Dict[str, object]] = {}
+    masters_all: set = set()
+    region_instances: Dict[str, List[str]] = {}
+    for top in tops:
+        top_xml = report_dirs[top] / f"{top}_csynth.xml"
+        top_rpt = report_dirs[top] / f"{top}_csynth.rpt"
+        top_root = ET.parse(top_xml).getroot()
+        version = xml_text(top_root, "ReportVersion/Version")
+        target_ns = float(xml_text(top_root, "UserAssignments/TargetClockPeriod"))
+        estimated_ns = float(
+            xml_text(
+                top_root,
+                "PerformanceEstimates/SummaryOfTimingAnalysis/EstimatedClockPeriod",
+            )
         )
-    )
-    top_resources = resources(top_xml)
-    latency = top_root.find("PerformanceEstimates/SummaryOfOverallLatency")
-    if latency is None:
-        raise ValueError(f"missing top-level latency summary in {top_xml}")
-    top_latency = {
-        "best_cycles": int(xml_text(latency, "Best-caseLatency")),
-        "average_cycles": int(xml_text(latency, "Average-caseLatency")),
-        "worst_cycles": int(xml_text(latency, "Worst-caseLatency")),
-    }
-    summary.update(
-        {
+        latency = top_root.find("PerformanceEstimates/SummaryOfOverallLatency")
+        if latency is None:
+            raise ValueError(f"missing top-level latency summary in {top_xml}")
+        # A free-running (ap_ctrl_none) blackbox in the dataflow graph gives the
+        # top an unbounded latency model and HLS reports 'undef' (Iter77 S2);
+        # record it as null -- the architectural checks below do not depend on it.
+        def latency_cycles(tag: str):
+            text = xml_text(latency, tag)
+            return None if text in ("undef", "?", "") else int(text)
+        per_top[top] = {
             "hls_version": version,
             "target_ns": target_ns,
             "estimated_ns": estimated_ns,
             "estimated_fmax_mhz": 1000.0 / estimated_ns,
-            "top_resources": top_resources,
-            "top_latency": top_latency,
+            "resources": resources(top_xml),
+            "latency": {
+                "best_cycles": latency_cycles("Best-caseLatency"),
+                "average_cycles": latency_cycles("Average-caseLatency"),
+                "worst_cycles": latency_cycles("Worst-caseLatency"),
+            },
         }
-    )
-    if not version.startswith("2024.2"):
-        failures.append(f"HLS version is {version}, expected 2024.2")
-    if target_ns > 6.68:
-        failures.append(f"HLS target is {target_ns:.3f} ns, not 150 MHz")
-    if estimated_ns > target_ns:
-        failures.append(
-            f"estimated clock {estimated_ns:.3f} ns misses {target_ns:.3f} ns target"
-        )
-
-    top_text = top_rpt.read_text(errors="replace")
-    masters = sorted({int(port) for port in re.findall(r"m_axi_mem_weights_mm(\d+)_", top_xml.read_text(errors="replace"))})
+        if not version.startswith("2024.2"):
+            failures.append(f"{top}: HLS version is {version}, expected 2024.2")
+        if target_ns > target_limit_ns:
+            failures.append(
+                f"{top}: HLS target is {target_ns:.3f} ns, not {args.target_mhz:g} MHz")
+        if estimated_ns > target_ns:
+            failures.append(
+                f"{top}: estimated clock {estimated_ns:.3f} ns misses {target_ns:.3f} ns target"
+            )
+        masters_all |= {int(port) for port in re.findall(
+            r"m_axi_mem_weights_mm(\d+)_", top_xml.read_text(errors="replace"))}
+        module = REGION_MODULE[top]
+        instances = set()
+        for line in top_rpt.read_text(errors="replace").splitlines():
+            match = re.search(
+                r"\|\s*(grp_" + re.escape(module) + r"_fu_[^| ]+)\s*\|\s*" + re.escape(module) + r"\s*\|",
+                line,
+            )
+            if match:
+                instances.add(match.group(1))
+        region_instances[top] = sorted(instances)
+        if len(instances) != 1:
+            failures.append(
+                f"{top}: found {len(instances)} shared {module} instances, expected 1"
+            )
+    summary["per_top"] = per_top
+    masters = sorted(masters_all)
     summary["weight_master_indices"] = masters
     if masters != list(range(32)):
         failures.append(f"weight AXI masters are {masters}, expected exactly 0..31")
+    summary["shared_gemv_region_instances"] = region_instances
 
-    shared_instances = set()
-    for line in top_text.splitlines():
-        match = re.search(
-            r"\|\s*(grp_gdn_gemv_fu_[^| ]+)\s*\|\s*gdn_gemv\s*\|", line
-        )
-        if match:
-            shared_instances.add(match.group(1))
-    summary["shared_gdn_gemv_instances"] = sorted(shared_instances)
-    if len(shared_instances) != 1:
-        failures.append(
-            f"found {len(shared_instances)} shared gdn_gemv instances, expected 1"
-        )
-
-    clusters = reports(report_dir, r"gemv32_cluster2(?:_\d+)?_csynth\.xml")
+    clusters = reports(dirs, r"gemv32_cluster2(?:_\d+)?_csynth\.xml")
     cluster_weight = reports(
-        report_dir,
+        dirs,
         r"gemv32_cluster2(?:_\d+)?_Pipeline_gemv32_cl_weight_stream_csynth\.xml",
     )
     summary["cluster_report_count"] = len(clusters)
@@ -212,19 +297,27 @@ def main() -> int:
     # one representation, then apply the same PipelineII=1 gate.  Do not count
     # both if a future release happens to emit both forms.
     ordinary_top = reports(
-        report_dir, r"gemv32_mm2s_\d+_s_csynth\.xml"
+        dirs, r"gemv32_mm2s_\d+_s_csynth\.xml"
     )
     ordinary_pipeline = reports(
-        report_dir,
+        dirs,
         r"gemv32_mm2s_\d+_Pipeline_gemv32_mm2s_loop_csynth\.xml",
     )
-    ordinary_reports = ordinary_top if len(ordinary_top) == 27 else ordinary_pipeline
+    # Iter78 step 4: with style=frp the ordinary loop is outlined into its own
+    # `_Pipeline_gemv32_mm2s_loop` module and the `_s` report carries no II,
+    # so prefer the loop reports whenever all 27 exist.
+    ordinary_reports = (
+        ordinary_pipeline if len(ordinary_pipeline) == 27 else ordinary_top
+    )
+    # Port 0's combined x/w0 loader: the monolith's gemv32_load_x_and_w0, or the
+    # three-kernel control kernel's gemv32_load_x_bcast (x to the local chain
+    # and the two remote kernels; same two pipelined loops).
     port0_reports = reports(
-        report_dir,
-        r"gemv32_load_x_and_w0_Pipeline_gemv32_(?:lx|w0)_csynth\.xml",
+        dirs,
+        r"gemv32_load_x_(?:and_w0_Pipeline_gemv32_(?:lx|w0)|bcast_Pipeline_gemv32_(?:lx|w0)_bcast)_csynth\.xml",
     )
     state_owner_reports = reports(
-        report_dir,
+        dirs,
         r"gemv32_mm2s_with_state_\d+_Pipeline_gemv32_state_owner_"
         r"(?:weight|weight_only|prefetch)_csynth\.xml",
     )
@@ -292,7 +385,10 @@ def main() -> int:
             f"QKVG state-owner weight phase is not exactly 2048 beats: {qkvg_weight_trips}"
         )
 
-    gemv_rpt = report_dir / "gdn_gemv_csynth.rpt"
+    gemv_rpt = (
+        report_dirs["gdn_k_slr2"] / "gdn_gemv_part_slr2_csynth.rpt"
+        if partitioned else report_dirs["gdn_forward"] / "gdn_gemv_csynth.rpt"
+    )
     state_fifo_layout: Dict[str, Dict[str, int]] = {}
     if gemv_rpt.is_file():
         for line in gemv_rpt.read_text(errors="replace").splitlines():

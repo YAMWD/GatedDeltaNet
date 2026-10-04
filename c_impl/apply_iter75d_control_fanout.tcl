@@ -24,8 +24,51 @@ foreach spec $specs {
     lassign $spec role kind name limit
     if {$kind eq "cell"} {
         set driver [get_cells -quiet $name]
+        if {[llength $driver] != 1 && [regexp {_fu_[0-9]+} $name]} {
+            # Same renumbering tolerance as for nets (Iter77 S2 moved gdn_gemv
+            # from fu_1054 to fu_946 when its caller gained the inlined wrapper).
+            set renumbered [get_cells -quiet [regsub -all {_fu_[0-9]+} $name {_fu_*}]]
+            if {[llength $renumbered] == 1} {
+                puts "ITER75D_WARN role=$role: $name absent; using [get_property NAME $renumbered] (instance renumbered)"
+                set driver $renumbered
+            }
+        }
     } else {
         set net [get_nets -quiet $name]
+        if {[llength $net] != 1 && [regexp {_fu_[0-9]+} $name]} {
+            # HLS renumbers sub-function instances (grp_x_fu_NNN) whenever a
+            # caller's argument list changes: Iter77's `stable` scalars moved
+            # gemv32_store from fu_178 to fu_170 with its FSM intact (build 4168).
+            # Same path with the instance number wildcarded, same state index.
+            set renumbered [get_nets -quiet [regsub -all {_fu_[0-9]+} $name {_fu_*}]]
+            if {[llength $renumbered] != 1} {
+                # HLS also names nets after source lines (zext_ln1178_...); an
+                # edit above the function shifts them. Same op, any line.
+                set renumbered [get_nets -quiet [regsub -all {_ln[0-9]+_} [regsub -all {_fu_[0-9]+} $name {_fu_*}] {_ln*_}]]
+            }
+            if {[llength $renumbered] == 1} {
+                puts "ITER75D_WARN role=$role: $name absent; using [get_property NAME $renumbered] (instance renumbered)"
+                set net $renumbered
+            }
+        }
+        if {[llength $net] != 1 && [regexp {^(.*)/ap_CS_fsm_state[0-9]+$} $name -> fsm_hier]} {
+            set fsm_hier [regsub -all {_fu_[0-9]+} $fsm_hier {_fu_*}]
+            # A re-synthesis can re-encode an FSM: Iter77's `stable` scalars removed
+            # gemv32_store's FIFO-read state, so its measured state5 net vanished
+            # (build 4134). The repair target is "this FSM's highest-fanout state
+            # net", so fall back to that by measurement and say so. Exact names
+            # still resolve first, which keeps the 150 MHz recipe byte-identical.
+            set best {}
+            set best_pins -1
+            foreach cand [get_nets -quiet ${fsm_hier}/ap_CS_fsm_state*] {
+                set pins [get_property FLAT_PIN_COUNT $cand]
+                if {$pins > $best_pins} { set best_pins $pins; set best $cand }
+            }
+            if {[llength $best] == 1} {
+                puts "ITER75D_WARN role=$role: $name absent; using highest-fanout state net [get_property NAME $best] (flat pins $best_pins)"
+                set net $best
+            }
+        }
         if {[llength $net] != 1} {error "ITER75D: expected one $role net: $name"}
         set driver [get_cells -quiet -of_objects [get_pins -quiet -leaf \
             -of_objects $net -filter {DIRECTION == OUT}]]

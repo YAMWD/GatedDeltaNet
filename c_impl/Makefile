@@ -29,6 +29,9 @@ CXX            ?= c++
 # emits a separate multiply and add with two. Any such expression would then
 # give native and RTL different last bits, breaking the bit-exact gate.
 CXXFLAGS       ?= -O3 -std=c++14 -ffp-contract=off -Wall -Wextra -pedantic -Wno-unknown-pragmas -Wno-unused-label
+# Iter79: the partitioned C model runs its three kernels as threads on
+# thread-safe hls::streams.
+CXXFLAGS       += -DHLS_STREAM_THREAD_SAFE -pthread
 
 # Vitis HLS install location — provides hls_stream.h used by the systolic
 # matmul kernel in gdn_model.cpp.
@@ -58,8 +61,8 @@ VITIS_SETTINGS := $(XILINX_VITIS)/settings64.sh
 # different schedule.
 PLATFORM       ?= xilinx_u55c_gen3x16_xdma_3_202210_1
 TARGET         ?= hw
-FREQ           ?= 150
-HLS_FREQ       ?= 150
+FREQ           ?= 200
+HLS_FREQ       ?= 200
 LINK_FREQ      ?= $(FREQ)
 JOBS           ?= 48
 # HLS and Vivado have very different per-worker memory footprints. The Slurm
@@ -78,17 +81,34 @@ HLS_PRE_TCL    := $(abspath ./hls_gdn_forward.tcl)
 # Include both clocks so changing only the HLS target cannot silently reuse an
 # XO synthesized for a different period.
 BUILD_DIR      := build.$(TARGET).gdn32.h$(HLS_FREQ).f$(LINK_FREQ).o$(JOBS)
-XO             := $(BUILD_DIR)/$(KERNEL).xo
-XCLBIN         := $(BUILD_DIR)/$(KERNEL).xclbin
-# Exact 150 MHz recipe: pre-place control replication, then post-route
-# AggressiveExplore -> Explore -> focused kernel physical optimization.
-HW_CFG_TEMPLATE ?= hw_f150.cfg
+# Production image (Iter79, 2026-10-04): one source file, three kernels -- the
+# control kernel gdn_forward_p on SLR1 and the GEMV halves gdn_k_slr0 / gdn_k_slr2
+# on their dies -- joined by seven AXI-Stream links.  Each kernel's AXI masters
+# stay on the die of the HBM pseudo-channels they read.
+P_KERNELS      := gdn_forward_p gdn_k_slr0 gdn_k_slr2
+XO_P           := $(foreach k,$(P_KERNELS),$(BUILD_DIR)/$(k).xo)
+XCLBIN         := $(BUILD_DIR)/gdn_p.xclbin
+# The retired monolithic kernel (the 100/150 MHz lineage), reachable through
+# xo_mono / xclbin_mono with HW_CFG_TEMPLATE=hw_f150.cfg for A/B comparison only.
+XO_MONO        := $(BUILD_DIR)/$(KERNEL).xo
+XCLBIN_MONO    := $(BUILD_DIR)/$(KERNEL).xclbin
+# Exact 200 MHz recipe: one kernel per SLR, two quarter-SLR island pblocks on
+# SLR2, SSI_SpreadLogic_high + AlternateCLBRouting, then the finishing ladder
+# (AggressiveExplore -> Explore -> focused kernel pass) and the fail-closed
+# exact-clock gate on all three clocks.
+HW_CFG_TEMPLATE ?= hw_f200_p.cfg
+ifeq ($(HW_CFG_TEMPLATE),hw_f150.cfg)
 HW_RECIPE_FILES := $(HW_CFG_TEMPLATE) apply_iter69_kernel_clock_f150.tcl \
     apply_iter75d_control_fanout.tcl apply_iter66e_unpair.tcl \
     apply_f150_physical_islands.tcl apply_iter54_dma_timing.tcl \
     apply_iter35_dma_w15_fifoaddr_fanout.tcl apply_iter23_dma_fanout.tcl \
     check_f150_physical_islands.tcl finish_f150_timing.tcl \
     check_iter75d_final_timing.tcl report_final_qor.tcl
+else
+HW_RECIPE_FILES := $(HW_CFG_TEMPLATE) apply_p_islands.tcl apply_p_islands_body.tcl \
+    apply_iter69_kernel_clock_f150.tcl finish_p_timing.tcl \
+    check_p_final_timing.tcl report_final_qor.tcl
+endif
 GDN_ONCARD     ?= 0
 RESOLVED_HW_CFG := $(BUILD_DIR)/resolved_hw.cfg
 HW_CFG          ?= $(RESOLVED_HW_CFG)
@@ -162,17 +182,18 @@ PARITY_CHECKER ?= ../scripts/check_gdn_c_parity.py
 # ----------------------------------------------------------------------------
 # Default target
 # ----------------------------------------------------------------------------
-.PHONY: all host_tb xo xclbin host run_hw clean clean_hw distclean help
+.PHONY: all host_tb xo xo_mono xclbin xclbin_mono host run_hw clean clean_hw distclean help
 
 all: host_tb
 
 help:
 	@echo "Targets:"
 	@echo "  host_tb     decode-only native testbench: gdn_eval (default)"
-	@echo "  xo          v++ compile  → $(XO)"
+	@echo "  xo          v++ compile  → $(XO_P)"
 	@echo "  xclbin      v++ link     → $(XCLBIN)"
 	@echo "  host        XRT host    → $(HOST_BIN)"
-	@echo "  run_hw      submit a fresh 150 MHz Slurm build and dependent 8/64-token card tests"
+	@echo "  run_hw      submit a fresh 200 MHz three-kernel Slurm build and dependent 8/64-token card tests"
+	@echo "  xo_mono / xclbin_mono   the retired monolithic kernel (A/B only, HW_CFG_TEMPLATE=hw_f150.cfg)"
 	@echo "              run on acclhead1; no DCP, XO or RQS input is required"
 	@echo "  clean       remove host-tb binaries"
 	@echo "  clean_hw    remove build.\$$(TARGET), _x/, v++ logs"
@@ -221,7 +242,8 @@ all_bf16_layout_test: all_bf16_layout_test.cpp gdn_model.cpp gdn_model.h
 # ----------------------------------------------------------------------------
 # v++ compile: gdn_model.cpp → $(KERNEL).xo
 # ----------------------------------------------------------------------------
-xo: $(XO)
+xo: $(XO_P)
+xo_mono: $(XO_MONO)
 
 $(RESOLVED_HW_CFG): $(HW_RECIPE_FILES)
 	@mkdir -p $(@D)
@@ -232,7 +254,7 @@ $(RESOLVED_HW_CFG): $(HW_RECIPE_FILES)
 	    exit 1; \
 	fi
 
-$(XO): $(KERNEL_SRC) $(HLS_PRE_TCL)
+$(XO_MONO): $(KERNEL_SRC) $(HLS_PRE_TCL)
 	@mkdir -p $(BUILD_DIR)
 	@source '$(VITIS_SETTINGS)'; \
 	$(VPP) $(VPP_COMPILE_FLAGS) \
@@ -243,27 +265,60 @@ $(XO): $(KERNEL_SRC) $(HLS_PRE_TCL)
 	    2>&1 | tee $(BUILD_DIR)/$(KERNEL)_compile.log
 	@test -s '$@'
 	@sha256sum $(KERNEL_SRC) $(HLS_PRE_TCL) '$@' \
-	    > '$(BUILD_DIR)/xo_manifest.sha256'
+	    > '$(BUILD_DIR)/xo_manifest_mono.sha256'
 
+
+# ----------------------------------------------------------------------------
+# Production XOs: the three kernels, each a v++ compile of the same source with
+# the same pre-TCL (so csynth here and the hardware see identical interface
+# config).  One manifest per kernel plus the aggregate xo_manifest.sha256 the
+# build job publishes.
+# ----------------------------------------------------------------------------
+$(XO_P): $(BUILD_DIR)/%.xo: $(KERNEL_SRC) $(HLS_PRE_TCL)
+	@mkdir -p $(BUILD_DIR)
+	@source '$(VITIS_SETTINGS)'; \
+	$(VPP) $(VPP_COMPILE_FLAGS) \
+	    --temp_dir $(BUILD_DIR)/_x_compile_$* \
+	    --report_dir $(BUILD_DIR)/reports_compile_$* \
+	    --hls.pre_tcl $(HLS_PRE_TCL) \
+	    -k $* -c -o $@ $(filter %.cpp,$(KERNEL_SRC)) \
+	    2>&1 | tee $(BUILD_DIR)/$*_compile.log
+	@test -s '$@'
+	@sha256sum $(KERNEL_SRC) $(HLS_PRE_TCL) '$@' > '$(BUILD_DIR)/$*.xo.manifest.sha256'
+	@cat $(BUILD_DIR)/*.xo.manifest.sha256 | sort -u -k2 > '$(BUILD_DIR)/xo_manifest.sha256'
 
 # ----------------------------------------------------------------------------
 # v++ link: $(KERNEL).xo + hw.cfg → $(KERNEL).xclbin
 # ----------------------------------------------------------------------------
 xclbin: $(XCLBIN)
+xclbin_mono: $(XCLBIN_MONO)
 
-$(XCLBIN): $(XO) $(HW_CFG)
+$(XCLBIN): $(XO_P) $(HW_CFG)
 	@mkdir -p $(BUILD_DIR)
 	@source '$(VITIS_SETTINGS)'; \
 	cd $(BUILD_DIR) && $(VPP) -l $(VPP_LINK_FLAGS) $(VPP_LDFLAGS) \
 	    --temp_dir _x_temp/ \
 	    --report_dir reports/ \
+	    -o $(notdir $(XCLBIN)) \
+	    $(abspath $(XO_P)) \
+	    2>&1 | tee gdn_p_link.log
+	@test -s '$@'
+	@sha256sum $(KERNEL_SRC) $(HLS_PRE_TCL) '$(HW_CFG)' $(HW_RECIPE_FILES) \
+	    $(XO_P) '$@' > '$(BUILD_DIR)/build_manifest.sha256'
+
+$(XCLBIN_MONO): $(XO_MONO) $(HW_CFG)
+	@mkdir -p $(BUILD_DIR)
+	@source '$(VITIS_SETTINGS)'; \
+	cd $(BUILD_DIR) && $(VPP) -l $(VPP_LINK_FLAGS) $(VPP_LDFLAGS) \
+	    --temp_dir _x_temp_mono/ \
+	    --report_dir reports_mono/ \
 	    -o $(KERNEL).xclbin \
 	    $(abspath $<) \
 	    2>&1 | tee $(KERNEL)_link.log
 	@test -s '$@'
 	@sha256sum $(KERNEL_SRC) $(HLS_PRE_TCL) '$(HW_CFG)' \
 	    $(HW_RECIPE_FILES) \
-	    '$(XO)' '$@' > '$(BUILD_DIR)/build_manifest.sha256'
+	    '$(XO_MONO)' '$@' > '$(BUILD_DIR)/build_manifest_mono.sha256'
 
 
 # ----------------------------------------------------------------------------

@@ -3,7 +3,8 @@
 # Submit the hardware flow to Slurm as two chained jobs.
 #
 #   usage:  bash run_hw_sbatch.sh [TAG]
-#   knobs:  JOBS HLS_FREQ LINK_FREQ VIVADO_SYNTH_JOBS VIVADO_IMPL_JOBS
+#   knobs:  JOBS HLS_FREQ LINK_FREQ (200 default) HW_CFG_TEMPLATE (hw_f200_p.cfg default)
+#           VIVADO_SYNTH_JOBS VIVADO_IMPL_JOBS
 #           BUILD_CONSTRAINT BUILD_EXCLUDE BUILD_NODE (optional exceptional pin)
 #           BUILD_MEM BUILD_TIME ONCARD_TIME SKIP_ONCARD
 #   data:   WEIGHTS DECODE_STATE DECODE_FIXTURE DECODE_GOLDEN LOGITS_REFERENCE
@@ -38,13 +39,19 @@ test -x "$SBATCH_BIN" || { echo "FATAL: ${SBATCH_BIN} not found; submit from a h
 TAG="${1:-hw_$(date +%Y%m%d_%H%M%S)_$$}"
 [[ "$TAG" =~ ^[A-Za-z0-9_-]+$ ]] || { echo 'FATAL: invalid job tag'; exit 2; }
 JOBS="${JOBS:-48}"
-HLS_FREQ="${HLS_FREQ:-150}"
-LINK_FREQ="${LINK_FREQ:-150}"
-HW_CFG_TEMPLATE="${HW_CFG_TEMPLATE:-hw_f150.cfg}"
+HLS_FREQ="${HLS_FREQ:-200}"
+LINK_FREQ="${LINK_FREQ:-200}"
+HW_CFG_TEMPLATE="${HW_CFG_TEMPLATE:-hw_f200_p.cfg}"
 STATE_ADDRESS_GATE="${STATE_ADDRESS_GATE:-1}"
 REQUIRE_EXACT_CLOCK="${REQUIRE_EXACT_CLOCK:-1}"
-if [ "$HW_CFG_TEMPLATE" = hw_f150.cfg ] && [ "$LINK_FREQ" != 150 ]; then
-    echo 'FATAL: hw_f150.cfg contains exact 150 MHz constraints; select a matching config for another clock.' >&2
+case "$HW_CFG_TEMPLATE" in
+    hw_f150.cfg) want_link=150 ;;
+    hw_f200.cfg) want_link=200 ;;
+    hw_f200_p.cfg) want_link=200 ;;
+    *) want_link= ;;
+esac
+if [ -n "$want_link" ] && [ "$LINK_FREQ" != "$want_link" ]; then
+    echo "FATAL: $HW_CFG_TEMPLATE is the exact ${want_link} MHz recipe; LINK_FREQ=$LINK_FREQ does not match." >&2
     exit 2
 fi
 export HW_CFG_TEMPLATE STATE_ADDRESS_GATE REQUIRE_EXACT_CLOCK
@@ -147,8 +154,14 @@ snapshot_files=(
     apply_iter23_dma_fanout.tcl check_f150_physical_islands.tcl
     report_final_qor.tcl check_native_bf16_xo.py reconcile_exact_clock.py
     hw_f150.cfg apply_iter69_kernel_clock_f150.tcl
+    hw_a200.cfg hw_a200_r2.cfg apply_a200_islands.tcl apply_a200_pinned_cut.tcl
+    hw_a200_r3.cfg apply_a200_control_fanout.tcl
     apply_iter75d_control_fanout.tcl check_iter75d_final_timing.tcl
     finish_f150_timing.tcl run_hw_sbatch.sh slurm/hw_build.slurm slurm/hw_oncard.slurm
+    # Iter79 production recipe (three kernels, 200 MHz): the link template, its
+    # OPT_DESIGN.PRE / TCL.POST hooks and the files those hooks source.
+    hw_f200_p.cfg apply_p_islands.tcl apply_p_islands_body.tcl
+    finish_p_timing.tcl check_p_final_timing.tcl
 )
 if [ -n "${REUSE_XO:-}" ]; then
     test -s "$REUSE_XO" && test -d "${REUSE_XO_REFERENCE:-}" || {
@@ -168,6 +181,16 @@ if [ -n "${EXTRA_SNAPSHOT_FILES:-}" ]; then
     done
 fi
 snapshot_files+=("${HW_CFG_TEMPLATE}")
+# Every Tcl/Python hook the chosen link template names as @C_IMPL_DIR@/<file>
+# travels with it (Iter77 S2: the 200 MHz template's own hooks were missing
+# from the frozen snapshot and the link failed at OPT_DESIGN.TCL.PRE).
+for cfg_hook in $(grep -oE '@C_IMPL_DIR@/[A-Za-z0-9_./-]+' "${HW_CFG_TEMPLATE}" | sed 's|@C_IMPL_DIR@/||' | sort -u); do
+    already=0
+    for existing in "${snapshot_files[@]}"; do
+        [ "$existing" = "$cfg_hook" ] && { already=1; break; }
+    done
+    [ "$already" = 1 ] || snapshot_files+=("$cfg_hook")
+done
 echo "cfg tmpl   : ${HW_CFG_TEMPLATE}"
 for snapshot_file in "${snapshot_files[@]}"; do
     test -s "${snapshot_file}" || {

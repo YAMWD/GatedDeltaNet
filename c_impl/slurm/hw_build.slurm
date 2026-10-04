@@ -83,6 +83,13 @@ BUILD_DIR="$(make -s -C "${STAGE_C_IMPL}" \
     --eval='__p:;@echo $(BUILD_DIR)' __p JOBS="${JOBS}" \
     HLS_FREQ="${HLS_FREQ}" LINK_FREQ="${LINK_FREQ}" 2>/dev/null | tail -1)"
 STAGE_BUILD="${STAGE_C_IMPL}/${BUILD_DIR}"
+# The production image's file name (gdn_p.xclbin: three kernels) comes from the
+# same Makefile, so a template override that links the retired monolith still
+# ships the right file.
+IMAGE="$(make -s -C "${STAGE_C_IMPL}" \
+    --eval='__p:;@echo $(notdir $(XCLBIN))' __p JOBS="${JOBS}" \
+    HLS_FREQ="${HLS_FREQ}" LINK_FREQ="${LINK_FREQ}" 2>/dev/null | tail -1)"
+echo "  image      : ${IMAGE}"
 SHARED_BUILD="${SHARED_DIAG}/artifacts/${BUILD_DIR}"
 echo "  build dir  : ${BUILD_DIR}"
 printf '%s\n' "${BUILD_DIR}" > "${SHARED_DIAG}/build_dir.path"
@@ -96,6 +103,9 @@ if [ "${STATE_ADDRESS_GATE:-0}" = 1 ]; then
         set -e
         make -C "${STAGE_C_IMPL}" gdn_eval all_bf16_layout_test
         "${STAGE_C_IMPL}/all_bf16_layout_test"
+        # The image is the three-kernel partition; gate its C model (three threads
+        # joined by the same seven streams), not the retired monolith's.
+        export GDN_PARTITIONED=1
         # Dataset overrides can be either repository-relative or absolute.
         cd "$SUBMIT_C_IMPL"
         for steps in 6 32; do
@@ -155,6 +165,7 @@ if [ "${xo_rc}" -eq 0 ]; then
         | tee -a "${SHARED_DIAG}/build.live.log"
     set +e
     python3 "${STAGE_C_IMPL}/check_native_bf16_xo.py" "${STAGE_BUILD}" \
+        --target-mhz "${HLS_FREQ}" \
         --json-out "${SHARED_DIAG}/xo_gate_summary.json" 2>&1 \
         | tee "${SHARED_DIAG}/xo_gate.log" \
         | tee -a "${SHARED_DIAG}/build.live.log"
@@ -170,7 +181,8 @@ if [ "$xo_rc" -eq 0 ] && [ "$gate_rc" -eq 0 ] && [ "${STATE_ADDRESS_GATE:-0}" = 
     set -u
     set +e
     python3 "${STAGE_C_IMPL}/check_state_writer_addresses.py" \
-        "${STAGE_BUILD}/gdn_forward.xo" "${SHARED_DIAG}/state_address_gate" \
+        "${STAGE_BUILD}/gdn_k_slr2.xo" "${SHARED_DIAG}/state_address_gate" \
+        --clock-ns "$(python3 -c "print(1000.0/${LINK_FREQ})")" \
         2>&1 | tee "${SHARED_DIAG}/state_address_gate.live.log"
     gate_rc="${PIPESTATUS[0]}"
     set -e
@@ -186,6 +198,9 @@ elif [ "${gate_rc}" -ne 0 ]; then
     echo "STEP_2_GATE_FAIL rc=${rc}; Vivado link was not started" \
         | tee -a "${SHARED_DIAG}/build.live.log"
 else
+    # The link hooks (clock override, finishing hook, exact-clock gate) take the
+    # kernel target from this variable; 150 is their default.
+    export GDN_KERNEL_TARGET_MHZ="${LINK_FREQ}"
     printf '%s\n' "vivado_link" > "${SHARED_DIAG}/build.phase"
     # v++ stdout goes directly to NFS. The finishing Tcl independently writes
     # physical_finish.live.log there; Vitis removes pre-created runme symlinks.
@@ -230,16 +245,17 @@ if [ -d "${STAGE_BUILD}" ]; then
         rm -rf "${SHARED_DIAG}/gdn_final_qor"
         cp -a "${final_qor}" "${SHARED_DIAG}/gdn_final_qor"
     fi
-    for report_dir in reports reports_compile; do
+    for report_dir in reports reports_compile reports_compile_gdn_forward_p reports_compile_gdn_k_slr0 reports_compile_gdn_k_slr2; do
         if [ -d "${STAGE_BUILD}/${report_dir}" ]; then
             rm -rf "${SHARED_DIAG}/${report_dir}"
             cp -a "${STAGE_BUILD}/${report_dir}" "${SHARED_DIAG}/${report_dir}"
         fi
     done
-    for build_file in gdn_forward_compile.log gdn_forward_link.log \
-                      xo_manifest.sha256 build_manifest.sha256 resolved_hw.cfg; do
-        if [ -f "${STAGE_BUILD}/${build_file}" ]; then
-            cp -f "${STAGE_BUILD}/${build_file}" "${SHARED_DIAG}/${build_file}"
+    for build_file in "${STAGE_BUILD}"/*_compile.log "${STAGE_BUILD}"/*_link.log \
+                      "${STAGE_BUILD}"/xo_manifest.sha256 "${STAGE_BUILD}"/*.xo.manifest.sha256 \
+                      "${STAGE_BUILD}"/build_manifest.sha256 "${STAGE_BUILD}"/resolved_hw.cfg; do
+        if [ -f "${build_file}" ]; then
+            cp -f "${build_file}" "${SHARED_DIAG}/$(basename "${build_file}")"
         fi
     done
 fi
@@ -260,7 +276,7 @@ if [ -s "${STAGE_C_IMPL}/diagnostics/checkpoints/post_place.dcp" ]; then
 fi
 
 if [ "${rc}" -eq 0 ]; then
-    test -s "${STAGE_BUILD}/gdn_forward.xclbin" || rc=3
+    test -s "${STAGE_BUILD}/${IMAGE}" || rc=3
     test -x "${STAGE_C_IMPL}/host.exe" || rc=3
 fi
 if [ "$rc" -eq 0 ] && [ "${REQUIRE_EXACT_CLOCK:-0}" = 1 ]; then
@@ -274,7 +290,7 @@ if [ "$rc" -eq 0 ] && [ "${REQUIRE_EXACT_CLOCK:-0}" = 1 ]; then
     gate_tsv="$(find "${STAGE_BUILD}" -path '*/gdn_final_qor/exact_clock_gate.tsv' \
         -print -quit 2>/dev/null)"
     python3 "${STAGE_C_IMPL}/reconcile_exact_clock.py" \
-        "${STAGE_BUILD}/gdn_forward.xclbin" "${gate_tsv:-/nonexistent}" "$LINK_FREQ" \
+        "${STAGE_BUILD}/${IMAGE}" "${gate_tsv:-/nonexistent}" "$LINK_FREQ" \
         "${SHARED_DIAG}" 2>&1 | tee "${SHARED_DIAG}/exact_clock.log"
     clock_rc="${PIPESTATUS[0]}"
     if [ "$clock_rc" -eq 0 ] && grep -q '^EXACT_CLOCK_RECONCILED' "${SHARED_DIAG}/exact_clock.log"; then
@@ -285,11 +301,11 @@ if [ "$rc" -eq 0 ] && [ "${REQUIRE_EXACT_CLOCK:-0}" = 1 ]; then
         (
             cd "${STAGE_C_IMPL}" || exit 1
             manifest="${BUILD_DIR}/build_manifest.sha256"
-            new_line="$(sha256sum "${BUILD_DIR}/gdn_forward.xclbin")"
-            old_line="$(grep -E " ${BUILD_DIR}/gdn_forward.xclbin\$" "$manifest")"
+            new_line="$(sha256sum "${BUILD_DIR}/${IMAGE}")"
+            old_line="$(grep -E " ${BUILD_DIR}/${IMAGE}\$" "$manifest")"
             printf '%s\n' "$old_line" | sed 's/$/  (vpl-written metadata, before reconciliation)/' \
                 > "${BUILD_DIR}/build_manifest.pre_reconcile.txt"
-            grep -vE " ${BUILD_DIR}/gdn_forward.xclbin\$" "$manifest" > "${manifest}.tmp"
+            grep -vE " ${BUILD_DIR}/${IMAGE}\$" "$manifest" > "${manifest}.tmp"
             printf '%s\n' "$new_line" >> "${manifest}.tmp"
             mv "${manifest}.tmp" "$manifest"
             sha256sum -c --quiet "$manifest"
@@ -303,8 +319,8 @@ if [ "$rc" -eq 0 ] && [ "${REQUIRE_EXACT_CLOCK:-0}" = 1 ]; then
 fi
 if [ "${rc}" -eq 0 ]; then
     mkdir -p "${SHARED_BUILD}"
-    cp -f "${STAGE_BUILD}/gdn_forward.xclbin" \
-          "${SHARED_BUILD}/gdn_forward.xclbin"
+    cp -f "${STAGE_BUILD}/${IMAGE}" \
+          "${SHARED_BUILD}/${IMAGE}"
     for manifest in xo_manifest.sha256 build_manifest.sha256 build_manifest.pre_reconcile.txt resolved_hw.cfg; do
         if [ -f "${STAGE_BUILD}/${manifest}" ]; then
             cp -f "${STAGE_BUILD}/${manifest}" "${SHARED_BUILD}/${manifest}"
@@ -312,12 +328,12 @@ if [ "${rc}" -eq 0 ]; then
     done
     cp -f "${STAGE_C_IMPL}/host.exe" "${SHARED_BUILD}/host.exe"
     cp "${STAGE_C_IMPL}/Makefile" "${SHARED_DIAG}/reproduction.Makefile"
-    printf '%s\n' "$SHARED_BUILD/gdn_forward.xclbin" > "$SHARED_DIAG/xclbin.path"
+    printf '%s\n' "$SHARED_BUILD/${IMAGE}" > "$SHARED_DIAG/xclbin.path"
     printf '%s\n' "$SHARED_BUILD/host.exe" > "$SHARED_DIAG/host.path"
-    sha256sum "${SHARED_BUILD}/gdn_forward.xclbin" \
+    sha256sum "${SHARED_BUILD}/${IMAGE}" \
               "${SHARED_BUILD}/host.exe" > \
               "${SHARED_DIAG}/copied_artifacts.sha256"
-    ls -lh "${SHARED_BUILD}/gdn_forward.xclbin" | sed 's/^/  image: /'
+    ls -lh "${SHARED_BUILD}/${IMAGE}" | sed 's/^/  image: /'
 fi
 
 echo "EXIT_CODE=${rc} end=$(date --iso-8601=seconds)"
