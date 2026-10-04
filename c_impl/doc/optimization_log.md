@@ -18213,8 +18213,10 @@ production (the duplicator feeds internal pipes and never gated the region).
 closed at 450 MHz this time (vpl computed 453.1 and kept 450), so the option-1 bound was not
 exercised; DATA_CLK 200 natively, reconciliation a no-op (pre- and post-digests identical).
 Image `0326f01be04ff628…` (copy: `iter79_p_r6/gdn_p_0326f01b.xclbin`, host `0c6c92559113d57c`).
-Routed CLB LUT per SLR **46.1% / 52.7% / 57.2%** (production monolith: 97.1 / 75.8 / 77.8),
-24,833 SLLs used. Route status clean (hook gate).
+Routed per SLR: CLB slices **91.3 / 91.4 / 91.9 %** occupied (the 150 MHz monolith: 97.1 / 75.8 /
+77.8 — like-for-like), LUTs 46.1 / 52.7 / 57.2 %; 24,833 SLLs used (SLR1↔SLR0 57.4 %, SLR2↔SLR1 50.4 %).
+*(An earlier wording of this entry compared the monolith's slice occupancy with this image's LUT
+percentage; corrected 2026-10-04.)* Route status clean (hook gate).
 
 **On card (job 6549, 41 s, acclnode01, XRT 2.13.479):**
 

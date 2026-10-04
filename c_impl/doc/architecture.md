@@ -22,8 +22,11 @@ logits; qualification on the same image: 512-token drift bounded with the fork
 at step 447, WikiText-2 word perplexity 16.774839771 (−0.0077 % vs the GPU),
 paired power **57.8 W active, 0.717 J/token gross, 0.325 J idle-subtracted**.
 Versus the 150 MHz monolith (16.255 / 16.131 ms) that is **−24.0 % TPOT and
-−8 % energy per token on +1.06 % cycles**: the gain is clock, bought by density
-— routed CLB LUT per SLR fell from 97 / 76 / 78 % to **46 / 53 / 57 %**.
+−8 % energy per token on +1.06 % cycles**: the gain is clock, bought by locality:
+the same ~678K LUTs now sit in even slices across the three dies (CLB occupancy
+**91.3 / 91.4 / 91.9 %**, LUT 46 / 53 / 57 %) where the monolith packed SLR0 to
+97.1 % CLB against 75.8 / 77.8 % on the other two, and only the seven stream
+links and the shell's own HBM pipes cross a die.
 
 Production XCLBIN SHA-256
 `0326f01be04ff628499de68184e7ae3c10aeacd872c87db47119f0e0f8e08286` (build
@@ -799,17 +802,23 @@ The 200 MHz recipe lives in `hw_f200_p.cfg` and its hooks:
 - `reconcile_exact_clock.py` after the link, as before (a no-op on these
   images: vpl wrote DATA_CLK 200 natively because every clock closed).
 
-Routed utilization of the promoted image (build 6548, identical on 6568):
+Routed utilization of the promoted image (build 6548, identical on 6568 and
+6642), beside the 150 MHz monolith (build 4022) like for like:
 
 | | SLR0 | SLR1 | SLR2 |
 |---|---:|---:|---:|
-| CLB LUTs | 202,602 (46.1 %) | 227,761 (52.7 %) | 247,187 (57.2 %) |
-| CLB registers | 314,767 (35.8 %) | 303,298 (35.1 %) | 283,555 (32.8 %) |
-| DSP | 2,154 (74.8 %) | 1,465 (47.7 %) | 1,792 (58.3 %) |
-| URAM | 0 | 56 (17.5 %) | 96 (30.0 %) |
+| CLB slices occupied, 200 MHz image | 50,199 (91.3 %) | 49,348 (91.4 %) | 49,634 (91.9 %) |
+| CLB slices occupied, 150 MHz monolith | 53,375 (97.1 %) | 40,917 (75.8 %) | 42,002 (77.8 %) |
+| CLB LUTs, 200 MHz image | 202,602 (46.1 %) | 227,761 (52.7 %) | 247,187 (57.2 %) |
+| CLB LUTs, 150 MHz monolith | 266,530 (60.6 %) | 205,786 (47.6 %) | 210,884 (48.8 %) |
+| CLB registers, 200 / 150 | 314,767 / 363,058 | 303,298 / 227,627 | 283,555 / 239,356 |
+| DSP, 200 / 150 | 2,154 / 2,378 | 1,465 / 1,681 | 1,792 / 1,486 |
+| URAM, 200 / 150 | 0 / 0 | 56 / 34 | 96 / 78 |
 
-SLL use: SLR1↔SLR0 13,228 (57.4 %), SLR2↔SLR1 11,605 (50.4 %), 24,833 in
-total. csynth per kernel (`gdn_forward_p` / `gdn_k_slr0` / `gdn_k_slr2`):
+The LUT total barely moved (677,550 against 683,200); it moved *off SLR0*
+(−24 % there) onto the other two dies, the slices evened out at ~91 %, and
+SLL use fell by a quarter: SLR1↔SLR0 13,228 (57.4 %, was 19,749 = 85.7 %),
+SLR2↔SLR1 11,605 (50.4 %, was 13,216 = 57.4 %), 24,833 in total (was 32,965). csynth per kernel (`gdn_forward_p` / `gdn_k_slr0` / `gdn_k_slr2`):
 BRAM18 644 / 697 / 494, DSP 949 / 1,121 / 1,263, FF 250K / 278K / 307K, LUT
 249K / 236K / 308K, URAM 56 / 0 / 96 — 1,835 BRAM18, 3,333 DSP, 835K FF, 792K
 LUT, 152 URAM in all, each kernel at an estimated 3.650 ns.
