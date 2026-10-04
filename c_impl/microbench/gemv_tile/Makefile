@@ -31,7 +31,10 @@ HOST_INC     := -I$(XILINX_VITIS)/include -I$(XILINX_XRT)/include
 HOST_LIB     := -L$(XILINX_XRT)/lib -Wl,-rpath,$(XILINX_XRT)/lib \
                 -lxrt_core -lxrt_coreutil -lpthread -lrt -ldl -lstdc++
 
-VPP_FLAGS    := -t $(TARGET) --platform $(PLATFORM) --save-temps -g --optimize 2
+# VPP_G= drops -g: with Vitis 2024.2 the debug automation crashed design
+# initialisation on the 32-master production design (root CLAUDE.md).
+VPP_G        ?= -g
+VPP_FLAGS    := -t $(TARGET) --platform $(PLATFORM) --save-temps $(VPP_G) --optimize 2
 VPP_FLAGS    += --hls.jobs $(JOBS) --kernel_frequency $(FREQ)
 VPP_CFLAGS   := $(VPP_FLAGS) -D GEMV_READ_OUTSTANDING=$(READ_OUTSTANDING)
 VPP_LDFLAGS  := --vivado.synth.jobs $(JOBS) --vivado.impl.jobs $(JOBS)
@@ -39,7 +42,10 @@ VPP_LDFLAGS  += --connectivity.nk $(KERNEL):1:$(KERNEL)_1
 VPP_LDFLAGS  += $(foreach P,$(PORTS),--connectivity.sp $(KERNEL)_1.w$(P):HBM[$(P)])
 VPP_LDFLAGS  += --connectivity.sp $(KERNEL)_1.x:HBM[0]
 VPP_LDFLAGS  += --connectivity.sp $(KERNEL)_1.y:HBM[0]
-VPP_LDFLAGS  += --vivado.prop run.impl_1.STEPS.OPT_DESIGN.TCL.PRE=$(abspath pblock_gemv_full.tcl)
+# OPT_PRE_TCL may point at a wrapper that first forces the kernel clock (Vitis
+# 2024.2 otherwise implements it at 10 ns) and then sources pblock_gemv_full.tcl.
+OPT_PRE_TCL  ?= $(abspath pblock_gemv_full.tcl)
+VPP_LDFLAGS  += --vivado.prop run.impl_1.STEPS.OPT_DESIGN.TCL.PRE=$(OPT_PRE_TCL)
 VPP_LDFLAGS  += --vivado.prop run.impl_1.STEPS.PLACE_DESIGN.TCL.PRE=$(abspath place_gemv_full.tcl)
 VPP_LDFLAGS  += --vivado.prop run.impl_1.STEPS.PLACE_DESIGN.ARGS.DIRECTIVE=SSI_SpreadSLLs
 VPP_LDFLAGS  += --vivado.prop run.impl_1.STEPS.PHYS_OPT_DESIGN.IS_ENABLED=true
@@ -89,7 +95,7 @@ $(XO): gemv_full.cpp gemv_full.h hls_gemv_full.tcl
 
 xclbin_full: $(XCLBIN)
 
-$(XCLBIN): $(XO) pblock_gemv_full.tcl place_gemv_full.tcl
+$(XCLBIN): $(XO) pblock_gemv_full.tcl place_gemv_full.tcl $(OPT_PRE_TCL)
 	cd $(BUILD_DIR) && $(VPP) -l $(VPP_FLAGS) $(VPP_LDFLAGS) \
 	    --temp_dir _x_temp --report_dir reports \
 	    -o $(KERNEL).xclbin $(abspath $<) \
