@@ -730,6 +730,29 @@ static xrt::kernel open_gdn_kernel(xrt::device &device, const xrt::uuid &uuid) {
     }
 }
 
+/* Iter79: the SLR-partitioned image carries three kernels that run one token
+ * together.  XRT counts AXI-Stream ports as arguments (kernel.xml ids), so
+ * the m_axi argument indices are
+ *   gdn_forward_p : 0 aux_weights, 1 workspace, 2 mm0, 3 mm1, 4..9 mm18..23
+ *   gdn_k_slr0    : 0..15 mm2..mm17
+ *   gdn_k_slr2    : 0..7  mm24..mm31
+ * and the stream ports follow.  A weight buffer must be allocated in the
+ * memory group of the kernel that owns its port. */
+static bool try_open_kernel(xrt::device &device, const xrt::uuid &uuid,
+                            const char *name, const char *cu, xrt::kernel &out) {
+    try {
+        out = xrt::kernel(device, uuid, std::string(name) + ":{" + cu + "}");
+        return true;
+    } catch (const std::exception &) {
+    }
+    try {
+        out = xrt::kernel(device, uuid, name);
+        return true;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
 struct ForwardTiming {
     double tpot_seconds = 0.0;
     double embedding_write_seconds = 0.0;
@@ -739,14 +762,46 @@ struct ForwardTiming {
     double token_d2h_seconds = 0.0;
 };
 
+
+/* Diagnostic only (Iter79 P5 hang): GDN_KERNEL_WAIT_TIMEOUT_MS bounds each
+ * kernel wait. On expiry the host throws, so RAII releases the device cleanly --
+ * in hardware emulation that is what lets the simulator run its post-simulation
+ * snapshot script instead of being killed. Unset or 0: the blocking wait the
+ * production flow has always used. */
+static bool gdn_wait_run(xrt::run &r, const char *what) {
+    static const long timeout_ms = [] {
+        const char *s = std::getenv("GDN_KERNEL_WAIT_TIMEOUT_MS");
+        return s ? std::atol(s) : 0L;
+    }();
+    if (timeout_ms <= 0) {
+        r.wait();
+        return true;
+    }
+    const ert_cmd_state st = r.wait(std::chrono::milliseconds(timeout_ms));
+    if (st == ERT_CMD_STATE_COMPLETED)
+        return true;
+    std::cerr << "[hang-probe] " << what << " did not complete within " << timeout_ms
+              << " ms (ert_cmd_state " << static_cast<int>(st) << ")\n";
+    return false;
+}
+
 class HwRunner {
 public:
     HwRunner(xrt::device &device, const xrt::uuid &uuid, const ModelData &model)
-        : kernel_(open_gdn_kernel(device, uuid)),
-          hidden_(model.config.hidden_size),
+        : hidden_(model.config.hidden_size),
           vocab_(model.config.vocab_size),
           embeddings_(model.weight_data.data()),
           logits_host_(GDN_WSF_LOGITS, 0.0f) {
+        partitioned_ = try_open_kernel(device, uuid, "gdn_forward_p", "gdn_forward_p_1", kernel_);
+        if (partitioned_) {
+            if (!try_open_kernel(device, uuid, "gdn_k_slr0", "gdn_k_slr0_1", k_slr0_) ||
+                !try_open_kernel(device, uuid, "gdn_k_slr2", "gdn_k_slr2_1", k_slr2_)) {
+                throw std::runtime_error("partitioned image without gdn_k_slr0/gdn_k_slr2");
+            }
+            std::cerr << "[progress] partitioned image: gdn_forward_p + gdn_k_slr0 + gdn_k_slr2\n";
+        } else {
+            kernel_ = open_gdn_kernel(device, uuid);
+        }
         const size_t shard_beats = gdn_weight_shard_beats(&model.config);
         const size_t shard_bytes = gdn_weight_shard_bytes(&model.config);
         if (shard_beats != GDN_COMPILED_WEIGHT_SHARD_BEATS ||
@@ -767,7 +822,7 @@ public:
                 extra_bytes = state_stripe_bytes;
             }
             weight_bos_.emplace_back(device, shard_bytes + extra_bytes,
-                                     kernel_.group_id(2 + c));
+                                     port_group(c));
         }
         aux_weight_bo_ = xrt::bo(weight_bos_[0], aux_bytes, shard_bytes);
 
@@ -800,7 +855,7 @@ public:
         for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
             const int port = GDN_RECURRENT_STATE_FIRST_PORT + p;
             snapshot_state_bos_[p] = xrt::bo(
-                device, snapshot_state_bytes_, kernel_.group_id(2 + port));
+                device, snapshot_state_bytes_, port_group(port));
         }
         snapshot_conv_bo_ = xrt::bo(
             device, snapshot_conv_bytes_, kernel_.group_id(1));
@@ -882,14 +937,39 @@ public:
         // time `start` is sampled, but that skew is <1 part in 10^6 of a
         // multi-minute run and is dwarfed by host-clock resolution anyway.
         xrt::run run(kernel_);
+        xrt::run run_s0, run_s2;
         run.set_arg(0, aux_weight_bo_);
         run.set_arg(1, workspace_bo_);
-        for (int c = 0; c < GEMV_CHANNELS; ++c) {
-            run.set_arg(2 + c, weight_bos_[c]);
+        if (partitioned_) {
+            /* The remote kernels block on their activation stream until the
+             * control kernel sends it, so they are started first. */
+            run_s0 = xrt::run(k_slr0_);
+            for (int c = 2; c <= 17; ++c) run_s0.set_arg(c - 2, weight_bos_[c]);
+            run_s2 = xrt::run(k_slr2_);
+            for (int c = 24; c <= 31; ++c) run_s2.set_arg(c - 24, weight_bos_[c]);
+            run.set_arg(2, weight_bos_[0]);
+            run.set_arg(3, weight_bos_[1]);
+            for (int c = 18; c <= 23; ++c) run.set_arg(4 + (c - 18), weight_bos_[c]);
+            run_s0.start();
+            run_s2.start();
+        } else {
+            for (int c = 0; c < GEMV_CHANNELS; ++c) {
+                run.set_arg(2 + c, weight_bos_[c]);
+            }
         }
         run.start();
         const auto launch_end = std::chrono::high_resolution_clock::now();
-        run.wait();
+        {
+            const char *first = partitioned_ ? "gdn_forward_p (control kernel)" : "gdn_forward";
+            bool ok = gdn_wait_run(run, first);
+            if (ok && partitioned_) {
+                ok = gdn_wait_run(run_s0, "gdn_k_slr0") && gdn_wait_run(run_s2, "gdn_k_slr2");
+            }
+            if (!ok) {
+                hang_probe();
+                throw std::runtime_error("kernel did not complete within GDN_KERNEL_WAIT_TIMEOUT_MS");
+            }
+        }
         const auto kernel_end = std::chrono::high_resolution_clock::now();
 
         double seconds = std::chrono::duration<double>(
@@ -982,6 +1062,91 @@ public:
         }
         workspace_bo_.write(packed_conv.get(), cbytes, hb_off);
         sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_TO_DEVICE, cbytes, hb_off);
+        if (std::getenv("GDN_KERNEL_WAIT_TIMEOUT_MS") != nullptr)
+            capture_hang_shadow();
+    }
+
+    /* Diagnostic only (Iter79 P5 hang). The recurrent-state stripes on ports
+     * 28..31 are the only per-layer progress the kernels leave in HBM: layer L's
+     * stripe is rewritten at the end of layer L's QKVG call. A shadow taken right
+     * after the upload, compared with a download after a timed-out wait, tells
+     * which layer the hung image reached without touching the kernel. */
+    void capture_hang_shadow() {
+        const size_t shard_bytes = GDN_COMPILED_WEIGHT_SHARD_BYTES;
+        const size_t stripe_bytes =
+            static_cast<size_t>(GDN_RECURRENT_STATE_STRIPE_BF16_BEATS) * sizeof(Beat512);
+        hang_shadow_.assign(static_cast<size_t>(GDN_RECURRENT_STATE_PORTS) * stripe_bytes, 0);
+        for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
+            const int port = GDN_RECURRENT_STATE_FIRST_PORT + p;
+            sync_bo_chunked(weight_bos_[port], XCL_BO_SYNC_BO_FROM_DEVICE, stripe_bytes, shard_bytes);
+            weight_bos_[port].read(hang_shadow_.data() + static_cast<size_t>(p) * stripe_bytes,
+                                   stripe_bytes, shard_bytes);
+        }
+        std::cerr << "[hang-probe] state shadow captured (" << GDN_RECURRENT_STATE_PORTS
+                  << " stripes x " << stripe_bytes << " B)\n";
+    }
+
+    void hang_probe() {
+        const size_t shard_bytes = GDN_COMPILED_WEIGHT_SHARD_BYTES;
+        const size_t stripe_bytes =
+            static_cast<size_t>(GDN_RECURRENT_STATE_STRIPE_BF16_BEATS) * sizeof(Beat512);
+        const size_t layer_bytes = static_cast<size_t>(8) * 512u * sizeof(Beat512);   /* 8 heads x 512 beats per layer per port (kernel: state_base = (layer*8+head)*512) */
+        const size_t layers = stripe_bytes / layer_bytes;
+        if (hang_shadow_.size() != static_cast<size_t>(GDN_RECURRENT_STATE_PORTS) * stripe_bytes) {
+            std::cerr << "[hang-probe] no state shadow; skipping the layer probe\n";
+            return;
+        }
+        std::vector<uint8_t> now(stripe_bytes);
+        std::vector<std::vector<size_t>> changed(layers, std::vector<size_t>(GDN_RECURRENT_STATE_PORTS, 0));
+        for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
+            const int port = GDN_RECURRENT_STATE_FIRST_PORT + p;
+            try {
+                sync_bo_chunked(weight_bos_[port], XCL_BO_SYNC_BO_FROM_DEVICE, stripe_bytes, shard_bytes);
+                weight_bos_[port].read(now.data(), stripe_bytes, shard_bytes);
+            } catch (const std::exception &ex) {
+                std::cerr << "[hang-probe] port " << port << " download failed: " << ex.what() << "\n";
+                continue;
+            }
+            const uint8_t *was = hang_shadow_.data() + static_cast<size_t>(p) * stripe_bytes;
+            for (size_t L = 0; L < layers; ++L) {
+                size_t n = 0;
+                for (size_t i = L * layer_bytes; i < (L + 1) * layer_bytes; ++i) n += (now[i] != was[i]);
+                changed[L][p] = n;
+            }
+        }
+        std::cerr << "[hang-probe] recurrent-state bytes changed since upload, per layer (ports 28..31):\n";
+        size_t last_changed = 0; bool any = false;
+        for (size_t L = 0; L < layers; ++L) {
+            std::cerr << "[hang-probe]   layer " << std::setw(2) << L << ":";
+            for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) std::cerr << " " << std::setw(7) << changed[L][p];
+            std::cerr << "\n";
+            for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) if (changed[L][p]) { last_changed = L; any = true; }
+        }
+        std::cerr << "[hang-probe] verdict: " << (any ? "state written up to layer " + std::to_string(last_changed)
+                                                   : std::string("NO layer's state was written back"))
+                  << " (layer L's stripe is written at the end of layer L's QKVG call)\n";
+        /* per-head detail of the last written layer and the next one: a partial
+         * write-back would put the hang inside that layer's recurrence/writer */
+        const size_t head_bytes = 512u * sizeof(Beat512);
+        for (size_t L = last_changed; L < std::min(layers, last_changed + 2); ++L) {
+            std::cerr << "[hang-probe]   layer " << L << " per head (bytes changed, ports 28..31 side by side):\n";
+            for (size_t h = 0; h < 8; ++h) {
+                std::cerr << "[hang-probe]     head " << h << ":";
+                for (int p = 0; p < GDN_RECURRENT_STATE_PORTS; ++p) {
+                    const int port = GDN_RECURRENT_STATE_FIRST_PORT + p;
+                    std::vector<uint8_t> cur(stripe_bytes);
+                    try {
+                        sync_bo_chunked(weight_bos_[port], XCL_BO_SYNC_BO_FROM_DEVICE, stripe_bytes, shard_bytes);
+                        weight_bos_[port].read(cur.data(), stripe_bytes, shard_bytes);
+                    } catch (const std::exception &) { std::cerr << "     err"; continue; }
+                    const uint8_t *was = hang_shadow_.data() + static_cast<size_t>(p) * stripe_bytes;
+                    size_t n = 0;
+                    for (size_t i = L * layer_bytes + h * head_bytes; i < L * layer_bytes + (h + 1) * head_bytes; ++i) n += (cur[i] != was[i]);
+                    std::cerr << " " << std::setw(6) << n;
+                }
+                std::cerr << "\n";
+            }
+        }
     }
 
     /* Each rolling window is scored independently, so it must start from the
@@ -1149,6 +1314,16 @@ private:
     }
 
     xrt::kernel kernel_;
+    xrt::kernel k_slr0_, k_slr2_;
+    bool partitioned_ = false;
+    /* Memory group of weight port c in the kernel that owns it. */
+    int port_group(int c) const {
+        if (!partitioned_) return kernel_.group_id(2 + c);
+        if (c <= 1) return kernel_.group_id(2 + c);
+        if (c >= 18 && c <= 23) return kernel_.group_id(4 + (c - 18));
+        if (c >= 24) return k_slr2_.group_id(c - 24);
+        return k_slr0_.group_id(c - 2);
+    }
     uint32_t hidden_ = 0;
     uint32_t vocab_ = 0;
     const float *embeddings_ = nullptr;
@@ -1159,6 +1334,7 @@ private:
     xrt::bo aux_weight_bo_;
     xrt::bo workspace_bo_;
     std::vector<xrt::bo> weight_bos_;
+    std::vector<uint8_t> hang_shadow_;   /* diagnostic: state stripes right after upload */
     std::vector<float> logits_host_;
     int32_t device_token_ = -1;
     bool logits_valid_ = false;
