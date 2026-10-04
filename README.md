@@ -196,8 +196,9 @@ bash run_hw_sbatch.sh
 
 The wrapper freezes a source snapshot, creates separate build and FPGA jobs
 and chains the test with `afterok`; `make -C c_impl run_hw` on the login node
-invokes the same wrapper. The flow builds and closes the kernel at 150 MHz and
-validates the image on the card (see `c_impl/doc/reproduce_f150.md`). Run
+invokes the same wrapper. The flow builds the three kernels of the production
+image, closes them at 200 MHz and validates the image on the card (see
+`c_impl/doc/reproduce_f200.md`). Run
 `make -C c_impl help` for the current weight, state, logit-reference, clock,
 device, and output options.
 
@@ -208,8 +209,8 @@ diagnostic reports are generated artifacts and are intentionally not committed.
 
 - `c_impl/doc/README.md` — **start here**; says which document is current.
 - `c_impl/doc/architecture.md` — current top-level architecture and ABI
-  (the 150 MHz production image: 16.255 ms/token production TPOT and
-  16.131 ms kernel on card, 0.779 J/token gross).
+  (the 200 MHz three-kernel production image: 12.350 ms/token production
+  TPOT and 12.227 ms kernel on card, 0.717 J/token gross).
 - `c_impl/doc/gpu_latency_energy_evaluation.md` — the GPU latency and energy
   arm, from a fresh clone.
 - `c_impl/doc/decode_disaggregated_gemv.md` — 32-port GEMV engine.

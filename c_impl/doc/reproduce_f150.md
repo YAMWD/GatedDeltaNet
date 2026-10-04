@@ -1,3 +1,9 @@
+> **Historical (2026-10-04).** This is the 150 MHz monolith recipe that the
+> three-kernel 200 MHz flow replaced; see [reproduce_f200.md](reproduce_f200.md)
+> for the production command. The 150 MHz image can still be rebuilt with
+> `HW_CFG_TEMPLATE=hw_f150.cfg HLS_FREQ=150 LINK_FREQ=150 make run_hw` (the
+> Makefile's `xo_mono` / `xclbin_mono` lineage) for A/B comparison only.
+
 # Clean 150 MHz build and on-card validation
 
 From any host with the Slurm client (normally `acclhead1`; a running job may

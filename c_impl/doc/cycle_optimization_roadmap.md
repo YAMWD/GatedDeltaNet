@@ -1,5 +1,16 @@
 # Cycle-First Optimization Roadmap After Iter67c
 
+> **Update 2026-10-04 (Iter79 promotion).** The production image is now the
+> three-kernel 200 MHz image: **12.227 ms kernel / 12.350 ms TPOT = 2,445,400
+> cycles**, +1.06 % cycles over the 150 MHz image and **+1.47 % over Iter67c's
+> 2.4099M** (the seven inter-kernel stream hand-offs). The cycle reference below
+> deliberately stays Iter67c's, for the reason the next paragraphs give: every
+> gain since has been clock. The frequency lever is now **closed at 200 MHz**
+> by the kernel split (`architecture.md` § *Iter79 — the kernel split*): the
+> ports are busy 55.9 % of the token and a busy port draws 12.8 GB/s =
+> **88.9 % of its 14.4 GB/s pseudo-channel peak**, so a further clock step
+> needs weight compression first (§10) — 250 MHz would ask 111 %.
+
 **Current cycle reference (unchanged, reaffirmed 2026-09-09):** **Iter67c**,
 all-BF16, **2.4099M cycles/token = 24.099 ms kernel median / 24.208 ms
 production TPOT** at a true 100 MHz, WNS +0.003 / WHS +0.007 ns design-wide,

@@ -42,10 +42,10 @@ clone*.
 | `gdn_model.cpp`, `gdn_model.h` | Synthesizable kernel and native support code |
 | `gdn_eval.cpp` | Decode-only native correctness driver |
 | `host.cpp` | XRT host and on-card full-logit validation |
-| `Makefile` | Native, XO, XCLBIN, host, and complete `run_hw` flow |
+| `Makefile` | Native, the three kernel XOs, XCLBIN, host, and complete `run_hw` flow (`xo_mono`/`xclbin_mono` for the retired monolith) |
 | `test.tcl` | Integrated HLS synthesis entry point |
 | `hls_gdn_forward.tcl` | HLS interface and RTL configuration |
-| `hw_f150.cfg` | Production 150 MHz connectivity and physical hooks (`finish_f150_timing.tcl`, `check_iter75d_final_timing.tcl`, `apply_iter75d_control_fanout.tcl`, `apply_iter69_kernel_clock_f150.tcl`) |
+| `hw_f200_p.cfg` | Production 200 MHz three-kernel connectivity and physical hooks (`apply_p_islands.tcl`, `finish_p_timing.tcl`, `check_p_final_timing.tcl`); `hw_f150.cfg` is the retired 150 MHz monolith recipe for A/B |
 | `reconcile_exact_clock.py` | Fail-closed DATA_CLK metadata reconciliation after the link |
 | `run_hw_sbatch.sh` | Slurm build/test submission wrapper |
 | `slurm/` | Build and U55C test job definitions |
@@ -95,7 +95,7 @@ the test with `afterok`. The card job runs the submission's frozen
 `reproduction.Makefile` with `GDN_ONCARD=1`, so it can never start a link. The
 demonstrated launch, from `c_impl/`, is `BUILD_EXCLUSIVE=user BUILD_NODE=acclnode01
 BUILD_EXCLUDE=acclnode04,acclnode05,harrier make run_hw` (from the repository
-root, `make -C c_impl run_hw`); see `doc/reproduce_f150.md`.
+root, `make -C c_impl run_hw`); see `doc/reproduce_f200.md`.
 
 Use `make -C c_impl help` to display the configurable weights, state, fixture,
 reference, frequency, device, and output paths.
