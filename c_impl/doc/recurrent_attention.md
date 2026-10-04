@@ -1,8 +1,19 @@
 # Optimised Recurrent Attention
 
-**Status:** Active decode compute block, current as of **Iter66e**
-(2026-08-30). The prefill and v1--v7 synthesis discussions later in this
-document are historical.
+**Status:** Active decode compute block, current as of **Iter79**
+(2026-10-04): the block is unchanged since Iter66e/Iter73a in arithmetic and
+schedule, but it now lives in the SLR2 kernel `gdn_k_slr2` of the three-kernel
+production image. Its convolved Q/K/V arrive over the `conv_to_slr2` stream
+link (192 beats per QKVG call) and the per-head gate scalars over
+`scalars_to_slr2` (2 beats); the two islands' merged attention leaves over
+`attn_from_slr2` (64 beats) through `gdn_recurrent_merge_islands_stream`
+instead of a memory write. Because that merge writes a stream, HLS auto-rewinds
+its loop and counts it toward the region's completion, so the islands' dataflow
+region `gdn_recurrent_attention_islands_dataflow_p` runs **with start
+propagation on** — the one source change the partition needed; without it the
+first 200 MHz image hung after layer 0's state write-back (HLS warning
+200-656, `architecture.md` invariant 24). The prefill and v1--v7 synthesis
+discussions later in this document are historical.
 
 **This block is now the second-largest consumer of the token and the largest
 one that did not shrink when the weights went BF16.** At 43,427 cycles per

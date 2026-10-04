@@ -28,26 +28,40 @@ proc assign_cells_to_slr {slr cells} {
     }
 }
 
-proc loader_cells_for_port {port} {
-    if {$port == 0} {
-        return [required_cell "*loader0_sys_U0"]
+# HLS numbers dataflow instances differently per release (2022.1: clusters
+# _31.._37 and loaders _1.._30; 2024.2: clusters _1.._7 and loaders _8.._37)
+# but always in port/cluster order, so discover them and sort naturally.
+proc ordered_instances {pattern expected} {
+    set names {}
+    foreach c [get_cells -hierarchical -quiet $pattern] {
+        set leaf [lindex [split [get_property NAME $c] /] end]
+        if {[string match "*Pipeline*" $leaf]} { continue }
+        lappend names $leaf
     }
-    if {$port == 1} {
-        return [required_cell "*mm2s_loader_U0"]
+    set names [lsort -unique $names]
+    # The unsuffixed instance (cluster 0 / loader for port 1) sorts last under a
+    # dictionary sort but is first in port order: put it first, then the numbered
+    # instances in ascending numeric order.
+    set plain {}; set numbered {}
+    foreach n $names {
+        if {[regexp {_[0-9]+_U0$} $n]} { lappend numbered $n } else { lappend plain $n }
     }
-    set suffix [expr {$port - 1}]
-    return [required_cell "*mm2s_loader_${suffix}_U0"]
+    set names [concat $plain [lsort -dictionary $numbered]]
+    if {[llength $plain] != 1 || [llength $names] != $expected} {
+        error "pblock_gemv_full: expected $expected instances matching $pattern (one unsuffixed), found [llength $names]: $names"
+    }
+    return $names
 }
-
-set cluster_names {
-    cluster4_sys_U0
-    cluster4_sys_31_U0
-    cluster4_sys_32_U0
-    cluster4_sys_33_U0
-    cluster4_sys_34_U0
-    cluster4_sys_35_U0
-    cluster4_sys_36_U0
-    cluster4_sys_37_U0
+# Clusters: the unsuffixed instance is cluster 0, then the numbered ones in order.
+set cluster_names [ordered_instances "*cluster4_sys*_U0" 8]
+# Loaders: port 0 has its own module; port 1 is the unsuffixed mm2s_loader; ports
+# 2..31 are the numbered mm2s_loaders in order.
+set loader_names [concat [list loader0_sys_U0] [ordered_instances "*mm2s_loader*_U0" 31]]
+puts "pblock_gemv_full: clusters $cluster_names"
+puts "pblock_gemv_full: loaders $loader_names"
+proc loader_cells_for_port {port} {
+    global loader_names
+    return [required_cell "*[lindex $loader_names $port]"]
 }
 
 # Preserve activation-ripple order while balancing compute against the platform:

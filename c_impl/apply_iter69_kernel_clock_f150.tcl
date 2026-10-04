@@ -21,9 +21,12 @@
 #
 # Requested: 150 MHz from the 100 MHz `io_clk_freerun_00_clk_p` = x3/2.
 
-set iter69_target_mhz 150.0
-set iter69_mult 3
-set iter69_div 2
+# Target from GDN_KERNEL_TARGET_MHZ (hw_build.slurm exports LINK_FREQ there);
+# default 150. The multiply/divide pair is the smallest integer ratio from the
+# MMCM input (100 MHz), so 150 -> x3/2 exactly as before, 200 -> x2/1.
+set iter69_target_mhz [expr {[info exists ::env(GDN_KERNEL_TARGET_MHZ)] ? double($::env(GDN_KERNEL_TARGET_MHZ)) : 150.0}]
+set iter69_mult 0
+set iter69_div 0
 
 set iter69_mmcm level0_i/ulp/ulp_ucs/inst/aclk_kernel_00_hierarchy/clkwiz_aclk_kernel_00/inst/CLK_CORE_DRP_I/clk_inst/mmcme4_adv_inst
 set iter69_clk [get_clocks -quiet clk_kernel_00_unbuffered_net]
@@ -37,7 +40,13 @@ if {[llength $iter69_in] != 1 || [llength $iter69_out] != 1} {
     error "iter69 kernel clock: MMCM pins not found under $iter69_mmcm"
 }
 set iter69_in_period [get_property PERIOD [get_clocks -of_objects $iter69_in]]
-puts "iter69 kernel clock: before override period=$iter69_before ns, MMCM input period=$iter69_in_period ns"
+set iter69_in_mhz [expr {1000.0 / $iter69_in_period}]
+for {set d 1} {$d <= 16} {incr d} {
+    set m [expr {round($iter69_target_mhz * $d / $iter69_in_mhz)}]
+    if {abs($iter69_in_mhz * $m / $d - $iter69_target_mhz) < 0.01} { set iter69_mult $m; set iter69_div $d; break }
+}
+if {$iter69_mult == 0} { error "iter69 kernel clock: no integer MMCM ratio from $iter69_in_mhz MHz to $iter69_target_mhz MHz" }
+puts "iter69 kernel clock: before override period=$iter69_before ns, MMCM input period=$iter69_in_period ns, target $iter69_target_mhz MHz = x$iter69_mult/$iter69_div"
 
 create_generated_clock -name clk_kernel_00_unbuffered_net \
     -source $iter69_in -multiply_by $iter69_mult -divide_by $iter69_div $iter69_out
@@ -55,4 +64,9 @@ report_clocks -file [file join $iter69_rpt_dir iter69_clocks_after_override.rpt]
 
 # Then the unchanged Iter66e floorplan.
 set iter69_dir [file dirname [file normalize [info script]]]
-source [file join $iter69_dir apply_f150_physical_islands.tcl]
+# Iter77 S2: a caller (the 200 MHz hook) may substitute the floorplan script
+# for a source whose instance names differ; the production default is unchanged.
+if {![info exists gdn_islands_script]} {
+    set gdn_islands_script [file join $iter69_dir apply_f150_physical_islands.tcl]
+}
+source $gdn_islands_script

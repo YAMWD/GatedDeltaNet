@@ -124,7 +124,9 @@ int main(int argc, char **argv) {
     std::string kname = (argc > 2) ? argv[2] : "gemv_full";
     uint32_t rows = (argc > 3) ? (uint32_t)std::stoul(argv[3]) : 2048U;
     uint32_t k_packs = (argc > 4) ? (uint32_t)std::stoul(argv[4]) : 352U;
-    uint32_t dev = (argc > 5) ? (uint32_t)std::stoul(argv[5]) : 0U;
+    // Device by XRT index, or by PCIe BDF when the argument contains ':' --
+    // under Slurm the allocated card must be selected by BDF (root CLAUDE.md).
+    std::string dev_arg = (argc > 5) ? argv[5] : "0";
     bool verify = (argc > 6) ? (std::stoul(argv[6]) != 0) : true;
     double frequency_mhz = (argc > 7) ? std::stod(argv[7]) : 150.0;
     uint32_t timed_reps = (argc > 8) ? (uint32_t)std::stoul(argv[8]) : 5U;
@@ -147,7 +149,8 @@ int main(int argc, char **argv) {
               << "  weights     : " << (weight_file.empty() ? "synthetic" : weight_file) << "\n"
               << "  MACs        : " << macs/1e9 << " G  (" << flops/1e9 << " GFLOP)\n";
 
-    xrt::device device(dev);
+    xrt::device device = (dev_arg.find(':') != std::string::npos)
+        ? xrt::device(dev_arg) : xrt::device((unsigned)std::stoul(dev_arg));
     auto uuid = device.load_xclbin(xclbin);
     xrt::kernel krnl(device, uuid, kname + ":{" + kname + "_1}");
 

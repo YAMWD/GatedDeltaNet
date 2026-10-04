@@ -43,6 +43,16 @@ iter56_check_pblock pb_iter56_recurrent_slr2 SLR2 1
 iter56_check_pblock pb_iter56_cluster8_slr1 SLR1 1
 iter56_check_pblock pb_iter66b_cluster10_slr1 SLR1 4
 iter56_check_pblock pb_iter56_result_boundary_slr1 SLR1 4
+# Iter77 (200 MHz recipe only): every pb_iter77_*_slrN pblock present must hold
+# all its placed cells inside SLRN; root counts vary by hook version, so only
+# presence and containment are asserted.
+foreach iter77_pb [get_pblocks -quiet pb_iter77_*] {
+    set iter77_name [get_property NAME $iter77_pb]
+    if {![regexp {_slr([0-2])$} $iter77_name -> iter77_n]} { error "iter77 gate: cannot read SLR from $iter77_name" }
+    set iter77_roots [llength [get_cells -quiet -of_objects $iter77_pb -include_replicated_objects]]
+    if {$iter77_roots < 1} { error "iter77 gate: $iter77_name has no roots" }
+    iter56_check_pblock $iter77_name SLR$iter77_n $iter77_roots
+}
 
 # Report where clusters 9/10 and their transport hierarchies actually land.
 # Cluster 10 plus ws20/ws21/xr10 are checked above; cluster 9 and the remaining

@@ -26,10 +26,20 @@ def testbench(top, ports, port, allow_direct=False):
         if len(found) != 1:
             raise ValueError(f"Expected one {pattern}, got {found}")
         return found[0]
-    suffix = r"(?:_dout)?" if allow_direct else r"_dout"
-    pointer = one(r"(?:w" + str(port) + r"|weights)" + suffix)
-    layer = one(r"layer_index" + suffix)
-    mode = one(r"qkvg_recurrent_mode" + suffix)
+    def first_of(*patterns):
+        """The writer's scalar inputs arrive either through HLS FIFO copies
+        (`<name>_dout`, or `<name>_c_dout` for pointer offsets) or, when the
+        dataflow arguments are marked `stable`, as plain ports. Accept whichever
+        form this netlist has; the address contract is identical."""
+        for pattern in patterns:
+            found = [n for n in names if re.fullmatch(pattern, n)]
+            if len(found) == 1:
+                return found[0]
+        raise ValueError(f"Expected one of {patterns}, got none (or several)")
+    w = r"(?:w" + str(port) + r"|weights)"
+    pointer = first_of(w + r"(?:_c)?_dout", w) if allow_direct else first_of(w + r"(?:_c)?_dout")
+    layer = first_of(r"layer_index_dout", r"layer_index")
+    mode = first_of(r"qkvg_recurrent_mode_dout", r"qkvg_recurrent_mode")
     addr = one(r"m_axi_.*_AWADDR")
     valid = one(r"m_axi_.*_AWVALID")
     awready = one(r"m_axi_.*_AWREADY")
@@ -101,18 +111,22 @@ def main():
                         help="Accept scalar rather than FIFO control inputs in an isolated HLS wrapper")
     parser.add_argument("--diagnostic-keep-offset", action="store_true",
                         help="Test KEEP on the narrow offset net; never modifies the input XO")
+    parser.add_argument("--clock-ns", type=float, default=5.0,
+                        help="OOC synthesis clock for the writer (5.0 = the 200 MHz production kernel)")
     args = parser.parse_args()
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     if args.xo.is_dir():
-        sources = {p.stem: p.read_text() for p in args.xo.glob("gdn_forward*.v")}
+        sources = {p.stem: p.read_text() for p in args.xo.glob("*.v")}
     else:
         with zipfile.ZipFile(args.xo) as archive:
             sources = {Path(n).stem: archive.read(n).decode() for n in archive.namelist()
                        if "/hdl/verilog/" in n and n.endswith(".v")}
     results = []
     for port in args.ports:
-        tops = [n for n in sources if re.fullmatch(r"gdn_forward_gemv32_state_writer_" + str(port) + r"_s", n)]
+        # The writers live in the SLR2 kernel of the three-kernel image (Iter79) and in
+        # the retired monolith; both module prefixes are accepted.
+        tops = [n for n in sources if re.fullmatch(r"(?:gdn_forward|gdn_k_slr2)_gemv32_state_writer_" + str(port) + r"_s", n)]
         if len(tops) != 1:
             raise ValueError(f"Expected one writer{port}, got {tops}")
         top = tops[0]
@@ -144,7 +158,7 @@ def main():
         tcl = "\n".join([
             "read_verilog [list " + " ".join("{" + str(f) + "}" for f in files) + "]",
             f"synth_design -top {top} -part xcu55c-fsvh2892-2L-e -mode out_of_context -flatten_hierarchy rebuilt",
-            "create_clock -period 6.667 [get_ports ap_clk]",
+            f"create_clock -period {args.clock_ns:.3f} [get_ports ap_clk]",
             "write_verilog -force -mode funcsim -rename_top writer_synth writer_synth.v",
             "write_checkpoint -force writer_synth.dcp",
             "opt_design",

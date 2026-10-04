@@ -1,5 +1,11 @@
 # Frequency-Local Architecture Roadmap: 150 -> 200 -> 250 MHz
 
+> **2026-10-04:** 200 MHz was reached — not by the Iter68 approach below but by
+> the Iter79 SLR partition (three kernels, one per die, data-only stream links;
+> `architecture.md`). The production image closes 200 MHz with +0.029 ns on the
+> kernel clock. 250 MHz stays closed: at 200 MHz a busy port already draws
+> 88.9 % of its pseudo-channel peak, and 250 would need 111 %.
+
 **Status (2026-09-05): the Iter68 campaign is CLOSED as stopped/inconclusive
 and 250 MHz is no longer a target.** This document is kept as the record of
 what Iter68 proposed and implemented (Iter68A–G source, gates, failure

@@ -1,10 +1,11 @@
 # Disaggregated Decode-Only Accelerator (GEMV datapath)
 
 **Status:** Historical GEMV scaling and optimization record — **how the design
-got here, not what it is now.** The current production design is the integrated
-**Iter66e** 32-port/16-cluster kernel with packed-BF16 weights, a native
-`ap_float<16,8>` multiplier, free-running cluster pipelines, BF16 recurrent
-state and full-window URAM state queues, documented in
+got here, not what it is now.** The current production design is the **Iter79
+three-kernel 200 MHz image** — the 32-port/16-cluster GEMV with packed-BF16
+weights, a native `ap_float<16,8>` multiplier, free-running cluster pipelines,
+BF16 recurrent state and full-window URAM state queues, split across the three
+dies of the U55C with data-only stream links — documented in
 [architecture.md](architecture.md). Numbers in this document below this header
 describe earlier images and must not be quoted as current.
 The standalone 32-port microbenchmark remains documented separately in

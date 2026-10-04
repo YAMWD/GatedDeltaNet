@@ -1,33 +1,39 @@
 # Accelerator Documentation
 
 **Current architecture:** the FPGA is a decode-only accelerator. The
-production image — the **150 MHz design reproduced by the Iter76 `make run_hw`
-flow** (Iter73b2/75b source, Iter75d/e/f physical passes; Iter67c is its
-100 MHz predecessor) — forwards one token at a time with 32 HBM weight readers, 16 two-port GEMV
-clusters running free-running pipelines, a native `ap_float<16,8>` BF16
+production image — the **200 MHz three-kernel image of the Iter79 campaign**,
+promoted 2026-10-04 (the 150 MHz Iter76 monolith is its predecessor, Iter67c
+the 100 MHz one before that) — forwards one token at a time with 32 HBM weight
+readers and 16 two-port GEMV clusters split across three kernels, one per die:
+`gdn_forward_p` (control, SLR1), `gdn_k_slr0` (SLR0) and `gdn_k_slr2` (SLR2,
+with the recurrent islands and the state writers), joined by seven registered
+AXI-Stream links that carry data only under one static schedule. The datapath
+is unchanged: free-running cluster pipelines, a native `ap_float<16,8>` BF16
 multiplier feeding FP32 reduction trees, packed-BF16 weights, transient
 activations resident in local BRAM, four-port packed **BF16** recurrent state
 behind full-window 4,096-deep URAM queues, two concurrent 16-column recurrent
-islands, a five-phase II=1 recurrent read schedule, registered GEMV collector
-boundaries, head-streamed Q/K/V convolution and recurrence, an on-chip strict
-LM-head argmax, and a streamed full-vocabulary logit export. Prefill runs on
-the GPU and supplies persistent recurrent and convolution state.
+islands, a five-phase II=1 recurrent read schedule, head-streamed Q/K/V
+convolution and recurrence, an on-chip strict LM-head argmax, and a streamed
+full-vocabulary logit export. Prefill runs on the GPU and supplies persistent
+recurrent and convolution state.
 
-The production image routes with zero routing errors (1,592,229 nets) and
-closes a true **150 MHz** kernel clock — setup 0.000 / hold +0.002 ns, with the
-fixed 250 MHz DMA clock at +0.003 and the 450 MHz HBM clock at +0.052, no
-exceptions and no automatic scaling. It measures **16.255 ms/token production
-TPOT / 16.131 ms kernel (2.4197M cycles)** with an exact 64-token trajectory,
-or **7.53x** the 121.4 ms eight-port baseline by kernel median; paired power is
-48.0 W, 0.779 J/token gross. The build is reproducible from source in one
-command and was demonstrated twice (builds 3987 and 4022, checksum-identical
-implementations, on-card jobs 4021 and 4023); see
-[reproduce_f150.md](reproduce_f150.md).
+The production image routes with zero routing errors (1,671,899 nets) and
+closes a true **200 MHz** kernel clock — setup +0.029 / hold +0.010 ns, with
+the fixed 250 MHz DMA clock at +0.003 and the 450 MHz HBM clock at +0.015, no
+exceptions and no automatic scaling. It measures **12.350 ms/token production
+TPOT / 12.227 ms kernel (2,445,400 cycles)** with an exact 64-token trajectory,
+or **9.8x** the 121.4 ms eight-port baseline; paired power is 57.8 W,
+0.717 J/token gross (−24 % time and −8 % energy per token versus the 150 MHz
+image). The link reproduced itself to the picosecond (builds 6548 and 6568,
+on-card jobs 6549 and 6569) and the flow is one command; see
+[reproduce_f200.md](reproduce_f200.md).
 
 Toolchain: **Vitis 2024.2** (the native BF16 multiplier requires its
-`ap_float`). Evidence: closure jobs 3953/3955 and image 3956 (on-card 3957,
-qualification 3958–3960); reproduction builds 3987/4022 with on-card
-4021/4023.
+`ap_float`). Evidence: builds 6548/6568 with on-card 6549/6569, the
+`make run_hw` verification build 6642 with on-card 6643, qualification
+jobs 6570 (drift, WikiText-2) and 6571/6572 (paired power); the hang that the
+first 200 MHz link shipped with, and its one-line fix, are recorded in
+`architecture.md` and `optimization_log.md`.
 
 ## Current References
 
@@ -35,15 +41,18 @@ qualification 3958–3960); reproduction builds 3987/4022 with on-card
   standalone H100/A100 eager latency and energy measurement from a fresh clone,
   pinned dependencies, Slurm submission and CPU validation scope.
 - [architecture.md](architecture.md): authoritative top-level data flow,
-  arithmetic contract, activation residency, 32-port GEMV topology, interfaces,
-  state handling, HBM map, physical design, and measured result of the 150 MHz
-  production image (with Iter67c and Iter66e as recorded predecessors).
-- [reproduce_f150.md](reproduce_f150.md): how to rebuild and validate the
+  arithmetic contract, activation residency, 32-port GEMV topology, the
+  three-kernel split and its links, interfaces, state handling, HBM map,
+  physical design, and measured result of the 200 MHz production image (with
+  the 150 MHz Iter76 image, Iter67c and Iter66e as recorded predecessors).
+- [reproduce_f200.md](reproduce_f200.md): how to rebuild and validate the
   production image with `make run_hw`, what the flow checks, measured wall
-  times, and its evidence boundary.
-- [recurrent_attention.md](recurrent_attention.md): the recurrent block — now
-  the largest identifiable cycle consumer at 40.7% of the token — its BF16
-  state transport, per-head schedule, and measured per-loop cycles.
+  times, and its evidence boundary. [reproduce_f150.md](reproduce_f150.md) is
+  the historical 150 MHz monolith recipe.
+- [recurrent_attention.md](recurrent_attention.md): the recurrent block — the
+  largest identifiable cycle consumer at ~41% of the token, now hosted by the
+  SLR2 kernel and fed over the stream links — its BF16 state transport,
+  per-head schedule, and measured per-loop cycles.
 - [cycle_optimization_roadmap.md](cycle_optimization_roadmap.md): remaining
   cycle targets, rebased on the Iter67c measurement, with the levers ranked by
   measured share of the token rather than by share of bytes.

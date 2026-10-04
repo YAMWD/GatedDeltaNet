@@ -336,7 +336,10 @@ static int run_decode_from_state(
     for (uint32_t step = 1; step < n; ++step) {
         double t0 = monotonic_ms();
         int32_t prev = traj[step - 1];
-        if (gdn_decode_step_host(model, run_state, &prev) != 0)
+        const int step_rc = getenv("GDN_PARTITIONED") != NULL
+            ? gdn_decode_step_host_partitioned(model, run_state, &prev)
+            : gdn_decode_step_host(model, run_state, &prev);
+        if (step_rc != 0)
             die("decode-from-state: single-token step failed");
         if (hidden_dump != NULL &&
             fwrite(final_hidden, sizeof(float), model->config.hidden_size,

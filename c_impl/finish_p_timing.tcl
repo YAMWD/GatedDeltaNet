@@ -1,4 +1,5 @@
-# Called AFTER the normal post-route AggressiveExplore pass. Reproduce the
+# Iter79 partition variant: same ladder, the partition gate (hbm_aclk tolerance
+# through GDN_HBM_MIN_MHZ).  Called AFTER the normal post-route AggressiveExplore pass. Reproduce the
 # measured sequence, not an untested replacement of AggressiveExplore.
 set gdn_finish_f150_script_dir [file dirname [file normalize [info script]]]
 # Progress notes in plain Tcl: stdout (-> impl_1/runme.log) plus, when the build
@@ -49,7 +50,7 @@ proc gdn_finish_f150 {dir} {
     # Preserve the final candidate before a gate can abort the normal run.
     write_checkpoint -force gdn_f150_final_candidate.dcp
     gdn_f150_note "GDN_F150_STAGE exact-clock gate, route status, DRC, bus skew"
-    source [file join $dir check_iter75d_final_timing.tcl]
+    source [file join $dir check_p_final_timing.tcl]
     set route [report_route_status -return_string]
     foreach {key label} {total {routable nets} fully {fully routed nets} errors {nets with routing errors}} {
         if {![regexp [format {# of %s\.+\s*:\s*([0-9]+)} $label] $route -> count]} {

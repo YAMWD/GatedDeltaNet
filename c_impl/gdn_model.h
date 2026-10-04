@@ -239,6 +239,8 @@ int gdn_forward(
  * against the persistent per-layer recurrent/conv state in the run-state buffers
  * (loaded from the GPU .gdnstate export). */
 int gdn_decode_step_host(const GDNModel *model, GDNRunState *state, const int32_t *token);
+/* Iter79: the same step through the SLR-partitioned three-kernel C model (threads). */
+int gdn_decode_step_host_partitioned(const GDNModel *model, GDNRunState *state, const int32_t *token);
 void gdn_compute_logits(const GDNModel *model, const float *hidden, float *logits_out);
 
 /* Native-only visibility into the final normalized hidden vector and the
