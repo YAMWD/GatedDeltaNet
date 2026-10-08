@@ -47,6 +47,8 @@ clone*.
 | `hls_gdn_forward.tcl` | HLS interface and RTL configuration |
 | `hw_f200_p.cfg` | Production 200 MHz three-kernel connectivity and physical hooks (`apply_p_islands.tcl`, `finish_p_timing.tcl`, `check_p_final_timing.tcl`); `hw_f150.cfg` is the retired 150 MHz monolith recipe for A/B |
 | `reconcile_exact_clock.py` | Fail-closed DATA_CLK metadata reconciliation after the link |
+| `check_state_writer_addresses.py`, `check_state_reader_addresses.py` | Fail-closed synthesized-address gates on the SLR2 state writers and readers (HLS RTL, post-synthesis, post-opt) |
+| `check_island_names.py` | Fail-closed pre-link gate: the floorplan's island cell names and any new HLS 200-656 |
 | `run_hw_sbatch.sh` | Slurm build/test submission wrapper |
 | `slurm/` | Build and U55C test job definitions |
 

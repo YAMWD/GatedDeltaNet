@@ -1,5 +1,25 @@
 # Cycle-First Optimization Roadmap After Iter67c
 
+> **Update 2026-10-08 (Iter81, promoted).** The first cycle reduction since Iter67c: the recurrent
+> islands of the SLR2 kernel are now three-stage head pipelines (prep → read
+> → update) that hide under the QKVG weight stream, and ports 28–31 fetch the
+> layer's state in the pre-call gap instead of after every head's weights.
+> Measured on card: **2,069,400 cycles/token (10.347 ms kernel, 10.470 ms
+> TPOT at 200 MHz)** against the Iter79 image's 2,445,400 — **−15.4 %** —
+> with identical arithmetic (`architecture.md` § *Iter81*). It replaces
+> Iter67c's 2.4099M as this roadmap's cycle reference: **2.0694M at
+> 200 MHz**, 14.1 % below Iter67c. What it closes: Stage 4's recurrent-head
+> overlap, which Iter57 had only in the HLS minimum — the islands no longer
+> pace the call. What it opens: the stream now paces all 97 calls, so weight
+> compression (§ 13) shortens every call, which it could not do while the
+> islands paced QKVG; the balanced model predicted ≈ −550K cycles and the card
+> gave −376K, so about 7K cycles per layer are unlocated (an instrumented
+> build with per-call cycle probes in the SLR2 kernel is measuring them);
+> head-chunked output projection (the Stage 4 remainder) and Stages 5–6 stand.
+> The HBM AXI clock runs at 445.8 MHz on this image (`GDN_HBM_MIN_MHZ=440`
+> is the flow default since Iter81), which trims the pseudo-channel peak by
+> 0.9 % and leaves the HBM floor model of § 10 otherwise unchanged.
+
 > **Update 2026-10-04 (Iter79 promotion).** The production image is now the
 > three-kernel 200 MHz image: **12.227 ms kernel / 12.350 ms TPOT = 2,445,400
 > cycles**, +1.06 % cycles over the 150 MHz image and **+1.47 % over Iter67c's
@@ -406,7 +426,7 @@ Approximate steady work per head is:
 |---|---:|
 | QKVG weight stream | 4,096 |
 | Three Q/K/V convolutions | 3,250 |
-| Recurrent attention | 3,416--3,442 |
+| Recurrent attention | 3,416--3,442 (Iter81: ~1,640 per head, hidden under the stream) |
 | Output norm and gate | 629 |
 | O-projection input-head chunk | 1,024 |
 

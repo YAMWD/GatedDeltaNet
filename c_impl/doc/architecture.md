@@ -1,39 +1,48 @@
 # GatedDeltaNet Decode Accelerator Architecture
 
 **Status:** Current production architecture: the **200 MHz three-kernel image
-of the Iter79 campaign**, promoted 2026-10-04. The same `gdn_model.cpp` is
-compiled into three kernels, one per die of the U55C — `gdn_forward_p`
-(control: ports 0/1/18–23, store, convolution, norms, residuals, LM-head
-argmax) on SLR1, `gdn_k_slr0` (ports 2–17, GEMV clusters 1–8) on SLR0 and
-`gdn_k_slr2` (ports 24–31, clusters 12–15, the recurrent islands and the state
-writers) on SLR2 — joined by seven registered AXI-Stream links that carry data
-only. Each kernel runs the same static 97-call schedule, so no control crosses a
-die boundary. The image is HLS-synthesized and linked at **200 MHz** under
-**Vitis 2024.2**, routed with zero routing errors (1,671,899 nets), and closes
-the kernel clock at **+0.029 / +0.010 ns at 5.000 ns**, the fixed 250 MHz DMA
-clock at +0.003 / +0.009 ns and the 450 MHz HBM clock at +0.015 / +0.010 ns,
-0 failing of 2,169,691 setup and 2,166,868 hold endpoints, with no exceptions
-and no automatic scaling. The 64-token card run measures **12.350 ms/token
-production TPOT / 12.227 ms kernel = 2,445,400 cycles** by median over 63
-generated tokens (build 6548 / job 6549; a second link, build 6568 / job 6569,
-reproduced the implementation to the picosecond at 12.389 / 12.256 ms), with an
-exact token trajectory and the production vector-gate figures over 2,016,000
-logits; qualification on the same image: 512-token drift bounded with the fork
-at step 447, WikiText-2 word perplexity 16.774839771 (−0.0077 % vs the GPU),
-paired power **57.8 W active, 0.717 J/token gross, 0.325 J idle-subtracted**.
-Versus the 150 MHz monolith (16.255 / 16.131 ms) that is **−24.0 % TPOT and
-−8 % energy per token on +1.06 % cycles**: the gain is clock, bought by locality:
-the same ~678K LUTs now sit in even slices across the three dies (CLB occupancy
-**91.3 / 91.4 / 91.9 %**, LUT 46 / 53 / 57 %) where the monolith packed SLR0 to
-97.1 % CLB against 75.8 / 77.8 % on the other two, and only the seven stream
-links and the shell's own HBM pipes cross a die.
+with balanced recurrent islands — Iter81**, promoted 2026-10-08 after the
+full qualification (drift, WikiText-2 and paired power, § *Correctness and
+On-Card Performance*). It is the Iter79 partition — the
+same `gdn_model.cpp` compiled into three kernels, one per die of the U55C:
+`gdn_forward_p` (control: ports 0/1/18–23, store, convolution, norms,
+residuals, LM-head argmax) on SLR1, `gdn_k_slr0` (ports 2–17, GEMV clusters
+1–8) on SLR0 and `gdn_k_slr2` (ports 24–31, clusters 12–15, the recurrent
+islands and the state readers/writers) on SLR2, joined by seven registered
+AXI-Stream links that carry data only under one static 97-call schedule — with
+two changes inside the SLR2 kernel (§ *Iter81 — balanced recurrent islands*):
+each recurrent island is a three-stage head pipeline (prep → read → update)
+whose stages overlap across heads, so the islands hide under the QKVG weight
+stream instead of pacing it at 4,887 cycles per head; and ports 28–31 fetch the
+layer's whole recurrent state before the call's first weight beat, in the
+control kernel's pre-call gap, so every port streams 16,384 weight beats per
+QKVG call. The arithmetic is the Iter79 image's to the bit (native A/B over
+819,200 state beats, RTL against RTL, and the production vector-gate figures on
+card). The image is HLS-synthesized and linked at **200 MHz** under **Vitis
+2024.2**, routed with zero routing errors, and closes the kernel clock at
+**+0.027 / +0.010 ns at 5.000 ns** and the fixed 250 MHz DMA clock at
++0.003 / +0.009 ns; the 450 MHz HBM AXI clock missed by 0.021 ns on the
+shell's own SLR-crossing pipes and runs at **445.8 MHz** under the flow's
+440 MHz floor (§ *Physical Implementation*). The 64-token card run measures
+**10.470 ms/token production TPOT / 10.347 ms kernel = 2,069,400 cycles** by
+median over 63 generated tokens (build 7370 / job 7371), with an exact token
+trajectory and the production vector-gate figures over 2,016,000 logits.
+Versus the Iter79 image (12.350 / 12.227 ms, 2,445,400 cycles) that is
+**−15.2 % TPOT and −15.4 % cycles** — the first cycle reduction since Iter67c;
+every gain between Iter67c and Iter79 was clock. The balanced model predicted
+about −22 %; the ~7,000 cycles per layer between the two are being localized
+with an instrumented build (`optimization_log.md`, Iter81).
 
 Production XCLBIN SHA-256
-`0326f01be04ff628499de68184e7ae3c10aeacd872c87db47119f0e0f8e08286` (build
-6548), host `0c6c92559113d57c…`, from `gdn_model.cpp`
-`974936d334f999b5cc9e4a79bf0e4a9c5dd0da93c9379b2b5e1c7cee3b6a6f51`; the
-reproduction image is `39a88f6d31de6131…` (build 6568). The datapath is the
-150 MHz image's datapath unchanged — Iter66e's all-BF16 arithmetic, the fused
+`a95b9a8a7135bda4b395cf80b849149afd4ee898d1c42a90ff9ddc91c5844d16` (build
+7370, `diagnostics/hw_20261007_114231_1029342/`), host `3cce4f81e4331433…`,
+from `gdn_model.cpp`
+`68b39fcaf2cfc3f5a50e05ad105c53894d07d6c7b0e32af1045922303ed11a10`. The
+Iter79 image `0326f01be04ff628…` (build 6548, 12.350 ms/token; reproduced by
+builds 6568 and 6642) is the recorded predecessor in § *Correctness and
+On-Card Performance*, with the 150 MHz Iter76 image (`b2a0a478…`, 16.255 ms)
+and Iter67c (`fb4fc63f…`, 24.208 ms at 100 MHz) before it. The GEMV datapath is
+the 150 MHz image's datapath unchanged — Iter66e's all-BF16 arithmetic, the fused
 strict argmax, the five-phase II=1 recurrent read, the Iter73a/75b registered
 state write-back and the Iter73b2 straight-line cluster emit — cut along die
 boundaries; the one arithmetic-neutral source fix the partition needed (start
@@ -43,7 +52,9 @@ see. The integrated production flow reproduced the implementation a third time
 from a clean snapshot (`make run_hw`, build 6642, image `0479e581…`, card job
 6643: 12.387 ms TPOT, exact gates). The 150 MHz Iter76 image (`b2a0a478…`, 16.255 ms/token) and Iter67c
 (`fb4fc63f…`, 24.208 ms/token at 100 MHz) are the recorded predecessors in
-§ *Correctness and On-Card Performance*.
+§ *Correctness and On-Card Performance*. Iter81 changed only the SLR2 kernel's
+recurrent islands and state readers, plus the state readers' address form
+(§ *Design Invariants* item 26).
 
 **Read § *Arithmetic contract and what "correct" means* before treating any
 hardware/native mismatch as a defect.** With BF16 the end-to-end bit-exact
@@ -65,7 +76,10 @@ token per `gdn_forward` invocation. The successful design combines:
 - four packed **BF16** recurrent-state stripes appended to HBM weight ports
   28--31, behind full-window 4,096-deep 512-bit URAM queues;
 - two concurrent 16-column, head-local recurrent islands with HBM retrieval and
-  update fused into the two required attention passes;
+  update fused into the two required attention passes — since Iter81 each a
+  three-stage head pipeline (prep → read → update, an 8,192-word URAM replay
+  FIFO between read and update) whose interval, about 1,640 cycles per head,
+  sits under the 2,048-cycle weight pace;
 - a five-phase recurrent read schedule that maintains enough accumulator
   recurrence distance for II=1 without changing FP32 association;
 - concurrent transfer from all four state ports into packed low/high URAM
@@ -76,8 +90,10 @@ token per `gdn_forward` invocation. The successful design combines:
   head while later heads are still streaming;
 - immediate head-local Q/K/V streams from that convolution actor into the
   recurrent actor, avoiding whole-hidden Q/K/V materialization;
-- state reads on ports 28--31 interleaved with each QKVG head's weights and
-  decoupled through four two-head, depth-2048 BRAM queues;
+- state reads on ports 28--31 issued whole-layer (4,096 beats per port) before
+  the call's weights, in the control kernel's pre-call gap, into four
+  full-window depth-4096 URAM queues (Iter81; until then they were interleaved
+  with each head's weights);
 - duplicated Q/K/V head streams feeding the two recurrent islands, followed by
   a deterministic half-head merge;
 - explicit registered relay actors between each 4/6/6 SLR-local GEMV collector
@@ -93,15 +109,14 @@ token per `gdn_forward` invocation. The successful design combines:
   results, the convolved Q/K/V, the per-head gate scalars and the attention
   output between them — data only, no control, under one static schedule.
 
-The architecture routes all 1,671,899 routable nets with zero routing errors
-and preserves the exact 64-token trajectory. The in-link closure sequence
-closes the 200 MHz kernel clock at **+0.029 ns WNS / +0.010 ns WHS**, the
-fixed 250 MHz DMA clock at **+0.003 / +0.009 ns** and the 450 MHz HBM clock at
-**+0.015 / +0.010 ns**, with 0 failing of 2,169,691 setup and 2,166,868 hold
-endpoints. The production image spends 1.06 % more kernel cycles than the
-150 MHz monolith and 1.47 % more than Iter67c, and is 1.319x faster than the
-150 MHz image by kernel median (12.227 vs 16.131 ms), or **9.8x** the 121.4 ms
-eight-port baseline by production TPOT.
+The architecture routes every routable net with zero routing errors and
+preserves the exact 64-token trajectory. The in-link closure sequence closes
+the 200 MHz kernel clock at **+0.027 ns WNS / +0.010 ns WHS** and the fixed
+250 MHz DMA clock at **+0.003 / +0.009 ns**; the HBM AXI clock is programmed at
+445.8 MHz (seven of its shell-pipe endpoints miss 2.222 ns by ≤ 0.021 ns). The
+production image spends **15.4 % fewer kernel cycles** than the Iter79 image
+(2,069,400 against 2,445,400) and is 1.182x faster by kernel median (10.347 vs
+12.227 ms), or **11.6x** the 121.4 ms eight-port baseline by production TPOT.
 
 ## Fixed Model Shape
 
@@ -343,14 +358,15 @@ local x
             run one shared head-local convolution actor for Q, K, and V
             capture the new raw Q/K/V tail row
             stream convolved Q/K/V directly to recurrence
-       -> on ports 28--31, after each head's QKVG weights:
-            stream four 1,024-word old-state stripes into depth-2048 queues
+       -> on ports 28--31, before the call's first weight beat:
+            stream the layer's four 4,096-beat old-state stripes into
+            full-window URAM queues (hidden in the pre-call gap)
        -> duplicate Q/K/V into two recurrent islands
-       -> recurrent islands, concurrently with later QKVG heads:
-            drain one head of Q/K/V and state into local scratch
-            process disjoint 128-column halves at 16 columns/cycle each
-            fuse head-local retrieval and update
-            write updated state directly to ports 28--31
+       -> recurrent islands, each a three-stage head pipeline:
+            prep:   norms and alpha of head h+1
+            read:   retrieval/partial pass of head h straight off the queue,
+                    16 columns/cycle, replaying the state to the update stage
+            update: decayed state + k x delta of head h-1, to the state writers
        -> merge the two half-head outputs into norm_attn
   -> packed convolution-tail writeback
   -> output norm and gate, in place
@@ -368,13 +384,17 @@ The QKVG sink holds only one 256-element head. One convolution datapath is
 called serially for that head's Q, K, and V, then emits them to a broadcaster
 while the upstream graph produces later heads. Two independent recurrent
 actors each consume all Q/K/V values but own disjoint 128-column state/output
-halves; a small merge actor restores natural output order. The four state
-readers interleave a complete state-head burst between adjacent QKVG weight
-head bursts. Each island drains blocking FIFO reads in a narrow II=1 copy loop
-before touching its local URAM scratch. There is no feedback credit or
-readiness handshake in the graph. The two-head state FIFO depth makes the
-strictly forward schedule deadlock-free despite the registered GEMV collector
-boundaries.
+halves; a small merge actor restores natural output order. Since Iter81 the
+four state readers fetch the layer's whole state before the call's weights, so
+every port streams 16,384 weight beats per QKVG call, and each island's read
+stage takes the state beats straight off its full-window queue with
+non-blocking reads — the queue holds the complete layer, filled before the
+first head is needed — and hands every state word to the update stage through
+an 8,192-word replay FIFO. The three stages overlap across heads, so an
+island's interval is its slowest stage, about 1,640 cycles per head, below the
+2,048-cycle weight pace. There is no feedback credit or readiness handshake in
+the graph. The full-window state FIFO depth makes the strictly forward schedule
+deadlock-free despite the registered GEMV collector boundaries.
 
 The old three-row convolution tails and weights are staged through fixed-bank
 512-bit loops. After a head consumes its old context, obsolete tail row 0 stores
@@ -478,6 +498,59 @@ seven links — each a registered AXI-Stream hop — and the shell's own HBM
 pipes. That is what let the placer close 200 MHz where the monolith, at
 97 % CLB on SLR0, failed by −1.6 ns and every pblock variant was unroutable
 (Iter77/78 record in `optimization_log.md`).
+
+### Iter81 — balanced recurrent islands and the prefetch-first state reader
+
+Through Iter79 the QKVG call was paced by the recurrent islands, not by the
+weight stream: each island ran one head at a time through a serial chain —
+copy the head's state from the queue into a local array (1,027 cycles), prep
+(load Q/K/V, norms, alpha, ~1,480), the five-phase read pass (1,291),
+delta/output (~43) and the update loop (1,036) — 4,887 cycles per head,
+39,100 per call, while ports 0–27 streamed 16,384 weight beats per call and
+ports 28–31 20,480 (the 512-beat state slot after every head's 2,048 weight
+beats). Iter81 makes the call stream-paced with two changes, both bit-exact
+by construction (every value is the original expression with the original
+operands in the original order):
+
+- **Prefetch-first state reader** (`gemv32_mm2s_with_state_p`). In QKVG mode
+  each of ports 28–31 fetches the layer's 4,096 state beats first, then all
+  16,384 weight beats. The fetch sits in the ~9.4K-cycle gap in which the
+  control kernel runs its norm, the two tiny projections and the convolution
+  context before it broadcasts the activation, and the full-window queues hold
+  it. The address is the state writer's proven form (item 26): the second
+  Iter81 link read every state beat 128 MiB low after Vivado synthesis folded
+  the earlier form's 27-bit offset, and a reader address gate now covers it.
+- **Three-stage island** (`gdn_recurrent_attention_island_p<I>`): `prep`
+  reads the head's Q/K/V packs, the two squared norms (tree reductions) and
+  the merged normalize-and-alpha loop, and sends normalized q/k, the raw V
+  beats and the three scalars; `read` loads q/k into BRAM copies, runs the
+  five-phase II=1 read pass straight off the state queues (phases 0 and 2 take
+  a low and a high beat with `read_nb` and cache the upper halves), writes one
+  576-bit replay word per phase (16 low + 16 high state values, k and its copy)
+  into an 8,192-deep URAM FIFO, then the delta/output loop; `update` reads the
+  replay words back (`read_nb`), computes decay × old + k × delta per lane in
+  the original order and writes the joined BF16 beats to the write-back
+  queues. The dataflow region keeps start propagation on (item 24). csynth:
+  prep 9,793, read 13,129, update 8,409 cycles per call; interval 13,244
+  against 39,100 (RTL cosim 14,883–18,556 per call).
+- **Two timing changes found by an endpoint census** of the new island in a
+  quarter-SLR pblock: the update loop's 64 multipliers share the `decay`
+  register (32 of them) and the `k` registers, which Vivado merges into inputs
+  fanning out to 64 unregistered DSPs, so the four update products are bound
+  one stage deeper (`bind_op fmul maxdsp latency=4`, a five-stage core); and
+  the 8-trip delta loop runs at II=4 as a free-running pipeline, which removes
+  its clock-enable cone. Out of context the island then closes at +0.429 ns
+  against the original's +0.434 ns.
+
+Cost per island (Vivado): LUT 76,893 vs 69,705, FF 65,745 vs 54,778, DSP 526
+vs 353, BRAM 32 vs 46, URAM 16 vs 16. Measured on card: the token fell from
+2,445,400 to **2,069,400 cycles** (−376,000, −15.4 %), against the ≈ −550,000
+the stream-paced model predicts; the remaining ≈ 7,000 cycles per layer are
+not yet located (candidates: the last head's tail after the stream ends, the
+kernel hand-offs, the 445.8 MHz HBM clock), and an instrumented build with a
+per-call cycle probe in the SLR2 kernel measures it. The monolith keeps the
+original island and reader (`gdn_recurrent_attention_island`,
+`gemv32_mm2s_with_state`) for A/B.
 
 ### SLR-local result collection
 
@@ -795,10 +868,15 @@ The 200 MHz recipe lives in `hw_f200_p.cfg` and its hooks:
 - `finish_p_timing.tcl` (POST_ROUTE_PHYS_OPT_DESIGN.TCL.POST): if kernel setup is
   still negative, one `Explore` pass, then one focused kernel path-group pass;
   then `check_p_final_timing.tcl` — the exact-clock gate on all three clocks,
-  route status, DRC and bus skew; any failure aborts the link. The HBM AXI clock
-  closed at 450 MHz on both links (+0.015 ns); `GDN_HBM_MIN_MHZ` would let the
-  gate accept a bounded auto-scaling of that shell clock and is unset in the
-  production flow.
+  route status, DRC and bus skew; any failure aborts the link. The HBM AXI
+  clock's closure at 450 MHz is a per-draw ±0.02 ns coin on the shell's own
+  SLR-crossing pipes, not a property of the netlist (Iter79 P6 +0.015 ns; the
+  Iter81 links +0.000, then −0.021 twice on identical inputs), so since Iter81
+  `run_hw_sbatch.sh` defaults `GDN_HBM_MIN_MHZ=440`: the gate accepts a miss
+  that a clock scaled to that floor absorbs, vpl programs the achieved
+  frequency (445.8 MHz on the production image, −0.9 % HBM peak) and the build
+  job derives the matching tolerance for the metadata reconciliation. An
+  explicit empty value demands exact 450 MHz.
 - `reconcile_exact_clock.py` after the link, as before (a no-op on these
   images: vpl wrote DATA_CLK 200 natively because every clock closed).
 
@@ -988,7 +1066,41 @@ on-card-validated 115.7 MHz result, not a 130 MHz closure result.
 
 ## Correctness and On-Card Performance
 
-### Iter79 three-kernel image, 200 MHz (current)
+### Iter81 balanced-island image, 200 MHz (current)
+
+The image passed the production chain — the native 6/32-step trajectory gates
+on the three-thread C model with the stored native logits as a bit-exact
+reference, the BF16 layout check, the XO architecture gate, the synthesized
+state-address gates on both the writers and (new) the readers of `gdn_k_slr2`,
+the island-name and HLS 200-656 gate, the in-link exact-clock (kernel and DMA
+exact, HBM within the 440 MHz floor), route, DRC and bus-skew gates, the
+clock-metadata check, and the 8- and 64-token card gates (build 7370, job
+7371, 2026-10-07):
+
+| Metric | build 7370, job 7371 (production) | Iter79 image, build 6548 / job 6549 |
+|---|---:|---:|
+| Production TPOT, median of 63 | **10.470 ms/token** | 12.350 ms/token |
+| Kernel execution, median of 63 | **10.347 ms/token** (mean 10.348, 10.303–10.453) | 12.227 ms/token |
+| Host/XRT/PCIe overhead | 0.123 ms/token | 0.123 ms/token |
+| Effective kernel cycles at 200 MHz | **2,069,400** | 2,445,400 |
+| 8- and 64-token trajectories | exact | exact |
+| CUDA vector gate, 2,016,000 logits | NRMSE 0.004663, worst step 0.011908, cosine 0.999989, min step cosine 0.999946, top-5 5/5, 0 argmax mismatches | identical |
+| Kernel / DMA / HBM clocks | +0.027 / +0.003 / −0.021 ns (HBM at 445.8 MHz) | +0.029 / +0.003 / +0.015 ns |
+
+Qualification on this image, all on 2026-10-08: 512-token free-running drift **BOUNDED**, fork at step 447, window-NRMSE ratio 1.063, slope 2.133e-06 per step (job 7401) — the same three numbers as every image since Iter66n; WikiText-2 teacher-forced word perplexity **16.774839771** against GPU **16.776123769** on the verified-identical 62-document / 183-window / 314,843-token workload, **−0.0077 %** (gate 5 %), kernel 10.256 ms/token over the run (job 7401) — the Iter79 image's figures to the last digit, as identical arithmetic requires; paired power (jobs 7437 fp32 arm / 7438 bf16 arm, 4,096-token context, 60 s idle, 30 s warm-up, 3 × 60 s): **62.1 W active, 31.1 W idle, 0.646 J/token gross, 0.322 J idle-subtracted** at a sustained 10.40 / 10.34 ms TPOT, against the paired A100 eager runs' 32.06 ms / 94.9 W / 3.045 J (FP32) and 32.44 ms / 85.1 W / 2.761 J (BF16): **3.08x / 3.14x faster, 4.71x / 4.29x gross and 2.76x / 1.80x idle-subtracted energy efficiency**; against the Iter79 image (57.8 W, 0.717 J gross, 0.325 J idle-subtracted) +4.3 W active and −9.9 % energy per token. The card reads back DATA_CLK 200 MHz and hbm_aclk 445 MHz.
+
+Two earlier links of the same design are part of the record: the first
+(build 7261) closed timing and ran without a hang but computed wrong tokens
+from step 2 — its state reader, in the per-head address form, read every state
+beat 128 MiB low after Vivado synthesis folded a 27-bit signed offset into the
+pointer add (HLS RTL correct, post-synthesis wrong, exactly the Iter75 writer
+defect on the read side), found by on-card state dumps and confirmed by a
+reader address gate that is now part of the build; the second (build 7323) was
+refused by the exact-clock gate on `hbm_aclk` (−0.021 ns, seven shell-pipe
+endpoints) and reproduced to the picosecond by build 7370 with the 440 MHz
+floor.
+
+### Iter79 three-kernel image, 200 MHz (predecessor)
 
 The promoted image passed the production chain — native 6/32-step trajectory
 gates on the three-thread C model and the BF16 layout check, the XO
@@ -1307,7 +1419,7 @@ integrated csynth, full implementation, and on-card measurement:
 16. Keep the two concurrent 16-column recurrent islands and deterministic
     half-head merge until a replacement proves equal correctness, lower cycles,
     and timing closure at the current 200 MHz constraint, whose kernel-clock
-    margin is +0.029 ns, so any regression is a miss until it re-closes.
+    margin is +0.027 ns, so any regression is a miss until it re-closes.
 17. Keep native full-logits comparison enabled as a pre-hardware correctness
     gate; token parity alone cannot detect non-argmax numerical regressions.
 18. Keep `style=frp` on the cluster weight stream. It is what made this design
@@ -1351,6 +1463,22 @@ integrated csynth, full implementation, and on-card measurement:
     reproducible: `GDN_KERNEL_WAIT_TIMEOUT_MS` in `host.cpp` (bounded kernel
     wait plus a recurrent-state read-back that names the last layer written)
     is diagnostic-only and must stay off by default.
+26. Every `m_axi` address that combines a runtime layer offset with a port
+    base uses the state writer's form — the original base pointer plus a
+    complete `ap_uint<64>` index, the offset add registered
+    (`bind_op op=add impl=fabric latency=1`) — and passes both synthesized
+    address gates (`check_state_writer_addresses.py`,
+    `check_state_reader_addresses.py`: HLS RTL, post-synthesis, post-opt). A
+    narrower signed offset is folded into the pointer add 128 MiB low by Vivado
+    synthesis on the write side (Iter68G/73a/75) and on the read side (Iter81
+    link 1); the HLS RTL is right in every case, so no simulation sees it.
+27. Keep the islands' three-stage head pipeline (prep → read → update) with
+    its 8,192-word URAM replay FIFO, the read stage's non-blocking consumption
+    of the full-window state queues, the prefetch-first state reader, the
+    five-stage bound update multipliers and the free-running delta loop. They
+    are what hide the islands under the weight stream at the original island's
+    out-of-context timing (+0.429 against +0.434 ns); binding the read
+    multipliers the same way made timing worse and is recorded as rejected.
 
 Use [decode_disaggregated_gemv.md](decode_disaggregated_gemv.md) for the
 historical GEMV scaling progression and

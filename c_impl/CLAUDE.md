@@ -50,6 +50,19 @@ stale was wrong.
     **Invariant 24 (`doc/architecture.md`):** no `disable_start_propagation` on a region whose single-loop
     processes write a stream that leaves the region — HLS auto-rewinds the loop and the region never
     reports done. `WARNING: [HLS 200-656]` is a build blocker; csim cannot see this class.
+    **Invariant 26:** every `m_axi` address built from a runtime layer offset uses the state writer's form (the
+    original base plus a complete `ap_uint<64>` index, the offset add registered); Vivado synthesis folds a
+    narrower signed offset 128 MiB low on both the write (Iter75) and the read side (Iter81), with correct HLS
+    RTL, so `check_state_writer_addresses.py` and `check_state_reader_addresses.py` gate it before every link.
+  - **Iter81 (SLR2 kernel only):** the islands are `gdn_recurrent_attention_island_p<I>` — three dataflow
+    processes `gdn_island_prep` / `gdn_island_read` / `gdn_island_update` with an 8,192-word URAM replay FIFO,
+    non-blocking reads of the full-window state queues, the update products bound `maxdsp latency=4` and the
+    delta loop `II=4 style=frp` — and the state readers `gemv32_mm2s_with_state_p<28..31>` prefetch the layer's
+    4,096 state beats before the call's 16,384 weight beats. The monolith keeps `gdn_recurrent_attention_island`
+    and `gemv32_mm2s_with_state`. `-DGDN_CALL_PROBE=1` (`VPP_DEFINES="-D GDN_CALL_PROBE=1"
+    HOST_DEFINES=-DGDN_CALL_PROBE=1 make run_hw`) adds a per-call cycle probe (events from the SLR2 region's
+    processes, a counter, two record beats per call stored through port 27's tail, read back by
+    `host.exe --dump-probe`); it is compiled out of every production build and `gdn_eval` never gets it.
   - Other submodules: `gdn_rmsnorm_rows`, `gdn_gemv_tiny` (the two tiny a/b gate projections),
     `gdn_depthwise_conv_silu`, `gdn_recurrent_attention` (gated delta rule, head-local fused state
     buffer), `gdn_output_norm_and_gate`, `gdn_swiglu_inplace`.

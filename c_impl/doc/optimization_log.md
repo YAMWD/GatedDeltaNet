@@ -18355,3 +18355,474 @@ builds it by default. Commits follow this entry (kernel, host, flow, probes, doc
 
 Commits on branch `a200` (2026-10-04): kernel `2ed710024`, host `61a9482d2`, flow `f1ac09019`,
 probe microbenchmarks `51a0f2d3e`, documents and this log in the following commit.
+
+## Iter80 — recurrent state fully on chip? Step 0: island-level synthesis probe (opened 2026-10-06, branch `onchip_state`)
+
+**Question (user, 2026-10-06):** can the whole recurrent state stay on chip? Capacity from the
+200 MHz routed report (build 6548): 24 MiB of BF16 state needs at least **768 URAM** (four BF16 per
+64 of a URAM word's 72 bits, 32 per layer); 808 are free (SLR0 320, SLR1 264, SLR2 224) and the 64
+URAMs of the eight 4,096 x 512-bit HBM state queues on SLR2 would also free (csynth
+`gdn_gemv_part_slr2`: FIFO 64 URAM, islands 32). By count: 9 + 8 + 10 = 27 layers fit. Open: the
+banking factor (the FP32 design needed ~1.68x raw) and the cross-die paths for 15 of 24 layers.
+
+**Correction to the expected gain.** Of the two loops the record called "state movement",
+`recur_island_load_state` (1,024 cycles/head) is pure movement; `recur_island_update` computes
+the new state and stays. Upper bound ~1,024 cycles x 8 heads x 24 layers = 196,608 cycles/token
+(~8.0% of 2,445,400), if the island stays the QKVG-phase bottleneck.
+
+**Probe (csynth + Vivado synthesis only; no production top changed).** `gdn_model.cpp` gains, under
+`GDN_RESIDENT_STATE_TEST`, `gdn_recurrent_attention_island_res<ISLAND>` and the test top
+`gdn_island_resident_hls_top`: the state in `ap_uint<64>` words (lo/hi of two local columns),
+cyclic-8 banks, RAM_2P URAM; no load pass; the read pass and update read the stored BF16 and the
+update writes back `fp32_to_bf16_rne` -- the production arithmetic, operation for operation.
+Source `gdn_model.cpp` sha256 `c65c8e6e312bc2d3…` (production path unchanged; fast decode gate PASS).
+
+**Native equivalence (`diagnostics/iter80_resident_state/resident_state_test.cpp`): PASS** -- the
+production streamed island and the resident island on identical random inputs, 4 tokens x 2
+layers: 512/512 output beats and 2,097,152/2,097,152 state values bit-identical. A truncation
+mutant of the resident update FAILS it (192 output, 760,097 state mismatches), so the test can see
+a one-ULP difference.
+
+**Synthesis jobs (5.000 ns, production `hls_gdn_forward.tcl`, source snapshots per run):** base
+6884 (production island, csynth + Vivado synthesis), res1 6885 (1 resident layer, csynth), res2 6886
+(2 layers, csynth + Vivado synthesis), res24 6887 (24 layers, csynth). Results and verdict: below.
+
+**Step-0 results (jobs 6884–6887, all COMPLETED; csynth at 5.000 ns; Vivado synthesis for base and
+res2).** One island, cycles per call (8 heads):
+
+| variant | island cycles | per head | load pass | read pass (II) | update pass (II) | URAM | Vivado LUT / FF | Vivado CP est. |
+|---|---:|---:|---:|---:|---:|---:|---|---:|
+| base, production | 39,100 | 4,887 | 1,027 | 1,291 (1) | 1,036 (1) | 16 | 69,705 / 54,778 | 3.273 ns |
+| res1 | — | — | — | — | — | 16 (csynth) | — | — |
+| res2 | 30,972 | 3,871 | gone | 1,291 (1) | 1,037 (1) | 32 (csynth and Vivado) | 64,271 / 47,017 | 3.273 ns |
+| res24 | 31,007 | 3,871 | gone | 1,291 (1) | 1,037 (1) | 128 csynth / **384 Vivado** | 71,603 / 46,401 | 3.273 ns |
+
+- **Banking: the raw minimum, measured.** Each of the 8 banks holds 8,192 words per layer = 2 URAMs;
+  res2 is 4 URAMs per bank in both csynth and Vivado synthesis = **16 URAMs per island per layer,
+  32 per layer**, not the FP32 design's 1.68x. The per-head FP32 working buffer (`state_pair`, the
+  production island's 16 URAMs) is not needed, so one resident layer costs what the island holds
+  today (res1 = 16).
+- **res24's 128 is an HLS estimation error, confirmed:** its memory table gives 196,608 words x 64
+  bits per bank but only 16 URAMs; Vivado synthesis (job 6888, 12 min 44 s) maps **384 URAMs** =
+  48 per bank x 8, exactly linear with res2. Both islands: 768 for 24 layers. One island alone
+  (384) exceeds a die's 320, so full residency must span dies whatever the floorplan.
+- **Cycles: −8,128 per island call (−20.8%),** exactly the load pass; the read and update passes keep
+  II=1 and their latency (the update's read-modify-write costs +1 cycle of iteration latency). If the
+  island stays the QKVG-phase bottleneck, that is −195,072 cycles/token = **−8.0%** of 2,445,400
+  (estimate from csynth; nothing routed or on card).
+- **Logic falls** (Vivado synthesis, per island): −5,434 LUT, −7,761 FF; DSP and BRAM unchanged; the
+  post-synthesis CP estimate is unchanged at 3.273 ns.
+
+**What the probe also shows.** The gain is the load pass, and the load pass only copies a head's
+state from the full-window URAM queue into the per-head buffer before the head's two passes. A
+second (ping-pong) per-head buffer that loads head h+1 while head h computes would hide the same
+1,024 cycles without moving the state on chip (estimated +16 URAM per island, no cross-die path, no
+host change). Not measured; it is the cheaper candidate to csynth next. Verdict for step 0:
+**inconclusive as a lever, conclusive as a measurement** -- full residency fits the device by URAM
+count at the raw minimum (768 of 960; SLR2 holds 10 layers once its 32 island and 64 queue URAMs are
+reused), its cycle value is the load pass, and that value may be reachable without residency.
+
+## Iter81 — balance the QKVG call: islands keep pace with the weight stream (opened 2026-10-06, branch `recur_balance`)
+
+**Hypothesis.** Each layer's QKVG call is paced by the SLR2 islands (4,887 cycles/head, 39,100 per
+call, csynth job 6884), not by the weight stream (2,048 beats/head on ports 0–27, 2,560 on ports
+28–31 because of the per-head 512-beat state slot). Removing the islands' serial copy and
+overlapping their passes across heads, and moving the state fetch into the idle gap before the
+call, should make the call ≈ 16.4K weight beats + a ~2.5K tail instead of ~41.7K: about 0.55M
+cycles/token (~22%, estimate). Plan of record: `~/.claude/plans/lucky-booping-cray.md`; user
+decisions 2026-10-06: one link for both stages after all pre-link gates; Iter80 step-0 test code
+reverted (rule 2; copy kept in `diagnostics/iter80_resident_state/run_res2/`).
+
+**Stage A (`gemv32_mm2s_with_state_p`, production path only).** In QKVG mode the state owner
+fetches the layer's 4,096 state beats first, then all 16,384 weight beats. Same addresses and
+order. The fetch lands in the ~9.4K-cycle gap while the control kernel runs rmsnorm 2,419 + two
+gemv_tiny 2,165 + scalars 73 + conv context 2,573 (csynth, `diagnostics/iter79/csynth_p`).
+
+**Stage B (`gdn_recurrent_attention_island_p<I>`, production path only).** The island as a
+three-process head pipeline: prep (Q/K/V packs, norms, merged norm+alpha loop, scalars) → read
+(five-phase read pass straight off the state queues with `read_nb`, delta, output, a 576-bit
+replay word per phase via `write_nb`) → update (`read_nb` replay, original update arithmetic,
+`write_nb` beats). No state copy, no `state_pair`; replay FIFO 8,192 deep in URAM (16 URAM, as
+before). The single-kernel path keeps `gdn_recurrent_attention_island` and
+`gemv32_mm2s_with_state`. Source `gdn_model.cpp` sha256 `bbfb9753bf9e0b10…`.
+
+**Pre-link evidence so far.**
+- Native island A/B (`diagnostics/iter81_recur_balance/island_ab_test.cpp`): original vs new,
+  both islands, 5 cases (random, signed-zero state, BF16-subnormal state, zero q/k, tie-heavy
+  state) x 5 tokens x 2 layers with carried state: **6,400 output beats and 819,200 state beats
+  bit-identical, PASS**. A truncation mutant fails every case on both islands; a wrong-V-lane
+  mutant fails island 1 only, as it must.
+- Native decode gate (version 1): fast **PASS** on the three-kernel model (`GDN_PARTITIONED=1`)
+  and on the monolith, full 32-step **PASS** on the three-kernel model; exact trajectory
+  against the cached golden. The printed
+  `exact_ref_mismatch=0` was vacuous: no `LOGITS_REFERENCE` was set, so no logit was compared.
+- Version 1 synthesis (source `bbfb9753bf9e0b10…`, 5.000 ns): island_p csynth (job 6946)
+  **13,036 cycles/call against 39,100** for the original (job 6947), II=1 on the read and update
+  loops, no HLS 200-656 / 200-1946 / 200-2052. Vivado synthesis: DSP **622 against 353**
+  (+269/island), LUT +13.3K, FF +19.1K. Quarter-SLR pblock (CLOCKREGION_X0Y10:X3Y11),
+  placed and routed out of context: **WNS +0.208 ns against +0.434 ns** for the original on the
+  same source (jobs 6950/6951). The RTL cosim (job 6948) did not run: `COSIM 212-330`, the test
+  bench reached the top through a function pointer. Job 6949 (`gdn_k_slr2` csynth) is
+  superseded by version 2 and was not read.
+- **Review (2026-10-06, 11 confirmed findings) and the fixes, version 2** (source
+  `8b13e692c7657688…`):
+  1. The state reader used a new flat address (`layer*4096 + i`). No pre-link gate covers
+     reader addresses, and Iter68G/73a show Vivado can mis-implement a rebuilt state offset.
+     Restored the production reader's own expression, head by head:
+     `state[((size_t)layer_index * GDN_HEADS + head) * 512 + i]`, 8 x 512 trips, all heads
+     before the weights. The XO gate expects prefetch 512 in both modes and weight 16,384
+     (three-kernel) / 2,048 (monolith).
+  2. The 8-trip delta loop ran at II=1 with 16 lanes of fsub/fmul/fadd. Now II=4 (about +24
+     cycles/head) to share the arithmetic; the DSP effect is measured below, not assumed.
+  3. No zero initializers on `read_nb` targets.
+  4. Test harness: an output-count mismatch now fails instead of hanging; a one-LSB state
+     mutant (`-DAB_MUTANT`) must fail (it does: 118 mismatches).
+  5. RTL check rebuilt as **RTL against RTL**: the C model cannot be the reference for the
+     RTL, because the RTL `exp`/`log1p` cores differ from glibc in the last bit (Iter66m).
+     `island_cosim_tb.cpp` calls one top directly (`COSIM_TOP`), drives 5 cases x 2 layers of
+     seeded stimulus that never depends on outputs, and dumps every output and state beat;
+     `cmp_dumps.py` compares the original island's RTL dump with island_p's.
+  6. Native gates re-run with `LOGITS_REFERENCE=c_impl/artifacts/decode_native_bf16_product_native_64.gdnlog`
+     so `exact_ref_mismatch` counts real logit differences (`native_gates.sh`).
+- Version 2 evidence so far: native island A/B **PASS** again (6,400 output + 819,200 state
+  beats bit-identical; mutant FAIL); the cosim test bench in C gives identical dumps for both
+  tops (82,560 lines). Native gates with the stored native logits as the reference
+  (2026-10-06 15:54–16:05 UTC, `native_*.log`): three-kernel fast (5 steps, 160,000 logits),
+  three-kernel full (31 steps, 992,000 logits) and monolith fast all **PASS** with
+  `exact_ref_mismatch=0`, exact trajectory, zero argmax mismatches. Jobs: island_p csynth + synth 6952 → quarter-SLR P&R 6953, cosim of the
+  original 6954 and of island_p 6955, `gdn_k_slr2` csynth 6956.
+- **Version 2 results** (all jobs exit 0, 2026-10-06):
+
+  | island (one, 5.000 ns) | csynth cycles/call | RTL cosim interval min/avg/max | Vivado LUT / FF / DSP / BRAM / URAM | quarter-SLR P&R WNS | pblock CLB / DSP |
+  |---|---|---|---|---|---|
+  | original (6947/6954/6951) | 39,100 | 39,033 / 39,441 / 42,706 | 69,705 / 54,778 / 353 / 46 / 16 | +0.434 ns | 85.1% / 46.0% |
+  | island_p v1 (6946/–/6950) | 13,036 | not run | 83,030 / 73,887 / 622 / 32 / 16 | +0.208 ns | – |
+  | island_p v2 (6952/6955/6953) | 13,244 | **14,883 / 15,291 / 18,556** | 76,997 / 66,057 / 526 / 32 / 16 | **+0.268 ns** | 92.5% / 68.5% |
+
+  - **RTL against RTL: bit-identical.** 640 output beats and 2 x 40,960 state beats from the
+    original island's RTL equal island_p's RTL, read from the cosim RTL transaction files
+    (`sim/tv/rtldatafile`) and from the post-check dumps. On this stimulus each RTL also equals
+    its C model (0 differences in 82,560 lines), so no `exp`/`log1p` last-bit case occurred.
+  - Per process (csynth): prep 9,793, read 13,129, update 8,401 cycles/call; read paces at
+    ~1,640/head, under the 2,048-beat/head weight pace. DSP: read 208, update 256, prep 60.
+  - The II=4 delta loop saved 96 DSP, 6.0K LUT and 7.8K FF per island against v1, for +208
+    csynth cycles/call.
+  - **Plan gate 6 not met:** +0.268 ns against the planned +0.355 ns. The worst path is an
+    update-loop `fmul` (max_dsp) input register to its DSP, 4.586 ns, 67.6% route; the
+    original's worst path was an FSM-replica fan-out to a BRAM address. Before deciding, the
+    production islands' own slack is measured from the routed 200 MHz checkpoint (job 6973).
+  - `gdn_k_slr2` csynth (6956): HLS 200-656 only for `gdn_recurrent_duplicate_qkv`, as in
+    production; `gdn_recurrent_attention_island_p_{0,1}_U0` each instantiated once. **HLS
+    flattened the per-head prefetch nest** into one 4,096-trip pipeline
+    (`gemv32_mm2s_with_state_p_Pipeline_gemv32_state_owner_head_gemv32_state_owner_pre*`), i.e.
+    new head/beat address arithmetic. Fixed with `#pragma HLS loop_flatten off` on
+    `gemv32_state_owner_head` (source `ccd5f66f325eb99a…`; fast native gate with the logits
+    reference PASS, `exact_ref_mismatch=0`); re-check csynth job 6976:
+    `gemv32_mm2s_with_state_p_{28..31}_Pipeline_gemv32_state_owner_prefetch`, 512 trips, II=1,
+    then `..._weight` 16,384 trips — the production per-head structure and the names the XO
+    gate expects; 200-656 again only for `gdn_recurrent_duplicate_qkv`.
+  - **Production islands in context** (job 6973, routed 200 MHz checkpoint of build 6642,
+    `report_timing_summary -cells`): island 0 WNS **+0.102 ns**, island 1 **+0.097 ns**, each a
+    single outlier path into an update `fmul` input register; the next paths are +0.266 to
+    +0.33 ns. The whole `gdn_k_slr2` worst setup endpoint is island 1's (+0.097). So the
+    quarter-SLR OOC run (+0.434 for the original) overstates in-context margin by ~0.1–0.15 ns
+    for the bulk and ~0.33 ns for the outlier. (The job's last command,
+    `report_utilization -pblocks` with two pblocks, failed after the timing reports: Common 17-69.)
+  - **Endpoint census**, same OOC recipe with a checkpoint (jobs 7161 original, 7162 island_p v2;
+    WNS reproduced exactly, +0.434 / +0.268): the original has **1** endpoint below +0.5 ns (an
+    FSM-sourced path); island_p v2 has **744**, of which 648 are DSP inputs in the update loop
+    (296 below +0.4 ns, 43 below +0.3 ns) and 82 DSP inputs in the read loop (none below +0.4).
+    The worst 300 paths all start at an update `fmul` `din0_buf1_reg` with **fan-out 64** into
+    DSPs that have no input register: 4.586 ns = 3.102 ns route + 1.484 ns through the DSP
+    pre-adder, multiplier and ALU. Operands: `kj` 163, `decay` 137. Cause: the original island's
+    update multipliers are shared with its read loop (`grp_fu_*` ports with a mux on din0), so
+    every input register is distinct; island_p's update loop owns its 64 `fmul`s, 32 take
+    `decay` and 16 each take `kj`/`kj_b`, and Vivado merges the identical `din0_buf1` registers.
+    The `fmul` core is `floating_point` v7.1, `c_latency 2`, `Max_Usage`, plus the wrapper's
+    input and output registers (4 cycles).
+  - **Fix under test:** the update products are named and bound
+    (`bind_op op=fmul impl=maxdsp latency=GDN_ISLAND_UPDATE_FMUL_LATENCY`, default 4 = today),
+    so a deeper core can register the DSP inputs. Arithmetic unchanged (native island A/B PASS
+    again, source `e0dbfd35af6bb9de…`). Synthesis + census at depth 4 (control), 5 and 6: jobs
+    7214/7215, 7216/7217, 7218/7219.
+  - **Depth results** (OOC quarter-SLR, census bands):
+
+    | `bind_op latency` → module | LUT / FF / DSP | WNS | endpoints < 0.5 ns | where |
+    |---|---|---|---|---|
+    | unbound (v2) → `fmul_..._4_max_dsp` | 76,997 / 66,057 / 526 | +0.268 | 744 | update DSP inputs 648 |
+    | 4 → `_5_max_dsp` | 77,577 / 66,570 / 526 | **+0.334** | 240 | read only |
+    | 5 → `_6_max_dsp` | 77,449 / 66,956 / 526 | +0.307 | 233 | read 201, update 18 |
+    | 6 → `_7_max_dsp` | 77,769 / 69,389 / 526 | +0.317 | 131 | update DSP inputs 126 again (fan-out 64) |
+
+    "latency 4" is not a control: bound, HLS builds a 5-stage core (unbound it picked 4). One
+    extra stage clears the update class; deeper is not monotonic. Remaining at depth 4 (worst
+    300): read-pass phase-parity select `tmp_reg` with fan-out 516 into the 512-bit
+    current-half mux (+0.334, 95.7% route), read `fmul` `din1_buf1` with fan-out 44 into DSPs
+    (112), and CE pins of the partitioned `partial_*`/`retrieval_*` output registers.
+  - **Round 4** (source `22cf74baae807398…`, native A/B PASS): the four read products named and
+    bound the same way (`GDN_ISLAND_READ_FMUL_LATENCY` 4); variant b also makes the II=4 delta
+    loop `style=frp` (`GDN_ISLAND_DELTA_FRP=1`). Jobs 7246/7247 (a), 7248/7249 (b).
+    Results: **both worse.** Binding the read products moved them to 3-DSP `maxdsp` cores
+    (DSP 526 → 586): a +0.172 ns, 1,458 endpoints < 0.5 ns; b +0.287 ns, 904. The frp delta
+    loop helped within the round (a → b). Read binding removed (source `b0e10c9fe63a7477…`,
+    otherwise the depth-4 netlist).
+  - **Round 5:** depth 4 + frp delta loop (c), standard OOC census (jobs 7250/7251). And a
+    link-like OOC recipe — +0.300 ns user setup uncertainty during placement and
+    AggressiveExplore `phys_opt` before and after `AlternateCLBRouting`, uncertainty removed
+    before reporting — on c (7252), depth 4 (7253) and the original (7254), because the
+    standard OOC run never invokes the repair passes on positive-slack paths.
+    Results:
+
+    | island | recipe | WNS | endpoints < 0.5 ns |
+    |---|---|---|---|
+    | original | standard / link-like | +0.434 / **+0.626** | 1 / 0 |
+    | depth 4 | standard / link-like | +0.334 / +0.475 | 240 / 3 |
+    | **depth 4 + frp delta (c)** | standard / link-like | **+0.429** / +0.489 | 132 / 42 |
+
+    (The original's link-like census script stopped on an empty path list — 0 endpoints below
+    0.5 ns; its WNS is from `timing_base_linklike.rpt`.) Variant c: LUT 76,893, FF 65,745,
+    DSP 526, BRAM 32, URAM 16 (Vivado); csynth 13,244 cycles/call (prep 9,793, read 13,129,
+    update 8,409); no HLS 200-656. **Gate 6 passes** in its defined recipe (+0.429 ≥ +0.355).
+    With the link's repair steps the original keeps a 0.137 ns lead.
+  - **Chosen: variant c**, made the source default (source `6dcd68d36b9c799c…`: update products
+    bound `maxdsp latency=4`, delta loop `II=4 style=frp`, no build macros). Fast native gate with
+    the logits reference PASS (`exact_ref_mismatch=0`). Final RTL cosim (job 7259, compared RTL
+    against the original island's RTL dump from job 6954) and `gdn_k_slr2` csynth (7260) before
+    the link.
+  - **Final pre-link results (all pass):** cosim 7259 interval 14,883 / 15,291 / 18,556
+    (min/avg/max), and its RTL transaction files equal the original island's RTL (job 6954)
+    beat for beat: 640 output + 2 x 40,960 state beats, 0 differences. `gdn_k_slr2` csynth 7260:
+    200-656 only for `gdn_recurrent_duplicate_qkv`; four `..._state_owner_prefetch` reports
+    (512 trips); each island instance name once as a word in the RTL (the name gate's count);
+    top latency 423,989–6,245,541 cycles. Floorplan regexes match `..._island_p_{0,1}_U0`.
+  - **Link launched** 2026-10-06 20:10 UTC: `BUILD_EXCLUSIVE=user
+    BUILD_EXCLUDE=acclnode04,acclnode05,harrier make -C c_impl run_hw` → tag
+    `hw_20261006_201011_883243`, build job 7261 (acclnode01), on-card job 7262 (afterok).
+    Snapshot `gdn_model.cpp` `6dcd68d36b9c799c…`; HLS 200 / link 200 / `hw_f200_p.cfg`.
+  - **Link result (build 7261, acclnode01, 7 h 05 m, exit 0):** routed and timing-closed at
+    200 MHz, exact-clock gate: kernel **+0.022 / +0.010 ns**, DMA +0.003 / +0.009, hbm_aclk
+    **+0.000** / +0.010; native, XO, state-address (writer) and island-name gates PASS; image
+    `diagnostics/hw_20261006_201011_883243/artifacts/.../gdn_p.xclbin`.
+  - **On card: FAILED correctness (job 7262, exit 2).** No hang; 8 tokens; kernel
+    **10.23–10.29 ms/token** (12.227 production) — but trajectory
+    [21225, 28723, 13, 1014, …] against golden [21225, 28723, 3672, 871, …]: step 1 right, step 2
+    on wrong; GPU vector gate global NRMSE 0.79, 6 argmax mismatches of 7. Not a result: the
+    speed is of a wrong computation.
+  - **Diagnosis, from real data** (on-card job 7313 `--dump-state` after 0/1/2 steps on the
+    Iter81 image and after 1 step on the production image; native dumps from the same source;
+    `diagnostics/iter81_recur_balance/statedump/`):
+    - upload/read-back identical (0 beats differ after 0 steps); the production image after 1
+      step differs from native in exactly the known 129 last-bit beats, conv identical;
+    - the Iter81 image after 1 step differs in **every** state beat of all four stripes and in
+      4,416 conv-tail beats (layer 0's conv exact, layer 1 on wrong);
+    - per head, the card's new state fits `0 x S_old + k (x) delta` with rank-1 residual 0.0007
+      in **every layer** (native needs its own decay: 0.239, 0.478, …); regressing the card's
+      delta on the native delta and the retrieval S_old^T k gives lambda = 1.0000 and the
+      native beta (head 0: 0.569–0.571 vs native 0.5703; head 2: 0.733 vs 0.7326) — scalars,
+      k and v are right, the **old state the islands read was zero** in every layer, with no
+      leftover beats reaching a later layer;
+    - the island's read pipeline takes `state_stream_dout` whether or not the queue is empty
+      (RTL), so an empty queue reads as zero: the queue never held a beat when read.
+  - **Suspect, being confirmed:** the new reader's state burst. HLS merged the 8 per-head
+    prefetch loops into one 4,096-beat AR burst whose offset is
+    `$signed(layer<<18 [27b]) + $signed(27'd87457792)` → zero-extended → `+ w28`. In RTL
+    semantics this is right (the 27-bit sum does not overflow), but it is the narrow-offset
+    form that Vivado synthesis mis-folded into the pointer add on the **write** side in
+    Iter68G/73a/75 (state 128 MiB low; `87457792` has bit 26 set, as a signed 27-bit value
+    −46,759,936, exactly −128 MiB). The production reader has no such constant (registered
+    per-head arithmetic). Reads 128 MiB low land 46.8 MB before the port-28 weight buffer.
+    Check: `check_state_reader_addresses.py` (the writer gate's twin: HLS RTL, post-synth,
+    post-opt, 24 layers x 2 bases) on the production XO (control) and the new XO, job 7317.
+  - **Confirmed (job 7317, acclnode01):** production XO reader, port 28: PASS at HLS RTL,
+    post-synth and post-opt. Iter81 XO (copied from build 7261's stage, sha256
+    `6e6862823bb09e3d…`), ports 28–31: PASS at HLS RTL, **FAIL in all 48 cases post-synth and
+    post-opt**, every state request at exactly **−134,217,728 bytes** (e.g. layer 0, base
+    0x380000000: expected word 0x0e14da00, actual 0x0df4da00). Vivado synthesis, not HLS,
+    misplaces the read — the same mechanism as the Iter75 writer. The card read 128 MiB below
+    the stripe and got zeros.
+  - **Fix (source `68b39fcaf2cfc3f5…`):** the reader's prefetch takes the writer's proven form —
+    the original AXI base `w`, a full `ap_uint<64>` beat index
+    `SHARD_BEATS + layer*4096 + i`, the offset add bound `impl=fabric latency=1` — in one
+    4,096-trip loop. The XO gate expects prefetch 4,096 (three-kernel) / 512 (monolith).
+    `check_state_reader_addresses.py` is now a fail-closed pre-link gate in
+    `slurm/hw_build.slurm` after the writer gate (snapshot list updated), closing the review's
+    "no gate covers reader addresses" gap. Pre-link: native gates with the logits reference,
+    and `gdn_k_slr2` csynth + reader gate on its RTL (job 7319).
+  - **Fix pre-link results (all pass):** native three-kernel fast and full 32-step and monolith
+    fast with the logits reference, `exact_ref_mismatch=0`; job 7319: reader gate PASS on ports
+    28–31 at HLS RTL, post-synth and post-opt (48 cases each); prefetch 4,096 trips, II=1;
+    200-656 only for `gdn_recurrent_duplicate_qkv`. The island is unchanged from the cosim'd
+    variant c.
+  - **Link 2 launched** 2026-10-07 04:01 UTC, same command: tag `hw_20261007_040145_938415`,
+    build 7323, on-card 7324 (afterok); snapshot `gdn_model.cpp` `68b39fcaf2cfc3f5…`, the build
+    runs the new reader gate before the link.
+  - **Link 2 result (build 7323, acclnode03, 7 h 34 m, MaxRSS 69.7 GB): REFUSED by the
+    exact-clock gate on `hbm_aclk`; the on-card job 7324 was cancelled by `afterok`.** Every
+    pre-link gate passed, including the new reader gate (`state_reader_gate.exit=0`). Routed:
+    0 routing errors; kernel `clk_kernel_00` **+0.027 / +0.010 ns at 5.000 ns** (first pass of the
+    ladder, no Explore needed), `dma_ip_axi_aclk_1` +0.003 / +0.009, **`hbm_aclk` −0.021 /
+    +0.010 at 2.222 ns, 7 failing endpoints, TNS −0.097**. The failing paths are the shell's
+    HMSS SLR-crossing pipes of HBM paths 29–31 (`r15.r_multi triple_slr.resp slr_slave pipe[4]`
+    SLR0 → `slr_middle pipe[0]` SLR1, 1.71–1.76 ns of wire, 0 logic levels) plus one `w15`
+    forward hop of path 29 — the Iter79 P2/P4/P5 class, and in the column the campaign read as
+    marginal: both registers at **SLICE_X193** (Y190→Y250, Y218→Y278). Link 1 (7261) had its
+    worst `hbm_aclk` path in the same column at exactly +0.000 (path 22, X193 Y193→Y253), the
+    production image closes at +0.015 elsewhere. So the CLAUDE.md open question is answered by
+    measurement: **hbm_aclk closure does not hold across netlist changes** — it is a per-draw
+    ±0.02 ns coin on the shell's own X193 crossings, untouched by our logic. Per-SLR CLB
+    90.80 / 91.65 / 92.00 % (production 91.34 / 91.39 / 91.91), LUT 202,149 / 227,602 /
+    **253,564** (production 247,187 on SLR2: +6.4K for the two islands), DSP 2,154 / 1,465 /
+    **2,134** (SLR2 69.5 %, was 58.3 %: +346 = 2 x 173), URAM 0 / 56 / 96, SLLs 24,814 (24,833).
+    Checkpoints `gdn_f150_final_candidate.dcp` / `gdn_f150_after_aggressive.dcp` copied back.
+    Evidence level: routed, kernel/DMA timing-closed, hbm_aclk −0.021.
+  - **Decision: link 3 with the documented escape hatch, one variable.** Iter79's post-route
+    repairs (Explore, focused hbm group, `-slr_crossing_opt`, TNS cleanup: jobs 6326/6334) never
+    moved these shell pipes, and the boundary strips (P3) made them worse, so the recorded remedy
+    is the bounded auto-scaling the user chose on 2026-10-03 (option 1): `GDN_HBM_MIN_MHZ=440`,
+    tolerance 1000/440 − 2.222 = 0.051 ns ≥ 0.021; vpl then programs hbm_aclk at the achieved
+    ≈446 MHz (P5 ran at 446.4). Cost: pseudo-channel peak 14.4 → ≈14.3 GB/s, a busy port's
+    12.8 GB/s demand at 200 MHz = 89.7 % instead of 88.9 % of peak; the card run measures it.
+    Flow fix so the one knob works in `make run_hw`: `slurm/hw_build.slurm` now derives
+    `GDN_SCALED_CLOCKS=hbm_aclk:$GDN_HBM_MIN_MHZ` for `reconcile_exact_clock.py` (as
+    `iter79/build_p.slurm` did; the production job previously left it unset, which would have
+    failed the reconciliation after a scaled link) and both the launcher and the build log print
+    the knob. Same source (`68b39fcaf2cfc3f5…`), same recipe, same node class.
+  - **Link 3 launched** 2026-10-07 11:42 UTC: `GDN_HBM_MIN_MHZ=440 BUILD_EXCLUSIVE=user
+    BUILD_EXCLUDE=acclnode04,acclnode05,harrier make -C c_impl run_hw` → tag
+    `hw_20261007_114231_1029342`, build 7370, on-card 7371 (afterok). Snapshot: `gdn_model.cpp`
+    `68b39fcaf2cfc3f5…` (unchanged), `slurm/hw_build.slurm` `a5e0be0e39b1f0f1…`,
+    `run_hw_sbatch.sh` `dde7b973fc758f10…`; the launcher printed "hbm clock: bounded
+    auto-scaling, floor 440 MHz".
+  - **User decisions 2026-10-08:** (1) run the promotion qualification (512-token drift,
+    WikiText-2 on card, paired power) and the docs + commits; (2) **accept the HBM AXI clock at
+    445.8 MHz** — `run_hw_sbatch.sh` now defaults `GDN_HBM_MIN_MHZ=440` (an explicit empty value
+    demands exact 450), so `make run_hw` reproduces this image without extra knobs; (3) measure
+    the ~7K-cycle/layer gap with an instrumented build in parallel.
+  - **Qualification launched** (chained, one FPGA per user): robustness job **7401** (512-token
+    drift vs the GPU 512 reference + WikiText-2 on 62 documents vs the Iter66o GPU reference,
+    the Iter79 script with only image/host/output paths changed), paired power **7402** (fp32
+    arm) → **7403** (bf16 arm), copies of `iter79_p_r6/power/slurm_power_p6.sh` with the image
+    digest `a95b9a8a…`, the source-hash gate `68b39fcaf2cfc3f5…` and the output roots changed;
+    `diagnostics/iter81_recur_balance/qual/`.
+  - **Call-timeline probe (`GDN_CALL_PROBE`, diagnostic build only).** In `gdn_gemv_part_slr2` a
+    counter process per call stamps the cycle, from the region's start, of: the first activation
+    beat received, each state reader's prefetch end and weight-loop end (ports 28–31), the
+    result send's last word, the attention send's last beat and each state writer's end; the
+    stamps go as 16 64-bit records (two beats) per call into a probe tail on **port 27** (HLS
+    200-1013 forbids a second writer on port 31's bundle; port 27 has no state writer, so the
+    writer address gate sees no probe traffic) and `host.exe --dump-probe` reads them back
+    after every step. Events are `write_nb` into depth-16 streams from inside the existing
+    processes (probe copies of the three relays, an extra stream parameter on the readers and
+    writers under the flag); the counter polls them one per cycle (II=1, csynth job 7413) and is
+    bounded by 2^26 cycles. Native model: the counter runs last in program order and the store
+    is skipped (`__SYNTHESIS__`); the default build compiles none of it and the default fast
+    native gate still passes `exact_ref_mismatch=0`. Probe csynth of `gdn_k_slr2` (job 7413):
+    200-656 only for `gdn_recurrent_duplicate_qkv`, reader gate PASS (ports 28–31), writer gate
+    PASS (port 31), `probe_poll` and `probe_store` II=1.
+  - **Probe build launched** 2026-10-08 12:15 UTC: `VPP_DEFINES="-D GDN_CALL_PROBE=1"
+    HOST_DEFINES=-DGDN_CALL_PROBE=1 GDN_KERNEL_WAIT_TIMEOUT_MS=120000 BUILD_EXCLUSIVE=user
+    BUILD_EXCLUDE=acclnode04,acclnode05,harrier make -C c_impl run_hw` → tag
+    `hw_20261008_121547_1231079`, build **7429**, card gates **7430**; snapshot `gdn_model.cpp`
+    `f2645eea5cc01757…` (the Iter81 source plus the probe hooks), `Makefile` `bb658042cef4de59…`,
+    `host.cpp` `c52f188f092b76c2…`. A light card job (`probe/probe_dump.slurm`, afterany:7430)
+    then runs 8 and 64 tokens with `--dump-probe` and `analyze_probe.py` reports per-call lengths
+    by call kind, the event timeline inside QKVG calls, and the cycles outside the SLR2 call
+    regions. The probe image is not a production candidate (an extra process on SLR2; its TPOT
+    is reported for context only).
+    Build 7429 failed its preflight in one second: acclnode01's node-local `/tmp` had 53 GB free
+    (94 % used; the Iter81 link-1 stage `/tmp/yaoz0b-7261` is mine and is being removed by a
+    cleanup job — every report and the XO of that link are in the shared diagnostics).
+    Relaunched with `BUILD_EXCLUDE=acclnode01,acclnode04,acclnode05,harrier` → tag `hw_20261008_121910_1232024`,
+    build **7434**, card gates **7435**, probe dump job chained afterany.
+    Build 7434 (acclnode03, 34 min) passed the native gate and **failed the XO gate** on two
+    counts, both in `gdn_k_slr2`: estimated clock **16.001 ns** against 5.000 (the
+    `gdn_call_probe_counter` parent module, not its II=1 loops — its complete-partitioned
+    16-entry record array written with a dynamic index), and the port-27 reader's report set no
+    longer matched the gate's 27 outlined-loop expectation once port 27 had a write channel.
+    Fix: port 27 is `const` again; the counter keeps its records in a one-port LUTRAM (written
+    in order, read once) and packs the two beats by static 64-bit shifts; the beats go to all
+    four state writers, each of which stores them at its own port's probe tail *after* its
+    4,096-beat state burst (the writer gate samples only the stripe burst), so every port keeps
+    one writing process and the production writer text is untouched (preprocessor-guarded).
+    Native probe run and the default fast gate pass; csynth + reader gate (28–31) + writer gate
+    (28–31) + a per-module estimated-clock scan rerun as job (see `jobs.txt`, `slr2_probe3`).
+  - **Committed 2026-10-08 on `recur_balance`** (the on-card improvement is demonstrated; the
+    documents and this log follow after the qualification): kernel `77c3eb310`, host
+    `8545a4dbf`, gates `ddc163ea0`, flow `3b4113a9d`.
+  - **Robustness on the Iter81 image (job 7401, 1 h 05 m, acclnode01, `qual/robustness/`):
+    PASS, numerically identical to every image since Iter66n.** 512-token free-running decode
+    vs the GPU 512 reference: fork at step **447**, 6 of 8 windows comparable, window NRMSE
+    0.005305 → 0.005638 (ratio **1.063**), slope **2.133e-06** per step, `TREND_VERDICT=BOUNDED`.
+    WikiText-2 teacher-forced on the verified-identical workload (62 documents, 183 windows,
+    314,843 scored tokens, 241,335 words, 1,290,527 bytes): FPGA word perplexity
+    **16.774839771** vs GPU **16.776123769** = **−0.0077 %** (gate 5 %), byte perplexity
+    1.6944051 vs 1.6944293 — the Iter79 image's figures to the last digit, as identical
+    arithmetic requires — at **10.256 ms/token** kernel over the whole run (Iter79: 12.267).
+  - Paired power jobs 7402/7403 exited in 25 s at the script's source-hash gate: the working
+    tree's `gdn_model.cpp` had moved from the image's `68b39fcaf2cfc3f5…` to the probe-hooked
+    `f2645eea5cc01757…` (commit `77c3eb310`; the probe is compiled out of the host the script
+    rebuilds, so the host is functionally the image's). Gate updated to the current hash
+    (xclbin and weights digests verified unchanged); resubmitted as **7437** (fp32 arm) →
+    **7438** (bf16 arm).
+  - **Paired power on the Iter81 image (jobs 7437 fp32 arm 13 m 28 s, 7438 bf16 arm 11 m 41 s,
+    acclnode01, `qual/power/perf_{float32,bfloat16}/`): 4,096-token context, 60 s idle / 30 s
+    warm-up / 3 × 60 s intervals, both arms.**
+
+    | device | steps | TPOT (ms) | device time (ms) | idle W | active W (mean / median / p95) | J/token gross | J/token idle-subtracted |
+    |---|---:|---:|---:|---:|---|---:|---:|
+    | U55C, fp32-arm run | 17,300 | 10.402 | 10.266 | 31.14 | 62.08 / 61.94 / 64.28 | **0.6460** | 0.3220 |
+    | U55C, bf16-arm run | 17,400 | 10.344 | 10.241 | 31.02 | 62.17 / 62.24 / 63.11 | **0.6432** | 0.3223 |
+    | A100 fp32 eager | 5,614 | 32.063 | 31.986 | 67.25 | 94.94 / 94.89 / 96.76 | 3.0450 | 0.8882 |
+    | A100 bf16 eager | 5,548 | 32.438 | 32.360 | 67.21 | 85.09 / 85.08 / 86.17 | 2.7613 | 0.5804 |
+
+    Ratios (A100 / U55C): **3.08x / 3.14x faster**, **4.71x / 4.29x** gross and **2.76x / 1.80x**
+    idle-subtracted energy efficiency (fp32 / bf16 arms). Against the Iter79 image (57.8 W active,
+    31.5 W idle, 0.717 J gross, 0.325 J idle-subtracted; 2.56x, 4.20x / 3.87x, 2.60x / 1.72x):
+    **+4.3 W active, −9.9 % energy per token gross, −1 % idle-subtracted**. The card reads back
+    DATA_CLK 200 MHz, KERNEL_CLK 500 MHz, hbm_aclk 445 MHz.
+  - **Verdict: RETAINED AND PROMOTED (2026-10-08).** The Iter81 image — build 7370, XCLBIN
+    `a95b9a8a7135bda4…`, source `68b39fcaf2cfc3f5…` — is the production image: exact 8/64-token
+    trajectories, the production vector-gate figures, bounded 512-token drift, WikiText-2 within
+    −0.0077 % of the GPU, 10.470 ms production TPOT / 10.347 ms kernel (2,069,400 cycles),
+    0.646 J/token. Documents updated in the same series (`architecture.md`,
+    `recurrent_attention.md`, `cycle_optimization_roadmap.md`, the READMEs, the CLAUDE.md status
+    block). Open and recorded: the ≈ 7K cycles/layer between the balanced model and the card
+    (probe build in progress), and whether a 450 MHz hbm_aclk draw exists (the flow accepts the
+    440 MHz floor).
+  - **Link 3 result (build 7370, acclnode03, 8 h 01 m): closed and accepted.** The implementation
+    reproduced link 2 to the picosecond (kernel **+0.027 / +0.010 ns at 5.000 ns**, DMA +0.003 /
+    +0.009, hbm_aclk −0.021 / +0.010 with the same 7 endpoints; CLB 90.80 / 91.65 / 92.00 %,
+    SLLs 24,814; 0 routing errors) — same inputs, same node, deterministic. The hook gate
+    accepted hbm_aclk inside the 440 MHz bound; vpl programmed **hbm_aclk 445.8 MHz**
+    (`AUTO-FREQ-SCALING-07`), kernel 201.0 capped at the requested 200; image metadata
+    hbm_aclk 445 / KERNEL_CLK 500 / **DATA_CLK 200**; reconciliation `EXACT_CLOCK_OK` with the
+    derived `GDN_SCALED_CLOCKS`, DATA_CLK untouched. Image `gdn_p.xclbin` sha256
+    `a95b9a8a7135bda4…`, host `3cce4f81e4331433…`
+    (`diagnostics/hw_20261007_114231_1029342/artifacts/build.hw.gdn32.h200.f200.o48/`).
+    csynth of this build: `gdn_k_slr2` BRAM 472 · DSP **1,609** · FF 333,040 · LUT 319,248 · URAM 96
+    (production 494 / 1,263 / 307K / 308K / 96); `gdn_forward_p` and `gdn_k_slr0` unchanged.
+  - **On card (job 7371, harrier, U55C 0000:41:00.1): ALL GATES PASS.**
+
+    | gate | result |
+    |---|---|
+    | 8-token exact trajectory | MATCH, top-1 100 %; kernel median 10.328 ms, TPOT 10.452 |
+    | 64-token exact trajectory | **MATCH** (= golden), top-1 100 % |
+    | CUDA vector gate, 63 steps / 2,016,000 logits | global NRMSE **0.004663**, worst step 0.011908, cosine 0.999989, min step cosine 0.999946, top-5 overlap 5/5, **0 argmax mismatches**, 0 tolerance failures — the production image's figures (0.00466 / 0.0119 / 0.999989) |
+    | kernel_ms, median of 63 | **10.347 ms** (mean 10.348, min 10.303, max 10.453) |
+    | per_step_tpot_ms, median of 63 | **10.470 ms** (mean 10.483); host/XRT overhead 0.123 ms |
+
+    Against the production image (12.227 kernel / 12.350 TPOT): kernel **−1.880 ms = −15.4 %**,
+    TPOT **−15.2 %**; at 200 MHz that is **2,069,400 cycles/token** against 2,445,400, **−376,000
+    cycles**. The plan's csynth-level estimate was ≈ −550,000 (≈19K + L per QKVG call); the
+    measured call is therefore ≈ 7K cycles/layer longer than the weight-stream model — not yet
+    localised (candidates: the island tail after the last head, the collector/merge hand-offs, the
+    prefetch's share of the pre-call gap, the 445.8 MHz HBM clock). Evidence level: **on-card**,
+    exact 8/64 + vector gate + TPOT; identical arithmetic to production (the island RTL is
+    bit-identical to the original's, job 7259).
+  - **Verdict: RETAINED (on-card).** Not promoted: promotion needs the 512-token drift run, the
+    on-card WikiText-2 perplexity and the power measurement as for Iter79, and the docs
+    (`architecture.md`, `recurrent_attention.md`, `cycle_optimization_roadmap.md`, the CLAUDE.md
+    status block) in the same commit series. Open items recorded: the 7K-cycle/layer gap above;
+    whether a 450 MHz hbm_aclk draw exists for this netlist (two draws: +0.000 on acclnode01 for
+    the v2 source, −0.021 twice on acclnode03 for the final source); `GDN_HBM_MIN_MHZ=440` is now
+    part of the reproduction command for this image.
