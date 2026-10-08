@@ -125,6 +125,12 @@ VPP_FLAGS      += --hls.jobs $(JOBS)
 # synthesize HLS at 150 MHz, then request the independently chosen physical
 # DATA_CLK during link (150 MHz by default).
 VPP_COMPILE_FLAGS := $(VPP_FLAGS) --kernel_frequency $(HLS_FREQ)
+# Diagnostic defines for a probe build (VPP_DEFINES="-D GDN_CALL_PROBE=1"
+# HOST_DEFINES=-DGDN_CALL_PROBE=1); empty for production. gdn_eval never gets
+# them, so the native gate always models the production kernel.
+VPP_DEFINES    ?=
+HOST_DEFINES   ?=
+VPP_COMPILE_FLAGS += $(VPP_DEFINES)
 VPP_LINK_FLAGS    := $(VPP_FLAGS) --kernel_frequency $(LINK_FREQ)
 
 VPP_LDFLAGS    := --config $(abspath $(HW_CFG))
@@ -330,7 +336,7 @@ host: $(HOST_BIN)
 # (gdn_build_weight_shards / gdn_weight_shard_floats). gdn_model.cpp needs the
 # Vitis HLS include for hls_stream.h; -lm for the libm calls it pulls in.
 $(HOST_BIN): $(HOST_SRC) gdn_model.cpp gdn_model.h
-	$(CXX) -O2 -std=c++17 -Wall -Wno-unknown-pragmas -Wno-unused-label \
+	$(CXX) -O2 -std=c++17 -Wall -Wno-unknown-pragmas -Wno-unused-label $(HOST_DEFINES) \
 	    $(HOST_INC) -I$(XILINX_HLS_INC) -o $@ $(HOST_SRC) gdn_model.cpp $(HOST_LIB) -lm
 
 

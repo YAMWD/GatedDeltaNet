@@ -103,6 +103,13 @@ echo "constraint : ${BUILD_CONSTRAINT:-<none>}"
 echo "exclude    : ${BUILD_EXCLUDE:-<none>}"
 echo "build node : ${BUILD_NODE:-scheduler-selected}"
 echo "exclusive  : ${BUILD_EXCLUSIVE:-<shared node>}"
+# Iter81 (user decision 2026-10-08): the production reproduction accepts the shell's
+# HBM AXI clock scaled down to 440 MHz (the Iter79 option-1 hatch): closure at 450 is a
+# per-draw +-0.02 ns coin on the shell's own crossing pipes, not a property of the
+# netlist (links 7261 +0.000, 7323/7370 -0.021). GDN_HBM_MIN_MHZ= (empty) demands exact.
+GDN_HBM_MIN_MHZ="${GDN_HBM_MIN_MHZ-440}"
+export GDN_HBM_MIN_MHZ
+echo "hbm clock  : ${GDN_HBM_MIN_MHZ:+bounded auto-scaling, floor }${GDN_HBM_MIN_MHZ:-exact 450} MHz"
 echo "weights    : ${WEIGHTS}"
 echo "state      : ${DECODE_STATE}"
 echo "golden     : ${DECODE_GOLDEN}"
@@ -152,7 +159,7 @@ snapshot_files=(
     hw_f150_physical_islands.cfg apply_f150_physical_islands.tcl
     apply_iter54_dma_timing.tcl apply_iter35_dma_w15_fifoaddr_fanout.tcl
     apply_iter23_dma_fanout.tcl check_f150_physical_islands.tcl
-    report_final_qor.tcl check_native_bf16_xo.py reconcile_exact_clock.py
+    report_final_qor.tcl check_native_bf16_xo.py check_island_names.py reconcile_exact_clock.py
     hw_f150.cfg apply_iter69_kernel_clock_f150.tcl
     hw_a200.cfg hw_a200_r2.cfg apply_a200_islands.tcl apply_a200_pinned_cut.tcl
     hw_a200_r3.cfg apply_a200_control_fanout.tcl
@@ -171,7 +178,7 @@ if [ -n "${REUSE_XO:-}" ]; then
     snapshot_files+=(prepare_reused_xo.py)
 fi
 if [ "${STATE_ADDRESS_GATE:-0}" = 1 ]; then
-    snapshot_files+=(gdn_eval.cpp all_bf16_layout_test.cpp check_state_writer_addresses.py)
+    snapshot_files+=(gdn_eval.cpp all_bf16_layout_test.cpp check_state_writer_addresses.py check_state_reader_addresses.py)
 fi
 # A variant build (HW_CFG_TEMPLATE=... and/or extra hook Tcl) must freeze its
 # extra inputs too: EXTRA_SNAPSHOT_FILES="fileA fileB" appends to the list.
