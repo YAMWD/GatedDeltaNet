@@ -89,10 +89,9 @@ typedef struct {
     (GDN_RECURRENT_STATE_STRIPE_FLOATS / 32u)
 #define GDN_COMPILED_WEIGHT_SHARD_BEATS 1366528u
 /* Iter81 call-timeline probe (diagnostic -DGDN_CALL_PROBE=1 builds only): two
- * 512-bit beats of records per call in a tail of weight port 27 after its shard
- * (no state writer on that port); the host allocates GDN_PROBE_ALLOC_BEATS
- * extra beats there. GDN_PROBE_BEAT_OFF keeps the ports 28-31 geometry so one
- * constant serves every port. */
+ * 512-bit beats of records per call in a tail of each of weight ports 28-31,
+ * after the state stripe, written by that port's state writer; the host
+ * allocates GDN_PROBE_ALLOC_BEATS extra beats on those ports and reads 31's. */
 #define GDN_PROBE_CALLS            (4u * 24u + 1u)
 #define GDN_PROBE_RECORDS_PER_CALL 16u
 #define GDN_PROBE_BEATS_PER_CALL   2u

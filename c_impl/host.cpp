@@ -837,8 +837,9 @@ public:
                 extra_bytes = state_stripe_bytes;
             }
 #ifdef GDN_CALL_PROBE
-            if (c == 27) extra_bytes = (size_t)GDN_PROBE_BEAT_OFF * sizeof(Beat512) - shard_bytes +
-                                       (size_t)GDN_PROBE_ALLOC_BEATS * sizeof(Beat512);
+            if (c >= GDN_RECURRENT_STATE_FIRST_PORT &&
+                c < GDN_RECURRENT_STATE_FIRST_PORT + GDN_RECURRENT_STATE_PORTS)
+                extra_bytes += (size_t)GDN_PROBE_ALLOC_BEATS * sizeof(Beat512);
 #endif
             weight_bos_.emplace_back(device, shard_bytes + extra_bytes,
                                      port_group(c));
@@ -1307,8 +1308,8 @@ public:
         const size_t off = (size_t)GDN_PROBE_BEAT_OFF * sizeof(Beat512);
         const size_t bytes = (size_t)GDN_PROBE_BEATS * sizeof(Beat512);
         std::vector<uint64_t> words(bytes / sizeof(uint64_t));
-        sync_bo_chunked(weight_bos_[27], XCL_BO_SYNC_BO_FROM_DEVICE, bytes, off);
-        weight_bos_[27].read(words.data(), bytes, off);
+        sync_bo_chunked(weight_bos_[31], XCL_BO_SYNC_BO_FROM_DEVICE, bytes, off);
+        weight_bos_[31].read(words.data(), bytes, off);
         for (uint32_t call = 0; call < GDN_PROBE_CALLS; ++call) {
             for (uint32_t r = 0; r < GDN_PROBE_RECORDS_PER_CALL; ++r) {
                 const uint64_t v = words[(size_t)call * GDN_PROBE_RECORDS_PER_CALL + r];

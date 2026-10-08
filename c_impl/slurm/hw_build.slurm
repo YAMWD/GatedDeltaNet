@@ -181,9 +181,14 @@ if [ "$xo_rc" -eq 0 ] && [ "$gate_rc" -eq 0 ] && [ "${STATE_ADDRESS_GATE:-0}" = 
     source "/tools/Xilinx/Vitis/${VITIS_VERSION}/settings64.sh"
     set -u
     set +e
+    # A GDN_CALL_PROBE diagnostic build gives the writers two extra stream/scalar
+    # arguments, after which HLS passes the pointer and layer index as plain ports
+    # instead of FIFO copies; the gate has a switch for that isolated form.
+    writer_gate_args=()
+    case " ${VPP_DEFINES:-} " in *GDN_CALL_PROBE*) writer_gate_args+=(--diagnostic-direct-inputs);; esac
     python3 "${STAGE_C_IMPL}/check_state_writer_addresses.py" \
         "${STAGE_BUILD}/gdn_k_slr2.xo" "${SHARED_DIAG}/state_address_gate" \
-        --clock-ns "$(python3 -c "print(1000.0/${LINK_FREQ})")" \
+        --clock-ns "$(python3 -c "print(1000.0/${LINK_FREQ})")" "${writer_gate_args[@]}" \
         2>&1 | tee "${SHARED_DIAG}/state_address_gate.live.log"
     gate_rc="${PIPESTATUS[0]}"
     set -e

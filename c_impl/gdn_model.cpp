@@ -4044,7 +4044,7 @@ gemv32_state_owner_head: for (uint32_t head = 0;
  * In the SLR2 kernel, a counter process per call records the cycle (from the
  * call region's start) at which the region's processes reach named points and
  * stores up to 16 records per call as two 512-bit beats in a probe tail of
- * weight port 27, after the shard (a port no state writer touches). Events travel on depth-16 streams
+ * weight ports 28-31, after the state stripe (written by the state writers). Events travel on depth-16 streams
  * written with write_nb from inside the existing processes; the counter polls
  * them one per cycle, so a stamp is late by at most the number of events that
  * arrived in the same cycle. The native model skips the store (its shard
@@ -4064,17 +4064,20 @@ static inline void gdn_probe_emit(hls::stream<GDNProbeEvent> &ev,
     (void)ev.write_nb(e);
 }
 static hls::stream<GDNProbeEvent> gdn_probe_null_ev("gdn_probe_null_ev"); /* monolith call sites */
+static hls::stream<Beat512> gdn_probe_null_beats("gdn_probe_null_beats");
 #define GDN_PROBE_ARG(x) , x
 #define GDN_PROBE_PARAM(x) , hls::stream<GDNProbeEvent> &x
-/* The records are stored through weight port 27, which no other process
- * writes (HLS 200-1013: one bundle, one writing process); ports 28-31 keep
- * their state writers unchanged, so the writer address gate sees no probe
- * traffic. */
-typedef Beat512 GDNProbeMm27;
+/* The records are stored by the state writers themselves (HLS 200-1013: one
+ * bundle, one writing process): each of ports 28-31 gets the two record
+ * beats of the call after its state burst, so every port's tail holds the
+ * same records and the host reads port 31's. */
+#define GDN_PROBE_WR_PARAMS , hls::stream<GDNProbeEvent> &ev, hls::stream<Beat512> &probe_in, uint32_t probe_call
+#define GDN_PROBE_WR_ARGS(e, b, c) , e, b, c
 #else
 #define GDN_PROBE_ARG(x)
 #define GDN_PROBE_PARAM(x)
-typedef const Beat512 GDNProbeMm27;
+#define GDN_PROBE_WR_PARAMS
+#define GDN_PROBE_WR_ARGS(e, b, c)
 #endif
 
 template <int CHANNEL>
@@ -4154,12 +4157,16 @@ static void gemv32_state_writer(
     hls::stream<Beat512> &state_wr,
     Beat512 *weights,
     uint32_t layer_index,
-    bool qkvg_recurrent_mode GDN_PROBE_PARAM(ev)
+    bool qkvg_recurrent_mode GDN_PROBE_WR_PARAMS
 ) {
 #pragma HLS inline off
     (void)CHANNEL;
+#ifndef GDN_CALL_PROBE
     if (!qkvg_recurrent_mode)
         return;
+#else
+    if (qkvg_recurrent_mode) {
+#endif
     const uint32_t state_packs_per_head =
         GDN_DK * (GDN_DV / 32) / GDN_RECURRENT_STATE_PORTS;
     // Use the original AXI base and a complete unsigned beat index. Explicit
@@ -4182,6 +4189,24 @@ gemv32_state_writer_beat: for (uint32_t i = 0;
     }
 #ifdef GDN_CALL_PROBE
     gdn_probe_emit(ev, GDN_PROBE_EV_WRITER_DONE, CHANNEL);
+    }
+    /* Probe tail: this call's two record beats, after the state burst (the
+     * writer address gate samples only the 4,096-beat stripe), in the same
+     * 64-bit base + index form. The native model has no tail: skip. */
+    const ap_uint<64> probe_base = ap_uint<64>(GDN_PROBE_BEAT_OFF) +
+        ap_uint<64>(probe_call) * ap_uint<64>(GDN_PROBE_BEATS_PER_CALL);
+#pragma HLS bind_op variable=probe_base op=add impl=fabric latency=1
+gemv32_state_writer_probe_tail: for (uint32_t b = 0; b < GDN_PROBE_BEATS_PER_CALL; ++b) {
+#pragma HLS pipeline II=1
+#ifdef __SYNTHESIS__
+        const Beat512 beat = probe_in.read();
+        const ap_uint<64> probe_index = probe_base + ap_uint<64>(b);
+        weights[probe_index.to_uint64()] = beat;
+#else
+        Beat512 beat;
+        (void)probe_in.read_nb(beat); (void)probe_base;
+#endif
+    }
 #endif
 }
 
@@ -5080,13 +5105,13 @@ static void gdn_gemv(
         a, b, layer_a_log, layer_dt_bias,
         layer_index, qkvg_recurrent_mode);
     gemv32_state_writer<28>(state_wr0, w28,
-                            layer_index, qkvg_recurrent_mode GDN_PROBE_ARG(gdn_probe_null_ev));
+                            layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(gdn_probe_null_ev, gdn_probe_null_beats, 0u));
     gemv32_state_writer<29>(state_wr1, w29,
-                            layer_index, qkvg_recurrent_mode GDN_PROBE_ARG(gdn_probe_null_ev));
+                            layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(gdn_probe_null_ev, gdn_probe_null_beats, 0u));
     gemv32_state_writer<30>(state_wr2, w30,
-                            layer_index, qkvg_recurrent_mode GDN_PROBE_ARG(gdn_probe_null_ev));
+                            layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(gdn_probe_null_ev, gdn_probe_null_beats, 0u));
     gemv32_state_writer<31>(state_wr3, w31,
-                            layer_index, qkvg_recurrent_mode GDN_PROBE_ARG(gdn_probe_null_ev));
+                            layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(gdn_probe_null_ev, gdn_probe_null_beats, 0u));
 }
 
 /* =====================================================================
@@ -5557,9 +5582,13 @@ gdn_axis_send512_probe_loop: for (uint32_t i = 0; i < n; ++i) {
         if (i + 1 == n) gdn_probe_emit(ev, GDN_PROBE_EV_ATTN_DONE, 0);
     }
 }
-/* The per-call counter: one record per event (event, port, cycle); the last
- * record is the counter's own end (event 7, port = events seen). Bounded by
- * 2^26 cycles so a miscounted expectation can never hang the kernel. */
+/* The per-call counter. Every event source has its own record slot, so the
+ * eleven non-blocking reads are independent (a priority chain of FIFO reads
+ * was estimated at 16 ns by HLS: each internal FIFO read costs ~1.4 ns and the
+ * chain serialized them). Slots: 0 xr, 1 ys, 2 attn, 3+2k prefetch / 4+2k
+ * weights of reader k, 11+k writer k, 15 the counter's own end (event 7,
+ * port = events seen). Bounded by 2^26 cycles so a miscounted expectation can
+ * never hang the kernel. */
 static void gdn_call_probe_counter(
     hls::stream<GDNProbeEvent> &ev_xr, hls::stream<GDNProbeEvent> &ev_ys,
     hls::stream<GDNProbeEvent> &ev_attn,
@@ -5567,7 +5596,8 @@ static void gdn_call_probe_counter(
     hls::stream<GDNProbeEvent> &ev_rd2, hls::stream<GDNProbeEvent> &ev_rd3,
     hls::stream<GDNProbeEvent> &ev_wr0, hls::stream<GDNProbeEvent> &ev_wr1,
     hls::stream<GDNProbeEvent> &ev_wr2, hls::stream<GDNProbeEvent> &ev_wr3,
-    hls::stream<Beat512> &probe_out, bool qkvg) {
+    hls::stream<Beat512> &out0, hls::stream<Beat512> &out1,
+    hls::stream<Beat512> &out2, hls::stream<Beat512> &out3, bool qkvg) {
 #pragma HLS inline off
     ap_uint<64> rec[GDN_PROBE_RECORDS_PER_CALL];
 #pragma HLS array_partition variable=rec complete
@@ -5581,27 +5611,37 @@ probe_init: for (uint32_t i = 0; i < GDN_PROBE_RECORDS_PER_CALL; ++i) {
     ap_uint<48> cyc = 0;
 probe_poll: while (seen < expected && cyc < (ap_uint<48>)0x4000000u) {
 #pragma HLS pipeline II=1
-        GDNProbeEvent e = 0;
-        bool got = false;
-        if (ev_xr.read_nb(e)) got = true;
-        else if (ev_ys.read_nb(e)) got = true;
-        else if (ev_attn.read_nb(e)) got = true;
-        else if (ev_rd0.read_nb(e)) got = true;
-        else if (ev_rd1.read_nb(e)) got = true;
-        else if (ev_rd2.read_nb(e)) got = true;
-        else if (ev_rd3.read_nb(e)) got = true;
-        else if (ev_wr0.read_nb(e)) got = true;
-        else if (ev_wr1.read_nb(e)) got = true;
-        else if (ev_wr2.read_nb(e)) got = true;
-        else if (ev_wr3.read_nb(e)) got = true;
-        if (got) {
-            ap_uint<64> r = 0;
-            r.range(63, 56) = (ap_uint<8>)(e >> 8);
-            r.range(55, 48) = (ap_uint<8>)(e & 0xffu);
-            r.range(47, 0) = cyc;
-            rec[seen & 15u] = r;
-            ++seen;
-        }
+        GDNProbeEvent e0 = 0, e1 = 0, e2 = 0, e3 = 0, e4 = 0, e5 = 0, e6 = 0,
+                      e7 = 0, e8 = 0, e9 = 0, e10 = 0;
+        const bool g0 = ev_xr.read_nb(e0);
+        const bool g1 = ev_ys.read_nb(e1);
+        const bool g2 = ev_attn.read_nb(e2);
+        const bool g3 = ev_rd0.read_nb(e3);
+        const bool g4 = ev_rd1.read_nb(e4);
+        const bool g5 = ev_rd2.read_nb(e5);
+        const bool g6 = ev_rd3.read_nb(e6);
+        const bool g7 = ev_wr0.read_nb(e7);
+        const bool g8 = ev_wr1.read_nb(e8);
+        const bool g9 = ev_wr2.read_nb(e9);
+        const bool g10 = ev_wr3.read_nb(e10);
+#define GDN_PROBE_REC(ev) \
+        (((ap_uint<64>)(ap_uint<8>)((ev) >> 8) << 56) | \
+         ((ap_uint<64>)(ap_uint<8>)((ev) & 0xffu) << 48) | (ap_uint<64>)cyc)
+        if (g0) rec[0] = GDN_PROBE_REC(e0);
+        if (g1) rec[1] = GDN_PROBE_REC(e1);
+        if (g2) rec[2] = GDN_PROBE_REC(e2);
+        if (g3) { if ((e3 >> 8) == GDN_PROBE_EV_PREFETCH_DONE) rec[3] = GDN_PROBE_REC(e3); else rec[4] = GDN_PROBE_REC(e3); }
+        if (g4) { if ((e4 >> 8) == GDN_PROBE_EV_PREFETCH_DONE) rec[5] = GDN_PROBE_REC(e4); else rec[6] = GDN_PROBE_REC(e4); }
+        if (g5) { if ((e5 >> 8) == GDN_PROBE_EV_PREFETCH_DONE) rec[7] = GDN_PROBE_REC(e5); else rec[8] = GDN_PROBE_REC(e5); }
+        if (g6) { if ((e6 >> 8) == GDN_PROBE_EV_PREFETCH_DONE) rec[9] = GDN_PROBE_REC(e6); else rec[10] = GDN_PROBE_REC(e6); }
+        if (g7) rec[11] = GDN_PROBE_REC(e7);
+        if (g8) rec[12] = GDN_PROBE_REC(e8);
+        if (g9) rec[13] = GDN_PROBE_REC(e9);
+        if (g10) rec[14] = GDN_PROBE_REC(e10);
+#undef GDN_PROBE_REC
+        seen += (uint32_t)g0 + (uint32_t)g1 + (uint32_t)g2 + (uint32_t)g3 +
+                (uint32_t)g4 + (uint32_t)g5 + (uint32_t)g6 + (uint32_t)g7 +
+                (uint32_t)g8 + (uint32_t)g9 + (uint32_t)g10;
         ++cyc;
     }
     {
@@ -5609,45 +5649,26 @@ probe_poll: while (seen < expected && cyc < (ap_uint<48>)0x4000000u) {
         r.range(63, 56) = (ap_uint<8>)GDN_PROBE_EV_COUNTER_END;
         r.range(55, 48) = (ap_uint<8>)seen;
         r.range(47, 0) = cyc;
-        rec[15] = r;
+        rec[GDN_PROBE_RECORDS_PER_CALL - 1] = r;
     }
-probe_pack_beats: for (uint32_t b = 0; b < GDN_PROBE_BEATS_PER_CALL; ++b) {
-#pragma HLS pipeline II=1
-        Beat512 beat = 0;
-    probe_pack: for (uint32_t j = 0; j < 8; ++j) {
+    /* two beats, static lane positions: record 8b+j in lanes 64j.. of beat b */
+    Beat512 beat0 = 0, beat1 = 0;
+probe_pack: for (uint32_t j = 0; j < 8; ++j) {
 #pragma HLS unroll
-            beat.range(64 * j + 63, 64 * j) = rec[8 * b + j];
-        }
-#ifdef __SYNTHESIS__
-        probe_out.write(beat);
-#else
-        (void)probe_out; (void)beat;   /* native: nothing to store */
-#endif
+        beat0.range(64 * j + 63, 64 * j) = rec[j];
+        beat1.range(64 * j + 63, 64 * j) = rec[8 + j];
     }
-}
-/* The one process that writes port 27: two beats per call at the probe
- * tail, in the state writer's proven address form (64-bit base + index). */
-static void gdn_probe_store(hls::stream<Beat512> &probe_in, GDNProbeMm27 *w27, uint32_t call) {
-#pragma HLS inline off
-    const ap_uint<64> base = ap_uint<64>(GDN_PROBE_BEAT_OFF) +
-        ap_uint<64>(call) * ap_uint<64>(GDN_PROBE_BEATS_PER_CALL);
-#pragma HLS bind_op variable=base op=add impl=fabric latency=1
-probe_store: for (uint32_t b = 0; b < GDN_PROBE_BEATS_PER_CALL; ++b) {
-#pragma HLS pipeline II=1
 #ifdef __SYNTHESIS__
-        const Beat512 beat = probe_in.read();
-        const ap_uint<64> beat_index = base + ap_uint<64>(b);
-        w27[beat_index.to_uint64()] = beat;
+    (void)out0.write_nb(beat0); (void)out1.write_nb(beat0); (void)out2.write_nb(beat0); (void)out3.write_nb(beat0);
+    (void)out0.write_nb(beat1); (void)out1.write_nb(beat1); (void)out2.write_nb(beat1); (void)out3.write_nb(beat1);
 #else
-        Beat512 beat;
-        (void)probe_in.read_nb(beat); (void)w27; (void)base;
+    (void)out0; (void)out1; (void)out2; (void)out3; (void)beat0; (void)beat1;   /* native: nothing to store */
 #endif
-    }
 }
 #endif
 
 static void gdn_gemv_part_slr2(
-    const Beat512 *w24, const Beat512 *w25, const Beat512 *w26, GDNProbeMm27 *w27,
+    const Beat512 *w24, const Beat512 *w25, const Beat512 *w26, const Beat512 *w27,
     Beat512 *w28, Beat512 *w29, Beat512 *w30, Beat512 *w31,
     hls::stream<GDNAxisBeat> &xr_in, hls::stream<GDNAxisBeat> &conv_in,
     hls::stream<GDNAxisBeat> &scalars_in,
@@ -5681,7 +5702,8 @@ static void gdn_gemv_part_slr2(
 #ifdef GDN_CALL_PROBE
     hls::stream<GDNProbeEvent> ev_xr, ev_ys, ev_attn;
     hls::stream<GDNProbeEvent> ev_rd[4], ev_wr[4];
-    hls::stream<Beat512> probe_beats;
+    hls::stream<Beat512> probe_beats[4];
+#pragma HLS array_partition variable=probe_beats complete
 #pragma HLS stream variable=probe_beats depth=4
 #pragma HLS array_partition variable=ev_rd complete
 #pragma HLS array_partition variable=ev_wr complete
@@ -5763,17 +5785,17 @@ static void gdn_gemv_part_slr2(
 #else
     gdn_axis_send512(attn_stream, attn_out, attn_beats);
 #endif
-    gemv32_state_writer<28>(state_wr0, w28, layer_index, qkvg_recurrent_mode GDN_PROBE_ARG(ev_wr[0]));
-    gemv32_state_writer<29>(state_wr1, w29, layer_index, qkvg_recurrent_mode GDN_PROBE_ARG(ev_wr[1]));
-    gemv32_state_writer<30>(state_wr2, w30, layer_index, qkvg_recurrent_mode GDN_PROBE_ARG(ev_wr[2]));
-    gemv32_state_writer<31>(state_wr3, w31, layer_index, qkvg_recurrent_mode GDN_PROBE_ARG(ev_wr[3]));
+    gemv32_state_writer<28>(state_wr0, w28, layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(ev_wr[0], probe_beats[0], probe_call));
+    gemv32_state_writer<29>(state_wr1, w29, layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(ev_wr[1], probe_beats[1], probe_call));
+    gemv32_state_writer<30>(state_wr2, w30, layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(ev_wr[2], probe_beats[2], probe_call));
+    gemv32_state_writer<31>(state_wr3, w31, layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(ev_wr[3], probe_beats[3], probe_call));
 #ifdef GDN_CALL_PROBE
     /* Last in program order: the C model runs the region's processes in
      * sequence, so the counter must find every event already queued. */
     gdn_call_probe_counter(ev_xr, ev_ys, ev_attn, ev_rd[0], ev_rd[1], ev_rd[2], ev_rd[3],
-                           ev_wr[0], ev_wr[1], ev_wr[2], ev_wr[3], probe_beats,
+                           ev_wr[0], ev_wr[1], ev_wr[2], ev_wr[3],
+                           probe_beats[0], probe_beats[1], probe_beats[2], probe_beats[3],
                            qkvg_recurrent_mode);
-    gdn_probe_store(probe_beats, w27, probe_call);
 #endif
 }
 
@@ -5829,7 +5851,7 @@ gdn_k_slr0_calls: for (uint32_t call = 0; call < GDN_P_CALLS; ++call) {
 
 void gdn_k_slr2(
     const Beat512 *weight_data_mm24, const Beat512 *weight_data_mm25,
-    const Beat512 *weight_data_mm26, GDNProbeMm27 *weight_data_mm27,
+    const Beat512 *weight_data_mm26, const Beat512 *weight_data_mm27,
     Beat512 *weight_data_mm28, Beat512 *weight_data_mm29,
     Beat512 *weight_data_mm30, Beat512 *weight_data_mm31,
     hls::stream<GDNAxisBeat> &xr_in,
@@ -6234,7 +6256,7 @@ int gdn_forward_partitioned(
     static hls::stream<GDNAxisWord> ys_s0("p_ys_s0"), ys_s2("p_ys_s2");
     std::thread t0([&] { gdn_k_slr0(mm2, mm3, mm4, mm5, mm6, mm7, mm8, mm9, mm10, mm11, mm12, mm13,
                                     mm14, mm15, mm16, mm17, xr_s0, ys_s0); });
-    std::thread t2([&] { gdn_k_slr2(mm24, mm25, mm26, (GDNProbeMm27 *)mm27, mm28, mm29, mm30, mm31, xr_s2, conv_s2, scal_s2, ys_s2, attn_s2); });
+    std::thread t2([&] { gdn_k_slr2(mm24, mm25, mm26, mm27, mm28, mm29, mm30, mm31, xr_s2, conv_s2, scal_s2, ys_s2, attn_s2); });
     const int rc = gdn_forward_p(aux_weights, workspace, mm0, mm1,
                                  mm18, mm19, mm20, mm21, mm22, mm23,
                                  xr_s0, xr_s2, ys_s0, ys_s2, conv_s2, attn_s2, scal_s2);
