@@ -545,22 +545,33 @@ operands in the original order):
 Cost per island (Vivado): LUT 76,893 vs 69,705, FF 65,745 vs 54,778, DSP 526
 vs 353, BRAM 32 vs 46, URAM 16 vs 16. Measured on card: the token fell from
 2,445,400 to **2,069,400 cycles** (−376,000, −15.4 %), against the ≈ −550,000
-the stream-paced model predicts. The per-call cycle probe (`GDN_CALL_PROBE`,
-build 7468 / dump 7470) then measured the token: SLR2's call regions cover
-98.5 % of it and never wait for the control kernel; the QKVG call is 34,518
-cycles for a 20,480-beat stream because the control kernel's head-serial Q/K/V
-convolution actor (≈ 3.3K cycles per head) back-pressures the weight stream to
-0.62 beats per cycle, the 4,096-beat state prefetch sits on SLR2's critical
-path (neutral against the old interleave, not a gain), every GEMV call carries
-2.2–4.6K cycles of fill and drain, and the islands' tail after the last result
-word is 3.8K. The model's error was its "today" figure: the old QKVG call was
-≈ 50K cycles on card, not the csynth-derived 41.7K, so Iter81's 15.5K-per-layer
-saving is the whole measured −376K. The next lever is the convolution actor
-(≈ 12 % of the token), then prefetching the next layer's state during the
-preceding calls (5 %), the per-call fill/drain (10 %) and the island tail
-(4 %); see `optimization_log.md`, Iter81 probe. The monolith keeps the
-original island and reader (`gdn_recurrent_attention_island`,
-`gemv32_mm2s_with_state`) for A/B.
+the stream-paced model predicts. The model's error was its "today" figure:
+the old QKVG call was ≈ 50K cycles on card, not the csynth-derived 41.7K, so
+Iter81's 15.5K-per-layer saving is the whole measured −376K. The dual-kernel
+call probe (`GDN_CALL_PROBE`, Iter82: build 7602 / dump 7604, data-dependent
+stamps on both kernels; the Iter81 probe's reading that SLR2 "never waits" and
+that the Q/K/V convolution actor paces QKVG was a stamp artifact) measured the
+2,053,983-cycle token exactly: the weight stream at one beat per cycle is
+1,366,528 (66.5 %); the **control kernel's serial work between its GEMV
+regions is 487,494 (23.7 %)** — per layer 11,168 before QKVG, 3,529 after it,
+3,502 after o_proj, 2,061 after GU, 18 % above csynth where that code reads
+scalar weights over mm0 — and the SLR2 kernel enters every region before the
+control kernel does and waits there for the x broadcast; the QKVG region runs
+6,001 cycles beyond its 16,384-beat stream (144K, 7.0 %) because ports 28–31
+stream at 0.833 beats per cycle while the **state write-back** shares their
+pseudo-channels (78.8K), the islands' last head follows the last Q/K/V beat by
+2,018 cycles (48.4K) and the x broadcast and first results cost ≈ 620 (14.9K);
+the other calls' fill and drain are 502 / 1,028 / 639 per layer (52K, 2.5 %);
+the LM head 3.7K. The islands read a head in 1,622 cycles and update it in
+1,044, so at the stream's 2,465-cycle head pace they wait ≈ 840 cycles per head
+for Q/K/V — they are not the pacer; the convolution actor takes ≈ 600 cycles
+per head; the state prefetch is done at 4.3K of the 11.1K pre-QKVG wait and is
+hidden. The levers, in measured order: the serial work (packed aux image and
+fused tiny GEMV, residual/SOS, per-head output norm, loader tails), deferring
+the state write-back until after the weight loop (−78.8K), the islands' last
+head, and the per-call fill/drain; see `optimization_log.md`, Iter82. The
+monolith keeps the original island and reader
+(`gdn_recurrent_attention_island`, `gemv32_mm2s_with_state`) for A/B.
 
 ### SLR-local result collection
 

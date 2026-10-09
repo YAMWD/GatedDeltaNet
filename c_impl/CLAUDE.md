@@ -60,9 +60,13 @@ stale was wrong.
     delta loop `II=4 style=frp` — and the state readers `gemv32_mm2s_with_state_p<28..31>` prefetch the layer's
     4,096 state beats before the call's 16,384 weight beats. The monolith keeps `gdn_recurrent_attention_island`
     and `gemv32_mm2s_with_state`. `-DGDN_CALL_PROBE=1` (`VPP_DEFINES="-D GDN_CALL_PROBE=1"
-    HOST_DEFINES=-DGDN_CALL_PROBE=1 make run_hw`) adds a per-call cycle probe (events from the SLR2 region's
-    processes, a counter, two record beats per call stored through port 27's tail, read back by
-    `host.exe --dump-probe`); it is compiled out of every production build and `gdn_eval` never gets it.
+    HOST_DEFINES=-DGDN_CALL_PROBE=1 make run_hw`) adds the Iter82 dual-kernel call probe: data-dependent event
+    stamps (a tag byte of the beat they mark, so the scheduler cannot hoist them — `check_stamp_schedule.py`
+    verifies the csynth schedule) from the processes of both GEMV regions, one counter per kernel (32 records
+    per call in four beats: the SLR2 kernel's through the state writers' tails on ports 28–31, the control
+    kernel's through the workspace tail at `GDN_WS_PROBE_BEAT_OFF`), read back by `host.exe --dump-probe` and
+    decomposed by `analyze_call_probe.py`; it is compiled out of every production build (token-identical
+    preprocessed source) and `gdn_eval` never gets it.
   - Other submodules: `gdn_rmsnorm_rows`, `gdn_gemv_tiny` (the two tiny a/b gate projections),
     `gdn_depthwise_conv_silu`, `gdn_recurrent_attention` (gated delta rule, head-local fused state
     buffer), `gdn_output_norm_and_gate`, `gdn_swiglu_inplace`.

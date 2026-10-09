@@ -12,15 +12,17 @@
 > overlap, which Iter57 had only in the HLS minimum — the islands no longer
 > pace the call. What it opens: the stream now paces all 97 calls, so weight
 > compression (§ 13) shortens every call, which it could not do while the
-> islands paced QKVG. The per-call probe (build 7468) then showed where the
-> token goes: SLR2's call regions cover 98.5 % of it; the QKVG call is 34.5K
-> cycles for a 20.5K-beat stream because the control kernel's head-serial
-> Q/K/V convolution (≈ 3.3K/head) back-pressures the stream to 0.62 beats per
-> cycle — the next lever, ≈ 12 % — then the state prefetch moved off the
-> critical path (5 %), the per-call fill/drain of every GEMV (10 %) and the
-> island tail (4 %); the model's −550K rested on a wrong "today" (the old call
-> was ≈ 50K on card, not 41.7K). Head-chunked output projection (the Stage 4
-> remainder) and Stages 5–6 stand.
+> islands paced QKVG. The Iter82 dual-kernel probe (build 7602, data-dependent
+> stamps; the Iter81 probe's "convolution actor back-pressures the stream"
+> reading was a stamp artifact) then measured where the token goes: the weight
+> stream 66.5 %; the **control kernel's serial work between regions 23.7 %**
+> (11,168 / 3,529 / 3,502 / 2,061 cycles per layer before QKVG / after QKVG /
+> after o_proj / after GU — Stage 6's target, now first); the QKVG region 7.0 %
+> beyond its stream (ports 28–31 at 0.833 beats/cycle under the state
+> write-back 3.8 %, the islands' last head 2.4 %, start-up 0.7 %); the other
+> calls' fill/drain 2.5 %; the model's −550K rested on a wrong "today" (the old
+> call was ≈ 50K on card, not 41.7K). Head-chunked output projection (the
+> Stage 4 remainder) and Stages 5–6 stand.
 > The HBM AXI clock runs at 445.8 MHz on this image (`GDN_HBM_MIN_MHZ=440`
 > is the flow default since Iter81), which trims the pseudo-channel peak by
 > 0.9 % and leaves the HBM floor model of § 10 otherwise unchanged.
