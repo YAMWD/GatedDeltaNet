@@ -862,7 +862,13 @@ public:
             throw std::runtime_error("loaded model shape != compiled-in GDN-1.3B kernel shape");
         }
         workspace_bo_ = xrt::bo(device,
-            static_cast<size_t>(GDN_WS_FLOATS) * sizeof(float), kernel_.group_id(1));
+            static_cast<size_t>(GDN_WS_FLOATS) * sizeof(float)
+#ifdef GDN_CALL_PROBE
+            /* Iter82: the control kernel's probe records live in a tail
+             * after the workspace proper (GDN_WS_PROBE_BEAT_OFF). */
+            + (size_t)GDN_PROBE_ALLOC_BEATS * sizeof(Beat512)
+#endif
+            , kernel_.group_id(1));
 
         /* Evaluation-only branch snapshots. Keep each backup beside the
          * corresponding live state allocation so xrt::bo::copy can use the
@@ -1302,22 +1308,42 @@ public:
     }
 
 #ifdef GDN_CALL_PROBE
-    /* Iter81: read the SLR2 kernel's per-call probe records after a step and
-     * append them as text: step call record event port cycle. */
-    void dump_call_probe(FILE *out, uint32_t step) {
-        const size_t off = (size_t)GDN_PROBE_BEAT_OFF * sizeof(Beat512);
-        const size_t bytes = (size_t)GDN_PROBE_BEATS * sizeof(Beat512);
-        std::vector<uint64_t> words(bytes / sizeof(uint64_t));
-        sync_bo_chunked(weight_bos_[31], XCL_BO_SYNC_BO_FROM_DEVICE, bytes, off);
-        weight_bos_[31].read(words.data(), bytes, off);
+    /* Iter81/82: read both kernels' per-call probe records after a step and
+     * append them as text: step kernel call record event port tag cycle
+     * (kernel 1 = control, from the workspace tail; 2 = SLR2, from port
+     * 31's tail).  A record is event[63:56] port[55:48] tag[47:40]
+     * cycle[39:0]; the counter-end record (event 7) carries the number of
+     * events seen in [55:40], printed in the port column. */
+    static void dump_probe_words(FILE *out, uint32_t step, unsigned kernel,
+                                 const std::vector<uint64_t> &words) {
         for (uint32_t call = 0; call < GDN_PROBE_CALLS; ++call) {
             for (uint32_t r = 0; r < GDN_PROBE_RECORDS_PER_CALL; ++r) {
                 const uint64_t v = words[(size_t)call * GDN_PROBE_RECORDS_PER_CALL + r];
                 if (v == 0) continue;
-                std::fprintf(out, "%u %u %u %u %u %llu\n", step, call, r,
-                             (unsigned)(v >> 56), (unsigned)((v >> 48) & 0xffu),
-                             (unsigned long long)(v & 0xffffffffffffULL));
+                const unsigned event = (unsigned)(v >> 56);
+                unsigned port = (unsigned)((v >> 48) & 0xffu);
+                unsigned tag = (unsigned)((v >> 40) & 0xffu);
+                if (event == 7u) { port = (unsigned)((v >> 40) & 0xffffu); tag = 0; }
+                std::fprintf(out, "%u %u %u %u %u %u %u %llu\n", step, kernel, call, r,
+                             event, port, tag,
+                             (unsigned long long)(v & 0xffffffffffULL));
             }
+        }
+    }
+    void dump_call_probe(FILE *out, uint32_t step) {
+        const size_t bytes = (size_t)GDN_PROBE_BEATS * sizeof(Beat512);
+        std::vector<uint64_t> words(bytes / sizeof(uint64_t));
+        {
+            const size_t off = (size_t)GDN_WS_PROBE_BEAT_OFF * sizeof(Beat512);
+            sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_FROM_DEVICE, bytes, off);
+            workspace_bo_.read(words.data(), bytes, off);
+            dump_probe_words(out, step, 1u, words);
+        }
+        {
+            const size_t off = (size_t)GDN_PROBE_BEAT_OFF * sizeof(Beat512);
+            sync_bo_chunked(weight_bos_[31], XCL_BO_SYNC_BO_FROM_DEVICE, bytes, off);
+            weight_bos_[31].read(words.data(), bytes, off);
+            dump_probe_words(out, step, 2u, words);
         }
         std::fflush(out);
     }
@@ -2640,7 +2666,7 @@ int main(int argc, char **argv) {
                 gdn_probe_dump_file = std::fopen(opts.probe_dump_path.c_str(), "w");
                 if (gdn_probe_dump_file == nullptr)
                     throw std::runtime_error("cannot create probe dump: " + opts.probe_dump_path);
-                std::fprintf(gdn_probe_dump_file, "# step call record event port cycle\n");
+                std::fprintf(gdn_probe_dump_file, "# step kernel call record event port tag cycle\n");
             }
 #endif
             std::vector<DecodeExample> results =

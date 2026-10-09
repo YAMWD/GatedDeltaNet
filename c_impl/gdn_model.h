@@ -88,17 +88,23 @@ typedef struct {
 #define GDN_RECURRENT_STATE_STRIPE_BF16_BEATS \
     (GDN_RECURRENT_STATE_STRIPE_FLOATS / 32u)
 #define GDN_COMPILED_WEIGHT_SHARD_BEATS 1366528u
-/* Iter81 call-timeline probe (diagnostic -DGDN_CALL_PROBE=1 builds only): two
- * 512-bit beats of records per call in a tail of each of weight ports 28-31,
- * after the state stripe, written by that port's state writer; the host
- * allocates GDN_PROBE_ALLOC_BEATS extra beats on those ports and reads 31's. */
+/* Iter81/82 call-timeline probe (diagnostic -DGDN_CALL_PROBE=1 builds only).
+ * SLR2 kernel: four 512-bit beats of records per call in a tail of each of
+ * weight ports 28-31, after the state stripe, written by that port's state
+ * writer; the host allocates GDN_PROBE_ALLOC_BEATS extra beats on those
+ * ports and reads 31's.  Control kernel (Iter82): four beats per call in a
+ * tail of the workspace after its GDN_WS_FLOATS, written by the control
+ * region's own counter.  A record is event[63:56] port[55:48] tag[47:40]
+ * cycle[39:0], the cycle counted from the region's start; the counter-end
+ * record carries the number of events seen in [55:40]. */
 #define GDN_PROBE_CALLS            (4u * 24u + 1u)
-#define GDN_PROBE_RECORDS_PER_CALL 16u
-#define GDN_PROBE_BEATS_PER_CALL   2u
+#define GDN_PROBE_RECORDS_PER_CALL 32u
+#define GDN_PROBE_BEATS_PER_CALL   4u
 #define GDN_PROBE_BEATS            (GDN_PROBE_CALLS * GDN_PROBE_BEATS_PER_CALL)
-#define GDN_PROBE_ALLOC_BEATS      256u
+#define GDN_PROBE_ALLOC_BEATS      512u
 #define GDN_PROBE_BEAT_OFF \
     ((uint64_t)GDN_COMPILED_WEIGHT_SHARD_BEATS + (uint64_t)GDN_RECURRENT_STATE_STRIPE_BF16_BEATS)
+#define GDN_WS_PROBE_BEAT_OFF      ((uint64_t)GDN_WS_FLOATS / 16u)
 #define GDN_COMPILED_WEIGHT_SHARD_BYTES \
     ((size_t)GDN_COMPILED_WEIGHT_SHARD_BEATS * sizeof(Beat512))
 
