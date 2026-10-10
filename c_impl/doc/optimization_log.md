@@ -19253,3 +19253,111 @@ noted, not pursued.
 **Verdict: retained** (on-card, same card as the reference; not promoted — the production
 image stays Iter81's until the campaign-end qualification). Evidence: on-card for the timing,
 the gates and the cycle decomposition; csynth for the module figures.
+
+## Iter84 — deferred state write-back on ports 28–31 (opened 2026-10-10, branch `recur_balance`)
+
+**Why.** The Iter82/83 probes measure ports 28–31 streaming QKVG weights at **0.833–0.839
+beats/cycle** against 0.973–0.986 in every other call: the islands' state write-back (4,096
+beats per port, as the heads update) shares those pseudo-channels with the 16,384-beat weight
+stream for most of the call (reads + writes ≈ 95 % of the channel). Everything downstream —
+the collector, the ingest, the convolution actor, the islands (which wait ≈ 840 cycles per head
+for Q/K/V) — runs at that pace, and the control kernel's QKVG region ends when the islands'
+last head arrives: 19,525 cycles of stream per layer instead of ≈ 16,640.
+
+**Hypothesis.** Each state writer drains its 4,096-deep URAM `state_wr` queue only after its
+port's weight loop has finished (a one-token `wr_go` stream from `gemv32_mm2s_with_state_p<CH>`
+to `gemv32_state_writer<CH>`, written after the weight loop, read before the drain): the
+weight stream runs at full rate, and the 4,096-beat write-back moves into the window after it,
+where the port is idle — the islands' 3.8K tail and the control kernel's post-QKVG serial work.
+The queue holds a whole layer (the islands' write_nb proof of ≤ 4,096 pending beats is
+unchanged; the writer starts before the last head updates, so fewer are ever pending).
+Expected: ≈ −2.9K cycles per layer on the control kernel's QKVG region, ≈ **−69K per token
+(−3.8 %)**; the SLR2 region ends ≈ 400 cycles later than today, still long before the next x
+broadcast. Arithmetic untouched; a process-graph change in the SLR2 region (invariant 24: both
+processes stay multi-loop; csim cannot see a dataflow deadlock, so the region's RTL behaviour
+must be checked before the link). Protocol: native gates, csynth of `gdn_k_slr2` with the probe
+(200-656 list `{gdn_recurrent_duplicate_qkv}`, II, clock scan, reader and writer address gates),
+RTL cosim or an equivalent check of the region, the probe link, card gates, dump.
+
+**Record: below.**
+
+**Implementation (2026-10-10).** `gemv32_mm2s_with_state_p<CH>` writes one token to
+`wr_go[CH-28]` (`hls::stream<ap_uint<1>>`, depth 2, declared in `gdn_gemv_part_slr2`) after its
+QKVG weight loop; `gemv32_state_writer<CH>` reads it before its 4,096-beat drain (QKVG mode
+only; non-QKVG calls touch neither). The writer's signature is shared with the monolith, whose
+interleaved reader (`gemv32_mm2s_with_state`) writes the same token at its end (A/B model only).
+Arithmetic untouched. Native fast gates PASS bit-exact (monolith and partitioned; the
+partitioned C model runs the readers before the writers, so the tokens are queued).
+- *Address gates:* the writer gate drives every `*_empty_n` input high, so the isolated writer
+  sees the token as always present; the reader gate drives `*_full_n` high, so the token write
+  never blocks there — both gates stay meaningful for the addresses.
+- *RTL check of the region (invariant 24, csim-blind):* a new cosim harness,
+  `diagnostics/iter84_deferred_wb/cosim/` — the test top `gdn_slr2_region_cosim_top` (under
+  `GDN_SLR2_REGION_COSIM`, never built) calls `gdn_gemv_part_slr2` for one QKVG call of layer 0
+  on a source copy whose shard constant is scaled to 16,384 beats (a 20,992-beat port holds the
+  call's weights, the state stripe and the probe tail; the copy differs from the tree by exactly
+  that constant, asserted by `make_cosim.sh`). The testbench drives the x, Q/K/V and scalar
+  links with BF16 values of magnitude in [0.125, 1) and scalars that make β = sigmoid(0) = 0.5 and
+  decay = exp(−0·softplus) = 1 exactly, so the islands' arithmetic is plain IEEE ops and cosim's
+  C/RTL comparison of the ys words, the attention beats and the written state must be
+  bit-exact; the AESL deadlock detector covers the new reader → writer dependency and the
+  queue that now holds a whole layer. Source `gdn_model.cpp` a4416ba0… (+ the cosim top).
+- *csynth of `gdn_k_slr2` with the probe (jobs 7753, 7765):* 200-656 list unchanged
+  (`gdn_recurrent_duplicate_qkv`), every loop II=1, no module above 5.0 ns, stamp order PASS,
+  resources unchanged (472 / 1,609 / 348K / 331K / 96); **reader gate PASS, writer gate PASS**
+  (192 cases, direct inputs). HLS 200-1018 advised a token FIFO deeper than 2 ("to avoid
+  deadlocks"); depth 4 (job 7765: advisory gone). Native fast gates re-run PASS on the final
+  source (`gdn_model.cpp` bbc61c1a…).
+- *RTL cosim of the region (job 7764, 1 h 14 m; the harness above, after a testbench fix —
+  the shape constants are defined in the .cpp, not the header):* **C/RTL co-simulation PASS**,
+  the AESL deadlock detector silent, the C and RTL digests of the 1,024 ys words, 64 attention
+  beats and the 4 × 4,096 written state beats identical; RTL latency **25,109 cycles** for the
+  call = the 4,096-beat prefetch (not hidden in the harness, whose x beats are pre-queued) +
+  16,384 weights + the write-back serialized after them at ≈ 1 beat/cycle — the deferral
+  behaving as designed. The harness is kept for the SLR2 changes to come (Iter89's prefetch
+  across calls).
+- **Probe link launched 2026-10-10 09:52 UTC** — tag `hw_20261010_095224_1601340`, build **7777**
+  (shared node, acclnode03 excluded), card **7778** (afterok), dump **7779** (afterany,
+  `diagnostics/iter84_deferred_wb/probe/`). Same command as Iter83's link; source
+  `gdn_model.cpp` bbc61c1a…, `gdn_model.h` 337d7bc5…, `host.cpp` def56de3…. Expected on the
+  probe: ports 28–31's QKVG stream rate 0.839 → ≈ 0.985 beats/cycle, the control kernel's QKVG
+  region ≈ 22,381 → ≈ 19,500, ≈ −69K cycles per token; the SLR2 region's end moves ≈ 400 cycles
+  later (write-back after the stream), still ahead of the next x broadcast.
+- *Build 7777 (acclnode01, shared, 8 h 15 m after ≈ 6 h in the queue):* closed — kernel
+  **+0.039 / +0.008 ns**, DMA +0.003 / +0.009, **hbm_aclk −0.033 / +0.010** → programmed 443 MHz
+  under the 440 floor (seventh draw: +0.000, −0.021, −0.021, +0.055, −0.039, +0.001, −0.033);
+  every pre-link gate PASS (native, XO, writer and reader address gates, island names); XCLBIN
+  `6f5233234534037d…`, host `e686fc3c15e9794a…`.
+- *Card job 7778 failed in 3 s — the node, not the design:* Slurm placed it on **harrier**, whose
+  `libstdc++` lacks `GLIBCXX_3.4.30`, which a `host.exe` built on acclnode01 requires (the Iter81
+  production host, built on acclnode03, needs only 3.4.26 and ran on harrier). The afterany dump
+  7779 failed the same way. Resubmitted on a matching node (`--exclude=harrier`): card **8104**,
+  dump **8105**. Flow fix: `run_hw_sbatch.sh` gains `ONCARD_EXCLUDE` (default `harrier`;
+  `ONCARD_EXCLUDE=` lifts it) so the card job is placed where the build node's toolchain exists.
+
+**Result (on-card, 2026-10-10): retained — −3.6 % cycles, as hypothesized.** Card job 8104
+(acclnode01): exact 8- and 64-token trajectories, CUDA vector gate NRMSE 0.004663 / worst step
+0.011908 / zero argmax mismatches (identical), **kernel 8.889 ms median, TPOT 8.979** (mean 8.911
+/ 9.007) against Iter83's 9.218 / 9.304 on the same card. Probe (job 8105, 242,424 records, counts
+exact): token **1,777,102 cycles** (8.886 ms) vs Iter83's 1,844,236: **−67,134 (−3.6 %)**, the
+predicted ≈ −69K. Control-side evidence of the mechanism: the QKVG control region **22,381 →
+19,593** (−2,788 per layer = 16,384 beats at 0.839 vs 0.985 beats/cycle); the final collector's
+wait on SLR2's words (source 3) **9,917 → 96** — SLR2 is no longer the slow source, and its
+source-0 "wait" (12,532 = 32 groups × 384) is now the full-rate stream pace; o_proj / GU / down
+/ LM-head regions unchanged (4,623 / 23,537 / 11,904 / 67,794); serial work unchanged (276,131
+outside the control regions). Non-QKVG SLR2 regions unchanged (5,970 / 24,490 / 13,992 /
+66,568).
+
+*Instrument defect found in this build (not a design defect):* in QKVG calls the SLR2 kernel's
+probe counter starts late — its records put the x arrival, the prefetch and all four weight
+loops at cycles 0–1 and the region's "length" at 4,232 (= the islands' last head + the deferred
+write-back after the counter's start), so the SLR2 QKVG stamps and the cross-kernel alignment
+(Δ = +8,310 "link latency" 8,250) are unusable for this build; the non-QKVG calls' stamps are
+intact (link latency 1.0 on every one). The counter's start is gated by an HLS start-propagation
+token, and the new reader → writer dependency changed which process pushes it (under
+investigation in the synthesized RTL; the Iter83 build's counter started at the region start).
+The design evidence does not depend on it: the card gates, the token and the control-side
+stamps carry the result.
+
+**Verdict: retained** (on-card, same card as the reference; not promoted). Resources (csynth)
+unchanged; routed: kernel +0.039 ns, hbm_aclk −0.033 → 443 MHz.

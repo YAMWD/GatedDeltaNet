@@ -58,7 +58,10 @@ stale was wrong.
     processes `gdn_island_prep` / `gdn_island_read` / `gdn_island_update` with an 8,192-word URAM replay FIFO,
     non-blocking reads of the full-window state queues, the update products bound `maxdsp latency=4` and the
     delta loop `II=4 style=frp` — and the state readers `gemv32_mm2s_with_state_p<28..31>` prefetch the layer's
-    4,096 state beats before the call's 16,384 weight beats. The monolith keeps `gdn_recurrent_attention_island`
+    4,096 state beats before the call's 16,384 weight beats; **Iter84:** each state writer drains its 4,096-deep
+    URAM queue only after a one-token `wr_go` stream from its reader's weight loop (the write-back no longer shares
+    ports 28–31 with the weight stream). `slr2_region_cosim/` is the one-call RTL cosim of that region (deadlock
+    detector + bit-exact C/RTL compare) to run before any link that changes its process graph. The monolith keeps `gdn_recurrent_attention_island`
     and `gemv32_mm2s_with_state`. `-DGDN_CALL_PROBE=1` (`VPP_DEFINES="-D GDN_CALL_PROBE=1"
     HOST_DEFINES=-DGDN_CALL_PROBE=1 make run_hw`) adds the Iter82 dual-kernel call probe: data-dependent event
     stamps (a tag byte of the beat they mark, so the scheduler cannot hoist them — `check_stamp_schedule.py`

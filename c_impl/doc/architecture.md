@@ -580,8 +580,12 @@ the LM head 3.7K. The islands read a head in 1,622 cycles and update it in
 for Q/K/V — they are not the pacer; the convolution actor takes ≈ 600 cycles
 per head; the state prefetch is done at 4.3K of the 11.1K pre-QKVG wait and is
 hidden. The levers, in measured order: the serial work (packed aux image and
-fused tiny GEMV, residual/SOS, per-head output norm, loader tails), deferring
-the state write-back until after the weight loop (−78.8K), the islands' last
+fused tiny GEMV, residual/SOS, per-head output norm, loader tails — Iter83
+took the first two: −209.7K), deferring the state write-back until after the
+weight loop (**Iter84, done: each state writer drains its 4,096-deep URAM queue
+only after a one-token `wr_go` from its reader's weight loop; measured
+−67.1K, the ports back at 0.985 beats/cycle and the collector's wait on SLR2
+gone**), the islands' last
 head, and the per-call fill/drain; see `optimization_log.md`, Iter82. The
 monolith keeps the original island and reader
 (`gdn_recurrent_attention_island`, `gemv32_mm2s_with_state`) for A/B.
