@@ -826,8 +826,8 @@ public:
         const size_t state_stripe_bytes =
             static_cast<size_t>(GDN_RECURRENT_STATE_STRIPE_BF16_BEATS) *
             sizeof(Beat512);
-        const size_t aux_floats = gdn_aux_weight_floats(&model.config);
-        const size_t aux_bytes = aux_floats * sizeof(float);
+        const size_t aux_beats = gdn_aux_image_beats(&model.config);
+        const size_t aux_bytes = aux_beats * sizeof(Beat512);
         // step 4 Stage B arg order: 0=aux_weights, 1=workspace, 2..33=weight_mm0..31.
         weight_bos_.reserve(GEMV_CHANNELS);
         for (int c = 0; c < GEMV_CHANNELS; ++c) {
@@ -909,8 +909,11 @@ public:
                 sync_bo_chunked(weight_bos_[c], XCL_BO_SYNC_BO_TO_DEVICE,
                                 shard_bytes, 0);
             }
-            std::vector<float> aux(aux_floats);
-            gdn_build_aux_weights(model.weight_data.data(), &model.config, aux.data());
+            std::vector<Beat512> aux(aux_beats);
+            gdn_build_aux_image(model.weight_data.data(), &model.config, aux.data());
+            if (gdn_validate_aux_image(aux.data(), model.weight_data.data(),
+                                       &model.config) != 0)
+                throw std::runtime_error("packed aux-weight image failed validation");
             aux_weight_bo_.write(aux.data(), aux_bytes, 0);
             sync_bo_chunked(aux_weight_bo_, XCL_BO_SYNC_BO_TO_DEVICE, aux_bytes, 0);
         }

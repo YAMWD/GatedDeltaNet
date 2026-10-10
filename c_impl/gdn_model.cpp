@@ -149,11 +149,25 @@ static hls::stream<Beat512> gdn_probe_null_beats("gdn_probe_null_beats");
 #define GDN_CONV         4
 #define GDN_VOCAB    32000
 #define GDN_NORM_EPS  1e-6f       /* .gdnw header 0x358637BD, bit-exact as 1e-6f */
-/* Compile-time form of gdn_aux_layer_stride() for the hardcoded shape; must equal
- * H + 2*nh + 2*nh*H + 3*H*cs + hd + H exactly (see gdn_aux_layer_stride). */
-#define GDN_AUX_LAYER_STRIDE ((size_t)GDN_HIDDEN + 2*(size_t)GDN_HEADS \
-    + 2*(size_t)GDN_HEADS*GDN_HIDDEN + 3*(size_t)GDN_HIDDEN*GDN_CONV \
-    + GDN_HEAD_DIM + GDN_HIDDEN)
+/* Iter83: the packed aux-weight image, in 512-bit beats. Per layer:
+ * attn_norm (BF16 lanes), one FP32 beat of a_log[8] | dt_bias[8], o_norm,
+ * mlp_norm, the a/b projections (beat j*16 + c: row c -- a rows 0..7, b rows
+ * 8..15 -- columns 32j..32j+31) and the q/k/v conv kernels in blob order
+ * (channel-major, the four taps contiguous: 8 channels per beat); the final
+ * norm after the last layer. gdn_aux_image_layer_beats() must equal
+ * GDN_AUXB_LAYER_STRIDE for the compiled shape (the validator checks it). */
+#define GDN_AUXB_ATTN_NORM    0
+#define GDN_AUXB_SCALARS      (GDN_HIDDEN / 32)                             /* 64 */
+#define GDN_AUXB_O_NORM       (GDN_AUXB_SCALARS + 1)                        /* 65 */
+#define GDN_AUXB_MLP_NORM     (GDN_AUXB_O_NORM + GDN_HEAD_DIM / 32)         /* 73 */
+#define GDN_AUXB_AB           (GDN_AUXB_MLP_NORM + GDN_HIDDEN / 32)         /* 137 */
+#define GDN_AUXB_CONV_KIND    ((GDN_HIDDEN * GDN_CONV) / 32)                /* 256 */
+#define GDN_AUXB_CONV         (GDN_AUXB_AB + (2 * GDN_HEADS * GDN_HIDDEN) / 32) /* 1161 */
+#define GDN_AUXB_LAYER_STRIDE (GDN_AUXB_CONV + 3 * GDN_AUXB_CONV_KIND)      /* 1929 */
+#define GDN_AUXB_TOTAL        (GDN_LAYERS * GDN_AUXB_LAYER_STRIDE + GDN_HIDDEN / 32) /* 46360 */
+static_assert(2 * GDN_HEADS == 16, "the a/b image packs 16 output rows per column pair");
+static_assert(8 * GDN_CONV == 32, "one conv beat holds 8 channels x 4 taps");
+static_assert(GDN_AUXB_LAYER_STRIDE == 1929 && GDN_AUXB_TOTAL == 46360, "aux image size");
 /* GEMV_CHANNELS lives in gdn_model.h (shared by the kernel and the host shard
  * builder / run-state); do not redefine it here. */
 
@@ -910,48 +924,155 @@ int gdn_pack_conv_tails_bf16(Beat512 *workspace_head_buffer,
 /* Compact non-GEMV weights. The host supplies the selected embedding row in x;
  * all large projection weights and lm_head already live in the 32 GEMV shards.
  * Keeping only these small tensors avoids a second 5.6 GB weight copy. */
-static size_t gdn_aux_layer_stride(const GDNWeightHeader *config) {
-    size_t H = config->hidden_size;
-    size_t nh = config->num_heads;
-    size_t hd = config->head_dim;
-    size_t cs = config->conv_size;
-    return H + 2 * nh + 2 * nh * H + 3 * H * cs + hd + H;
+static size_t gdn_aux_image_layer_beats(const GDNWeightHeader *config) {
+    const size_t H = config->hidden_size, nh = config->num_heads;
+    const size_t hd = config->head_dim, cs = config->conv_size;
+    return H / 32 + 1 + hd / 32 + H / 32 + (2 * nh * H) / 32 + (3 * H * cs) / 32;
 }
 
-size_t gdn_aux_weight_floats(const GDNWeightHeader *config) {
-    return (size_t)config->num_layers * gdn_aux_layer_stride(config) +
-           config->hidden_size;
+size_t gdn_aux_image_beats(const GDNWeightHeader *config) {
+    return (size_t)config->num_layers * gdn_aux_image_layer_beats(config) +
+           config->hidden_size / 32;
 }
 
-void gdn_build_aux_weights(const float *wd, const GDNWeightHeader *config,
-                           float *aux) {
-    size_t H = config->hidden_size;
-    size_t nh = config->num_heads;
-    size_t hd = config->head_dim;
-    size_t cs = config->conv_size;
-    size_t dst = 0;
+/* The blob's per-layer order (gdn_assign_weight_views): attn_norm H, a_log nh,
+ * dt_bias nh, q/k/v_proj 3*H*H, a_proj nh*H, b_proj nh*H, q/k/v_conv 3*H*cs,
+ * g_proj H*H, o_norm hd, o_proj H*H, mlp_norm H. */
+typedef struct {
+    const float *attn_norm, *a_log, *dt_bias, *a_proj, *b_proj;
+    const float *q_conv, *k_conv, *v_conv, *o_norm, *mlp_norm;
+} GDNAuxLayerSources;
 
+static GDNAuxLayerSources gdn_aux_layer_sources(const float *wd,
+                                                const GDNWeightHeader *config,
+                                                uint32_t layer) {
+    const size_t H = config->hidden_size, nh = config->num_heads;
+    const size_t hd = config->head_dim, cs = config->conv_size;
+    const float *base = wd + gdn_layer_weight_offset(config, layer);
+    GDNAuxLayerSources s;
+    s.attn_norm = base;
+    s.a_log = s.attn_norm + H;
+    s.dt_bias = s.a_log + nh;
+    s.a_proj = s.dt_bias + nh + 3 * H * H;
+    s.b_proj = s.a_proj + nh * H;
+    s.q_conv = s.b_proj + nh * H;
+    s.k_conv = s.q_conv + H * cs;
+    s.v_conv = s.k_conv + H * cs;
+    s.o_norm = s.v_conv + H * cs + H * H;
+    s.mlp_norm = s.o_norm + hd + H * H;
+    return s;
+}
+
+static void gdn_pack_bf16_lanes(Beat512 *dst, const float *src, size_t count) {
+    for (size_t i = 0; i < count; ++i)
+        set_bf16_lane(dst[i / 32], (uint32_t)(i % 32), gdn_exact_bf16_bits(src[i]));
+}
+
+void gdn_build_aux_image(const float *wd, const GDNWeightHeader *config,
+                         Beat512 *image) {
+    const size_t H = config->hidden_size, nh = config->num_heads;
+    const size_t hd = config->head_dim, cs = config->conv_size;
+    const size_t per_layer = gdn_aux_image_layer_beats(config);
+    const size_t off_scal = H / 32, off_onorm = off_scal + 1;
+    const size_t off_mlp = off_onorm + hd / 32, off_ab = off_mlp + H / 32;
+    const size_t off_conv = off_ab + (2 * nh * H) / 32, conv_beats = (H * cs) / 32;
+    for (size_t b = 0; b < gdn_aux_image_beats(config); ++b) image[b] = 0;
     for (uint32_t layer = 0; layer < config->num_layers; ++layer) {
-        size_t src = gdn_layer_weight_offset(config, layer);
-        size_t count = H + 2 * nh;
-        memcpy(aux + dst, wd + src, count * sizeof(float));
-        dst += count;
-        src += count + 3 * H * H;
-
-        count = 2 * nh * H + 3 * H * cs;
-        memcpy(aux + dst, wd + src, count * sizeof(float));
-        dst += count;
-        src += count + H * H;
-
-        memcpy(aux + dst, wd + src, hd * sizeof(float));
-        dst += hd;
-        src += hd + H * H;
-
-        memcpy(aux + dst, wd + src, H * sizeof(float));
-        dst += H;
+        const GDNAuxLayerSources s = gdn_aux_layer_sources(wd, config, layer);
+        Beat512 *L = image + (size_t)layer * per_layer;
+        gdn_pack_bf16_lanes(L, s.attn_norm, H);
+        for (size_t h = 0; h < nh; ++h) {
+            set_fp32_lane(L[off_scal], (uint32_t)h, s.a_log[h]);
+            set_fp32_lane(L[off_scal], (uint32_t)(nh + h), s.dt_bias[h]);
+        }
+        gdn_pack_bf16_lanes(L + off_onorm, s.o_norm, hd);
+        gdn_pack_bf16_lanes(L + off_mlp, s.mlp_norm, H);
+        for (size_t cidx = 0; cidx < 2 * nh; ++cidx) {
+            const float *row = cidx < nh ? s.a_proj + cidx * H : s.b_proj + (cidx - nh) * H;
+            for (size_t j = 0; j < H / 32; ++j)
+                for (uint32_t lane = 0; lane < 32; ++lane)
+                    set_bf16_lane(L[off_ab + j * (2 * nh) + cidx], lane,
+                                  gdn_exact_bf16_bits(row[j * 32 + lane]));
+        }
+        gdn_pack_bf16_lanes(L + off_conv, s.q_conv, H * cs);
+        gdn_pack_bf16_lanes(L + off_conv + conv_beats, s.k_conv, H * cs);
+        gdn_pack_bf16_lanes(L + off_conv + 2 * conv_beats, s.v_conv, H * cs);
     }
+    gdn_pack_bf16_lanes(image + (size_t)config->num_layers * per_layer,
+                        wd + gdn_final_norm_offset(config), H);
+}
 
-    memcpy(aux + dst, wd + gdn_final_norm_offset(config), H * sizeof(float));
+/* Lane-exact check of the image against the blob with its own walk: every
+ * BF16 lane must be the upper half of a BF16-exact source, every FP32 scalar
+ * lane bit-identical. */
+static int gdn_aux_check_bf16(const Beat512 *beats, const float *src, size_t count,
+                              const char *what, uint32_t layer) {
+    for (size_t i = 0; i < count; ++i) {
+        GDNFloatBits converted;
+        converted.value = src[i];
+        const uint16_t expected = (uint16_t)(converted.bits >> 16);
+        const uint16_t actual = (uint16_t)get_bf16_lane(beats[i / 32], (uint32_t)(i % 32));
+        if ((converted.bits & 0xffffu) != 0 || actual != expected) {
+            fprintf(stderr, "gdn: aux image %s mismatch layer=%u index=%zu "
+                            "source=0x%08x lane=0x%04x\n",
+                    what, layer, i, converted.bits, actual);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int gdn_validate_aux_image(const Beat512 *image, const float *wd,
+                           const GDNWeightHeader *config) {
+    const size_t H = config->hidden_size, nh = config->num_heads;
+    const size_t hd = config->head_dim, cs = config->conv_size;
+    const size_t per_layer = gdn_aux_image_layer_beats(config);
+    if (per_layer != (size_t)GDN_AUXB_LAYER_STRIDE || H % 32 != 0 || hd % 32 != 0 ||
+        (H * cs) % 32 != 0 || 2 * nh > 16 || 2 * nh != 16) {
+        fprintf(stderr, "gdn: aux image layout %zu beats/layer != compiled %d\n",
+                per_layer, (int)GDN_AUXB_LAYER_STRIDE);
+        return -1;
+    }
+    for (uint32_t layer = 0; layer < config->num_layers; ++layer) {
+        const GDNAuxLayerSources s = gdn_aux_layer_sources(wd, config, layer);
+        const Beat512 *L = image + (size_t)layer * per_layer;
+        if (gdn_aux_check_bf16(L + GDN_AUXB_ATTN_NORM, s.attn_norm, H, "attn_norm", layer) != 0 ||
+            gdn_aux_check_bf16(L + GDN_AUXB_O_NORM, s.o_norm, hd, "o_norm", layer) != 0 ||
+            gdn_aux_check_bf16(L + GDN_AUXB_MLP_NORM, s.mlp_norm, H, "mlp_norm", layer) != 0 ||
+            gdn_aux_check_bf16(L + GDN_AUXB_CONV, s.q_conv, H * cs, "q_conv", layer) != 0 ||
+            gdn_aux_check_bf16(L + GDN_AUXB_CONV + GDN_AUXB_CONV_KIND, s.k_conv, H * cs, "k_conv", layer) != 0 ||
+            gdn_aux_check_bf16(L + GDN_AUXB_CONV + 2 * GDN_AUXB_CONV_KIND, s.v_conv, H * cs, "v_conv", layer) != 0)
+            return -1;
+        for (size_t h = 0; h < nh; ++h) {
+            GDNFloatBits a, d, la, ld;
+            a.value = s.a_log[h]; d.value = s.dt_bias[h];
+            la.value = get_fp32_lane(L[GDN_AUXB_SCALARS], (uint32_t)h);
+            ld.value = get_fp32_lane(L[GDN_AUXB_SCALARS], (uint32_t)(nh + h));
+            if (a.bits != la.bits || d.bits != ld.bits) {
+                fprintf(stderr, "gdn: aux image scalar mismatch layer=%u head=%zu\n", layer, h);
+                return -1;
+            }
+        }
+        /* a/b: value (row r, column k) of a at beat (k/32)*16 + r lane k%32; b at row 8 + r */
+        for (size_t r = 0; r < nh; ++r) {
+            for (size_t k = 0; k < H; ++k) {
+                for (int which = 0; which < 2; ++which) {
+                    const float v = which == 0 ? s.a_proj[r * H + k] : s.b_proj[r * H + k];
+                    GDNFloatBits converted; converted.value = v;
+                    const Beat512 beat = L[GDN_AUXB_AB + (k / 32) * 16 + (which == 0 ? r : nh + r)];
+                    const uint16_t actual = (uint16_t)get_bf16_lane(beat, (uint32_t)(k % 32));
+                    if ((converted.bits & 0xffffu) != 0 || actual != (uint16_t)(converted.bits >> 16)) {
+                        fprintf(stderr, "gdn: aux image %s_proj mismatch layer=%u row=%zu col=%zu\n",
+                                which == 0 ? "a" : "b", layer, r, k);
+                        return -1;
+                    }
+                }
+            }
+        }
+    }
+    return gdn_aux_check_bf16(image + (size_t)config->num_layers * per_layer,
+                              wd + gdn_final_norm_offset(config), H, "final_norm",
+                              config->num_layers);
 }
 
 static int gdn_validate_config(const GDNWeightHeader *config) {
@@ -1109,11 +1230,6 @@ void gdn_model_free(GDNModel *model) {
     memset(model, 0, sizeof(*model));
 }
 
-static int gdn_alloc_run_buffer(float **buffer, size_t count) {
-    *buffer = (float *)gdn_malloc_bytes(count * sizeof(float));
-    return (*buffer == NULL) ? -1 : 0;
-}
-
 static int gdn_alloc_beat_buffer(Beat512 **buffer, size_t count) {
     void *allocation = NULL;
     if (posix_memalign(&allocation, 64, count * sizeof(Beat512)) != 0)
@@ -1161,9 +1277,14 @@ int gdn_run_state_init(GDNRunState *state, const GDNModel *model, uint32_t max_t
         }
         gdn_build_weight_shards(model->weight_data, &model->config, state->weight_shards);
     }
-    if (gdn_alloc_run_buffer(&state->aux_weights,
-            gdn_aux_weight_floats(&model->config)) != 0) return -1;
-    gdn_build_aux_weights(model->weight_data, &model->config, state->aux_weights);
+    if (gdn_alloc_beat_buffer(&state->aux_weights,
+            gdn_aux_image_beats(&model->config)) != 0) return -1;
+    gdn_build_aux_image(model->weight_data, &model->config, state->aux_weights);
+    if (gdn_validate_aux_image(state->aux_weights, model->weight_data,
+                               &model->config) != 0) {
+        gdn_print_error("packed aux-weight image failed validation");
+        return -1;
+    }
 
     return 0;
 }
@@ -1269,7 +1390,7 @@ static float gdn_tree_reduce_256(const float arr[256]) {
 static void gdn_rmsnorm_rows_bf16(
     Beat512 *out,
     const Beat512 *in,
-    const float *weight,
+    const Beat512 *weight,
     uint32_t num_rows,
     uint32_t num_cols,
     float eps
@@ -1283,10 +1404,16 @@ static void gdn_rmsnorm_rows_bf16(
      * row); partitioning follows the independently tuned norm lane count. */
     float w_loc[2048];
     #pragma HLS array_partition variable=w_loc cyclic factor=GDN_NORM_LANES
-    rms_load_w: for (uint32_t c = 0; c < num_cols; ++c) {
-    #pragma HLS loop_tripcount min=2048 max=2048
-    #pragma HLS pipeline II=1
-        w_loc[c] = weight[c];
+    /* Iter83: 64 packed BF16 beats in one burst (was 2,048 scalar FP32 reads
+     * over mm0); the widened lane is the same FP32 value. */
+    rms_load_w: for (uint32_t cp = 0; cp < col_packs; ++cp) {
+    #pragma HLS loop_tripcount min=64 max=64
+    #pragma HLS pipeline II=4
+        const Beat512 wb = weight[cp];
+    rms_load_w_lane: for (uint32_t lane = 0; lane < 32; ++lane) {
+        #pragma HLS unroll
+            w_loc[cp * 32u + lane] = bf16_to_fp32(get_bf16_lane(wb, lane));
+        }
     }
 
     rmsnorm_row: for (uint32_t row = 0; row < num_rows; ++row) {
@@ -1343,151 +1470,65 @@ static void gdn_rmsnorm_rows_bf16(
 }
 
 
-/* Compile-time bounds for gdn_gemv_tiny's on-chip buffers (the a/b gate
- * projections: out_dim = num_heads = 8, in_dim = hidden = 2048). */
-#define GDN_GEMV_TINY_OUT_MAX 8
-#define GDN_GEMV_TINY_IN_MAX  2048
-#define GDN_GEMV_TINY_OUT_LANES 2
-
-static void gdn_gemv_tiny_mm2s(
-    const float *weights,
-    hls::stream<Beat512> &weight_stream,
-    uint32_t in_dim,
-    uint32_t out_dim
-) {
-#pragma HLS inline off
-    const Beat512 *weight_words = reinterpret_cast<const Beat512 *>(weights);
-    const uint32_t total_words = out_dim * (in_dim / 16);
-gvt_mm2s: for (uint32_t i = 0; i < total_words; ++i) {
-#pragma HLS loop_tripcount min=1024 max=1024
-#pragma HLS pipeline II=1
-        weight_stream.write(weight_words[i]);
-    }
+/* The fixed 4-level 16-lane tree of the retired gdn_gemv_tiny_compute, so
+ * every partial sum is formed in the same order. */
+static inline float gdn_tree16(const float p[32], uint32_t base) {
+#pragma HLS inline
+    const float s2_0 = p[base + 0]  + p[base + 1],  s2_1 = p[base + 2]  + p[base + 3];
+    const float s2_2 = p[base + 4]  + p[base + 5],  s2_3 = p[base + 6]  + p[base + 7];
+    const float s2_4 = p[base + 8]  + p[base + 9],  s2_5 = p[base + 10] + p[base + 11];
+    const float s2_6 = p[base + 12] + p[base + 13], s2_7 = p[base + 14] + p[base + 15];
+    const float s4_0 = s2_0 + s2_1, s4_1 = s2_2 + s2_3;
+    const float s4_2 = s2_4 + s2_5, s4_3 = s2_6 + s2_7;
+    const float s8_0 = s4_0 + s4_1, s8_1 = s4_2 + s4_3;
+    return s8_0 + s8_1;
 }
 
-static void gdn_gemv_tiny_compute(
-    float *out,
-    const Beat512 *in,
-    hls::stream<Beat512> &weight_stream,
-    uint32_t in_dim,
-    uint32_t out_dim
-) {
-    /* Decode-shape GEMV for the tiny a/b gate projections
-     * (in_dim=hidden=2048, out_dim=num_heads=8). Three buffered steps:
-     *   1. load the single activation row into resident a_loc (read once);
-     *   2. preload all out_dim weight rows to BRAM as one CONTIGUOUS burst (a/b are
-     *      [out_dim][in_dim] row-major) — avoids the per-(c,kc) strided HBM reads;
-     *   3. one k-pass computing two output rows at a time, each with its own
-     *      accumulator + the SAME balanced-tree-per-16-chunk sequential reduction.
-     * Bit-exact to the prior per-output reduction (each acc[c] keeps the chunk
-     * order); removes the 8x per-output pipeline restart + redundant activation
-     * reads that made the prior form ~0.18 ms/call. */
-    uint32_t k_packs = in_dim / 16;   /* FP32 auxiliary-weight packs */
-    uint32_t activation_packs = in_dim / 32;
-    uint32_t c, kc, i;
-
-    /* (1) resident activation — read the token's in[] once, reused by every output */
-    float a_loc[GDN_GEMV_TINY_IN_MAX];
-    #pragma HLS array_partition variable=a_loc cyclic factor=16
-    gvt_la: for (kc = 0; kc < activation_packs; ++kc) {
-    #pragma HLS loop_tripcount min=64 max=64
-        Beat512 a = in[kc];
-        Bf16Half a_half[2];
-        #pragma HLS array_partition variable=a_half complete
-        split_bf16_beat(a, a_half);
-    gvt_la_half: for (uint32_t half = 0; half < 2; ++half) {
-        #pragma HLS pipeline II=1
-            const Bf16Half current = a_half[half];
-        gvt_la_i: for (i = 0; i < 16; ++i) {
-        #pragma HLS unroll
-                a_loc[kc * 32 + half * 16 + i] = bf16_to_fp32(
-                    get_bf16_half_lane(current, i));
-            }
-        }
-    }
-
-    /* (2) preload weights to BRAM — one contiguous burst over [out_dim][in_dim] */
-    float w_loc[GDN_GEMV_TINY_OUT_MAX][GDN_GEMV_TINY_IN_MAX];
-    #pragma HLS array_partition variable=w_loc dim=1 cyclic factor=GDN_GEMV_TINY_OUT_LANES
-    #pragma HLS array_partition variable=w_loc dim=2 cyclic factor=16
-    gvt_lw_c: for (c = 0; c < out_dim; ++c) {
-    #pragma HLS loop_tripcount min=8 max=8
-        gvt_lw_kc: for (kc = 0; kc < k_packs; ++kc) {
-        #pragma HLS loop_tripcount min=128 max=128
-        #pragma HLS pipeline II=1
-            Beat512 w = weight_stream.read();
-            gvt_lw_i: for (i = 0; i < 16; ++i) {
-            #pragma HLS unroll
-                w_loc[c][kc * 16 + i] = get_fp32_lane(w, i);
-            }
-        }
-    }
-
-    /* (3) one k-pass with two physical output lanes. Keep each output's kc
-     * accumulation order unchanged, but pipeline groups of independent outputs
-     * instead of pipelining gvt_k. Pipelining gvt_k made Vitis completely
-     * unroll gvt_c (all 8 outputs), ignoring its partial-unroll factor. */
-    float acc[GDN_GEMV_TINY_OUT_MAX];
-    #pragma HLS array_partition variable=acc cyclic factor=GDN_GEMV_TINY_OUT_LANES
-    gvt_init: for (c = 0; c < out_dim; ++c) {
-    #pragma HLS unroll factor=GDN_GEMV_TINY_OUT_LANES
+/* Iter83 (A2): both tiny gate projections (a and b, 8 outputs each) in one
+ * II=1 loop over (32-column pair j, output c) that reads one packed weight
+ * beat per trip in image order (beat j*16 + c, a burst of 1,024 over mm0),
+ * the activation beat x[j] from BRAM, forms the 32 FP32 products of BF16
+ * operands, reduces each 16-lane half with the fixed tree and accumulates
+ * acc[c] = (acc[c] + T(2j)) + T(2j+1) -- the retired per-output sequence
+ * (chunk 2j, then 2j+1, from 0.0f), so every output is bit-identical. Each
+ * accumulator is revisited every 16 trips, which covers the two dependent
+ * adds (dependence distance 16). Replaces 2 x (1,098 scalar weight reads +
+ * 2,092 compute cycles) with ~1,100 cycles for both. */
+static void gdn_gemv_tiny_ab(float a_out[GDN_HEADS], float b_out[GDN_HEADS],
+                             const Beat512 *in, const Beat512 *weights) {
+#pragma HLS inline off
+    float acc[2 * GDN_HEADS];
+#pragma HLS array_partition variable=acc complete
+gvt_ab_init: for (uint32_t c = 0; c < 2 * GDN_HEADS; ++c) {
+#pragma HLS unroll
         acc[c] = 0.0f;
     }
-    gvt_k: for (kc = 0; kc < k_packs; ++kc) {
-    #pragma HLS loop_tripcount min=128 max=128
-        gvt_c_group: for (uint32_t cg = 0;
-                          cg < GDN_GEMV_TINY_OUT_MAX;
-                          cg += GDN_GEMV_TINY_OUT_LANES) {
-        #pragma HLS loop_tripcount min=4 max=4
-        #pragma HLS pipeline II=2
-            gvt_c_lane: for (uint32_t co = 0;
-                             co < GDN_GEMV_TINY_OUT_LANES; ++co) {
-            #pragma HLS unroll
-                uint32_t c_lane = cg + co;
-                if (c_lane < out_dim) {
-                    float p[16];
-                    #pragma HLS array_partition variable=p complete
-                    gvt_mul: for (i = 0; i < 16; ++i) {
-                    #pragma HLS unroll
-                        p[i] = a_loc[kc * 16 + i]
-                             * w_loc[c_lane][kc * 16 + i];
-                    }
-                    /* Same balanced 4-level tree as before. */
-                    float s2_0 = p[0]  + p[1],  s2_1 = p[2]  + p[3];
-                    float s2_2 = p[4]  + p[5],  s2_3 = p[6]  + p[7];
-                    float s2_4 = p[8]  + p[9],  s2_5 = p[10] + p[11];
-                    float s2_6 = p[12] + p[13], s2_7 = p[14] + p[15];
-                    float s4_0 = s2_0 + s2_1, s4_1 = s2_2 + s2_3;
-                    float s4_2 = s2_4 + s2_5, s4_3 = s2_6 + s2_7;
-                    float s8_0 = s4_0 + s4_1, s8_1 = s4_2 + s4_3;
-                    acc[c_lane] += s8_0 + s8_1;
-                }
-            }
+gvt_ab: for (uint32_t i = 0; i < (GDN_HIDDEN / 32) * (2 * GDN_HEADS); ++i) {
+#pragma HLS loop_tripcount min=1024 max=1024
+#pragma HLS pipeline II=1
+#pragma HLS dependence variable=acc type=inter direction=RAW distance=16 dependent=true
+        const uint32_t j = i >> 4;
+        const uint32_t c = i & 15u;
+        const Beat512 xb = in[j];
+        const Beat512 wb = weights[i];
+        float p[32];
+#pragma HLS array_partition variable=p complete
+    gvt_ab_mul: for (uint32_t lane = 0; lane < 32; ++lane) {
+#pragma HLS unroll
+            p[lane] = bf16_to_fp32(get_bf16_lane(xb, lane)) *
+                      bf16_to_fp32(get_bf16_lane(wb, lane));
         }
+        const float t0 = gdn_tree16(p, 0);
+        const float t1 = gdn_tree16(p, 16);
+        acc[c] = (acc[c] + t0) + t1;
     }
-    gvt_st: for (c = 0; c < out_dim; ++c) {
-    #pragma HLS unroll factor=GDN_GEMV_TINY_OUT_LANES
-        /* Tiny-GEMV is an operator boundary in the all-BF16 contract. Keep the
-         * scalar interface for the recurrent actor, but store a BF16-exact
-         * value in that FP32 slot. */
-        out[c] = bf16_to_fp32(fp32_to_bf16_rne(acc[c]));
+gvt_ab_store: for (uint32_t c = 0; c < GDN_HEADS; ++c) {
+#pragma HLS unroll
+        /* Tiny-GEMV is an operator boundary in the all-BF16 contract: a
+         * BF16-exact value in the FP32 slot the recurrent actor reads. */
+        a_out[c] = bf16_to_fp32(fp32_to_bf16_rne(acc[c]));
+        b_out[c] = bf16_to_fp32(fp32_to_bf16_rne(acc[GDN_HEADS + c]));
     }
-}
-
-static void gdn_gemv_tiny(
-    float *out,
-    const Beat512 *in,
-    const float *weights,
-    uint32_t in_dim,
-    uint32_t out_dim
-) {
-#pragma HLS inline off
-    hls::stream<Beat512> weight_stream;
-#pragma HLS stream variable=weight_stream depth=64
-#pragma HLS bind_storage variable=weight_stream type=fifo impl=bram
-#pragma HLS dataflow disable_start_propagation
-    gdn_gemv_tiny_mm2s(weights, weight_stream, in_dim, out_dim);
-    gdn_gemv_tiny_compute(out, in, weight_stream, in_dim, out_dim);
 }
 
 /* No dispatch wrapper — gdn_forward calls gdn_gemv directly for the large
@@ -1498,7 +1539,7 @@ static void gdn_gemv_tiny(
 static void gdn_depthwise_conv_silu_head_kind(
     hls::stream<Beat512> &conv_out,
     const Beat512 head_value[4][GDN_HEAD_DIM / 32],
-    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 32],
     const Beat512 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32],
     uint32_t head,
     uint32_t kind GDN_PROBE_TAG_PARAM
@@ -1524,19 +1565,21 @@ static void gdn_depthwise_conv_silu_head_kind(
     const uint32_t head_packs = GDN_HEAD_DIM / 32;
     const uint32_t hidden_packs = GDN_HIDDEN / 32;
     const uint32_t weight_packs_per_head =
-        (GDN_HEAD_DIM * GDN_CONV) / 16;
+        (GDN_HEAD_DIM * GDN_CONV) / 32;
 
+    /* Iter83: a beat holds 8 channels x 4 taps as BF16 (was 4 channels as
+     * FP32); two channels per w_loc bank per beat, so II=2 over 32 beats. */
 iter39_head_conv_load_w: for (uint32_t wb = 0;
                               wb < weight_packs_per_head; ++wb) {
-#pragma HLS loop_tripcount min=64 max=64
-#pragma HLS pipeline II=1
+#pragma HLS loop_tripcount min=32 max=32
+#pragma HLS pipeline II=2
         Beat512 wp = conv_weights[kind][head * weight_packs_per_head + wb];
-    iter39_head_conv_load_w_col: for (uint32_t col4 = 0; col4 < 4; ++col4) {
+    iter39_head_conv_load_w_col: for (uint32_t col8 = 0; col8 < 8; ++col8) {
 #pragma HLS unroll
         iter39_head_conv_load_w_k: for (uint32_t k = 0; k < GDN_CONV; ++k) {
 #pragma HLS unroll
-                w_loc[wb * 4 + col4][k] =
-                    get_fp32_lane(wp, col4 * GDN_CONV + k);
+                w_loc[wb * 8 + col8][k] = bf16_to_fp32(
+                    get_bf16_lane(wp, col8 * GDN_CONV + k));
             }
         }
     }
@@ -1625,28 +1668,29 @@ iter39_head_conv_compute: for (uint32_t p = 0; p < head_packs; ++p) {
  * persistent tails needed by the bounded head consumer. */
 static void gdn_read_qkvg_conv_context(
     hls::stream<Beat512> &context,
-    const float *q_weights,
-    const float *k_weights,
-    const float *v_weights,
+    const Beat512 *q_weights,
+    const Beat512 *k_weights,
+    const Beat512 *v_weights,
     const Beat512 *q_tail,
     const Beat512 *k_tail,
     const Beat512 *v_tail
 ) {
 #pragma HLS inline off
-    const Beat512 *q_weight_words = reinterpret_cast<const Beat512 *>(q_weights);
-    const Beat512 *k_weight_words = reinterpret_cast<const Beat512 *>(k_weights);
-    const Beat512 *v_weight_words = reinterpret_cast<const Beat512 *>(v_weights);
-qkvg_context_read_q_weight: for (uint32_t p = 0; p < 512; ++p) {
+    /* Iter83: the conv kernels are packed BF16 beats (256 per kind). */
+qkvg_context_read_q_weight: for (uint32_t p = 0; p < GDN_AUXB_CONV_KIND; ++p) {
+#pragma HLS loop_tripcount min=256 max=256
 #pragma HLS pipeline II=1
-        context.write(q_weight_words[p]);
+        context.write(q_weights[p]);
     }
-qkvg_context_read_k_weight: for (uint32_t p = 0; p < 512; ++p) {
+qkvg_context_read_k_weight: for (uint32_t p = 0; p < GDN_AUXB_CONV_KIND; ++p) {
+#pragma HLS loop_tripcount min=256 max=256
 #pragma HLS pipeline II=1
-        context.write(k_weight_words[p]);
+        context.write(k_weights[p]);
     }
-qkvg_context_read_v_weight: for (uint32_t p = 0; p < 512; ++p) {
+qkvg_context_read_v_weight: for (uint32_t p = 0; p < GDN_AUXB_CONV_KIND; ++p) {
+#pragma HLS loop_tripcount min=256 max=256
 #pragma HLS pipeline II=1
-        context.write(v_weight_words[p]);
+        context.write(v_weights[p]);
     }
 qkvg_context_read_q_tail: for (uint32_t p = 0; p < 192; ++p) {
 #pragma HLS pipeline II=1
@@ -1663,7 +1707,7 @@ qkvg_context_read_v_tail: for (uint32_t p = 0; p < 192; ++p) {
 }
 
 static void gdn_store_qkvg_conv_context_stream(
-    Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 32],
     Beat512 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32],
     hls::stream<Beat512> &context
 ) {
@@ -1672,20 +1716,20 @@ static void gdn_store_qkvg_conv_context_stream(
 #pragma HLS aggregate variable=conv_tails compact=bit
 
 iter39_context_q_weight: for (uint32_t p = 0;
-                              p < (GDN_HIDDEN * GDN_CONV) / 16; ++p) {
-#pragma HLS loop_tripcount min=512 max=512
+                              p < (GDN_HIDDEN * GDN_CONV) / 32; ++p) {
+#pragma HLS loop_tripcount min=256 max=256
 #pragma HLS pipeline II=1
         conv_weights[0][p] = context.read();
     }
 iter39_context_k_weight: for (uint32_t p = 0;
-                              p < (GDN_HIDDEN * GDN_CONV) / 16; ++p) {
-#pragma HLS loop_tripcount min=512 max=512
+                              p < (GDN_HIDDEN * GDN_CONV) / 32; ++p) {
+#pragma HLS loop_tripcount min=256 max=256
 #pragma HLS pipeline II=1
         conv_weights[1][p] = context.read();
     }
 iter39_context_v_weight: for (uint32_t p = 0;
-                              p < (GDN_HIDDEN * GDN_CONV) / 16; ++p) {
-#pragma HLS loop_tripcount min=512 max=512
+                              p < (GDN_HIDDEN * GDN_CONV) / 32; ++p) {
+#pragma HLS loop_tripcount min=256 max=256
 #pragma HLS pipeline II=1
         conv_weights[2][p] = context.read();
     }
@@ -1710,11 +1754,11 @@ iter39_context_v_tail: for (uint32_t p = 0;
 }
 
 static void gdn_load_qkvg_conv_context(
-    Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 32],
     Beat512 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32],
-    const float *q_weights,
-    const float *k_weights,
-    const float *v_weights,
+    const Beat512 *q_weights,
+    const Beat512 *k_weights,
+    const Beat512 *v_weights,
     const Beat512 *q_tail,
     const Beat512 *k_tail,
     const Beat512 *v_tail
@@ -1764,12 +1808,11 @@ iter39_context_store_v: for (uint32_t p = 0; p < tail_packs; ++p) {
 }
 
 static void gdn_read_recurrent_scalar_word(
-    const float *layer_a_log,
+    const Beat512 *layer_scalars,
     hls::stream<Beat512> &scalar_word
 ) {
 #pragma HLS inline off
-    const Beat512 *source = reinterpret_cast<const Beat512 *>(layer_a_log);
-    scalar_word.write(source[0]);
+    scalar_word.write(layer_scalars[0]);   /* FP32 lanes: a_log[0..7], dt_bias[0..7] */
 }
 
 static void gdn_store_recurrent_scalar_word(
@@ -1789,13 +1832,13 @@ recur_scalar_local_lane: for (uint32_t head = 0; head < GDN_HEADS; ++head) {
 static void gdn_load_recurrent_scalars(
     float a_log_storage[GDN_HEADS],
     float dt_bias_storage[GDN_HEADS],
-    const float *layer_a_log
+    const Beat512 *layer_scalars
 ) {
 #pragma HLS inline off
     hls::stream<Beat512> scalar_word;
 #pragma HLS stream variable=scalar_word depth=2
 #pragma HLS dataflow disable_start_propagation
-    gdn_read_recurrent_scalar_word(layer_a_log, scalar_word);
+    gdn_read_recurrent_scalar_word(layer_scalars, scalar_word);
     gdn_store_recurrent_scalar_word(scalar_word,
                                     a_log_storage, dt_bias_storage);
 }
@@ -3180,7 +3223,7 @@ static void gdn_output_norm_and_gate(
     Beat512 *out,
     const Beat512 *attn,
     const Beat512 *gate,
-    const float *weight,
+    const Beat512 *weight,
     uint32_t num_tokens,
     uint32_t num_heads,
     uint32_t head_dim,
@@ -3194,10 +3237,15 @@ static void gdn_output_norm_and_gate(
     float weight_loc[GDN_DV];
     #pragma HLS array_partition variable=weight_loc cyclic factor=GDN_NORM_LANES
     uint32_t windex;
-    onorm_load_w: for (windex = 0; windex < head_dim; ++windex) {
-    #pragma HLS loop_tripcount min=256 max=256
-    #pragma HLS pipeline II=1
-        weight_loc[windex] = weight[windex];
+    /* Iter83: eight packed BF16 beats (was 256 scalar FP32 reads over mm0). */
+    onorm_load_w: for (windex = 0; windex < head_dim / 32; ++windex) {
+    #pragma HLS loop_tripcount min=8 max=8
+    #pragma HLS pipeline II=4
+        const Beat512 wb = weight[windex];
+    onorm_load_w_lane: for (uint32_t lane = 0; lane < 32; ++lane) {
+        #pragma HLS unroll
+            weight_loc[windex * 32u + lane] = bf16_to_fp32(get_bf16_lane(wb, lane));
+        }
     }
 
     uint32_t token_index;
@@ -3440,7 +3488,7 @@ static void gdn_gemv(
     uint32_t in_dim, uint32_t out_dim,
     bool qkvg_recurrent_mode,
     Beat512 *attn_out, Beat512 *gate_out,
-    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 32],
     Beat512 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32],
     const float a[GDN_HEADS],
     const float b[GDN_HEADS],
@@ -3461,7 +3509,7 @@ static void gdn_gemv(
     weight_data_mm28, weight_data_mm29, weight_data_mm30, weight_data_mm31
 
 int gdn_forward(
-    const float *aux_weights,
+    const Beat512 *aux_weights,
     Beat512 *workspace,
     const Beat512 *weight_data_mm0,
     const Beat512 *weight_data_mm1,
@@ -3513,7 +3561,7 @@ int gdn_forward(
      * compact the design, pull cluster 5 back into SLR0 and use SLR2 less. The
      * whole margin between routing and refusal is ~22 K cells of SLR0
      * occupancy. See doc/optimization_log.md sec iter15. */
-    #pragma HLS interface m_axi port=aux_weights depth=2000000 offset=slave bundle=mem_weights_mm0 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=64 max_write_burst_length=64 num_write_outstanding=64
+    #pragma HLS interface m_axi port=aux_weights depth=46360 offset=slave bundle=mem_weights_mm0 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=64 max_write_burst_length=64 num_write_outstanding=64
     /* Thirty-two compact GEMV shards, each on an independent 512-bit master.
      * The clustered datapath consumes one Beat512 beat per master per cycle. */
     /* One compact GDN-1.3B shard is 43,728,896 floats (166.8125 MiB).
@@ -3571,8 +3619,8 @@ int gdn_forward(
     const uint32_t num_tokens = 1;
     uint32_t layer_index;
     size_t mlp_count;
-    const float *final_norm = aux_weights +
-        (size_t)GDN_LAYERS * GDN_AUX_LAYER_STRIDE;
+    const Beat512 *final_norm = aux_weights +
+        (size_t)GDN_LAYERS * GDN_AUXB_LAYER_STRIDE;
 
     /* Iter32: only persistent state and the host handoff remain in workspace.
      * Preserve every external offset so the committed host/ABI stays unchanged,
@@ -3599,7 +3647,7 @@ int gdn_forward(
     Beat512 k_mlp_up_storage[GDN_INTER / 32];
     Beat512 gate_storage[GDN_HIDDEN / 32];
     Beat512 gemv_out_storage[(2 * GDN_INTER) / 32];
-    Beat512 conv_weight_storage[3][(GDN_HIDDEN * GDN_CONV) / 16];
+    Beat512 conv_weight_storage[3][(GDN_HIDDEN * GDN_CONV) / 32];
     Beat512 conv_tail_storage[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32];
     float a_storage[GDN_HEADS];
     float b_storage[GDN_HEADS];
@@ -3670,34 +3718,17 @@ int gdn_forward(
 
     layer_loop: for (layer_index = 0; layer_index < GDN_LAYERS; ++layer_index) {
     #pragma HLS loop_tripcount min=24 max=24  /* num_layers=24 */
-        size_t layer_offset = (size_t)layer_index * GDN_AUX_LAYER_STRIDE;
-        const float *layer_attn_norm = aux_weights + layer_offset;
-        const float *layer_a_log;
-        const float *layer_a_proj;
-        const float *layer_b_proj;
-        const float *layer_q_conv;
-        const float *layer_k_conv;
-        const float *layer_v_conv;
-        const float *layer_o_norm;
-        const float *layer_mlp_norm;
-
-        /* Non-GEMV tensors are packed contiguously in aux_weights. */
-        layer_offset += hidden;                          /* past attn_norm */
-        layer_a_log = aux_weights + layer_offset;
-        layer_offset += 2 * num_heads;                  /* a_log + dt_bias */
-        layer_a_proj = aux_weights + layer_offset;
-        layer_offset += (size_t)num_heads * hidden;
-        layer_b_proj = aux_weights + layer_offset;
-        layer_offset += (size_t)num_heads * hidden;
-        layer_q_conv = aux_weights + layer_offset;
-        layer_offset += (size_t)hidden * GDN_CONV;
-        layer_k_conv = aux_weights + layer_offset;
-        layer_offset += (size_t)hidden * GDN_CONV;
-        layer_v_conv = aux_weights + layer_offset;
-        layer_offset += (size_t)hidden * GDN_CONV;
-        layer_o_norm = aux_weights + layer_offset;
-        layer_offset += head_dim;
-        layer_mlp_norm = aux_weights + layer_offset;
+        /* Iter83: the packed aux image, GDN_AUXB_* beat offsets per layer. */
+        const Beat512 *layer_aux =
+            aux_weights + (size_t)layer_index * GDN_AUXB_LAYER_STRIDE;
+        const Beat512 *layer_attn_norm = layer_aux + GDN_AUXB_ATTN_NORM;
+        const Beat512 *layer_scalars = layer_aux + GDN_AUXB_SCALARS;
+        const Beat512 *layer_o_norm = layer_aux + GDN_AUXB_O_NORM;
+        const Beat512 *layer_mlp_norm = layer_aux + GDN_AUXB_MLP_NORM;
+        const Beat512 *layer_ab = layer_aux + GDN_AUXB_AB;
+        const Beat512 *layer_q_conv = layer_aux + GDN_AUXB_CONV;
+        const Beat512 *layer_k_conv = layer_q_conv + GDN_AUXB_CONV_KIND;
+        const Beat512 *layer_v_conv = layer_k_conv + GDN_AUXB_CONV_KIND;
 
         /* Running compact-shard offset (Beat512); order qkvg,o,gu,mlp_down —
          * matches gdn_build_weight_shards. */
@@ -3708,12 +3739,9 @@ int gdn_forward(
         /* Recurrence consumes each convolved head inside the QKVG dataflow
          * graph. Stage every auxiliary scalar before that graph starts so the
          * shared mem_weights_mm0 adapter retains a single active reader. */
-        gdn_gemv_tiny(a, gemv_in_storage, layer_a_proj,
-                      hidden, num_heads);
-        gdn_gemv_tiny(b, gemv_in_storage, layer_b_proj,
-                      hidden, num_heads);
+        gdn_gemv_tiny_ab(a, b, gemv_in_storage, layer_ab);
         gdn_load_recurrent_scalars(a_log_storage, dt_bias_storage,
-                                   layer_a_log);
+                                   layer_scalars);
 
         /* Per-(layer, conv) slice of the persistent conv tail in head_buffer:
          * 3 convs/layer x (conv_size-1) rows x hidden floats. Iter39B passes
@@ -4954,7 +4982,7 @@ static void gemv32_qkvg_consumer(
     hls::stream<Beat512> &head_stream,
     hls::stream<Beat512> &conv_out,
     Beat512 *gate_out,
-    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 32],
     Beat512 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32]
     GDN_PROBE_PARAM(ev)
 ) {
@@ -5022,7 +5050,7 @@ static void gemv32_qkvg_dataflow(
     hls::stream<ResultWord> &result,
     hls::stream<Beat512> &conv_out,
     Beat512 *gate_out,
-    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 32],
     Beat512 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32]
     GDN_PROBE_PARAM(ev_st) GDN_PROBE_PARAM(ev_con)
 ) {
@@ -5052,7 +5080,7 @@ static void gemv32_store_or_qkvg_conv_stream(
     uint32_t row_groups,
     bool qkvg_recurrent_mode,
     Beat512 *gate_out,
-    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 32],
     Beat512 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32]
     GDN_PROBE_PARAM(ev_st) GDN_PROBE_PARAM(ev_con)
 ) {
@@ -5086,7 +5114,7 @@ static void gdn_gemv(
     uint32_t in_dim, uint32_t out_dim,
     bool qkvg_recurrent_mode,
     Beat512 *attn_out, Beat512 *gate_out,
-    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 32],
     Beat512 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32],
     const float a[GDN_HEADS],
     const float b[GDN_HEADS],
@@ -5880,7 +5908,7 @@ static void gdn_gemv_part_ctrl(
     uint32_t in_dim, uint32_t out_dim,
     bool qkvg_recurrent_mode,
     Beat512 *attn_out, Beat512 *gate_out,
-    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 16],
+    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 32],
     Beat512 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32],
     const float a[GDN_HEADS],
     const float b[GDN_HEADS],
@@ -6408,7 +6436,7 @@ gdn_k_slr2_calls: for (uint32_t call = 0; call < GDN_P_CALLS; ++call) {
     xr_to_slr0, xr_to_slr2, ys_from_slr0, ys_from_slr2, \
     conv_to_slr2, attn_from_slr2, scalars_to_slr2
 int gdn_forward_p(
-    const float *aux_weights,
+    const Beat512 *aux_weights,
     Beat512 *workspace,
     const Beat512 *weight_data_mm0,
     const Beat512 *weight_data_mm1,
@@ -6443,7 +6471,7 @@ int gdn_forward_p(
      * compact the design, pull cluster 5 back into SLR0 and use SLR2 less. The
      * whole margin between routing and refusal is ~22 K cells of SLR0
      * occupancy. See doc/optimization_log.md sec iter15. */
-    #pragma HLS interface m_axi port=aux_weights depth=2000000 offset=slave bundle=mem_weights_mm0 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=64 max_write_burst_length=64 num_write_outstanding=64
+    #pragma HLS interface m_axi port=aux_weights depth=46360 offset=slave bundle=mem_weights_mm0 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=64 max_write_burst_length=64 num_write_outstanding=64
     /* Thirty-two compact GEMV shards, each on an independent 512-bit master.
      * The clustered datapath consumes one Beat512 beat per master per cycle. */
     /* One compact GDN-1.3B shard is 43,728,896 floats (166.8125 MiB).
@@ -6484,8 +6512,8 @@ int gdn_forward_p(
     const uint32_t num_tokens = 1;
     uint32_t layer_index;
     size_t mlp_count;
-    const float *final_norm = aux_weights +
-        (size_t)GDN_LAYERS * GDN_AUX_LAYER_STRIDE;
+    const Beat512 *final_norm = aux_weights +
+        (size_t)GDN_LAYERS * GDN_AUXB_LAYER_STRIDE;
 
     /* Iter32: only persistent state and the host handoff remain in workspace.
      * Preserve every external offset so the committed host/ABI stays unchanged,
@@ -6512,7 +6540,7 @@ int gdn_forward_p(
     Beat512 k_mlp_up_storage[GDN_INTER / 32];
     Beat512 gate_storage[GDN_HIDDEN / 32];
     Beat512 gemv_out_storage[(2 * GDN_INTER) / 32];
-    Beat512 conv_weight_storage[3][(GDN_HIDDEN * GDN_CONV) / 16];
+    Beat512 conv_weight_storage[3][(GDN_HIDDEN * GDN_CONV) / 32];
     Beat512 conv_tail_storage[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32];
     float a_storage[GDN_HEADS];
     float b_storage[GDN_HEADS];
@@ -6583,34 +6611,17 @@ int gdn_forward_p(
 
     layer_loop: for (layer_index = 0; layer_index < GDN_LAYERS; ++layer_index) {
     #pragma HLS loop_tripcount min=24 max=24  /* num_layers=24 */
-        size_t layer_offset = (size_t)layer_index * GDN_AUX_LAYER_STRIDE;
-        const float *layer_attn_norm = aux_weights + layer_offset;
-        const float *layer_a_log;
-        const float *layer_a_proj;
-        const float *layer_b_proj;
-        const float *layer_q_conv;
-        const float *layer_k_conv;
-        const float *layer_v_conv;
-        const float *layer_o_norm;
-        const float *layer_mlp_norm;
-
-        /* Non-GEMV tensors are packed contiguously in aux_weights. */
-        layer_offset += hidden;                          /* past attn_norm */
-        layer_a_log = aux_weights + layer_offset;
-        layer_offset += 2 * num_heads;                  /* a_log + dt_bias */
-        layer_a_proj = aux_weights + layer_offset;
-        layer_offset += (size_t)num_heads * hidden;
-        layer_b_proj = aux_weights + layer_offset;
-        layer_offset += (size_t)num_heads * hidden;
-        layer_q_conv = aux_weights + layer_offset;
-        layer_offset += (size_t)hidden * GDN_CONV;
-        layer_k_conv = aux_weights + layer_offset;
-        layer_offset += (size_t)hidden * GDN_CONV;
-        layer_v_conv = aux_weights + layer_offset;
-        layer_offset += (size_t)hidden * GDN_CONV;
-        layer_o_norm = aux_weights + layer_offset;
-        layer_offset += head_dim;
-        layer_mlp_norm = aux_weights + layer_offset;
+        /* Iter83: the packed aux image, GDN_AUXB_* beat offsets per layer. */
+        const Beat512 *layer_aux =
+            aux_weights + (size_t)layer_index * GDN_AUXB_LAYER_STRIDE;
+        const Beat512 *layer_attn_norm = layer_aux + GDN_AUXB_ATTN_NORM;
+        const Beat512 *layer_scalars = layer_aux + GDN_AUXB_SCALARS;
+        const Beat512 *layer_o_norm = layer_aux + GDN_AUXB_O_NORM;
+        const Beat512 *layer_mlp_norm = layer_aux + GDN_AUXB_MLP_NORM;
+        const Beat512 *layer_ab = layer_aux + GDN_AUXB_AB;
+        const Beat512 *layer_q_conv = layer_aux + GDN_AUXB_CONV;
+        const Beat512 *layer_k_conv = layer_q_conv + GDN_AUXB_CONV_KIND;
+        const Beat512 *layer_v_conv = layer_k_conv + GDN_AUXB_CONV_KIND;
 
         /* Running compact-shard offset (Beat512); order qkvg,o,gu,mlp_down —
          * matches gdn_build_weight_shards. */
@@ -6621,12 +6632,9 @@ int gdn_forward_p(
         /* Recurrence consumes each convolved head inside the QKVG dataflow
          * graph. Stage every auxiliary scalar before that graph starts so the
          * shared mem_weights_mm0 adapter retains a single active reader. */
-        gdn_gemv_tiny(a, gemv_in_storage, layer_a_proj,
-                      hidden, num_heads);
-        gdn_gemv_tiny(b, gemv_in_storage, layer_b_proj,
-                      hidden, num_heads);
+        gdn_gemv_tiny_ab(a, b, gemv_in_storage, layer_ab);
         gdn_load_recurrent_scalars(a_log_storage, dt_bias_storage,
-                                   layer_a_log);
+                                   layer_scalars);
 
         /* Per-(layer, conv) slice of the persistent conv tail in head_buffer:
          * 3 convs/layer x (conv_size-1) rows x hidden floats. Iter39B passes
@@ -6762,7 +6770,7 @@ int gdn_forward_p(
  * Bit-identical to gdn_forward by construction -- same arithmetic, same
  * result order -- and checked by the native decode gate. */
 int gdn_forward_partitioned(
-    const float *aux_weights, Beat512 *workspace,
+    const Beat512 *aux_weights, Beat512 *workspace,
     const Beat512 *mm0,  const Beat512 *mm1,  const Beat512 *mm2,  const Beat512 *mm3,
     const Beat512 *mm4,  const Beat512 *mm5,  const Beat512 *mm6,  const Beat512 *mm7,
     const Beat512 *mm8,  const Beat512 *mm9,  const Beat512 *mm10, const Beat512 *mm11,

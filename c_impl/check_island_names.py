@@ -21,7 +21,7 @@ from pathlib import Path
 
 EXPECTED_ISLANDS = ("gdn_recurrent_attention_island_p_0_U0",
                     "gdn_recurrent_attention_island_p_1_U0")
-ALLOWED_656 = {"gdn_recurrent_duplicate_qkv", "gdn_gemv_tiny_mm2s"}
+ALLOWED_656 = {"gdn_recurrent_duplicate_qkv"}   # Iter83 removed gdn_gemv_tiny_mm2s (no dataflow region left in the tiny GEMV)
 KERNELS = ("gdn_forward_p", "gdn_k_slr0", "gdn_k_slr2")
 
 
