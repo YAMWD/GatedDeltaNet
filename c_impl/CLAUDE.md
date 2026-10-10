@@ -67,7 +67,8 @@ stale was wrong.
     kernel's through the workspace tail at `GDN_WS_PROBE_BEAT_OFF`), read back by `host.exe --dump-probe` and
     decomposed by `analyze_call_probe.py`; it is compiled out of every production build (token-identical
     preprocessed source) and `gdn_eval` never gets it.
-  - Other submodules: `gdn_rmsnorm_rows`, `gdn_gemv_tiny` (the two tiny a/b gate projections),
+  - Other submodules: `gdn_rmsnorm_rows_bf16`, `gdn_gemv_tiny_ab` (both tiny a/b gate projections in one II=1
+    loop over the packed image; Iter83),
     `gdn_depthwise_conv_silu`, `gdn_recurrent_attention` (gated delta rule, head-local fused state
     buffer), `gdn_output_norm_and_gate`, `gdn_swiglu_inplace`.
   - **No embedding-lookup or argmax module exists, by design.** The 32000×2048 embedding table stays
@@ -87,7 +88,7 @@ stale was wrong.
   falls back to the monolith `gdn_forward`), maps each weight buffer to the bank of the master that reads it
   (`port_group`), starts the two GEMV kernels before the control kernel and waits for all three;
   `GDN_KERNEL_WAIT_TIMEOUT_MS` (diagnostic, default off) bounds the wait and reads the recurrent-state
-  stripes back to name the last layer written. It builds the 32 compact weight shards and the compact aux-weight image from
+  stripes back to name the last layer written. It builds the 32 compact weight shards and the packed-BF16 aux-weight image (Iter83, `gdn_build_aux_image` + `gdn_validate_aux_image`, 2.97 MB) from
   the flat blob, allocates one `xrt::bo` per kernel arg on disjoint HBM banks, uploads the 32 packed-BF16 shards (2.799 GB, exactly the dense weight bytes with no padding) plus the aux image via
   `sync_bo_chunked`, loads the `.gdnstate` into the resident state BOs, then decodes token-by-token,
   emitting the same JSON schema as `gdn_eval`. **`kSyncChunk` is 8 MiB**: a 16 MiB `bo.sync()` at a

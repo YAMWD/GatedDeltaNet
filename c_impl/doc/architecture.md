@@ -148,7 +148,7 @@ GPU prefill
 XRT host
     |-- keeps the original embedding table in host memory
     |-- builds 32 compact, output-row-striped GEMV weight shards
-    |-- builds one compact non-GEMV auxiliary-weight image
+    |-- builds and validates one packed-BF16 non-GEMV auxiliary-weight image (Iter83)
     |-- writes the selected 8 KiB embedding row to workspace[X]
     v
 +---------------------------------------------------------------------------+
@@ -249,7 +249,20 @@ which totals 1,366,528 beats per port and equals
 2048x2048 projection per layer, 98,304 beats per port.) Ports 28--31 append one 3,145,728-value
 BF16 state stripe (**6 MiB**) after that fixed boundary. The small norms, A/B
 projections, convolution kernels, and final norm are packed into
-`aux_weights`.
+`aux_weights` — since Iter83 a host-built **packed BF16 beat image** (46,360
+beats = 2.97 MB; per layer 1,929 beats: attn_norm 64, one FP32 beat of
+a_log/dt_bias, o_norm 8, mlp_norm 64, the a/b projections 1,024 as beat
+j·16 + c, the q/k/v conv kernels 3 × 256 in blob order; the final norm after
+layer 23), validated lane by lane against the blob at load by
+`gdn_validate_aux_image()`; it is not part of the `.gdnstate` ABI. The
+consumers read it in 512-bit bursts (RMSNorm 64 beats, output norm 8, conv
+context 3 × 256) and the two tiny a/b projections are one II=1 loop
+(`gdn_gemv_tiny_ab`, 1,024 beats, the per-output accumulation order of the
+retired per-output form). Measured by the Iter82 probe on card: the control
+kernel's serial work between GEMV regions fell from 487.7K to 278.2K cycles
+per token (−10.2 % of the token; per layer 11,168 → 4,865 before QKVG,
+3,502 → 1,468 after o_proj, 3,529 → 3,244 after QKVG), with every GEMV region
+unchanged.
 
 Two weight sizes coexist and are easy to confuse. The `.gdnw` file on disk is
 still a **5.87 GB FP32-container** blob whose values are required to be

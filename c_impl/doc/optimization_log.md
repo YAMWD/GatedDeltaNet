@@ -19152,3 +19152,104 @@ where ports 28–31 are idle: ≈ −3.3K per layer, **−78.8K (3.8 %)**, SLR2 
 arithmetic change, RTL cosim required (a new stream in the region's process graph); (3) the
 islands' last head on the critical path, 48.4K; (4) fill/drain, 52K + 15K (Iter87, C).
 Everything in this entry is on-card except the csynth references.
+
+## Iter83 — packed BF16 aux-weight image and an exact 32-lane tiny GEMV (A1 + A2; opened 2026-10-10, branch `recur_balance`)
+
+**Why.** The Iter82 probe put the control kernel's serial work between GEMV regions at
+487,494 cycles per token (23.7 %): 11,168 before every QKVG call (residual, RMSNorm, the two
+tiny a/b projections, scalars, the convolution context), 3,502 after o_proj (residual, RMSNorm),
+3,529 after QKVG, 2,061 after GU — 18 % above csynth, the excess where that code reads scalar
+FP32 weights over `aux_weights` (RMSNorm 2,048 scalars, the tiny GEMVs 2 × 1,098, the conv
+context 3 × 512 FP32 beats + 3 × 192). The aux weights are BF16-exact in the blob.
+
+**Hypothesis.** A1: a host-built packed BF16 beat image of the aux weights (32 values per beat;
+per-layer stride in beats; validated bit-for-bit against the blob) read with 512-bit bursts by
+the RMSNorm, tiny-GEMV, conv-context and output-norm loaders — identical FP32 operands after
+`bf16_to_fp32`, no reordering. A2: the two tiny projections as one II=1 loop over (32-column
+pair, output) reading one packed weight beat per trip, the per-output accumulation kept in the
+current order `(acc + T(2j)) + T(2j+1)` with the fixed 16-lane trees. Expected (csynth, then the
+probe's pre-QKVG and post-o_proj gaps): ≈ −7.7K and −2.6K per layer, ≈ −250K per token (−12 %);
+bit-exact natively. Protocol: native gates (monolith, partitioned; the aux-image validator),
+csynth of the control top (II=1 on the new loops, no module above 5.0 ns, 200-656 list
+`{gdn_gemv_tiny_mm2s}` or its replacement explained), the probe link, card gates, dump.
+
+**Record: below.**
+
+**Implementation (2026-10-10).** `gdn_build_aux_image` / `gdn_validate_aux_image` (host-side,
+`gdn_aux_image_beats`): per layer 1,929 beats — attn_norm 64, one FP32 scalar beat (a_log |
+dt_bias), o_norm 8, mlp_norm 64, a/b 1,024 (beat j·16 + c), q/k/v conv 3 × 256 (blob order, 8
+channels × 4 taps per beat); final norm after layer 23; 46,360 beats = 2.97 MB (was 1,483,136
+FP32 = 5.93 MB). The validator walks the blob tensors independently and checks every BF16 lane
+against the exact upper half of a BF16-exact source and every scalar lane bit for bit; the run
+state (`gdn_eval`) and the host both build and validate the image at load. Kernel: `aux_weights`
+is a `const Beat512 *` (both tops, the partitioned runner, the prototype; m_axi depth 46,360);
+`GDN_AUXB_*` offsets replace the float stride; `gdn_rmsnorm_rows_bf16` loads 64 beats at II=4
+(was 2,048 scalar reads), `gdn_output_norm_and_gate` 8 beats (was 256), the conv actor unpacks 8
+channels × 4 taps per beat at II=2 over 32 beats (was 4 channels over 64), the context reader
+streams 256 beats per kind (was 512), the recurrent-scalar word is the image's FP32 beat;
+`gdn_gemv_tiny_ab` replaces the two `gdn_gemv_tiny` dataflow calls: one II=1 loop over
+(column pair j, output c) reading beat j·16 + c in a 1,024-beat burst, `acc[c] = (acc[c] +
+T(2j)) + T(2j+1)` with the retired 4-level tree (`gdn_tree16`), dependence distance 16 declared.
+The tiny GEMV's `disable_start_propagation` region and its HLS 200-656 entry
+(`gdn_gemv_tiny_mm2s`) no longer exist. No dataflow region's process graph changed (no cosim
+required by the protocol); the only new m_axi readers are on the control kernel's mm0 aux
+pointer in the proven 64-bit top-level offset form, and a wrong read address would fail the
+exact-trajectory card gates (reads corrupt nothing persistent).
+- *Native:* monolith and partitioned fast gates **PASS bit-exact** (`exact_ref_mismatch=0`),
+  the image validator passing at load; host builds PASS with and without the probe define.
+  Source `gdn_model.cpp` 337b3a3a… (csynth snapshot; a host-only `memset` → loop cleanup after
+  it), `gdn_model.h` 337d7bc5…, `host.cpp` def56de3….
+- *csynth* of `gdn_forward_p` with `-DGDN_CALL_PROBE=1` submitted: job **7624**
+  (`diagnostics/iter83_aux_image/csynth/`): II of `gvt_ab` / the packed loads, the tiny module's
+  estimated clock and latency, the 200-656 list (expected empty), the clock scan, resources.
+- *csynth (job 7624, 2 m 50 s):* `gvt_ab` **II=1**, 1,058 cycles; `gdn_gemv_tiny_ab` 1,134 cycles
+  for both projections (was 2 × 2,165), estimated 3.650 ns, 100 DSP / 11.1K FF / 10.7K LUT;
+  `gdn_rmsnorm_rows_bf16` **1,072** (was 2,419), `gdn_output_norm_and_gate` 2,204 (was 2,428),
+  `gdn_load_qkvg_conv_context` 1,806 (was 2,573); the packed loads: `rms_load_w` 64 trips at
+  II=4, `onorm_load_w` 8 at II=4, `iter39_head_conv_load_w` 32 at II=2, the context reads
+  3 × 256 at II=1. **No HLS 200-656 process left in the control kernel** (the tiny GEMV's region
+  is gone); the four 200-880 II-violation warnings are the pre-existing ones
+  (`load_embedding_local`, `rmsnorm_sq`, `onorm_sq`, `argmax_merge` — identical set to Iter82's
+  csynth); no module above 5.0 ns; stamp order PASS. Top: BRAM **605** (was 644), DSP 969 (+20),
+  FF 254.7K, LUT 253.3K, URAM 56. csynth-level serial work per layer: before QKVG ≈ 4,160 (was
+  9,532), after o_proj 1,209 (was 2,556), after QKVG 3,000 (was 3,224), final norm 1,072 (was
+  2,419): −6.9K per layer ≈ −168K per token at csynth level, more on hardware if the measured
+  excess (+1.6K / +0.9K / +0.3K per layer) leaves with the scalar reads.
+- **Probe link launched 2026-10-10 00:14 UTC** — tag `hw_20261010_001443_1529902`, build **7625**
+  (acclnode01, shared node, acclnode03 excluded for its dead home mount), card **7626** (afterok),
+  dump **7627** (afterany, `diagnostics/iter83_aux_image/probe/`). Same command as Iter82's
+  link; source `gdn_model.cpp` 2e547eb8…, `gdn_model.h` 337d7bc5…, `host.cpp` def56de3….
+  Iter83 carries A1 + A2 only (the deferred state write-back waits for the user's choice).
+- *Full native gates (1 × 32 steps), monolith and partitioned:* **PASS**, `exact_ref_mismatch=0`,
+  `argmax_mismatch=0` on the launched source (2e547eb8…).
+
+**Result (on-card, 2026-10-10): retained — −10.2 % cycles, the whole gain in the control
+kernel's serial work, as hypothesized.** Build 7625 (acclnode01, shared node, 7 h 33 m: synth
+1 h 26 m, opt 10 m, place 2 h 20 m, route 1 h 19 m, bitstream 1 h 17 m): kernel **+0.038 /
++0.007 ns** at 5.000 ns, DMA +0.003 / +0.009, **hbm_aclk +0.001 / +0.007 at 450 MHz** (this
+draw closed the shell clock exactly; six draws now: +0.000, −0.021, −0.021, +0.055, −0.039,
++0.001); XCLBIN `353e2a006434b890…`, host `98d7728f9acd931a…`; native gate, XO gate, writer and
+reader address gates, island-name gate (no 200-656 process in the control kernel any more)
+all PASS in the build. Card job 7626 (acclnode01): exact 8- and 64-token trajectories, CUDA
+vector gate NRMSE 0.004663 / worst step 0.011908 / zero argmax mismatches (identical to every
+image since Iter66e, as it must be for identical arithmetic), **kernel 9.218 ms median, TPOT
+9.304** (mean 9.219 / 9.309). Resources (csynth): control **605 / 969 / 254.7K / 253.3K / 56**
+(BRAM −39, DSP +20 vs Iter82's probe build), SLR0 and SLR2 unchanged.
+
+Probe (job 7627, 242,424 records, counts exact, self-test exact): token **1,844,236 cycles**
+(9.221 ms) against the Iter82 probe image's 2,053,983 on the same card: **−209,747 (−10.2 %)**.
+The control regions are unchanged (1,566,045 vs 1,566,332); the serial work outside them is
+**278,191 (was 487,651): −209.5K, the whole difference.** Per layer: before QKVG **4,865** (was
+11,168; csynth 4,160), after o_proj **1,468** (was 3,502; csynth 1,209), after QKVG 3,244 (was
+3,529; csynth 3,000), after GU 2,061 (unchanged); the hardware excess over csynth shrank from
++1,636 / +946 / +305 to +705 / +259 / +244. SLR2 now enters the QKVG region 4,835 cycles before
+the control kernel (was 11,149); the state prefetch is done at 4,352 — still hidden, with
+480 cycles to spare: after Iter84 the pre-QKVG wait will be shorter than the prefetch and
+Iter88's prefetch-in-the-tails item becomes necessary (recorded). Ports 28–31 still stream QKVG
+at 0.839 beats/cycle under the state write-back (the deferred write-back lever stands at
+≈ −79K). GU's collector waits 828 on its local source 2 (was 132) — a few hundred cycles,
+noted, not pursued.
+
+**Verdict: retained** (on-card, same card as the reference; not promoted — the production
+image stays Iter81's until the campaign-end qualification). Evidence: on-card for the timing,
+the gates and the cycle decomposition; csynth for the module figures.

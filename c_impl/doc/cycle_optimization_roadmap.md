@@ -474,7 +474,12 @@ and integrated csynth prove exactness and a material schedule reduction.
 
 Retain only changes that shorten the measured critical schedule:
 
-- load RMSNorm weights as Pack16 rather than through scalar 2,048-cycle loops;
+- ~~load RMSNorm weights as Pack16 rather than through scalar 2,048-cycle loops~~
+  **done, Iter83** (packed BF16 image: RMSNorm, output norm, conv kernels,
+  a/b in bursts; the two tiny GEMVs as one II=1 loop): measured on card
+  −209.7K cycles/token (−10.2 %), the control kernel's serial work
+  487.7K → 278.2K; the remaining serial work is 4,865 / 3,244 / 1,468 / 2,061
+  per layer before QKVG / after QKVG / after o_proj / after GU (Iter84–86);
 - preload compact norm, convolution, and tiny-GEMV weights;
 - execute A/B tiny GEMVs when QKVG has the required local activation;
 - accumulate the next RMSNorm sum of squares during the preceding residual
