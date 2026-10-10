@@ -79,6 +79,11 @@ BUILD_EXCLUSIVE="${BUILD_EXCLUSIVE:-}"
 BUILD_MEM="${BUILD_MEM:-192G}"
 BUILD_TIME="${BUILD_TIME:-2-00:00:00}"
 ONCARD_TIME="${ONCARD_TIME:-4:00:00}"
+# The card job must run where the build node's libstdc++ exists: a host.exe
+# built on acclnode01 needs GLIBCXX_3.4.30, which harrier does not have (card
+# job 7778, Iter84, failed in 3 s with "version `GLIBCXX_3.4.30' not found").
+# Exclude harrier by default; ONCARD_EXCLUDE= (empty) lifts it.
+ONCARD_EXCLUDE="${ONCARD_EXCLUDE-harrier}"
 WEIGHTS="${WEIGHTS:-artifacts/gdn-1.3b-bf16w.gdnw}"
 DECODE_FIXTURE="${DECODE_FIXTURE:-fixtures_decode/decode.gdnreq}"
 DECODE_STATE="${DECODE_STATE:-fixtures_decode/decode_ex0_native_bf16_product.gdnstate}"
@@ -100,7 +105,7 @@ echo "tag        : ${TAG}"
 echo "knobs      : JOBS=${JOBS} HLS_FREQ=${HLS_FREQ} LINK_FREQ=${LINK_FREQ}"
 echo "vivado     : SYNTH_JOBS=${VIVADO_SYNTH_JOBS} IMPL_JOBS=${VIVADO_IMPL_JOBS}"
 echo "constraint : ${BUILD_CONSTRAINT:-<none>}"
-echo "exclude    : ${BUILD_EXCLUDE:-<none>}"
+echo "exclude    : ${BUILD_EXCLUDE:-<none>} (build); ${ONCARD_EXCLUDE:-<none>} (card)"
 echo "build node : ${BUILD_NODE:-scheduler-selected}"
 echo "exclusive  : ${BUILD_EXCLUSIVE:-<shared node>}"
 # Iter81 (user decision 2026-10-08): the production reproduction accepts the shell's
@@ -253,6 +258,7 @@ else
         --time="$ONCARD_TIME" \
         --dependency="afterok:${build_id}" \
         --kill-on-invalid-dep=yes \
+        ${ONCARD_EXCLUDE:+--exclude="${ONCARD_EXCLUDE}"} \
         --output="${C_IMPL}/${DIAG}/oncard.slurm-%j.log" \
         --export=ALL,TAG="$TAG",JOBS="$JOBS",HLS_FREQ="$HLS_FREQ",LINK_FREQ="$LINK_FREQ" \
         "$DIAG/hw_oncard.slurm")"

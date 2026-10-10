@@ -4149,7 +4149,8 @@ static void gemv32_mm2s_with_state(
     hls::stream<Beat512> &state_stream,
     uint32_t n_packs,
     uint32_t layer_index,
-    bool qkvg_recurrent_mode
+    bool qkvg_recurrent_mode,
+    hls::stream<ap_uint<1> > &wr_go
 ) {
 #pragma HLS inline off
     (void)CHANNEL;
@@ -4202,6 +4203,7 @@ gemv32_state_owner_head: for (uint32_t head = 0;
 #endif
         }
     }
+    wr_go.write(1);   /* Iter84: release the writer (monolith, A/B only) */
 }
 
 /* Iter73: the write-side twin of gemv32_mm2s_with_state.  The recurrent
@@ -4237,7 +4239,8 @@ static void gemv32_mm2s_with_state_p(
     hls::stream<Beat512> &state_stream,
     uint32_t n_packs,
     uint32_t layer_index,
-    bool qkvg_recurrent_mode GDN_PROBE_PARAM(ev)
+    bool qkvg_recurrent_mode,
+    hls::stream<ap_uint<1> > &wr_go GDN_PROBE_PARAM(ev)
 ) {
 #pragma HLS inline off
     (void)CHANNEL;
@@ -4319,6 +4322,11 @@ gemv32_state_owner_weight: for (uint32_t i = 0; i < n_packs; ++i) {
         ws.write(w[weight_base + i]);
 #endif
     }
+    /* Iter84: release this port's state writer only now, so the 4,096-beat
+     * write-back no longer shares the pseudo-channel with the weight stream
+     * (measured 0.833 beats/cycle with it, 0.985 without); the islands'
+     * 4,096-deep URAM queue holds the layer until then. */
+    wr_go.write(1);
 #ifdef GDN_CALL_PROBE
     gdn_probe_emit(ev, GDN_PROBE_EV_WEIGHTS_DONE, CHANNEL, tag);
 #endif
@@ -4329,7 +4337,8 @@ static void gemv32_state_writer(
     hls::stream<Beat512> &state_wr,
     Beat512 *weights,
     uint32_t layer_index,
-    bool qkvg_recurrent_mode GDN_PROBE_WR_PARAMS
+    bool qkvg_recurrent_mode,
+    hls::stream<ap_uint<1> > &wr_go GDN_PROBE_WR_PARAMS
 ) {
 #pragma HLS inline off
     (void)CHANNEL;
@@ -4339,6 +4348,10 @@ static void gemv32_state_writer(
 #else
     if (qkvg_recurrent_mode) {
 #endif
+    /* Iter84: drain only after this port's weight loop (one token per QKVG
+     * call from the reader); until then the queue buffers the islands'
+     * output, at most the layer's 4,096 beats. */
+    (void)wr_go.read();
     const uint32_t state_packs_per_head =
         GDN_DK * (GDN_DV / 32) / GDN_RECURRENT_STATE_PORTS;
     // Use the original AXI base and a complete unsigned beat index. Explicit
@@ -5180,6 +5193,9 @@ static void gdn_gemv(
     hls::stream<Beat512> state_stream0, state_stream1;
     hls::stream<Beat512> state_stream2, state_stream3;
     hls::stream<Beat512> state_wr0, state_wr1, state_wr2, state_wr3;
+    hls::stream<ap_uint<1> > wr_go_m[4];     /* Iter84: reader -> writer tokens */
+#pragma HLS array_partition variable=wr_go_m complete
+#pragma HLS stream variable=wr_go_m depth=4
     #pragma HLS array_partition variable=ws complete
     #pragma HLS array_partition variable=xr complete
     #pragma HLS array_partition variable=ys complete
@@ -5284,16 +5300,16 @@ static void gdn_gemv(
     gemv32_mm2s<27>(sh27, shard_off, ws[27], n_packs);
     gemv32_mm2s_with_state<28>(
         sh28, state_in28, shard_off, ws[28], state_stream0,
-        n_packs, layer_index, qkvg_recurrent_mode);
+        n_packs, layer_index, qkvg_recurrent_mode, wr_go_m[0]);
     gemv32_mm2s_with_state<29>(
         sh29, state_in29, shard_off, ws[29], state_stream1,
-        n_packs, layer_index, qkvg_recurrent_mode);
+        n_packs, layer_index, qkvg_recurrent_mode, wr_go_m[1]);
     gemv32_mm2s_with_state<30>(
         sh30, state_in30, shard_off, ws[30], state_stream2,
-        n_packs, layer_index, qkvg_recurrent_mode);
+        n_packs, layer_index, qkvg_recurrent_mode, wr_go_m[2]);
     gemv32_mm2s_with_state<31>(
         sh31, state_in31, shard_off, ws[31], state_stream3,
-        n_packs, layer_index, qkvg_recurrent_mode);
+        n_packs, layer_index, qkvg_recurrent_mode, wr_go_m[3]);
 
     gemv32_cluster2(ws[0],  ws[1],  xr[0],  xr[1],  ys[0],  k_packs, rows_per_ch);
     gemv32_cluster2(ws[2],  ws[3],  xr[1],  xr[2],  ys[1],  k_packs, rows_per_ch);
@@ -5343,13 +5359,13 @@ static void gdn_gemv(
         a, b, layer_a_log, layer_dt_bias,
         layer_index, qkvg_recurrent_mode);
     gemv32_state_writer<28>(state_wr0, w28,
-                            layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(gdn_probe_null_ev, gdn_probe_null_beats, 0u));
+                            layer_index, qkvg_recurrent_mode, wr_go_m[0] GDN_PROBE_WR_ARGS(gdn_probe_null_ev, gdn_probe_null_beats, 0u));
     gemv32_state_writer<29>(state_wr1, w29,
-                            layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(gdn_probe_null_ev, gdn_probe_null_beats, 0u));
+                            layer_index, qkvg_recurrent_mode, wr_go_m[1] GDN_PROBE_WR_ARGS(gdn_probe_null_ev, gdn_probe_null_beats, 0u));
     gemv32_state_writer<30>(state_wr2, w30,
-                            layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(gdn_probe_null_ev, gdn_probe_null_beats, 0u));
+                            layer_index, qkvg_recurrent_mode, wr_go_m[2] GDN_PROBE_WR_ARGS(gdn_probe_null_ev, gdn_probe_null_beats, 0u));
     gemv32_state_writer<31>(state_wr3, w31,
-                            layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(gdn_probe_null_ev, gdn_probe_null_beats, 0u));
+                            layer_index, qkvg_recurrent_mode, wr_go_m[3] GDN_PROBE_WR_ARGS(gdn_probe_null_ev, gdn_probe_null_beats, 0u));
 }
 
 /* =====================================================================
@@ -6227,6 +6243,9 @@ static void gdn_gemv_part_slr2(
     hls::stream<Beat512> qkv, attn_stream;
     hls::stream<Beat512> state_stream0, state_stream1, state_stream2, state_stream3;
     hls::stream<Beat512> state_wr0, state_wr1, state_wr2, state_wr3;
+    hls::stream<ap_uint<1> > wr_go[4];      /* Iter84: reader -> writer, one token per QKVG call */
+#pragma HLS array_partition variable=wr_go complete
+#pragma HLS stream variable=wr_go depth=4      /* one token per call; HLS 200-1018 advised > 2 */
     float a_l[GDN_HEADS], b_l[GDN_HEADS], a_log_l[GDN_HEADS], dt_bias_l[GDN_HEADS];
 #ifdef GDN_CALL_PROBE
     hls::stream<GDNProbeEvent> ev_xr, ev_ys, ev_attn, ev_qkv;
@@ -6295,10 +6314,10 @@ static void gdn_gemv_part_slr2(
     gemv32_mm2s<25>(w25, shard_off, ws[1], n_packs);
     gemv32_mm2s<26>(w26, shard_off, ws[2], n_packs);
     gemv32_mm2s<27>(w27, shard_off, ws[3], n_packs);
-    gemv32_mm2s_with_state_p<28>(w28, state_in28, shard_off, ws[4], state_stream0, n_packs, layer_index, qkvg_recurrent_mode GDN_PROBE_ARG(ev_rd[0]));
-    gemv32_mm2s_with_state_p<29>(w29, state_in29, shard_off, ws[5], state_stream1, n_packs, layer_index, qkvg_recurrent_mode GDN_PROBE_ARG(ev_rd[1]));
-    gemv32_mm2s_with_state_p<30>(w30, state_in30, shard_off, ws[6], state_stream2, n_packs, layer_index, qkvg_recurrent_mode GDN_PROBE_ARG(ev_rd[2]));
-    gemv32_mm2s_with_state_p<31>(w31, state_in31, shard_off, ws[7], state_stream3, n_packs, layer_index, qkvg_recurrent_mode GDN_PROBE_ARG(ev_rd[3]));
+    gemv32_mm2s_with_state_p<28>(w28, state_in28, shard_off, ws[4], state_stream0, n_packs, layer_index, qkvg_recurrent_mode, wr_go[0] GDN_PROBE_ARG(ev_rd[0]));
+    gemv32_mm2s_with_state_p<29>(w29, state_in29, shard_off, ws[5], state_stream1, n_packs, layer_index, qkvg_recurrent_mode, wr_go[1] GDN_PROBE_ARG(ev_rd[1]));
+    gemv32_mm2s_with_state_p<30>(w30, state_in30, shard_off, ws[6], state_stream2, n_packs, layer_index, qkvg_recurrent_mode, wr_go[2] GDN_PROBE_ARG(ev_rd[2]));
+    gemv32_mm2s_with_state_p<31>(w31, state_in31, shard_off, ws[7], state_stream3, n_packs, layer_index, qkvg_recurrent_mode, wr_go[3] GDN_PROBE_ARG(ev_rd[3]));
     gemv32_cluster2(ws[0], ws[1], xr[0], xr[1], ys[0], k_packs, rows_per_ch);   /* cluster 12 */
     gemv32_cluster2(ws[2], ws[3], xr[1], xr[2], ys[1], k_packs, rows_per_ch);   /* cluster 13 */
     gemv32_cluster2(ws[4], ws[5], xr[2], xr[3], ys[2], k_packs, rows_per_ch);   /* cluster 14 */
@@ -6326,10 +6345,10 @@ static void gdn_gemv_part_slr2(
 #else
     gdn_axis_send512(attn_stream, attn_out, attn_beats);
 #endif
-    gemv32_state_writer<28>(state_wr0, w28, layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(ev_wr[0], probe_beats[0], probe_call));
-    gemv32_state_writer<29>(state_wr1, w29, layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(ev_wr[1], probe_beats[1], probe_call));
-    gemv32_state_writer<30>(state_wr2, w30, layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(ev_wr[2], probe_beats[2], probe_call));
-    gemv32_state_writer<31>(state_wr3, w31, layer_index, qkvg_recurrent_mode GDN_PROBE_WR_ARGS(ev_wr[3], probe_beats[3], probe_call));
+    gemv32_state_writer<28>(state_wr0, w28, layer_index, qkvg_recurrent_mode, wr_go[0] GDN_PROBE_WR_ARGS(ev_wr[0], probe_beats[0], probe_call));
+    gemv32_state_writer<29>(state_wr1, w29, layer_index, qkvg_recurrent_mode, wr_go[1] GDN_PROBE_WR_ARGS(ev_wr[1], probe_beats[1], probe_call));
+    gemv32_state_writer<30>(state_wr2, w30, layer_index, qkvg_recurrent_mode, wr_go[2] GDN_PROBE_WR_ARGS(ev_wr[2], probe_beats[2], probe_call));
+    gemv32_state_writer<31>(state_wr3, w31, layer_index, qkvg_recurrent_mode, wr_go[3] GDN_PROBE_WR_ARGS(ev_wr[3], probe_beats[3], probe_call));
 #ifdef GDN_CALL_PROBE
     /* Last in program order: the C model runs the region's processes in
      * sequence, so the counter must find every event already queued. */
@@ -6427,6 +6446,37 @@ gdn_k_slr2_calls: for (uint32_t call = 0; call < GDN_P_CALLS; ++call) {
                            d.shard_off, d.in_dim, d.out_dim, d.qkvg, d.layer_index GDN_PROBE_ARG(call));
     }
 }
+
+#ifdef GDN_SLR2_REGION_COSIM
+/* Iter84: RTL cosim top for the SLR2 GEMV region, one QKVG call of layer 0
+ * (diagnostics/iter84_deferred_wb/cosim; the source copy scales the shard
+ * constant so a port holds 16,384 weight beats, the state stripe and the
+ * probe tail). Never part of a build. */
+void gdn_slr2_region_cosim_top(
+    const Beat512 *w24, const Beat512 *w25, const Beat512 *w26, const Beat512 *w27,
+    Beat512 *w28, Beat512 *w29, Beat512 *w30, Beat512 *w31,
+    hls::stream<GDNAxisBeat> &xr_in, hls::stream<GDNAxisBeat> &conv_in,
+    hls::stream<GDNAxisBeat> &scalars_in,
+    hls::stream<GDNAxisWord> &ys_out, hls::stream<GDNAxisBeat> &attn_out) {
+#pragma HLS interface m_axi port=w24 depth=20992 offset=slave bundle=mem_weights_mm24 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w25 depth=20992 offset=slave bundle=mem_weights_mm25 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w26 depth=20992 offset=slave bundle=mem_weights_mm26 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w27 depth=20992 offset=slave bundle=mem_weights_mm27 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w28 depth=20992 offset=slave bundle=mem_weights_mm28 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+#pragma HLS interface m_axi port=w29 depth=20992 offset=slave bundle=mem_weights_mm29 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+#pragma HLS interface m_axi port=w30 depth=20992 offset=slave bundle=mem_weights_mm30 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+#pragma HLS interface m_axi port=w31 depth=20992 offset=slave bundle=mem_weights_mm31 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+#pragma HLS interface axis port=xr_in
+#pragma HLS interface axis port=conv_in
+#pragma HLS interface axis port=scalars_in
+#pragma HLS interface axis port=ys_out
+#pragma HLS interface axis port=attn_out
+#pragma HLS interface s_axilite port=return
+    gdn_gemv_part_slr2(w24, w25, w26, w27, w28, w29, w30, w31,
+                       xr_in, conv_in, scalars_in, ys_out, attn_out,
+                       0u, GDN_HIDDEN, 4u * GDN_HIDDEN, true, 0u GDN_PROBE_ARG(0u));
+}
+#endif
 
 /* ---- the control kernel: gdn_forward with the engine reduced to its slice ---- */
 #define GDN_GEMV_P_ARGUMENTS \
