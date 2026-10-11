@@ -210,6 +210,21 @@ if [ "$xo_rc" -eq 0 ] && [ "$gate_rc" -eq 0 ] && [ "${STATE_ADDRESS_GATE:-0}" = 
     printf '%s\n' "$gate_rc" > "${SHARED_DIAG}/state_reader_gate.exit"
 fi
 
+# Iter86: the control kernel's conv-tail writer on mm0 (gdn_tails_writer), checked
+# with the state writers' three-stage method on gdn_forward_p.xo: HLS RTL,
+# post-synthesis, post-opt; 24 layers x three bases, 576 (+4 probe) beats per call.
+if [ "$xo_rc" -eq 0 ] && [ "$gate_rc" -eq 0 ] && [ "${STATE_ADDRESS_GATE:-0}" = 1 ]; then
+    printf '%s\n' "tails_gate" > "${SHARED_DIAG}/build.phase"
+    set +e
+    python3 "${STAGE_C_IMPL}/check_tails_writer_addresses.py" \
+        "${STAGE_BUILD}/gdn_forward_p.xo" "${SHARED_DIAG}/tails_gate" \
+        --c-impl "${STAGE_C_IMPL}" --clock-ns "$(python3 -c "print(1000.0/${LINK_FREQ})")" \
+        2>&1 | tee "${SHARED_DIAG}/tails_gate.live.log"
+    gate_rc="${PIPESTATUS[0]}"
+    set -e
+    printf '%s\n' "$gate_rc" > "${SHARED_DIAG}/tails_gate.exit"
+fi
+
 # Iter81: island cell names and HLS 200-656, checked on this XO before the link.
 # The floorplan hook needs exactly one gdn_recurrent_attention_island_p_{0,1}_U0
 # cell each (a mismatch errors out ~50 min into the link), and a new 200-656
