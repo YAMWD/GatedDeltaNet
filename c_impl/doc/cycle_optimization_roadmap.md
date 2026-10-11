@@ -1,5 +1,15 @@
 # Cycle-First Optimization Roadmap After Iter67c
 
+> **Update 2026-10-11 (Iter82–86, retained, not yet promoted).** The dual-kernel
+> probe (Iter82) and four schedule iterations took the token from 2,053,983 to
+> **1,684,509 cycles** on acclnode01's card (8.423 ms kernel; −18.0 %): the packed
+> aux image and fused tiny GEMV (Iter83, −10.2 %), the deferred state write-back
+> (Iter84, −3.6 %), the fused residual + RMSNorm and SwiGLU in the GU store (Iter85,
+> −3.1 %), the per-head output norm and the conv-tail writer in the QKVG region
+> (Iter86, −2.2 %). The fixed SLR2 counter shows the four state ports' traffic
+> now bounds the QKVG call (floor ≈ 62.5K cycles per layer); Stage 6 reached its
+> stop condition (§ 7).
+
 > **Update 2026-10-08 (Iter81, promoted).** The first cycle reduction since Iter67c: the recurrent
 > islands of the SLR2 kernel are now three-stage head pipelines (prep → read
 > → update) that hide under the QKVG weight stream, and ports 28–31 fetch the
@@ -487,9 +497,20 @@ Retain only changes that shorten the measured critical schedule:
   −55.2K cycles/token (−3.1 %), the serial work outside the control regions
   278.2K → 222.6K; after o_proj ≈ 900 and after GU ≈ 180 per layer, the two
   gaps around QKVG ≈ 8.1K per layer (Iter86 and Iter87 target them);
-- preload compact norm, convolution, and tiny-GEMV weights;
-- execute A/B tiny GEMVs when QKVG has the required local activation; and
-- overlap convolution-tail traffic through persistent port services.
+- ~~overlap convolution-tail traffic~~ **done, Iter86** (the conv tails written by
+  a process of the QKVG region as each head finishes, and the output norm/gate per
+  head as its attention arrives): measured on card −37.4K cycles/token (−2.2 %),
+  below this stage's 0.05M retention bar (retained under the campaign protocol);
+- preload compact norm, convolution, and tiny-GEMV weights; and
+- execute A/B tiny GEMVs when QKVG has the required local activation — **capped**
+  (Iter86 probe): the four state ports' prefetch (4,401 cycles) sits inside the
+  pre-QKVG wait it would shorten, so this gains ≤ 0.3–0.5K cycles per layer.
+
+**Stop condition reached (2026-10-11, Iter86 probe).** Every remaining Stage 6
+item and the per-call fill/drain levers are projected below 0.05M cycles/token
+with four state ports; Stage 7 (eight state ports, then the pre-QKVG cut)
+projects ≈ 60K, below its 0.15M bar. The four-port floor is ≈ 62.5K cycles per
+layer (≈ 1.564M per token); the measured token is 1.685M.
 
 Expected additional saving: **0.10--0.20M cycles/token**. Do not widen norm,
 convolution, output-gate, or SwiGLU arithmetic without a measured actor-stall

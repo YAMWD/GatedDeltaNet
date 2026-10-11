@@ -19528,3 +19528,218 @@ gates PASS bit-exact (monolith and partitioned)**, `exact_ref_mismatch=0`. Sourc
   after them. Remaining measured waste (1,721,911 cycles, floor 1,366.5K): serial work ≈ 223K
   (12.9 %: ≈ 8.1K around QKVG + 0.9K + 0.2K per layer), the islands' last head ≈ 48K, fill/drain
   ≈ 52K, QKVG start-up ≈ 15K.
+
+## Iter86 — per-head output norm/gate and the conv-tail writer inside the QKVG region (B1 + B2; opened 2026-10-11, branch `recur_balance`)
+
+**Why.** After Iter85 the control kernel's serial work after the QKVG call is ≈ 3.2K cycles per
+layer (Iter84 probe: 3,244): the conv-tail store (3 × 192 beats to HBM, csynth 796) and the
+output norm/gate pass (csynth 2,204), both run after the region ends — and the region ends
+when the last head's attention arrives, so the first seven heads' norm/gate and tails could
+have been done while the stream was still running.
+
+**Hypothesis.** B1: `gdn_attn_norm_gate`, a process of the control region that reads each
+head's 8 attention beats from the SLR2 link and its 8 gate beats from a new `gate_stream`
+written by the consumer (instead of the `gate_out` buffer), applies the retired per-head
+arithmetic (the same reduction order, scale, `normalized · gate · sigmoid(gate)`, one RNE) and
+writes `attn_out`; the layer's o_norm weight is loaded into an 8-beat array before the region.
+After the region a 64-beat copy puts the result in the engine's input (the region cannot write
+the loader's array). B2: `gdn_tails_writer`, the region's only writer on mm0, stores each head's
+new tails (old rows 1/2 + the new raw row, 72 beats per head streamed by the consumer) in
+8-beat bursts at the tails' proven addresses (raw `workspace` + 64-bit index, registered
+layer add); in probe builds it also stores the control counter's records (the counter no
+longer writes mm0 — one writer per bundle, HLS 200-1013). `gdn_attn_recv`, the post-region
+`gdn_store_qkvg_conv_tails` call and the post-region norm pass go (the monolith keeps its
+post-region passes and drains the consumer's streams into its old buffers). Expected: the
+post-QKVG serial work 3,244 → ≈ 300 (copy 70 + the region's extension by the last head's
+norm/gate ≈ 230): ≈ −2.9K per layer ≈ −70K per token (−3.9 %); elementwise/order-preserving
+arithmetic, bit-exact natively. Risks: two new region processes (invariant 24 — both multi-loop;
+RTL cosim of the control region required), the mm0 writer inside the region (the Iter61 rule
+puts the FIFO between the block and the port: here the consumer → `tails_stream` → writer
+→ port, the writer free-placed), the tails' addresses (a wrong fold cannot land in range:
+788,162 − 2,097,152 beats < 0; the exact-trajectory card gates would see a wrong tail at the next
+token).
+
+**Implementation (2026-10-11).** As above; `gate_stream` depth 64 (a whole layer), `tails_stream`
+depth 128 (72 per head), `probe_beats_ctrl` depth 8. Native fast gates **PASS bit-exact**
+(monolith and partitioned; probe-enabled partitioned PASS, no counter abort); host builds PASS.
+Source `gdn_model.cpp` 8fb50e57…, `gdn_model.h` 337d7bc5…, `host.cpp` def56de3….
+csynth of the control top submitted (job 8178): the 200-1013 single-writer rule, the new loops'
+II, the clock scan, resources.
+
+**csynth of the control top, job 8178 (source 8fb50e57…, probe on), 2 m 44 s: PASS with one finding.**
+No HLS 200-656 process, no 200-1013 (one mm0 writer), no module above 5.000 ns (the two new
+modules estimate 3.646 / 3.650 ns), stamp-schedule gate PASS (11 modules, 0 early). Loops:
+`tails_head…tails_beat` 576 trips II=1 (646 cycles), `qkvg_stream_tails_old/new` II=1,
+`ang_gate_group` II=1, `ang_load_g` flattened II=2, `copy_local` 64 / 176 trips II=1.
+`gdn_tails_writer` 80–729 cycles, 0 BRAM / 1.6K FF / 1.5K LUT; `gdn_attn_norm_gate` 7,380
+cycles (919 per head), 88 DSP / 15.7K FF / 18.8K LUT; `gemv32_qkvg_consumer` 6,185 (was ≈ 5.6K:
++576 tail beats). Control top BRAM18K 619 (Iter85 597, the two 512-bit streams), DSP 1,031 (971),
+FF 263.4K (255.6K), LUT 258.5K (254.7K), URAM 56. **The finding:** the new norm process costs
+919 cycles per head against the retired pass's 262, because `HLS 200-960` refused to flatten
+its sum-of-squares loop nest ("nontrivial logic before entering the inner loop" — the probe
+stamp before the half loop), so the 88-cycle fold latency is paid once per beat (`ang_sq` 95 ×
+8) instead of once per head. Hidden under the 2,048-cycle head pace for heads 0–6, but the
+last head's tail (the region's extension after the last attention beat) would be ≈ 900 instead
+of ≈ 260. Fix (same arithmetic — the 16-lane chain per half and `sum += s` in beat order, lower
+half first): the loop nest written as one 16-trip pipelined loop by hand, the beat read and the
+stamp under `half == 0`. Source `gdn_model.cpp` c4368800…; native fast gates rerun (monolith,
+partitioned, probe-enabled partitioned); csynth rerun as job 8182 (`csynth2/`).
+
+**RTL cosim of the control region (`slr2_region_cosim/ctrl/`, one QKVG call of layer 0).**
+Harness: a cosim-only top `gdn_ctrl_region_cosim_top` (`-DGDN_CTRL_REGION_COSIM`, never
+built) calls `gdn_gemv_part_ctrl` with the real workspace layout (port depth 818,176 beats,
+the probe tail included), eight 16,384-beat weight ports, `ap_memory` arrays for the activation,
+the outputs and the conv context; the testbench pre-queues the 2,048 + 1,024 zero `ys` words
+of the two remote kernels and 64 random-BF16 attention beats, drives zero activations (every
+Q/K/V/gate value 0: silu(0) = 0 and sigmoid(0) = ½ are exact in C and RTL, so cosim's compare of
+the conv link, the scalars, `attn_out` and the written tails is bit-exact by construction) and
+random conv tails of magnitude [⅛, 1), and checks the link beat counts (64 + 64 x, 192 conv, 2
+scalars) and that exactly the 2 × 3 × 64 old-row tail beats are non-zero after the run. What it
+proves: the region's process graph with the two new processes completes (AESL deadlock
+detector) and the RTL matches C on every output; what it does not: real-data arithmetic
+(covered by the card's exact-trajectory gates). Jobs: 8179 failed in seconds (the new top had
+been placed inside the `GDN_SLR2_REGION_COSIM` block — "Top function not found"); 8180 failed
+at csynth (`HLS 214-288`: the array arguments defaulted to m_axi in the vitis flow, compact=bit
+on a 2-D `Beat512` array); 8183 runs on source c4368800… with explicit `ap_memory` interfaces.
+
+**csynth rerun, job 8182 (source c4368800…), 3 m 08 s: PASS.** `ang_sq` is now one 16-trip
+pipelined loop, II=3 (the fold's carried `sum` — the same II=3 the rmsnorm and the retired
+`onorm_sq` loops reach), 133 cycles; `ang_head` 296 cycles per head (was 919), the process 2,396
+for the eight heads (the retired pass: 2,096 plus its 330-cycle weight reload). Everything else
+unchanged: no 200-656 process, stamp-schedule gate PASS (11 modules, 0 early), no module above
+5.000 ns, control top BRAM18K 619 / DSP 1,031 / FF 263.4K / LUT 258.5K / URAM 56. Expected
+post-QKVG serial work after the region: the last head's norm/gate ≈ 300 + the 64-beat copy ≈ 70.
+Native gates on c4368800…: fast monolith, fast partitioned and fast probe-enabled partitioned
+PASS bit-exact; full 32-step partitioned PASS bit-exact (`exact_ref_mismatch=0`, the monolith's
+full gate too). Still open before the link: the control-region cosim (job 8183) and Iter85's card
+verdict (the Iter86 link starts from Iter85's retained state).
+
+**Probe link launched 2026-10-11 02:45 UTC** from Iter85's retained state — tag
+`hw_20261011_024541_1799724`, build **8188** (shared acclnode01; acclnode03/04/05 and harrier
+excluded), card **8189** (afterok, harrier excluded), dump **8190** (afterany,
+`diagnostics/iter86_norm_tails/probe/`). Command: `GDN_KERNEL_WAIT_TIMEOUT_MS=120000
+VPP_DEFINES="-D GDN_CALL_PROBE=1" HOST_DEFINES=-DGDN_CALL_PROBE=1 BUILD_EXCLUSIVE=
+BUILD_EXCLUDE=acclnode03,acclnode04,acclnode05,harrier make run_hw` (HLS 200 / link 200 /
+`hw_f200_p.cfg`, HBM floor 440). Source at launch: `gdn_model.cpp` c4368800…, `gdn_model.h`
+337d7bc5…, `host.cpp` def56de3…. The image also carries the SLR2 counter fix (derived-scalar
+start form; the two-call cosim 8177 is its RTL confirmation). Expected on card: the post-QKVG
+serial work ≈ 3.2K → ≈ 0.4K per layer (the last head's norm/gate ≈ 300 after the last attention
+beat + the 64-beat copy), ≈ −65K cycles (−3.8 %) against Iter85's 1,721,911 on acclnode01's card.
+**Tails writer address gate.** The writer's HLS RTL forms its addresses through a 26-bit signed
+offset (`p_cast…` / `sext_ln5845` in the tail loop, `sext_ln5861` in the probe-tail store) —
+the invariant-26 pattern — so a new gate, `check_tails_writer_addresses.py` (the state writers'
+three-stage method: HLS RTL, post-`synth_design`, post-`opt_design` in xsim; every AXI write
+request at the module boundary must land at the next tail beat's word address, 576 + 4 beats per
+call, 24 layers × three base addresses 0 / 128 MiB / 4 GiB plus the probe-only mode), runs on
+the csynth RTL (job in `diagnostics/iter86_norm_tails/tails_gate/`) in parallel with the link; a
+failure would cancel the link.
+Tails writer address gate, job **8198** (2 m 03 s, source c4368800…): **PASS at all three stages** —
+HLS RTL, post-`synth_design`, post-`opt_design`, 75 cases each (24 layers × bases 0 / 128 MiB /
+4 GiB with the tails enabled, plus the probe-only mode per base): every write request landed at
+the expected word address, 576 + 4 beats requested and handed over per call. The 26-bit signed
+offset survives Vivado's synthesis for this writer; evidence level: synthesized-netlist simulation
+of the module, not the linked design (the on-card exact-trajectory gates remain the end check).
+The gate derives the two layout constants by compiling `gdn_model.h` (no hard-coded offsets) and
+joins the build job after the state reader gate (`slurm/hw_build.slurm`, `tails_gate.exit`, on
+`gdn_forward_p.xo`); the running link 8188 predates that edit and was gated by job 8198 instead.
+**SLR2 counter fix confirmed in RTL (two-call cosim, job 8177, 1 h 45 m, C/RTL PASS).** With the
+counter started by the derived scalar (`probe_expected`, so HLS gives it the once-per-call
+`_empty_n` start form instead of the sticky free-running one), call 1's (QKVG) records are
+call-relative: XR_FIRST 0, go-wait 0 (slot 30), island prep/read/update of head 0 at 3 / 606 /
+—, read and update of the last head at 12,023 / 13,645, update end 14,690, QKV first 2,221,
+weights done on ports 28–31 at 20,628 (first beats at 4,239 — after the 4,096-beat state
+prefetch), write-back done 24,794, END 24,796; call 0 (down-shaped) END 11,537. The Iter84
+instrument defect (QKVG records starting at the weight loops' end) is closed; the fix is in
+Iter86's image, so its dump will give the first direct measurement of the two gaps around QKVG.
+
+**Link and card (2026-10-11).** Build **8188** on acclnode01 (shared node), 7 h 31 m; every pre-link
+gate 0 (native 32-step partitioned, XO, state address, state reader, island names); routed **0
+routing errors**; clocks **kernel +0.023 / +0.008 ns at 5.000 ns, DMA +0.003 / +0.009, hbm_aclk
++0.024 / +0.006 at 2.222 ns — exactly 450 MHz** (vpl: auto-scaled 454.9 MHz exceeds the original,
+450 kept; the coin's ninth draw: +0.024). XCLBIN `db55600d…`, host `8e6b7926…`
+(`diagnostics/hw_20261011_024541_1799724/`). Routed per SLR: CLB **91.50 / 91.89 / 93.75 %**
+occupied, LUTs 203,047 / 234,925 / 259,889 (46.18 / 54.38 / 60.16 %), DSP 2,154 / 1,548 / 2,134,
+BRAM tiles 429 / 549 / 298.5, URAM 0 / 56 / 96, SLLs 24,831 (SLR1↔SLR0 57.48 %, SLR2↔SLR1
+50.30 %). Card **8189** (acclnode01): exact 8- and 64-token trajectories PASS; vector gate over
+2,016,000 logits NRMSE 0.00466270, worst step 0.011908, cosine 0.999989, top-1 100 %, 0 tolerance
+failures (the production figures); **kernel 8.423 ms median** (mean 8.423), **TPOT 8.512** (mean
+8.515) = **1,684,509 cycles**; against Iter85 on the same card (8.609 / 8.702, 1,721,911):
+**−37,402 cycles, −2.2 %** — short of the predicted −65K. Evidence level: on-card.
+
+**Probe (job 8190, 248,535 records; the first dump with call-relative SLR2 QKVG stamps).** Link
+latency 1.0 cycle on every call including QKVG (it was 8,273 under the old counter); tag self-test
+18,152 / 18,333. Control regions 1,528,103 (**+28,766** vs Iter85); outside them 156,406
+(**−66,168**). Per boundary, the control's serial work minus SLR2's (gc − gs, medians) and SLR2's
+wait for the activation at the next call:
+
+| boundary | gc − gs | SLR2 waits for x |
+|---|---:|---:|
+| down → QKVG | 4,345 | 4,682 (the 4,401-cycle state prefetch runs inside it) |
+| QKVG → o_proj | 130 | 0 (SLR2 is the late one: it enters o_proj 634 cycles after the control) |
+| o_proj → GU | 897 (exactly the fused norm's csynth latency) | 1,015 |
+| GU → down | 182 (the 176-beat copy) | 609 |
+
+- *What worked:* the post-QKVG serial work went from ≈ 3.2K to ≈ 0.13K per layer (+ the per-call
+  overhead below) — the outside-the-regions total fell by the predicted ≈ 2.8K per layer.
+- *Why the token gained only 1.56K per layer:* the control regions grew 1.2K per layer.
+  **QKVG +581:** the head pace slowed from 2,062 to 2,104 cycles (ingest h0..h7) — port 0's
+  QKVG stream ends at 17,036 (was 16,688), 436 cycles after ports 28–31, because the tails writer's
+  580 beats per call share HBM pseudo-channel 0 with port 0's weight reads (≈ 0.6 cycles lost
+  per written beat — the read/write interference Iter82/84 measured on ports 28–31); and SLR2's
+  last attention beat leaves 262 cycles after the last head's read stage ends (1 cycle in Iter85
+  and in the RTL cosim), a lag that grows by ≈ 38 cycles per head on the attention path into the
+  new norm process (its `ang_sq` accepts one beat per 6 cycles; not located further with
+  first/last stamps — off the critical path, see next point). **o_proj +525:** SLR2's QKVG region
+  (25,630 = the 4,682 wait + the 16,599-cycle weight stream + a 4,349-cycle tail: the islands'
+  last head, prep 392 + read 1,622 + update 1,044 after the last Q/K/V beat, and the deferred
+  write-back) now ends 772 cycles after the control's QKVG END, so SLR2 enters o_proj 634 cycles
+  after the control (delta −1,659 → +634.5) and the collector's wait on SLR2's words grows 24 →
+  3,185. Before Iter86 that tail hid behind the control's 3.2K post-QKVG work.
+- *The token per layer on SLR2's timeline (67,402):* weights 54,272 + state prefetch 4,401 +
+  QKVG tail 4,349 + waits for the control 1,905 (281 before QKVG beyond the prefetch, 1,015 after
+  o_proj, 609 after GU) + fill/drain and HBM efficiency 1,415 (QKVG stream 215, o_proj 318, GU 462,
+  down 420) + region boundaries 4 × ≈ 265.
+- *The state traffic now bounds the QKVG call.* Ports 28–31 move 4,096 read + 4,096 written state
+  beats per layer; the prefetch precedes and the write-back follows their 16,384 QKVG weight beats
+  (one HBM pseudo-channel each), so the SLR2 QKVG region cannot go below ≈ 24.6K (it is 25.6K) and
+  the layer below ≈ 62.5K on four state ports (≈ 1.564M cycles per token with the LM head).
+  Consequences for the plan: **A3** (the loader tails, next in order) cuts the control's pre-QKVG
+  work, but ports 28–31 start their QKVG weights only after the prefetch (4,401), so it gains at
+  most ≈ 0.3–0.5K per layer (7–12K per token); **eight state ports** (roadmap Stage 7) with A3
+  project ≈ −2.5K per layer (≈ 60K per token), below that stage's 0.15M threshold; the islands'
+  tail trims are capped at ≈ 0.25K per layer by the write-back drain.
+- *The region boundary is real:* ≈ 265 cycles per call on both kernels (25.7K per token). It is not
+  the probe — the Iter81 production image ran at 10.256 ms on acclnode01's card against the Iter82
+  probe image's 10.267 (≈ 2.2K cycles per token of probe cost) — and the two-call RTL cosim of the
+  SLR2 region shows ≈ 247 per call between the counter's END and the next call.
+
+**Verdict: RETAINED, not promoted** (on-card, same card as the reference, gates identical; control
+kernel +60 DSP, +3.8K LUT, +22 BRAM18K, timing closed at exactly 450 MHz HBM). Its integrated saving
+(37.4K) is below the roadmap's Stage 6 retention bar of 0.05M cycles per token; it is retained
+under the campaign protocol (kernel time improved on the same card). **Stage 6 has reached its stop
+condition:** every remaining in-plan lever (A3, the per-call fill/drain C, the islands' trims, the
+prefetch move) is projected below 0.05M per token with four state ports. The campaign therefore
+goes to its end step — a probe-free promotion candidate of this source and the qualification
+(drift, WikiText-2, paired power) — and the next lever is a decision outside this plan: eight
+state ports (+ A3, ≈ 60K), a bundle of the sub-threshold items (≈ 50–70K together: the exposed
+post-o_proj norm, the post-GU copy, the tails writes deferred after port 0's weights, the
+progressive write-out, the region boundary), or sub-byte weight compression (the only lever above
+10 %).
+
+**Tails gate on a probe-free netlist (pre-promotion check, 2026-10-11).** The probe-free csynth of
+`gdn_forward_p` (job 8228, source c4368800…) ran the new gate for the first time on a production
+netlist: **FAIL at the HLS-RTL stage, exactly the 36 odd-numbered cases (64 mismatches each), every
+even case clean.** Cause: the test bench, not the design. It held `ap_start` high for the whole case;
+the probe-free writer reaches its last state right after its last data beat (`ap_ready` and
+`ap_done` only there), returns to idle, sees `ap_start` and the held scalar FIFOs, and starts a second
+run with the same inputs; the bench's per-case reset then aborts that run, and with
+`config_rtl -reset control` the datapath keeps its stale state, so the next case's flattened loop
+replays bursts (from the 9th burst on, the sequence restarts one burst late). The probe build's
+writer ends later (its record store follows the tails), so the bench reset it before it could
+restart — which is why the 75-case probe runs passed. The real kernel's dataflow start logic drops a
+process's start after its `ap_ready` (the `ap_sync` registers); the bench now does the same (start
+dropped at the first `ap_ready`) and fails if any write request follows a completed case or the start
+is never acknowledged. Rerun (job 8229) on both netlists: **probe-free 72 cases and probe 75 cases PASS
+at HLS RTL, post-`synth_design` and post-`opt_design`**, no stray request. The state writer/reader
+gates use the same held-start bench and have passed on every build; their DUTs were not re-examined
+here.

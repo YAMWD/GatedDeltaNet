@@ -368,9 +368,10 @@ local x
   -> shared GEMV aperture
        -> one head-serial/all-port QKVG command
        -> for each completed head while later heads stream:
-            store gate
+            stream the head's gate to the norm/gate process
             run one shared head-local convolution actor for Q, K, and V
-            capture the new raw Q/K/V tail row
+            stream the old tail rows 1-2 and the new raw row to the
+            tails writer (mm0, 8-beat bursts; Iter86)
             stream convolved Q/K/V directly to recurrence
        -> on ports 28--31, before the call's first weight beat:
             stream the layer's four 4,096-beat old-state stripes into
@@ -381,9 +382,10 @@ local x
             read:   retrieval/partial pass of head h straight off the queue,
                     16 columns/cycle, replaying the state to the update stage
             update: decayed state + k x delta of head h-1, to the state writers
-       -> merge the two half-head outputs into norm_attn
-  -> packed convolution-tail writeback
-  -> output norm and gate, in place
+       -> merge the two half-head outputs and send them to the control kernel
+       -> per head, as its attention arrives: output norm and gate
+          (gdn_attn_norm_gate, the retired pass's arithmetic; Iter86)
+  -> 64-beat copy of the gated attention into the engine's input
   -> output-projection GEMV
   -> residual accumulation into x fused with the MLP RMSNorm (Iter85: one pass
      forms the rounded sum beats and their sum of squares, then the scale pass)
@@ -590,8 +592,20 @@ only after a one-token `wr_go` from its reader's weight loop; measured
 gone**), the residual add fused with the following RMSNorm and the SwiGLU inside
 the GU store (**Iter85, done:** `gdn_residual_rmsnorm_bf16` and the store's fill
 loop; measured −55.2K, the serial work outside the control regions 278.2K →
-222.6K, after o_proj ≈ 900 and after GU ≈ 180 cycles per layer), the islands' last
-head, and the per-call fill/drain; see `optimization_log.md`, Iter82. The
+222.6K, after o_proj ≈ 900 and after GU ≈ 180 cycles per layer), the per-head
+output norm/gate and the conv-tail writer inside the QKVG region (**Iter86, done:**
+`gdn_attn_norm_gate`, `gdn_tails_writer`; measured −37.4K: the post-QKVG serial
+work 3.2K → 0.13K per layer, partly returned as the islands' tail now exposed at
+the o_proj boundary and the tails writes slowing port 0), the islands' last
+head, and the per-call fill/drain; see `optimization_log.md`, Iter82–86.
+**Measured structure after Iter86 (1,684,509 cycles on acclnode01's card, probe
+build):** per layer on the SLR2 kernel 67.4K = weights 54.3K + state prefetch
+4.4K + the QKVG tail 4.3K (the islands' last head and the deferred write-back) +
+waits for the control kernel 1.9K + fill/drain 1.4K + region boundaries 4 × ≈ 265.
+The four state ports' traffic (4,096 read + 4,096 written beats per port per
+layer, before and after the QKVG weights) puts the floor at ≈ 62.5K per layer
+(≈ 1.564M per token); cutting the control's pre-QKVG work cannot gain beyond the
+prefetch it hides. The
 monolith keeps the original island and reader
 (`gdn_recurrent_attention_island`, `gemv32_mm2s_with_state`) for A/B.
 

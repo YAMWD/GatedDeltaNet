@@ -76,9 +76,18 @@ stale was wrong.
     final norm after layer 23; Iter85), `gdn_gemv_tiny_ab` (both tiny a/b gate projections in one II=1
     loop over the packed image; Iter83),
     `gdn_depthwise_conv_silu`, `gdn_recurrent_attention` (gated delta rule, head-local fused state
-    buffer), `gdn_output_norm_and_gate`; the SwiGLU is evaluated inside `gemv32_store`'s fill loop for the
-    GU shape and written out in the down projection's layout (Iter85; the separate SwiGLU and unpack
-    passes are gone).
+    buffer), `gdn_output_norm_and_gate` (monolith only since Iter86); the SwiGLU is evaluated inside
+    `gemv32_store`'s fill loop for the GU shape and written out in the down projection's layout (Iter85;
+    the separate SwiGLU and unpack passes are gone).
+  - **Iter86 (control kernel's QKVG region):** `gdn_attn_norm_gate` normalizes and gates each head as its
+    attention arrives from the SLR2 kernel (gate beats from the consumer's `gate_stream`, the layer's o_norm
+    weight from an 8-beat array loaded before the call) into `attn_out`, copied into the engine's input after
+    the region; `gdn_tails_writer` is the region's only mm0 writer — the consumer streams each head's old tail
+    rows 1–2 and new raw row (72 beats) and the writer stores them at the tails' addresses with the
+    invariant-26 form (and, in probe builds, the control counter's four record beats).
+    `slr2_region_cosim/ctrl/` is the one-call RTL cosim of the control region (zero activations so every
+    output compares bit-exactly); `check_tails_writer_addresses.py` gates the writer's synthesized addresses
+    (HLS RTL, post-synth, post-opt) in every `make run_hw` build (`tails_gate.exit`).
   - **No embedding-lookup or argmax module exists, by design.** The 32000×2048 embedding table stays
     in *host* memory and `host.cpp` writes the selected row straight into `workspace[X]`. The greedy
     argmax is *fused into the LM-head store stage* (`gemv32_argmax_*` labels inside `gemv32_store`),
