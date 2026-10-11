@@ -132,7 +132,6 @@ static hls::stream<Beat512> gdn_probe_null_beats("gdn_probe_null_beats");
 #define GDN_NORM_LANES       8 /* RMS/output-norm arithmetic lanes   */
 #define GDN_CONV_LANES       4 /* depthwise-convolution lanes        */
 #define GDN_OUTPUT_GATE_LANES 4 /* output norm/gate arithmetic lanes */
-#define GDN_SWIGLU_LANES      4 /* independent SwiGLU lanes          */
 #define GDN_PK     GDN_RECURRENT_LANES
 
 /* iter19 (step 4): the decode kernel is specialized for the fixed GDN-1.3B shape.
@@ -3344,68 +3343,6 @@ static void gdn_output_norm_and_gate(
     }
 }
 
-/* SwiGLU at a BF16 operator boundary. Both operands widen to FP32, the
- * nonlinear arithmetic stays FP32, and the result is RNE-rounded once.  The
- * output is separate so it can feed the one fixed GEMV-input BRAM directly. */
-static void gdn_swiglu(Beat512 *out, const Beat512 *gate,
-                       const Beat512 *up, size_t count) {
-    const size_t count32 = count >> 5;
-    swiglu_loop: for (size_t i = 0; i < count32; ++i) {
-    #pragma HLS loop_tripcount min=176 max=360448
-        Beat512 g = gate[i];
-        Beat512 u = up[i];
-        Bf16Bits result_lane[32];
-        #pragma HLS array_partition variable=result_lane complete
-        swiglu_group: for (int jb = 0; jb < 32;
-                           jb += GDN_SWIGLU_LANES) {
-        #pragma HLS loop_tripcount min=8 max=8
-        #pragma HLS pipeline II=1
-            swiglu_lane: for (int jl = 0;
-                              jl < GDN_SWIGLU_LANES; ++jl) {
-            #pragma HLS unroll
-                int j = jb + jl;
-                const float gv = bf16_to_fp32(get_bf16_lane(g, j));
-                const float uv = bf16_to_fp32(get_bf16_lane(u, j));
-                /* Round in the four-lane compute pipeline.  Keeping FP32
-                 * results until a separately unrolled 32-lane pack caused HLS
-                 * to instantiate 32 complete RNE/special-case converters even
-                 * though only four arithmetic lanes are live. */
-                result_lane[j] = fp32_to_bf16_rne(gdn_silu(gv) * uv);
-            }
-        }
-        Beat512 packed = 0;
-        swiglu_pack_out: for (int j = 0; j < 32; ++j) {
-        #pragma HLS unroll
-            set_bf16_lane(packed, j, result_lane[j]);
-        }
-        out[i] = packed;
-    }
-}
-
-/* Deinterleave [chunk0 gate,up, chunk1 gate,up, ...] from the unified GU
- * command into the existing natural-row gate and up buffers. */
-static void gdn_unpack_gu_local(
-    Beat512 *gate, Beat512 *up, const Beat512 *gu
-) {
-#pragma HLS inline
-gu_unpack_block: for (uint32_t block = 0; block < GEMV_CHANNELS; ++block) {
-    uint32_t chunk = block >> 1;
-    uint32_t kind = block & 1;
-gu_unpack_pack: for (uint32_t p = 0;
-                     p < (GDN_INTER / (GEMV_CHANNELS / 2)) / 32; ++p) {
-#pragma HLS loop_tripcount min=11 max=11
-#pragma HLS pipeline II=1
-        Beat512 value = gu[block * ((GDN_INTER / (GEMV_CHANNELS / 2)) / 32) + p];
-        uint32_t destination =
-            chunk * ((GDN_INTER / (GEMV_CHANNELS / 2)) / 32) + p;
-        if (kind == 0)
-            gate[destination] = value;
-        else
-            up[destination] = value;
-    }
-}
-}
-
 static ap_uint<256> gdn_bf16_add_half(
     ap_uint<256> residual, ap_uint<256> projection
 ) {
@@ -3426,39 +3363,95 @@ add_half_lane: for (uint32_t lane = 0; lane < 16; ++lane) {
     return result;
 }
 
-static Beat512 gdn_bf16_add_beat(
-    const Beat512 residual_beat, const Beat512 projection_beat
+
+/* Iter85 (B3): the residual add fused with the RMSNorm that follows it, for
+ * the decode row. One pass forms each rounded residual beat (the exact
+ * gdn_bf16_add_half halves), stores it and accumulates the sum of squares of
+ * its lanes in the retired order (lower half, then upper half; 16 lanes
+ * sequentially; `sum += s` per half), then scales the stored beats; the norm
+ * weight is one 64-beat burst at II=1 into 32 banks. Residual, sum and output
+ * are bit-identical to the retired add-then-norm sequence. */
+static void gdn_residual_rmsnorm_bf16(
+    Beat512 *out,
+    Beat512 *residual_out,
+    const Beat512 *residual,
+    const Beat512 *projection,
+    const Beat512 *weight,
+    float eps
 ) {
-#pragma HLS inline
-    ap_uint<256> residual_half[2];
-    ap_uint<256> projection_half[2];
-    ap_uint<256> result_half[2];
-#pragma HLS array_partition variable=residual_half complete
-#pragma HLS array_partition variable=projection_half complete
-#pragma HLS array_partition variable=result_half complete
-    residual_half[0] = residual_beat.range(255, 0);
-    residual_half[1] = residual_beat.range(511, 256);
-    projection_half[0] = projection_beat.range(255, 0);
-    projection_half[1] = projection_beat.range(511, 256);
-add_local_half: for (uint32_t half = 0; half < 2; ++half) {
-#pragma HLS pipeline II=1
-        result_half[half] = gdn_bf16_add_half(
-            residual_half[half], projection_half[half]);
+#pragma HLS inline off
+    const uint32_t col_packs = GDN_HIDDEN / 32;
+    float w_loc[GDN_HIDDEN];
+    #pragma HLS array_partition variable=w_loc cyclic factor=32
+    rrn_load_w: for (uint32_t cp = 0; cp < col_packs; ++cp) {
+    #pragma HLS loop_tripcount min=64 max=64
+    #pragma HLS pipeline II=1
+        const Beat512 wb = weight[cp];
+    rrn_load_w_lane: for (uint32_t lane = 0; lane < 32; ++lane) {
+        #pragma HLS unroll
+            w_loc[cp * 32u + lane] = bf16_to_fp32(get_bf16_lane(wb, lane));
+        }
     }
-    Beat512 sum;
-    sum.range(255, 0) = result_half[0];
-    sum.range(511, 256) = result_half[1];
-    return sum;
+    float sum = 0.0f;
+    rrn_add_sq: for (uint32_t cp = 0; cp < col_packs; ++cp) {
+    #pragma HLS loop_tripcount min=64 max=64
+        Bf16Half r_half[2];
+        Bf16Half p_half[2];
+        Bf16Half s_half[2];
+        #pragma HLS array_partition variable=r_half complete
+        #pragma HLS array_partition variable=p_half complete
+        #pragma HLS array_partition variable=s_half complete
+        split_bf16_beat(residual[cp], r_half);
+        split_bf16_beat(projection[cp], p_half);
+    rrn_add_sq_half: for (uint32_t half = 0; half < 2; ++half) {
+        #pragma HLS pipeline II=2
+            const Bf16Half current = gdn_bf16_add_half(r_half[half], p_half[half]);
+            s_half[half] = current;
+            float s = 0.0f;
+        rrn_sq_lane: for (int kk = 0; kk < 16; ++kk) {
+            #pragma HLS unroll factor=GDN_NORM_LANES
+                const float lane = bf16_to_fp32(
+                    get_bf16_half_lane(current, (uint32_t)kk));
+                s += lane * lane;
+            }
+            sum += s;
+        }
+        residual_out[cp] = join_bf16_halves(s_half);
+    }
+    const float scale = 1.0f / sqrtf((float)(sum / GDN_HIDDEN) + eps);
+    rrn_scale: for (uint32_t cp = 0; cp < col_packs; ++cp) {
+    #pragma HLS loop_tripcount min=64 max=64
+        Bf16Half v_half[2];
+        Bf16Half o_half[2];
+        #pragma HLS array_partition variable=v_half complete
+        #pragma HLS array_partition variable=o_half complete
+        split_bf16_beat(residual_out[cp], v_half);
+    rrn_scale_half: for (uint32_t half = 0; half < 2; ++half) {
+        #pragma HLS pipeline II=2
+            const Bf16Half current = v_half[half];
+            Bf16Half result = 0;
+        rrn_scl_lane: for (int kk = 0; kk < 16; ++kk) {
+            #pragma HLS unroll factor=GDN_NORM_LANES
+                const uint32_t weight_index = cp * 32u + half * 16u + (uint32_t)kk;
+                const float value = bf16_to_fp32(
+                    get_bf16_half_lane(current, (uint32_t)kk));
+                set_bf16_half_lane(result, (uint32_t)kk,
+                    fp32_to_bf16_rne(value * scale * w_loc[weight_index]));
+            }
+            o_half[half] = result;
+        }
+        out[cp] = join_bf16_halves(o_half);
+    }
 }
 
-static void gdn_beat_add_local(
-    Beat512 *out, const Beat512 *residual, const Beat512 *projection,
-    uint32_t count32
-) {
-#pragma HLS inline
-add_local: for (uint32_t i = 0; i < count32; ++i) {
-#pragma HLS loop_tripcount min=64 max=64
-        out[i] = gdn_bf16_add_beat(residual[i], projection[i]);
+/* Iter85: 512-bit copy between two region buffers (the GU store's SwiGLU
+ * result into the down projection's input). */
+static void gdn_copy_beats_local(Beat512 *dst, const Beat512 *src, uint32_t count) {
+#pragma HLS inline off
+copy_local: for (uint32_t i = 0; i < count; ++i) {
+#pragma HLS loop_tripcount min=176 max=176
+#pragma HLS pipeline II=1
+        dst[i] = src[i];
     }
 }
 
@@ -3618,7 +3611,6 @@ int gdn_forward(
     const uint32_t intermediate = GDN_INTER;
     const uint32_t num_tokens = 1;
     uint32_t layer_index;
-    size_t mlp_count;
     const Beat512 *final_norm = aux_weights +
         (size_t)GDN_LAYERS * GDN_AUXB_LAYER_STRIDE;
 
@@ -3644,7 +3636,6 @@ int gdn_forward(
      * activation-packing pass. */
     Beat512 gemv_in_storage[GDN_INTER / 32];
     Beat512 q_mlp_gate_storage[GDN_INTER / 32];
-    Beat512 k_mlp_up_storage[GDN_INTER / 32];
     Beat512 gate_storage[GDN_HIDDEN / 32];
     Beat512 gemv_out_storage[(2 * GDN_INTER) / 32];
     Beat512 conv_weight_storage[3][(GDN_HIDDEN * GDN_CONV) / 32];
@@ -3657,7 +3648,6 @@ int gdn_forward(
 #pragma HLS bind_storage variable=x_alt_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=gemv_in_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=q_mlp_gate_storage type=ram_2p impl=bram
-#pragma HLS bind_storage variable=k_mlp_up_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=gate_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=gemv_out_storage type=ram_2p impl=bram
 
@@ -3684,7 +3674,6 @@ int gdn_forward(
     float *a = a_storage;
     float *b = b_storage;
 
-    mlp_count = (size_t)num_tokens * intermediate;
 
     /* Compact-shard geometry (Beat512 units): the first per-layer segment is one
      * head-major Q/K/V/gate command (four old HxH stripe lengths), followed by
@@ -3716,6 +3705,11 @@ int gdn_forward(
         }
     }
 
+    /* Iter85: layer 0's attention norm from the embedding row; every later
+     * layer's is fused with the preceding residual add inside the loop. */
+    gdn_rmsnorm_rows_bf16(gemv_in_storage, x_storage,
+                          aux_weights + GDN_AUXB_ATTN_NORM,
+                          num_tokens, hidden, GDN_NORM_EPS);
     layer_loop: for (layer_index = 0; layer_index < GDN_LAYERS; ++layer_index) {
     #pragma HLS loop_tripcount min=24 max=24  /* num_layers=24 */
         /* Iter83: the packed aux image, GDN_AUXB_* beat offsets per layer. */
@@ -3734,8 +3728,10 @@ int gdn_forward(
          * matches gdn_build_weight_shards. */
         size_t soff = (size_t)layer_index * shard_per_layer;
 
-        gdn_rmsnorm_rows_bf16(gemv_in_storage, x_storage, layer_attn_norm,
-                              num_tokens, hidden, GDN_NORM_EPS);
+        /* Iter85: this layer's attention norm was produced with the previous
+         * layer's final residual (gdn_residual_rmsnorm_bf16 below); layer 0's
+         * comes from the embedding before the loop. */
+        (void)layer_attn_norm;
         /* Recurrence consumes each convolved head inside the QKVG dataflow
          * graph. Stage every auxiliary scalar before that graph starts so the
          * shared mem_weights_mm0 adapter retains a single active reader. */
@@ -3783,12 +3779,11 @@ int gdn_forward(
                  q_mlp_gate_storage, gate_storage,
                  conv_weight_storage, conv_tail_storage,
                  a, b, a_log_storage, dt_bias_storage, layer_index);
-        gdn_beat_add_local(x_alt_storage, x_storage, gemv_out_storage,
-                           hidden / 32);
+        /* Iter85 (B3): residual add fused with the MLP norm. */
+        gdn_residual_rmsnorm_bf16(gemv_in_storage, x_alt_storage, x_storage,
+                                  gemv_out_storage, layer_mlp_norm, GDN_NORM_EPS);
         soff += shard_hh;
 
-        gdn_rmsnorm_rows_bf16(gemv_in_storage, x_alt_storage, layer_mlp_norm,
-                              num_tokens, hidden, GDN_NORM_EPS);
         gdn_gemv(gemv_out_storage, logits_stream, gemv_in_storage,
                  GDN_GEMV_SHARD_ARGUMENTS,
                  (uint32_t)soff, hidden, 2 * intermediate,
@@ -3796,11 +3791,11 @@ int gdn_forward(
                  q_mlp_gate_storage, gate_storage,
                  conv_weight_storage, conv_tail_storage,
                  a, b, a_log_storage, dt_bias_storage, layer_index);
-        gdn_unpack_gu_local(q_mlp_gate_storage, k_mlp_up_storage,
-                            gemv_out_storage);
+        /* Iter85 (B4): the SwiGLU result left the GU store in down-projection
+         * input order; copy it to the engine's input (the store cannot write
+         * the array the loader reads). */
+        gdn_copy_beats_local(gemv_in_storage, gemv_out_storage, GDN_INTER / 32);
         soff += shard_gu;
-        gdn_swiglu(gemv_in_storage, q_mlp_gate_storage,
-                   k_mlp_up_storage, mlp_count);
         gdn_gemv(gemv_out_storage, logits_stream, gemv_in_storage,
                  GDN_GEMV_SHARD_ARGUMENTS,
                  (uint32_t)soff, intermediate, hidden,
@@ -3808,12 +3803,17 @@ int gdn_forward(
                  q_mlp_gate_storage, gate_storage,
                  conv_weight_storage, conv_tail_storage,
                  a, b, a_log_storage, dt_bias_storage, layer_index);
-        gdn_beat_add_local(x_storage, x_alt_storage, gemv_out_storage,
-                           hidden / 32);
+        /* Iter85 (B3): the MLP-down residual fused with the next layer's
+         * attention norm (the final norm after layer 23). */
+        gdn_residual_rmsnorm_bf16(gemv_in_storage, x_storage, x_alt_storage,
+                                  gemv_out_storage,
+                                  layer_index + 1 < GDN_LAYERS
+                                      ? aux_weights + (size_t)(layer_index + 1) * GDN_AUXB_LAYER_STRIDE
+                                            + GDN_AUXB_ATTN_NORM
+                                      : final_norm,
+                                  GDN_NORM_EPS);
     }
 
-    gdn_rmsnorm_rows_bf16(gemv_in_storage, x_storage, final_norm,
-                          num_tokens, hidden, GDN_NORM_EPS);
 #ifndef __SYNTHESIS__
     if (gdn_native_final_hidden_debug != NULL) {
         for (uint32_t p = 0; p < GDN_HIDDEN / 32; ++p) {
@@ -4713,6 +4713,14 @@ static void gemv32_store(hls::stream<ResultWord> &result, Beat512 *out,
     ResultWord bank[16][GEMV32_MAX_RESULT_PACKS / 2];
 #pragma HLS array_partition variable=bank dim=1 complete
 #pragma HLS bind_storage variable=bank type=ram_s2p impl=uram
+    /* Iter85 (B4): for the GU shape (352 rows per channel) a result word
+     * holds the gate (lane 0) and up (lane 1) of one intermediate row, so the
+     * SwiGLU is evaluated here at the stream's pace and the word keeps the
+     * BF16-exact result in lane 0 -- the retired unpack + SwiGLU passes'
+     * arithmetic (gate and up rounded to BF16, silu(g) * u rounded to BF16);
+     * the write-out below then emits the 176 down-projection input beats in
+     * chunk-major order. */
+    const bool gu_swiglu = (rows_per_ch == GDN_INTER / (GEMV_CHANNELS / 2));
 gemv32_store_fill: for (uint32_t g = 0; g < row_groups; ++g) {
 #pragma HLS loop_tripcount min=8 max=125
     gemv32_store_fill_w: for (uint32_t w = 0; w < GEMV_CLUSTERS * 8; ++w) {
@@ -4720,7 +4728,16 @@ gemv32_store_fill: for (uint32_t g = 0; g < row_groups; ++g) {
             const ResultWord word = result.read();
             const uint32_t cluster = w >> 3;
             const uint32_t lane = ((g & 1) << 3) | (w & 7);
-            bank[lane][(g >> 1) * GEMV_CLUSTERS + cluster] = word;
+            ResultWord stored = word;
+            if (gu_swiglu) {
+                const float gate_v = bf16_to_fp32(fp32_to_bf16_rne(gemv32_result_lane(word, 0)));
+                const float up_v = bf16_to_fp32(fp32_to_bf16_rne(gemv32_result_lane(word, 1)));
+                const float r = bf16_to_fp32(fp32_to_bf16_rne(gdn_silu(gate_v) * up_v));
+                Beat512 packed = 0;
+                set_fp32_lane(packed, 0, r);
+                stored = packed.range(63, 0);
+            }
+            bank[lane][(g >> 1) * GEMV_CLUSTERS + cluster] = stored;
 #ifdef GDN_CALL_PROBE
             tag = word.range(7, 0);
 #endif
@@ -4886,10 +4903,14 @@ gemv32_store_fill: for (uint32_t g = 0; g < row_groups; ++g) {
     }
 
     if ((rows_per_ch & 31) == 0) {
-    gemv32_store_c: for (uint32_t c = 0; c < GEMV_CHANNELS; ++c) {
+        /* GU (Iter85): only the even channels carry a value now (the SwiGLU
+         * result), written chunk-major: beat (chunk k, pack p) at k * 11 + p. */
+        const uint32_t out_channels = gu_swiglu ? GEMV_CHANNELS / 2 : GEMV_CHANNELS;
+    gemv32_store_c: for (uint32_t oc = 0; oc < out_channels; ++oc) {
         gemv32_store_p: for (uint32_t p = 0; p < opacks_per_ch / 2; ++p) {
 #pragma HLS loop_tripcount min=2 max=11
 #pragma HLS pipeline II=1
+                const uint32_t c = gu_swiglu ? 2u * oc : oc;
                 const Beat512 lo = gemv32_read_pack(bank, 2 * p, c);
                 const Beat512 hi = gemv32_read_pack(bank, 2 * p + 1, c);
                 Beat512 packed = 0;
@@ -4900,7 +4921,7 @@ gemv32_store_fill: for (uint32_t g = 0; g < row_groups; ++g) {
                     set_bf16_lane(packed, lane + 16,
                         fp32_to_bf16_rne(get_fp32_lane(hi, lane)));
                 }
-                size_t out_index = (size_t)c * (opacks_per_ch / 2) + p;
+                size_t out_index = (size_t)oc * (opacks_per_ch / 2) + p;
                 out[out_index] = packed;
 #ifdef GDN_CALL_PROBE
                 tag = packed.range(7, 0);
@@ -6561,7 +6582,6 @@ int gdn_forward_p(
     const uint32_t intermediate = GDN_INTER;
     const uint32_t num_tokens = 1;
     uint32_t layer_index;
-    size_t mlp_count;
     const Beat512 *final_norm = aux_weights +
         (size_t)GDN_LAYERS * GDN_AUXB_LAYER_STRIDE;
 
@@ -6587,7 +6607,6 @@ int gdn_forward_p(
      * activation-packing pass. */
     Beat512 gemv_in_storage[GDN_INTER / 32];
     Beat512 q_mlp_gate_storage[GDN_INTER / 32];
-    Beat512 k_mlp_up_storage[GDN_INTER / 32];
     Beat512 gate_storage[GDN_HIDDEN / 32];
     Beat512 gemv_out_storage[(2 * GDN_INTER) / 32];
     Beat512 conv_weight_storage[3][(GDN_HIDDEN * GDN_CONV) / 32];
@@ -6600,7 +6619,6 @@ int gdn_forward_p(
 #pragma HLS bind_storage variable=x_alt_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=gemv_in_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=q_mlp_gate_storage type=ram_2p impl=bram
-#pragma HLS bind_storage variable=k_mlp_up_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=gate_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=gemv_out_storage type=ram_2p impl=bram
 
@@ -6627,7 +6645,6 @@ int gdn_forward_p(
     float *a = a_storage;
     float *b = b_storage;
 
-    mlp_count = (size_t)num_tokens * intermediate;
 
     /* Compact-shard geometry (Beat512 units): the first per-layer segment is one
      * head-major Q/K/V/gate command (four old HxH stripe lengths), followed by
@@ -6659,6 +6676,11 @@ int gdn_forward_p(
         }
     }
 
+    /* Iter85: layer 0's attention norm from the embedding row; every later
+     * layer's is fused with the preceding residual add inside the loop. */
+    gdn_rmsnorm_rows_bf16(gemv_in_storage, x_storage,
+                          aux_weights + GDN_AUXB_ATTN_NORM,
+                          num_tokens, hidden, GDN_NORM_EPS);
     layer_loop: for (layer_index = 0; layer_index < GDN_LAYERS; ++layer_index) {
     #pragma HLS loop_tripcount min=24 max=24  /* num_layers=24 */
         /* Iter83: the packed aux image, GDN_AUXB_* beat offsets per layer. */
@@ -6677,8 +6699,10 @@ int gdn_forward_p(
          * matches gdn_build_weight_shards. */
         size_t soff = (size_t)layer_index * shard_per_layer;
 
-        gdn_rmsnorm_rows_bf16(gemv_in_storage, x_storage, layer_attn_norm,
-                              num_tokens, hidden, GDN_NORM_EPS);
+        /* Iter85: this layer's attention norm was produced with the previous
+         * layer's final residual (gdn_residual_rmsnorm_bf16 below); layer 0's
+         * comes from the embedding before the loop. */
+        (void)layer_attn_norm;
         /* Recurrence consumes each convolved head inside the QKVG dataflow
          * graph. Stage every auxiliary scalar before that graph starts so the
          * shared mem_weights_mm0 adapter retains a single active reader. */
@@ -6728,12 +6752,11 @@ int gdn_forward_p(
                  conv_weight_storage, conv_tail_storage,
                  a, b, a_log_storage, dt_bias_storage, layer_index
                  GDN_PROBE_ARG(workspace) GDN_PROBE_ARG(4u * layer_index + 1u));
-        gdn_beat_add_local(x_alt_storage, x_storage, gemv_out_storage,
-                           hidden / 32);
+        /* Iter85 (B3): residual add fused with the MLP norm. */
+        gdn_residual_rmsnorm_bf16(gemv_in_storage, x_alt_storage, x_storage,
+                                  gemv_out_storage, layer_mlp_norm, GDN_NORM_EPS);
         soff += shard_hh;
 
-        gdn_rmsnorm_rows_bf16(gemv_in_storage, x_alt_storage, layer_mlp_norm,
-                              num_tokens, hidden, GDN_NORM_EPS);
         gdn_gemv_part_ctrl(gemv_out_storage, logits_stream, gemv_in_storage,
                  GDN_GEMV_P_ARGUMENTS,
                  (uint32_t)soff, hidden, 2 * intermediate,
@@ -6742,11 +6765,11 @@ int gdn_forward_p(
                  conv_weight_storage, conv_tail_storage,
                  a, b, a_log_storage, dt_bias_storage, layer_index
                  GDN_PROBE_ARG(workspace) GDN_PROBE_ARG(4u * layer_index + 2u));
-        gdn_unpack_gu_local(q_mlp_gate_storage, k_mlp_up_storage,
-                            gemv_out_storage);
+        /* Iter85 (B4): the SwiGLU result left the GU store in down-projection
+         * input order; copy it to the engine's input (the store cannot write
+         * the array the loader reads). */
+        gdn_copy_beats_local(gemv_in_storage, gemv_out_storage, GDN_INTER / 32);
         soff += shard_gu;
-        gdn_swiglu(gemv_in_storage, q_mlp_gate_storage,
-                   k_mlp_up_storage, mlp_count);
         gdn_gemv_part_ctrl(gemv_out_storage, logits_stream, gemv_in_storage,
                  GDN_GEMV_P_ARGUMENTS,
                  (uint32_t)soff, intermediate, hidden,
@@ -6755,12 +6778,17 @@ int gdn_forward_p(
                  conv_weight_storage, conv_tail_storage,
                  a, b, a_log_storage, dt_bias_storage, layer_index
                  GDN_PROBE_ARG(workspace) GDN_PROBE_ARG(4u * layer_index + 3u));
-        gdn_beat_add_local(x_storage, x_alt_storage, gemv_out_storage,
-                           hidden / 32);
+        /* Iter85 (B3): the MLP-down residual fused with the next layer's
+         * attention norm (the final norm after layer 23). */
+        gdn_residual_rmsnorm_bf16(gemv_in_storage, x_storage, x_alt_storage,
+                                  gemv_out_storage,
+                                  layer_index + 1 < GDN_LAYERS
+                                      ? aux_weights + (size_t)(layer_index + 1) * GDN_AUXB_LAYER_STRIDE
+                                            + GDN_AUXB_ATTN_NORM
+                                      : final_norm,
+                                  GDN_NORM_EPS);
     }
 
-    gdn_rmsnorm_rows_bf16(gemv_in_storage, x_storage, final_norm,
-                          num_tokens, hidden, GDN_NORM_EPS);
 #ifndef __SYNTHESIS__
     if (gdn_native_final_hidden_debug != NULL) {
         for (uint32_t p = 0; p < GDN_HIDDEN / 32; ++p) {
