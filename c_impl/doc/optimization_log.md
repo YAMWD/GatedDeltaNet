@@ -19743,3 +19743,31 @@ is never acknowledged. Rerun (job 8229) on both netlists: **probe-free 72 cases 
 at HLS RTL, post-`synth_design` and post-`opt_design`**, no stray request. The state writer/reader
 gates use the same held-start bench and have passed on every build; their DUTs were not re-examined
 here.
+
+## Promotion candidate of the Iter82–86 series (opened 2026-10-11, branch `recur_balance`)
+
+**Purpose.** Stage 6 reached its stop condition (Iter86 entry), so the campaign goes to its end
+step: a probe-free `make run_hw` of the retained source (`56622ec53`, `gdn_model.cpp` c4368800…,
+`gdn_model.h` 337d7bc5…, `host.cpp` def56de3…), the card gates, then the qualification with the
+Iter81 protocol — 512-token drift and WikiText-2 on card (`diagnostics/promo_iter86/qual/robustness/`),
+paired power in both GPU precisions (`qual/power/`; the scripts take the build's artifact or
+diagnostics directory and read the expected XCLBIN digest from the build's own
+`copied_artifacts.sha256`, so they chain before the image exists).
+
+**Attempt 1 — build 8230 (tag `hw_20261011_110920_1860492`), FAILED at the tails gate after 52 min.**
+Command: `BUILD_EXCLUSIVE= BUILD_EXCLUDE=acclnode03,acclnode04,acclnode05,harrier make run_hw`.
+Native, XO, state-address and state-reader gates passed (0); `tails_gate.exit=2`:
+`python3: can't open file '/tmp/yaoz0b-8230/c_impl/check_tails_writer_addresses.py'`. The gate
+was added to `slurm/hw_build.slurm` but not to the launcher's frozen snapshot list
+(`run_hw_sbatch.sh`, the `STATE_ADDRESS_GATE` group). Card job 8231 was cancelled by its `afterok`;
+the chained qualification jobs 8232–8234 could no longer start and were cancelled by hand. Fix: the
+gate joins the snapshot list. Before relaunching, the gate runs on attempt 1's staged
+`gdn_forward_p.xo` (still on acclnode01's `/tmp`) to exercise its XO-reading path, which no run
+had used yet (job 8235).
+Job 8235: the gate on attempt 1's staged `gdn_forward_p.xo` (digest `f1c2f045…`, the XO-reading path)
+**PASS — 72 cases at HLS RTL, post-synth and post-opt**. Launcher fix committed (`71deccc11`).
+
+**Attempt 2 — build 8236 (tag `hw_20261011_120857_1867100`), launched 2026-10-11 12:09 UTC**, same
+command and source; the frozen snapshot now holds the gate. Chain: card 8237 (afterok) →
+robustness 8238 → paired power 8239 (fp32 arm) → 8240 (bf16 arm), all with
+`--kill-on-invalid-dep=yes` so a failed upstream cancels them.
