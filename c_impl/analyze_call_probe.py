@@ -18,7 +18,7 @@ SLR2 = {0: "xr_first", 1: "xr_last", 2: "ys_first", 3: "ys_last", 4: "attn_first
         6: "qkv_first", 7: "qkv_last", 8: "pf28", 9: "wt28", 10: "pf29", 11: "wt29", 12: "pf30", 13: "wt30",
         14: "pf31", 15: "wt31", 16: "wr28", 17: "wr29", 18: "wr30", 19: "wr31",
         20: "i0_prep_h0", 21: "i0_read_h0", 22: "i0_read_hl", 23: "i0_upd_hl", 24: "i0_upd_end",
-        25: "i1_prep_h0", 26: "i1_read_h0", 27: "i1_read_hl", 28: "i1_upd_hl", 29: "i1_upd_end", 31: "end"}
+        25: "i1_prep_h0", 26: "i1_read_h0", 27: "i1_read_hl", 28: "i1_upd_hl", 29: "i1_upd_end", 30: "go_wait", 31: "end"}
 COL_WORDS = [8, 64, 24, 32]   # words per sub-loop per row group: c0 | slr0 | local b | slr2
 def kind(call): return "lm_head" if call == 96 else ["QKVG", "o_proj", "GU", "down"][call % 4]
 def row_groups(call): return {"QKVG": 32, "o_proj": 8, "GU": 44, "down": 8, "lm_head": 125}[kind(call)]
@@ -31,6 +31,16 @@ tok = med(kernel_ms) * 200e3
 rec = defaultdict(dict)   # rec[(step, kernel, call)][slot] = (event, port, tag, cycle)
 for step, k, call, r, ev, port, tag, cyc in rows:
     rec[(int(step), int(k), int(call))][int(r)] = (int(ev), int(port), int(tag), int(cyc))
+# Since the go-token counter (Iter84 fix): the SLR2 counter's slot 30 (event 18) is its wait for
+# the x relay's start token; every other SLR2 stamp is relative to the counter's entry, so
+# subtract the wait to make them call-relative (older dumps have no slot 30: nothing changes).
+for key, d in rec.items():
+    if key[1] == 2 and 30 in d and d[30][0] == 18:
+        wait = d[30][3]
+        for slot in list(d):
+            if slot != 30:
+                ev, port, tag, cyc = d[slot]
+                d[slot] = (ev, port, tag, cyc - wait)
 steps = sorted({s for s, k, c in rec if s > 0})
 print(f"steps with records: {len(steps)}; kernel_ms median {med(kernel_ms):.3f} = {tok:,.0f} cycles at 200 MHz")
 

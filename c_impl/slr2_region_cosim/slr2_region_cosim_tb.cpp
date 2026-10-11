@@ -29,7 +29,9 @@ void gdn_slr2_region_cosim_top(
     hls::stream<GDNAxisBeat> &scalars_in,
     hls::stream<GDNAxisWord> &ys_out, hls::stream<GDNAxisBeat> &attn_out);
 
-static const uint32_t W_BEATS = 16384, STATE_BEATS = 4096, PORT_BEATS = 16384 + 4096 + 512;
+/* a port: the call's weights, layer 0's state stripe, and (probe builds) the record tail after
+ * the full 24-layer stripe at beat 16384 + 98304 = 114688 (GDN_PROBE_BEAT_OFF of the scaled header) */
+static const uint32_t W_BEATS = 16384, STATE_BEATS = 4096, STRIPE_BEATS = 98304, PORT_BEATS = 115200;
 static std::mt19937 rng(20261010);
 static uint16_t bf16_mag() {   // magnitude in [0.125, 1), random sign: exponent 124..126, 7 mantissa bits
     const uint32_t sign = (rng() & 1u) << 15, exp = 124u + rng() % 3u, mant = rng() & 0x7fu;
@@ -75,7 +77,7 @@ int main() {
     /* the SLR2 counter's 32 records of call 0, stored by writer 31 in its probe tail:
      * event[63:56] port[55:48] tag[47:40] cycle[39:0] (the native run prints zeros: no store) */
     for (uint32_t b = 0; b < 4; ++b) {
-        const Beat512 &beat = w[7][W_BEATS + STATE_BEATS + b];
+        const Beat512 &beat = w[7][W_BEATS + STRIPE_BEATS + b];
         for (uint32_t j = 0; j < 8; ++j) {
             const uint64_t v = (uint64_t)beat.range(64 * j + 63, 64 * j);
             if (v) printf("PROBE_REC slot=%u event=%u port=%u tag=%u cycle=%llu\n", 8 * b + j,
