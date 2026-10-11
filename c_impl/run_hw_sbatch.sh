@@ -183,7 +183,7 @@ if [ -n "${REUSE_XO:-}" ]; then
     snapshot_files+=(prepare_reused_xo.py)
 fi
 if [ "${STATE_ADDRESS_GATE:-0}" = 1 ]; then
-    snapshot_files+=(gdn_eval.cpp all_bf16_layout_test.cpp check_state_writer_addresses.py check_state_reader_addresses.py)
+    snapshot_files+=(gdn_eval.cpp all_bf16_layout_test.cpp check_state_writer_addresses.py check_state_reader_addresses.py check_tails_writer_addresses.py)
 fi
 # A variant build (HW_CFG_TEMPLATE=... and/or extra hook Tcl) must freeze its
 # extra inputs too: EXTRA_SNAPSHOT_FILES="fileA fileB" appends to the list.
