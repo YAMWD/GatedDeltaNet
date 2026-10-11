@@ -2,12 +2,11 @@
 
 Loads only when working under `c_impl/`. Project-wide guidance (the real-data principle, build
 commands, the iteration workflow, commit discipline, current status) stays in the root `CLAUDE.md`.
-`doc/architecture.md` is the authoritative spec (currently the **200 MHz three-kernel image of the Iter79
-campaign**, promoted 2026-10-04: the Iter76 datapath — all-BF16 weights and state, a native `ap_float<16,8>`
-product, free-running cluster pipelines, on-chip strict argmax, five-phase II=1 recurrent read, the Iter73b2/75b
-state-writer and cluster-emit changes — compiled into three kernels, one per SLR, joined by seven data-only
-AXI-Stream links; 12.350 ms/token production TPOT / 12.227 ms kernel on card. The 150 MHz Iter76 monolith,
-16.255 / 16.131 ms, is the predecessor). `README.md`
+`doc/architecture.md` is the authoritative spec (currently the **200 MHz three-kernel image of the
+Iter82–86 series**, promoted 2026-10-11: the Iter81 balanced-island image plus the packed aux image,
+the deferred state write-back, the fused residual + RMSNorm and SwiGLU-in-the-store, and the per-head
+output norm and convolution-tail writer in the QKVG region; 8.486 ms/token production TPOT / 8.369 ms
+kernel on acclnode01's card. The Iter81 image, 10.470 / 10.347 ms on harrier's card, is the predecessor). `README.md`
 in this directory is current — it was rewritten for the decode-only design; the earlier note calling it
 stale was wrong.
 

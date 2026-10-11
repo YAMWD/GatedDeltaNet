@@ -1,9 +1,10 @@
 # Accelerator Documentation
 
 **Current architecture:** the FPGA is a decode-only accelerator. The
-production image — the **200 MHz three-kernel image with balanced recurrent
-islands, Iter81**, promoted 2026-10-08 (the Iter79 three-kernel image of
-2026-10-04 is its predecessor, the 150 MHz Iter76 monolith and Iter67c before that) — forwards
+production image — the **200 MHz three-kernel image of the Iter82–86 series**,
+promoted 2026-10-11 (the Iter81 balanced-island image of 2026-10-08 is its
+predecessor, the Iter79 three-kernel image, the 150 MHz Iter76 monolith and
+Iter67c before that) — forwards
 one token at a time with 32 HBM weight
 readers and 16 two-port GEMV clusters split across three kernels, one per die:
 `gdn_forward_p` (control, SLR1), `gdn_k_slr0` (SLR0) and `gdn_k_slr2` (SLR2,
@@ -15,22 +16,27 @@ activations resident in local BRAM, four-port packed **BF16** recurrent state
 behind full-window 4,096-deep URAM queues, two concurrent 16-column recurrent
 islands — since Iter81 each a three-stage head pipeline (prep → read →
 update) that hides under the QKVG weight stream, with the layer's state
-fetched before the call's weights — a five-phase II=1 recurrent read
-schedule, head-streamed Q/K/V convolution and recurrence, an on-chip strict
-LM-head argmax, and a streamed full-vocabulary logit export. Prefill runs on the GPU and supplies persistent
+fetched before the call's weights and written back after them (Iter84) — a
+five-phase II=1 recurrent read schedule, head-streamed Q/K/V convolution and
+recurrence with the output norm/gate and the convolution-tail write done per
+head inside the QKVG call (Iter86), a packed BF16 aux-weight image with one
+fused tiny a/b GEMV (Iter83), the residual add fused with the following RMSNorm
+and the SwiGLU inside the GU store (Iter85), an on-chip strict LM-head argmax,
+and a streamed full-vocabulary logit export. Prefill runs on the GPU and supplies persistent
 recurrent and convolution state.
 
 The production image routes with zero routing errors and closes a true
-**200 MHz** kernel clock — setup +0.027 / hold +0.010 ns, with the fixed
+**200 MHz** kernel clock — setup +0.041 / hold +0.010 ns, with the fixed
 250 MHz DMA clock at +0.003 ns; the shell's 450 MHz HBM AXI clock missed by
-0.021 ns on its own crossing pipes and runs at 445.8 MHz under the flow's
-440 MHz floor. It measures **10.470 ms/token production TPOT / 10.347 ms
-kernel (2,069,400 cycles)** with an exact 64-token trajectory and the
-production vector-gate figures, **−15.2 % TPOT and −15.4 % cycles** against
-the Iter79 image (12.350 / 12.227 ms, 2,445,400 cycles) with identical
-arithmetic, or **11.6x** the 121.4 ms eight-port baseline. Paired power is
-62.1 W active, 0.646 J/token gross (−9.9 % energy per token versus the Iter79
-image at +4.3 W). The flow is one command (`make run_hw`); see
+0.018 ns on its own crossing pipes and runs at 446.4 MHz under the flow's
+440 MHz floor. It measures **8.486 ms/token production TPOT / 8.369 ms
+kernel (1,673,800 cycles)** on acclnode01's card with an exact 64-token
+trajectory and the production vector-gate figures, **−18.4 % kernel time**
+against the Iter81 image on the same card (10.256 ms) with order-preserving
+arithmetic, or **14.3x** the 121.4 ms eight-port baseline. Paired power is
+69.9 W active, 0.593 J/token gross (−8.2 % energy per token versus Iter81 at
++7.8 W), 3.7x faster than an A100 running eager PyTorch. The flow is one
+command (`make run_hw`); see
 [reproduce_f200.md](reproduce_f200.md).
 
 Toolchain: **Vitis 2024.2** (the native BF16 multiplier requires its

@@ -1,6 +1,6 @@
 # Cycle-First Optimization Roadmap After Iter67c
 
-> **Update 2026-10-11 (Iter82–86, retained, not yet promoted).** The dual-kernel
+> **Update 2026-10-11 (Iter82–86, promoted 2026-10-11; the cycle reference is now 1.6738M at 200 MHz, 8.369 ms kernel on acclnode01's card).** The dual-kernel
 > probe (Iter82) and four schedule iterations took the token from 2,053,983 to
 > **1,684,509 cycles** on acclnode01's card (8.423 ms kernel; −18.0 %): the packed
 > aux image and fused tiny GEMV (Iter83, −10.2 %), the deferred state write-back

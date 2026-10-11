@@ -19771,3 +19771,62 @@ Job 8235: the gate on attempt 1's staged `gdn_forward_p.xo` (digest `f1c2f045…
 command and source; the frozen snapshot now holds the gate. Chain: card 8237 (afterok) →
 robustness 8238 → paired power 8239 (fp32 arm) → 8240 (bf16 arm), all with
 `--kill-on-invalid-dep=yes` so a failed upstream cancels them.
+
+**Attempt 2 result (build 8236, acclnode01, shared node, 8 h 33 m): closed and gated.** Every
+pre-link gate 0 (native, XO, state address, state reader, the new tails gate, island names);
+routed **0 routing errors**; clocks **kernel +0.041 / +0.010 ns at 5.000 ns, DMA +0.003 / +0.009,
+hbm_aclk −0.018 / +0.010** (the shell's own SLR-crossing paths; accepted by the 440 MHz floor, vpl
+programmed **446.4 MHz**; the coin's tenth draw); post-route `phys_opt_design -directive
+AggressiveExplore` ran its full search for 46 m 13 s against the negative hbm_aclk slack (30 s in
+build 8188, where every clock met) and left WNS −0.018 — the whole of this link's 42 extra
+minutes in its "bitstream generation" phase. XCLBIN
+`6ee780219d7e3909d7d5fb71eacb7a47336c241f4552e834a4e612a1021f6e2c`, host
+`4f8050c3c3fe5879…`, source `gdn_model.cpp` c4368800… (`56622ec53`)
+(`diagnostics/hw_20261011_120857_1867100/`). Resources (csynth, the production XOs):
+`gdn_forward_p` 619 BRAM18K / 1,030 DSP / 256.0K FF / 251.3K LUT / 56 URAM, `gdn_k_slr0` 697 /
+1,121 / 277.8K / 236.0K / 0, `gdn_k_slr2` 472 / 1,609 / 333.1K / 319.4K / 96 — summed 1,788 /
+3,760 / 866.8K / 806.7K / 152 (Iter81: 1,813 / 3,679 / 861K / 804K / 152). Routed per SLR: CLB
+**91.12 / 92.41 / 91.49 %**, LUTs 202,259 / 232,834 / 255,487 (46.00 / 53.90 / 59.14 %), DSP
+2,154 / 1,547 / 2,134, BRAM tiles 429 / 549 / 299, URAM 0 / 56 / 96, SLLs 24,856 (SLR1↔SLR0
+57.54 %, SLR2↔SLR1 50.34 %).
+- *Card gates (job 8237, acclnode01):* exact 8- and 64-token trajectories; vector gate over
+  2,016,000 logits NRMSE 0.00466270, worst step 0.011908, cosine 0.999989, top-1 100 %, 0 tolerance
+  failures — the production figures; **kernel 8.369 ms median (mean 8.370, 8.360–8.424), TPOT
+  8.486 ms** (mean 8.489) = **1,673,800 kernel cycles**. Against the Iter86 probe image on the
+  same card (8.423 ms): the probe cost 0.054 ms per token. Against Iter81 on the same card (10.256
+  ms kernel over the WikiText run, job 7401; 10.267 on the Iter82 probe image's card gates):
+  **−18.4 % kernel time**. The card reads back DATA_CLK 200 MHz and hbm_aclk 446 MHz.
+- *Robustness (job 8238, 54 m):* 512-token free-running drift vs the GPU 512 reference: fork at
+  step **447**, 6 of 8 windows comparable, window NRMSE 0.005305 → 0.005638 (ratio **1.063**), slope
+  **2.133e-06** per step, `TREND_VERDICT=BOUNDED` — the same three numbers as every image since
+  Iter66n. WikiText-2 teacher-forced on the verified-identical workload (62 documents, 183 windows,
+  314,843 scored tokens): FPGA word perplexity **16.774839771** vs GPU **16.776123769** =
+  **−0.0077 %** (gate 5 %) — Iter81's figures to the last digit, as the order-preserving
+  arithmetic of Iter83–86 requires — at **8.371 ms/token** kernel over the run (Iter81 10.256 on
+  this card and workload: −18.4 %). The log's `[XRT] ERROR: Operation not permitted Device index 0`
+  is XRT failing to open the node's other, cgroup-blocked card at startup; the Iter81
+  qualification log carries the same line, and the run selects the U55C by PCIe address.
+- *Paired power (jobs 8239 fp32 arm 13 m 34 s, 8240 bf16 arm 11 m 40 s, acclnode01, 4,096-token
+  context, 60 s idle / 30 s warm-up / 3 × 60 s):*
+
+  | device | TPOT (ms) | device time (ms) | idle W | active W (mean) | J/token gross | J/token idle-subtracted |
+  |---|---:|---:|---:|---:|---:|---:|
+  | U55C, fp32-arm run | 8.478 | 8.376 | 31.71 | 69.92 | **0.5929** | 0.3240 |
+  | U55C, bf16-arm run | 8.475 | 8.377 | 31.06 | 69.46 | **0.5888** | 0.3255 |
+  | A100 fp32 eager | 30.991 | 30.916 | 67.12 | 96.01 | 2.9766 | 0.8956 |
+  | A100 bf16 eager | 31.883 | 31.808 | 67.72 | 85.52 | 2.7275 | 0.5679 |
+
+  Ratios (A100 / U55C): **3.66x / 3.76x faster**, **5.02x / 4.63x** gross and **2.76x / 1.74x**
+  idle-subtracted energy efficiency (fp32 / bf16 arms). Against Iter81 (62.1 W active, 0.646 J
+  gross, 0.322 J idle-subtracted): **+7.8 W active, −8.2 % gross energy per token**, idle-subtracted
+  energy per token unchanged within 1 % (the same work in less time at higher power; the gross gain
+  is the idle power over a shorter token). The A100 arms ran faster than on 2026-10-08 (30.99 vs
+  32.06 ms fp32): the paired baseline moves with the host's load (memory: A100 latency probe); the
+  paper's baseline is unchanged.
+- **Verdict: RETAINED AND PROMOTED (2026-10-11).** The probe-free build of the Iter82–86 series —
+  build 8236, XCLBIN `6ee78021…`, source `56622ec53` — is the production image: exact 8/64-token
+  trajectories, the production vector-gate figures, bounded 512-token drift, WikiText-2 within
+  −0.0077 % of the GPU, **8.486 ms production TPOT / 8.369 ms kernel (1,673,800 cycles)** on
+  acclnode01's card, 0.593 J/token. Documents updated in the same series (`architecture.md`, the
+  READMEs, `cycle_optimization_roadmap.md`, the CLAUDE.md status block). Merging `recur_balance`
+  into `main` is the user's step.
