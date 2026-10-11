@@ -480,10 +480,15 @@ Retain only changes that shorten the measured critical schedule:
   −209.7K cycles/token (−10.2 %), the control kernel's serial work
   487.7K → 278.2K; the remaining serial work is 4,865 / 3,244 / 1,468 / 2,061
   per layer before QKVG / after QKVG / after o_proj / after GU (Iter84–86);
+- ~~accumulate the next RMSNorm sum of squares during the preceding residual
+  production~~ **done, Iter85** (the residual add fused with the following
+  RMSNorm, one pass; and the SwiGLU evaluated inside the GU store's fill loop
+  with the write-out in the down projection's layout): measured on card
+  −55.2K cycles/token (−3.1 %), the serial work outside the control regions
+  278.2K → 222.6K; after o_proj ≈ 900 and after GU ≈ 180 per layer, the two
+  gaps around QKVG ≈ 8.1K per layer (Iter86 and Iter87 target them);
 - preload compact norm, convolution, and tiny-GEMV weights;
-- execute A/B tiny GEMVs when QKVG has the required local activation;
-- accumulate the next RMSNorm sum of squares during the preceding residual
-  production; and
+- execute A/B tiny GEMVs when QKVG has the required local activation; and
 - overlap convolution-tail traffic through persistent port services.
 
 Expected additional saving: **0.10--0.20M cycles/token**. Do not widen norm,

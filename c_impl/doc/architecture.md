@@ -361,7 +361,8 @@ Each of the 24 layers executes serially:
 
 ```text
 local x
-  -> RMSNorm -> norm_attn
+  -> norm_attn (layer 0: RMSNorm of the embedding row before the loop; later
+     layers: from the fused residual + RMSNorm pass that ended the previous layer)
   -> tiny GEMV A and B -> partitioned scalar arrays
   -> load packed Q/K/V convolution weights and old tails
   -> shared GEMV aperture
@@ -384,13 +385,14 @@ local x
   -> packed convolution-tail writeback
   -> output norm and gate, in place
   -> output-projection GEMV
-  -> local residual accumulation into x
-  -> RMSNorm
-  -> one pair-interleaved GU GEMV
-  -> local deinterleave into reused Q/K buffers
-  -> SwiGLU, in place
+  -> residual accumulation into x fused with the MLP RMSNorm (Iter85: one pass
+     forms the rounded sum beats and their sum of squares, then the scale pass)
+  -> one pair-interleaved GU GEMV; the SwiGLU is evaluated per result word
+     inside the store's fill loop and written out in the down projection's
+     176-beat layout (Iter85), then copied into the engine's input
   -> MLP down GEMV
-  -> local residual accumulation into x
+  -> residual accumulation into x fused with the next layer's attention
+     RMSNorm (the final norm after layer 23)
 ```
 
 The QKVG sink holds only one 256-element head. One convolution datapath is
@@ -585,7 +587,10 @@ took the first two: −209.7K), deferring the state write-back until after the
 weight loop (**Iter84, done: each state writer drains its 4,096-deep URAM queue
 only after a one-token `wr_go` from its reader's weight loop; measured
 −67.1K, the ports back at 0.985 beats/cycle and the collector's wait on SLR2
-gone**), the islands' last
+gone**), the residual add fused with the following RMSNorm and the SwiGLU inside
+the GU store (**Iter85, done:** `gdn_residual_rmsnorm_bf16` and the store's fill
+loop; measured −55.2K, the serial work outside the control regions 278.2K →
+222.6K, after o_proj ≈ 900 and after GU ≈ 180 cycles per layer), the islands' last
 head, and the per-call fill/drain; see `optimization_log.md`, Iter82. The
 monolith keeps the original island and reader
 (`gdn_recurrent_attention_island`, `gemv32_mm2s_with_state`) for A/B.

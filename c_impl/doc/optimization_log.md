@@ -19361,3 +19361,170 @@ stamps carry the result.
 
 **Verdict: retained** (on-card, same card as the reference; not promoted). Resources (csynth)
 unchanged; routed: kernel +0.039 ns, hbm_aclk −0.033 → 443 MHz.
+
+- *Probed cosim of the SLR2 region (job 8106, 1 h 14 m, harrier): FAIL in the harness, not the
+  design.* With `GDN_CALL_PROBE` the writers store their records at `GDN_PROBE_BEAT_OFF` =
+  shard + the **24-layer** state stripe = beat 114,688 of the scaled layout, beyond the
+  harness's 20,992-beat ports — the AXI memory model for mm31 aborted on that write request
+  (`$finish`), so the RTL run never finished (the island-free part had run to the counter's
+  store). Harness widened to 115,200-beat ports (records read at 16,384 + 98,304); probed cosim
+  resubmitted. The Iter84 non-probe cosim PASS stands (no record store without the probe).
+
+- *Probed cosim, widened harness (job 8124, 1 h 14 m, acclnode01):* **C/RTL co-simulation PASS**,
+  digests identical, and the RTL counter's records for the single call are all consistent:
+  x 0..62 (pre-queued by the harness), state prefetch done 4,171 on all four ports, weights done
+  20,630, islands prep h0 6 / read h0 609 / read h7 12,026 / update h7 13,648 / update end
+  14,693 (per-head read pace 1,631 — the harness pre-queues Q/K/V), Q/K/V 0..6,416, attention
+  2,224..13,649, **writers done 24,796 = weights done + 4,166** (the deferred 4,096-beat drain,
+  the Iter84 mechanism seen in RTL), counter end 24,798. So in RTL the counter starts with the
+  region and stamps correctly for one call; the late QKVG stamps on card come from the 97-call
+  sequence. A two-call variant of the harness (`gdn_slr2_region_cosim_top2`: a down-shaped call
+  then the QKVG call, probe_call 0 and 1) is running to reproduce it in RTL.
+
+- *Two-call probed cosim (job 8144, 1 h 45 m; `gdn_slr2_region_cosim_top2`, a down-shaped call
+  then the QKVG call): PASS, 36,827 RTL cycles, and it **reproduces the card defect exactly**:
+  call 0's records are sane (x 1..176, ys 1,627..11,536, weights done 11,386, end 11,538) and
+  call 1's QKVG counter starts only when the weight loops have ended — prefetch 0, weights 1,
+  Q/K/V 0..1, attention 0..1, islands 0..1, writers 4,162, end 4,164 of a ≈ 25K-cycle call. So
+  the defect is the counter's late start after a *preceding* call in the same region
+  instance, now reproducible in RTL in under two hours (the harness is the test bed for the
+  fix; the netlist's counter-start logic is being read).
+
+- *Mechanism and fix under test:* in every synthesized netlist the counter's start is **sticky**
+  (`ap_start = ap_sync_reg | ap_start`, set once and never cleared — HLS treats this
+  all-non-blocking process as free-running and restarts it whenever it finishes), so its
+  iteration boundaries need not coincide with the region's calls; the readers, relays and
+  writers use the normal `(ready ^ 1) & ap_start` form. Fix (probe builds only): the SLR2 x relay
+  (`gdn_axis_recv512_probe_go`) writes a one-token `probe_go` at its start and the counter
+  waits for it before polling, recording the wait as slot 30 (event 18, `go_wait`); every later
+  stamp is relative to the counter's entry, and `analyze_call_probe.py` subtracts the wait. The
+  probe-enabled native model passes the fast gate (the token is consumed once per call); the
+  two-call harness runs again with it (job 8165) — the records will show both whether the
+  counter entered early (a large wait) and whether the QKVG stamps are now call-relative.
+
+- *Two-call cosim with the go token (job 8165, 1 h 43 m): PASS, 36,827 cycles — and decisive:* in
+  call 1 the counter's wait for the token was **1 cycle** (slot 30) and every QKVG stamp was
+  still already-queued (1–2), writers 4,160, end 4,162. So the counter **enters** its QKVG
+  iteration late, not early: the token (written by the x relay at the call's start) was waiting
+  for it. Its active cycles over the two calls (11,536 + 4,162 ≈ 15.7K) are far below the
+  region's 36,827: it spends ≈ 21K cycles outside its loops — in the done/continue handshake
+  HLS gives a free-running process (sticky `ap_start`) — before entering the next iteration.
+  Fix: the token read is now **blocking** (`go.read()` at the counter's entry), which makes the
+  counter an ordinary start-synced process; csynth of `gdn_k_slr2` with the probe runs to read
+  the counter's synthesized start form before the next two-call cosim.
+
+- *Root cause, from the netlist's start forms (csynth 8172):* HLS gives a region's processes
+  three start forms — `<channel>_empty_n` for a process fed a scalar **derived in the region**
+  by the entry process (the relays' trip counts, `collect4`'s, the islands' `a_l`): one start
+  per call; `(ready ^ 1) & ap_start` for the readers, writers and `scalars_recv`; and the sticky
+  `sync_reg | ap_start` for processes whose inputs are all internal streams and whose scalars
+  are raw region arguments — `gemv32_cluster2` 0/2/3, `gemv32_drain_x` and **the SLR2 counter**,
+  whose only scalar is the raw `qkvg` flag. A sticky process restarts whenever the region's
+  done/continue handshake releases it, so its iterations are not tied to the calls (the
+  clusters and the drain are, through their blocking stream reads; the counter, reading only
+  non-blockingly, is not). The control counter receives the *derived* `row_groups` and has the
+  gated form — which is why its records were always sane. The blocking `go.read()` alone did
+  not change the form (job 8172). Fix: the SLR2 counter now takes `probe_expected` (8 / 30),
+  a scalar derived in the region, so HLS gates its start per call; the `go` token stays as a
+  second guard. csynth (job 8175) reads the new start form; the two-call cosim then confirms.
+
+- *csynth 8175 (derived scalar):* the counter's start is now **`cond4_loc_channel_empty_n`** —
+  gated once per call by the entry process's channel, the relays' form; 200-656 list, clock scan
+  and stamp order unchanged. The two-call cosim runs on it for the RTL confirmation; the fix
+  rides the next probe link (Iter86's).
+
+## Iter85 — residual + sum-of-squares region and SwiGLU inside the GU store (B3 + B4; opened 2026-10-10, branch `recur_balance`)
+
+**Why.** After Iter84 the control kernel's serial work between GEMV regions is ≈ 276K cycles
+per token (15.5 %): per layer 4,865 before QKVG, 3,244 after QKVG, 1,468 after o_proj, 2,061
+after GU (Iter84 probe). Two of those pieces are plain data-parallel passes that run one after
+the other today: the residual add (137) followed by the RMSNorm's sum of squares (≈ 420) and
+scale (267) — twice per layer plus the final norm — and, after GU, the unpack of the
+pair-interleaved gate/up output (357) followed by the SwiGLU (1,443).
+
+**Hypothesis.** B3: the residual add and the sum of squares as a two-process dataflow region
+(the add streams each rounded sum beat to the SOS process, which keeps today's exact fold on
+the rounded values), hiding the add and the SOS's pipeline fill; B4: the SwiGLU evaluated
+per result word inside the GU store's fill loop (gate and up of one intermediate row sit in one
+result word), stored as the BF16 result, with the write-out emitting the 176 beats of the
+down projection's input directly — the separate unpack and SwiGLU passes disappear. Both are
+element-wise or order-preserving, so bit-exact natively. Expected: ≈ −0.9K per norm (×2 per
+layer + 1) and ≈ −1.6K per layer after GU, ≈ −60K per token (≈ −3.4 %). Protocol: native gates,
+csynth of the control top (II of the new loops, the clock scan, the 200-656 list), the probe
+link, card gates, dump.
+
+**Record: below.**
+
+**Implementation (2026-10-10).** B3: `gdn_residual_rmsnorm_bf16(out, residual_out, residual,
+projection, weight, eps)` — one pass forms each rounded residual beat with the exact
+`gdn_bf16_add_half` halves, stores it and accumulates the sum of squares of its lanes in the
+retired order (lower then upper half, 16 lanes sequentially, `sum += s` per half), then the
+scale pass over the stored beats; the norm weight loads at II=1 into 32 banks (was II=4). The
+tops hoist layer 0's attention norm before the layer loop (`gdn_rmsnorm_rows_bf16` from the
+embedding row) and call the fused function twice per layer: after o_proj with the MLP norm,
+and after MLP-down with the *next* layer's attention norm (the final norm after layer 23);
+the separate add passes and the trailing final norm are gone. B4: `gemv32_store` evaluates the
+SwiGLU in its (flattened, II=1) fill loop when `rows_per_ch == 352` (the GU shape; a result
+word holds gate and up of one intermediate row): gate and up rounded to BF16, `silu(g) · u`
+rounded to BF16, kept BF16-exact in lane 0 of the stored word; the aligned write-out then
+emits the 16 even channels' packs in chunk-major order (176 beats = the down projection's
+input layout); the tops replace the unpack + SwiGLU passes with a 176-beat copy
+(`gdn_copy_beats_local`, the store cannot write the loader's array). Removed: `gdn_swiglu`,
+`gdn_unpack_gu_local`, `gdn_beat_add_local`, `gdn_bf16_add_beat`, `k_mlp_up_storage` (both
+tops, −8 BRAM18K expected). Both changes are element-wise or order-preserving: **native fast
+gates PASS bit-exact (monolith and partitioned)**, `exact_ref_mismatch=0`. Source
+`gdn_model.cpp` f27c0722…, `gdn_model.h` 337d7bc5…, `host.cpp` def56de3….
+- *Expected (csynth figures of Iter83):* per norm 1,209 (add 137 + load 256 + SOS 470 + scale
+  265 + …) → ≈ 830: −380 × 49 ≈ −19K; after GU 1,800 → ≈ 200 (the copy): −1.6K × 24 ≈ −38K;
+  ≈ −57K per token (−3.2 %). csynth of the control top submitted (the fill loop's II with the
+  SwiGLU datapath and its estimated clock are the risks).
+- *csynth (job 8112, 2 m 51 s):* `gdn_residual_rmsnorm_bf16` **897 cycles** (the retired add
+  137 + norm 1,071 = 1,208: −311 per norm, ×49 ≈ −15K): `rrn_load_w` 65 at II=1, `rrn_add_sq`
+  486 at II=3 (the SOS's 470 plus the add's latency), scale 265. `gemv32_store`'s flattened fill
+  loop keeps **II=1** with the SwiGLU inside (iteration latency 12 → 35, the module estimated at
+  3.589 ns; store resources 22 DSP / 18.6K FF / 23.5K LUT / 48 URAM); the GU write-out 365 → 176
+  trips; `gdn_copy_beats_local` 178 (the retired unpack + SwiGLU 1,800: −1,622 per layer ≈
+  −39K). No HLS 200-656 process (the copy's auto-rewind note is on a sequential loop, not a
+  dataflow process); the 200-880 set unchanged; no module above 5.0 ns; stamp order PASS. Top:
+  BRAM **597** (−8), DSP 971 (+2), FF 255.6K, LUT 254.7K, URAM 56. csynth-level expectation
+  ≈ −54K per token (−3.0 %); host builds PASS with and without the probe.
+- **Probe link launched 2026-10-10 19:17 UTC** — tag `hw_20261010_191750_1732905`, build **8113**
+  (shared node, acclnode03 and harrier excluded), card **8114** (afterok, harrier excluded by
+  the new flow default), dump **8115** (afterany, `diagnostics/iter85_residual_swiglu/probe/`).
+  Same command as the Iter84 link; source `gdn_model.cpp` f27c0722…, `gdn_model.h` 337d7bc5…,
+  `host.cpp` def56de3…. Expected on the probe: the serial gaps after o_proj 1,468 → ≈ 1,150,
+  after GU 2,061 → ≈ 450, before QKVG 4,865 → ≈ 4,550, and the final norm; ≈ −54K per token.
+  The full 32-step native gates run in parallel (the build job repeats them before its link).
+- *Full native gates (1 × 32 steps), monolith and partitioned:* **PASS**, `exact_ref_mismatch=0`,
+  `argmax_mismatch=0` on the launched source (f27c0722…).
+
+- **Link and card (2026-10-11).** Build **8113** on acclnode01 (shared node), 7 h 12 m; every
+  pre-link gate 0 (native 32-step partitioned, XO, state address, state reader, island names);
+  routed **0 routing errors**; clocks **kernel +0.020 / +0.010 ns at 5.000 ns, DMA +0.003 /
+  +0.009, hbm_aclk +0.020 / +0.006 at 2.222 ns — exactly 450 MHz on this draw** (vpl: "auto
+  scaled 454.1 MHz exceeds the original", 450 kept; kernel 200.8 → 200; the coin's eighth draw:
+  +0.020). XCLBIN `0570541b…`, host `f0337724…` (`diagnostics/hw_20261010_191750_1732905/`).
+  Routed per SLR: CLB **91.13 / 92.04 / 93.44 %** occupied, LUTs 202,182 / 230,075 / 258,145
+  (45.98 / 53.26 / 59.76 %), DSP 2,154 / 1,488 / 2,134, BRAM tiles 429 / 541.5 / 298.5, URAM 0 /
+  56 / 96, SLLs 24,844 (SLR1↔SLR0 57.42 %, SLR2↔SLR1 50.41 %). Card **8114** (acclnode01, 45 s):
+  exact 8- and 64-token trajectories PASS; vector gate over 2,016,000 logits NRMSE 0.00466270,
+  worst step 0.011908, top-1 100 %, 0 tolerance failures (the production figures); **kernel
+  8.609 ms median** (mean 8.610), **TPOT 8.702** (mean 8.721) = **1,721,911 cycles**; against
+  Iter84 on the same card (8.889 / 8.979 ms, 1,777,102): **−55,191 cycles, −3.1 %** — the csynth
+  model's −54K. Evidence level: on-card.
+- **Probe (job 8115, 242,424 records, 63 steps, tag self-test 18,152/18,333).** Control regions
+  1,499,337 (87.1 %; unchanged: QKVG 19,596 vs 19,593, o_proj 4,657, GU 23,347, down 11,954,
+  LM head 67,762); **outside them 222,574 (was 278,191): −55.6K, the whole difference.** From the
+  reliable (non-QKVG) region-start deltas: after o_proj **≈ 900** (was 1,468; csynth 897), after
+  GU **≈ 180** (was 2,061; the 176-beat copy, csynth 178; the GU write-out 192 cycles after the
+  fill, was 365). The two QKVG-adjacent gaps sum to ≈ 8.1K per layer as before (8,109): the fused
+  post-down norm's predicted −311 lies inside this inference's ±0.2K, and the split is not
+  measurable on this image (the SLR2 counter's QKVG records still start at the weight loops'
+  end; the fixed counter rides Iter86's image). SLR2's o_proj / GU / down regions start 1,659 /
+  1,298 / 573 cycles before the control's (its wait for the activation).
+- **Verdict: RETAINED, not promoted.** Committed: source `a70695531` (from the build's frozen
+  snapshot f27c0722…, the working tree already carrying Iter86), instrument `a6803e706`
+  (`analyze_call_probe.py` go-wait normalisation, the SLR2 cosim ports), documents in the commit
+  after them. Remaining measured waste (1,721,911 cycles, floor 1,366.5K): serial work ≈ 223K
+  (12.9 %: ≈ 8.1K around QKVG + 0.9K + 0.2K per layer), the islands' last head ≈ 48K, fill/drain
+  ≈ 52K, QKVG start-up ≈ 15K.

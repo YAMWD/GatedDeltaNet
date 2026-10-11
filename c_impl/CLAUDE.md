@@ -70,10 +70,15 @@ stale was wrong.
     kernel's through the workspace tail at `GDN_WS_PROBE_BEAT_OFF`), read back by `host.exe --dump-probe` and
     decomposed by `analyze_call_probe.py`; it is compiled out of every production build (token-identical
     preprocessed source) and `gdn_eval` never gets it.
-  - Other submodules: `gdn_rmsnorm_rows_bf16`, `gdn_gemv_tiny_ab` (both tiny a/b gate projections in one II=1
+  - Other submodules: `gdn_rmsnorm_rows_bf16` (layer 0's attention norm of the embedding row),
+    `gdn_residual_rmsnorm_bf16` (the residual add fused with the following RMSNorm — one pass forms the
+    rounded sum beats and their sum of squares, then the scale pass; after o_proj and after MLP-down, the
+    final norm after layer 23; Iter85), `gdn_gemv_tiny_ab` (both tiny a/b gate projections in one II=1
     loop over the packed image; Iter83),
     `gdn_depthwise_conv_silu`, `gdn_recurrent_attention` (gated delta rule, head-local fused state
-    buffer), `gdn_output_norm_and_gate`, `gdn_swiglu_inplace`.
+    buffer), `gdn_output_norm_and_gate`; the SwiGLU is evaluated inside `gemv32_store`'s fill loop for the
+    GU shape and written out in the down projection's layout (Iter85; the separate SwiGLU and unpack
+    passes are gone).
   - **No embedding-lookup or argmax module exists, by design.** The 32000×2048 embedding table stays
     in *host* memory and `host.cpp` writes the selected row straight into `workspace[X]`. The greedy
     argmax is *fused into the LM-head store stage* (`gemv32_argmax_*` labels inside `gemv32_store`),
