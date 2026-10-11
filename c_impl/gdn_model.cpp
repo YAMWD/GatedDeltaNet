@@ -47,6 +47,7 @@ typedef ap_uint<24> GDNProbeEvent;          /* [23:16] event, [15:8] port, [7:0]
 #define GDN_PROBE_EV_READ_HL      15u   /* HL = the last head */
 #define GDN_PROBE_EV_UPD_HL       16u
 #define GDN_PROBE_EV_UPD_END      17u
+#define GDN_PROBE_EV_COUNTER_GO   18u   /* the counter's wait for the x relay's start token */
 /* control kernel events (Iter82) */
 #define GDN_PROBE_EV_X_BCAST_DONE  32u
 #define GDN_PROBE_EV_W0_DONE       33u
@@ -114,12 +115,16 @@ static hls::stream<Beat512> gdn_probe_null_beats("gdn_probe_null_beats");
  * same records and the host reads port 31's. */
 #define GDN_PROBE_WR_PARAMS , hls::stream<GDNProbeEvent> &ev, hls::stream<Beat512> &probe_in, uint32_t probe_call
 #define GDN_PROBE_WR_ARGS(e, b, c) , e, b, c
+#define GDN_PROBE_CTRL_WR_PARAMS , hls::stream<Beat512> &probe_in, uint32_t probe_call
+#define GDN_PROBE_CTRL_WR_ARGS(b, c) , b, c
 #else
 #define GDN_PROBE_ARG(x)
 #define GDN_PROBE_PARAM(x)
 #define GDN_PROBE_TAG_PARAM
 #define GDN_PROBE_WR_PARAMS
 #define GDN_PROBE_WR_ARGS(e, b, c)
+#define GDN_PROBE_CTRL_WR_PARAMS
+#define GDN_PROBE_CTRL_WR_ARGS(b, c)
 #endif
 
 #define GDN_WEIGHT_HEADER_BYTES 60
@@ -3455,6 +3460,29 @@ copy_local: for (uint32_t i = 0; i < count; ++i) {
     }
 }
 
+/* The monolith's drains of the consumer's streams (A/B model only). */
+static void gdn_gate_stream_to_array(hls::stream<Beat512> &gate_stream, Beat512 *gate_out, bool enabled) {
+#pragma HLS inline off
+    if (!enabled)
+        return;
+gate_to_array: for (uint32_t i = 0; i < GDN_HIDDEN / 32; ++i) {
+#pragma HLS loop_tripcount min=64 max=64
+#pragma HLS pipeline II=1
+        gate_out[i] = gate_stream.read();
+    }
+}
+static void gdn_tails_stream_drain(hls::stream<Beat512> &tails, bool enabled) {
+#pragma HLS inline off
+    if (!enabled)
+        return;
+tails_drain: for (uint32_t i = 0; i < 3u * (GDN_CONV - 1) * (GDN_HIDDEN / 32); ++i) {
+#pragma HLS loop_tripcount min=576 max=576
+#pragma HLS pipeline II=1
+        (void)tails.read();
+    }
+}
+
+
 #ifdef GDN_BF16_ADD_HLS_TEST
 Beat512 gdn_bf16_add_hls_top(
     const Beat512 residual, const Beat512 projection
@@ -5015,7 +5043,8 @@ qkvg_ingest_head: for (uint32_t head = 0; head < GDN_HEADS; ++head) {
 static void gemv32_qkvg_consumer(
     hls::stream<Beat512> &head_stream,
     hls::stream<Beat512> &conv_out,
-    Beat512 *gate_out,
+    hls::stream<Beat512> &gate_stream,
+    hls::stream<Beat512> &tails_stream,
     const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 32],
     Beat512 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32]
     GDN_PROBE_PARAM(ev)
@@ -5048,7 +5077,9 @@ qkvg_consume_head: for (uint32_t head = 0; head < GDN_HEADS; ++head) {
                                      p < GDN_HEAD_DIM / 32; ++p) {
 #pragma HLS loop_tripcount min=8 max=8
 #pragma HLS pipeline II=1
-            gate_out[head * (GDN_HEAD_DIM / 32) + p] = head_value[3][p];
+            /* Iter86 (B1): the gate goes to the per-head output norm/gate
+             * process of the region instead of a buffer read after it. */
+            gate_stream.write(head_value[3][p]);
         }
     qkvg_stream_conv_kind: for (uint32_t kind = 0; kind < 3; ++kind) {
 #pragma HLS loop_tripcount min=3 max=3
@@ -5065,9 +5096,27 @@ qkvg_consume_head: for (uint32_t head = 0; head < GDN_HEADS; ++head) {
                 conv_out, head_value, conv_weights, conv_tails, head, kind);
 #endif
         }
+        /* Iter86 (B2): this head's new convolution tail -- old rows 1 and 2,
+         * then the new raw row -- per kind, to the region's tails writer
+         * (the retired post-region store of 3 x 192 beats). */
+    qkvg_stream_tails_kind: for (uint32_t kind = 0; kind < 3; ++kind) {
+#pragma HLS loop_tripcount min=3 max=3
+        qkvg_stream_tails_old: for (uint32_t rp = 0; rp < 2 * (GDN_HEAD_DIM / 32); ++rp) {
+#pragma HLS loop_tripcount min=16 max=16
+#pragma HLS pipeline II=1
+                const uint32_t row = 1u + (rp >> 3);
+                tails_stream.write(conv_tails[kind][row * (GDN_HIDDEN / 32)
+                                                    + head * (GDN_HEAD_DIM / 32) + (rp & 7u)]);
+            }
+        qkvg_stream_tails_new: for (uint32_t p = 0; p < GDN_HEAD_DIM / 32; ++p) {
+#pragma HLS loop_tripcount min=8 max=8
+#pragma HLS pipeline II=1
+                tails_stream.write(head_value[kind][p]);
+            }
+        }
         /* All three actors have consumed this head's old three-row context.
-         * Reuse tail row 0 for the new raw row; the final packed store emits
-         * old rows 1/2 followed by this row without another BRAM buffer. */
+         * Reuse tail row 0 for the new raw row (the monolith's post-region
+         * store still reads it). */
     qkvg_stream_capture_new_tail: for (uint32_t p = 0;
                                            p < GDN_HEAD_DIM / 32; ++p) {
 #pragma HLS loop_tripcount min=8 max=8
@@ -5083,7 +5132,8 @@ qkvg_consume_head: for (uint32_t head = 0; head < GDN_HEADS; ++head) {
 static void gemv32_qkvg_dataflow(
     hls::stream<ResultWord> &result,
     hls::stream<Beat512> &conv_out,
-    Beat512 *gate_out,
+    hls::stream<Beat512> &gate_stream,
+    hls::stream<Beat512> &tails_stream,
     const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 32],
     Beat512 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32]
     GDN_PROBE_PARAM(ev_st) GDN_PROBE_PARAM(ev_con)
@@ -5096,7 +5146,7 @@ static void gemv32_qkvg_dataflow(
 #pragma HLS bind_storage variable=head_stream type=fifo impl=bram
 #pragma HLS dataflow disable_start_propagation
     gemv32_qkvg_ingest(result, head_stream GDN_PROBE_ARG(ev_st));
-    gemv32_qkvg_consumer(head_stream, conv_out, gate_out,
+    gemv32_qkvg_consumer(head_stream, conv_out, gate_stream, tails_stream,
                          conv_weights, conv_tails GDN_PROBE_ARG(ev_con));
 }
 
@@ -5113,7 +5163,8 @@ static void gemv32_store_or_qkvg_conv_stream(
     uint32_t opacks_per_ch,
     uint32_t row_groups,
     bool qkvg_recurrent_mode,
-    Beat512 *gate_out,
+    hls::stream<Beat512> &gate_stream,
+    hls::stream<Beat512> &tails_stream,
     const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 32],
     Beat512 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32]
     GDN_PROBE_PARAM(ev_st) GDN_PROBE_PARAM(ev_con)
@@ -5126,7 +5177,7 @@ static void gemv32_store_or_qkvg_conv_stream(
                      row_groups GDN_PROBE_ARG(ev_st));
         return;
     }
-    gemv32_qkvg_dataflow(result, conv_out, gate_out, conv_weights, conv_tails
+    gemv32_qkvg_dataflow(result, conv_out, gate_stream, tails_stream, conv_weights, conv_tails
                          GDN_PROBE_ARG(ev_st) GDN_PROBE_ARG(ev_con));
 }
 
@@ -5211,6 +5262,9 @@ static void gdn_gemv(
     hls::stream<ResultWord> slr0_result, slr1_result, slr2_result;
     hls::stream<ResultWord> slr0_boundary, slr1_boundary, slr2_boundary, result;
     hls::stream<Beat512> conv_out;
+    hls::stream<Beat512> gate_stream_m, tails_stream_m;   /* Iter86 (monolith drains) */
+#pragma HLS stream variable=gate_stream_m depth=64
+#pragma HLS stream variable=tails_stream_m depth=128
     hls::stream<Beat512> state_stream0, state_stream1;
     hls::stream<Beat512> state_stream2, state_stream3;
     hls::stream<Beat512> state_wr0, state_wr1, state_wr2, state_wr3;
@@ -5369,9 +5423,13 @@ static void gdn_gemv(
     gemv32_store_or_qkvg_conv_stream(
         result, conv_out,
         out, logits_stream, rows_per_ch, opacks_per_ch, row_groups,
-        qkvg_recurrent_mode, gate_out,
+        qkvg_recurrent_mode, gate_stream_m, tails_stream_m,
         conv_weights, conv_tails
         GDN_PROBE_ARG(gdn_probe_null_ev) GDN_PROBE_ARG(gdn_probe_null_ev));
+    /* Iter86: the monolith (A/B model) keeps its post-region tail store and
+     * output norm; the consumer's streams are drained into the old buffers. */
+    gdn_gate_stream_to_array(gate_stream_m, gate_out, qkvg_recurrent_mode);
+    gdn_tails_stream_drain(tails_stream_m, qkvg_recurrent_mode);
     gdn_recurrent_attention_islands(
         conv_out,
         state_stream0, state_stream1, state_stream2, state_stream3,
@@ -5534,6 +5592,28 @@ gdn_axis_recv512_probe_loop: for (uint32_t i = 0; i < n; ++i) {
             gdn_probe_emit(ev, first ? (uint32_t)FIRST : (uint32_t)LAST, port, v.range(7, 0));
     }
 }
+/* The SLR2 x relay: the same as gdn_axis_recv512_probe plus a one-token
+ * start signal to the counter, so each counter iteration is aligned with the
+ * call (the counter is an all-non-blocking process that HLS restarts freely;
+ * the Iter84 dumps and the two-call cosim showed its QKVG iterations starting
+ * only at the weight loops' end). */
+template <int FIRST, int LAST>
+static void gdn_axis_recv512_probe_go(hls::stream<GDNAxisBeat> &in, hls::stream<Beat512> &out, uint32_t n,
+                                      hls::stream<GDNProbeEvent> &ev, uint32_t port,
+                                      hls::stream<ap_uint<1> > &go) {
+#pragma HLS inline off
+    go.write(1);
+gdn_axis_recv512_probe_go_loop: for (uint32_t i = 0; i < n; ++i) {
+#pragma HLS loop_tripcount min=0 max=352
+#pragma HLS pipeline II=1
+        const Beat512 v = in.read().data;
+        out.write(v);
+        const bool first = (FIRST != 0) && (i == 0);
+        const bool last = (LAST != 0) && (i + 1 == n);
+        if (first || last)
+            gdn_probe_emit(ev, first ? (uint32_t)FIRST : (uint32_t)LAST, port, v.range(7, 0));
+    }
+}
 template <int FIRST, int LAST>
 static void gdn_axis_recv64_probe(hls::stream<GDNAxisWord> &in, hls::stream<ResultWord> &out, uint32_t n,
                                   hls::stream<GDNProbeEvent> &ev, uint32_t port) {
@@ -5627,29 +5707,182 @@ gdn_scalars_recv_lane: for (uint32_t h = 0; h < GDN_HEADS; ++h) {
         layer_dt_bias[h] = get_fp32_lane(b1, GDN_HEADS + h);
     }
 }
-/* The 64 merged attention beats of a QKVG call, written where the merge
- * used to write them (sequential index: head, half, block). */
-static void gdn_attn_recv(hls::stream<GDNAxisBeat> &in, Beat512 *attn_out, bool enabled
-                          GDN_PROBE_PARAM(ev)) {
+
+/* ---- the control kernel's loader: the activation beats to three chains ---- */
+/* Iter86 (B1): the output norm and gate of each head, as a process of the
+ * control region: the 8 attention beats of head h from the SLR2 link and its
+ * 8 gate beats from the consumer's stream, the retired gdn_output_norm_and_gate
+ * arithmetic per head (the same lower-then-upper 16-value reduction order,
+ * scale = 1/sqrt(sum/256 + eps), normalized * gate * sigmoid(gate), one RNE),
+ * written into attn_out (the region's output buffer, copied into the engine's
+ * input after the region).  The norm weight arrives as 8 packed beats loaded
+ * before the region.  Replaces gdn_attn_recv and the post-region pass. */
+static void gdn_attn_norm_gate(hls::stream<GDNAxisBeat> &attn_in,
+                               hls::stream<Beat512> &gate_stream,
+                               const Beat512 onorm_w[GDN_DV / 32],
+                               Beat512 *attn_out, bool enabled, float eps
+                               GDN_PROBE_PARAM(ev)) {
 #pragma HLS inline off
     if (!enabled)
         return;
-gdn_attn_recv_loop: for (uint32_t i = 0; i < GDN_P_ATTN_BEATS; ++i) {
-#pragma HLS loop_tripcount min=64 max=64
-#pragma HLS pipeline II=1
+    const uint32_t hd_packs = GDN_DV / 32;
+    float weight_loc[GDN_DV];
+    #pragma HLS array_partition variable=weight_loc cyclic factor=GDN_NORM_LANES
+    ang_load_w: for (uint32_t windex = 0; windex < hd_packs; ++windex) {
+    #pragma HLS loop_tripcount min=8 max=8
+    #pragma HLS pipeline II=4
+        const Beat512 wb = onorm_w[windex];
+    ang_load_w_lane: for (uint32_t lane = 0; lane < 32; ++lane) {
+        #pragma HLS unroll
+            weight_loc[windex * 32u + lane] = bf16_to_fp32(get_bf16_lane(wb, lane));
+        }
+    }
+    ang_head: for (uint32_t head_index = 0; head_index < GDN_HEADS; ++head_index) {
+    #pragma HLS loop_tripcount min=8 max=8
+        const size_t base = (size_t)head_index * hd_packs;
+        float attn_loc[GDN_DV];
+        float gate_loc[GDN_DV];
+        #pragma HLS array_partition variable=attn_loc cyclic factor=GDN_NORM_LANES
+        #pragma HLS array_partition variable=gate_loc cyclic factor=GDN_NORM_LANES
+        float sum = 0.0f;
+        /* One pipelined loop over the 16 half-beats (the retired pass's
+         * flattened onorm_sq loop, written by hand: the probe stamp before the
+         * inner loop stopped HLS from flattening it, 919 instead of 262 cycles
+         * per head).  Same arithmetic: the 16-lane chain per half, then
+         * sum += s in beat order, lower half first. */
+        Bf16Half v_half[2];
+        #pragma HLS array_partition variable=v_half complete
+        ang_sq: for (uint32_t t = 0; t < 2u * hd_packs; ++t) {
+        #pragma HLS loop_tripcount min=16 max=16
+        #pragma HLS pipeline II=2
+            const uint32_t ip = t >> 1, half = t & 1u;
+            if (half == 0u) {
+                const Beat512 v = attn_in.read().data;
 #ifdef GDN_CALL_PROBE
-        const Beat512 v = in.read().data;
-        attn_out[i] = v;
-        if (i == 0 || i + 1 == GDN_P_ATTN_BEATS)
-            gdn_probe_emit(ev, i == 0 ? GDN_PROBE_EV_ATTN_RX_FIRST : GDN_PROBE_EV_ATTN_RX_LAST,
-                           0, v.range(7, 0));
-#else
-        attn_out[i] = in.read().data;
+                if ((head_index == 0 && ip == 0) || (head_index + 1 == GDN_HEADS && ip + 1 == hd_packs))
+                    gdn_probe_emit(ev, head_index == 0 ? GDN_PROBE_EV_ATTN_RX_FIRST : GDN_PROBE_EV_ATTN_RX_LAST,
+                                   0, v.range(7, 0));
 #endif
+                split_bf16_beat(v, v_half);
+            }
+            float s = 0.0f;
+            const Bf16Half current = v_half[half];
+        ang_sq_lane: for (int kk = 0; kk < 16; ++kk) {
+        #pragma HLS unroll factor=GDN_NORM_LANES
+                const uint32_t lane = half * 16u + (uint32_t)kk;
+                float a = bf16_to_fp32(get_bf16_half_lane(current, (uint32_t)kk));
+                attn_loc[ip * 32u + lane] = a;
+                s += a * a;
+            }
+            sum += s;
+        }
+        ang_load_g: for (uint32_t ip = 0; ip < hd_packs; ++ip) {
+        #pragma HLS loop_tripcount min=8 max=8
+            const Beat512 g = gate_stream.read();
+            Bf16Half g_half[2];
+            #pragma HLS array_partition variable=g_half complete
+            split_bf16_beat(g, g_half);
+        ang_load_g_half: for (uint32_t half = 0; half < 2; ++half) {
+        #pragma HLS pipeline II=2
+                const Bf16Half current = g_half[half];
+            ang_g_lane: for (int kk = 0; kk < 16; ++kk) {
+            #pragma HLS unroll factor=GDN_NORM_LANES
+                    const uint32_t lane = half * 16u + (uint32_t)kk;
+                    gate_loc[ip * 32u + lane] =
+                        bf16_to_fp32(get_bf16_half_lane(current, (uint32_t)kk));
+                }
+            }
+        }
+        const float scale = 1.0f / sqrtf(sum / (float)GDN_DV + eps);
+        ang_gate: for (uint32_t ip = 0; ip < hd_packs; ++ip) {
+        #pragma HLS loop_tripcount min=8 max=8
+            float o_lane[32];
+            #pragma HLS array_partition variable=o_lane complete
+            ang_gate_group: for (int kb = 0; kb < 32; kb += GDN_OUTPUT_GATE_LANES) {
+            #pragma HLS loop_tripcount min=8 max=8
+            #pragma HLS pipeline II=1
+                ang_gate_lane: for (int kl = 0; kl < GDN_OUTPUT_GATE_LANES; ++kl) {
+                #pragma HLS unroll
+                    const int kk = kb + kl;
+                    const uint32_t index = ip * 32u + (uint32_t)kk;
+                    const float normalized = attn_loc[index] * scale * weight_loc[index];
+                    const float gate_value = gate_loc[index];
+                    o_lane[kk] = normalized * gate_value * gdn_sigmoid(gate_value);
+                }
+            }
+            Beat512 o = 0;
+            ang_pack_out: for (int kk = 0; kk < 32; ++kk) {
+            #pragma HLS unroll
+                set_bf16_lane(o, kk, fp32_to_bf16_rne(o_lane[kk]));
+            }
+            attn_out[base + ip] = o;
+        }
     }
 }
 
-/* ---- the control kernel's loader: the activation beats to three chains ---- */
+/* Iter86 (B2): the layer's convolution tails written to HBM by a process of
+ * the control region, as the consumer finishes each head -- the retired
+ * post-region store of 3 x 192 beats.  Stream order per head: kind 0..2, each
+ * old row 1, old row 2, new raw row (8 beats each); tail row r of kind k at
+ * head_buffer + (layer*3 + k) * 384 + r * 64 + head * 8 (the BF16 payload of
+ * the FP32-sized stripe), the raw workspace pointer plus a complete 64-bit
+ * index with the layer offset add registered (invariant 26).  The region's
+ * only writer on the mem_weights_mm0 bundle; in probe builds it also stores
+ * the control counter's four record beats after the tails (every call). */
+static void gdn_tails_writer(hls::stream<Beat512> &tails, Beat512 *workspace,
+                             uint32_t layer_index, bool enabled GDN_PROBE_CTRL_WR_PARAMS) {
+#pragma HLS inline off
+    if (enabled) {
+        const ap_uint<64> layer_base = ap_uint<64>((uint64_t)(GDN_WS_OFF_HEAD_BUF / 16)) +
+            ap_uint<64>(layer_index) * ap_uint<64>(3u * GDN_CONV_TAIL_RESERVED_BEATS_PER_STRIPE);
+#pragma HLS bind_op variable=layer_base op=add impl=fabric latency=1
+    tails_head: for (uint32_t head = 0; head < GDN_HEADS; ++head) {
+    #pragma HLS loop_tripcount min=8 max=8
+        tails_kind: for (uint32_t kind = 0; kind < 3; ++kind) {
+        #pragma HLS loop_tripcount min=3 max=3
+            tails_row: for (uint32_t row = 0; row < GDN_CONV - 1; ++row) {
+            #pragma HLS loop_tripcount min=3 max=3
+                tails_beat: for (uint32_t p = 0; p < GDN_HEAD_DIM / 32; ++p) {
+                #pragma HLS loop_tripcount min=8 max=8
+                #pragma HLS pipeline II=1
+                    const ap_uint<64> index = layer_base + ap_uint<64>(
+                        kind * GDN_CONV_TAIL_RESERVED_BEATS_PER_STRIPE + row * (GDN_HIDDEN / 32)
+                        + head * (GDN_HEAD_DIM / 32) + p);
+                    workspace[index.to_uint64()] = tails.read();
+                }
+            }
+        }
+    }
+    }
+#ifdef GDN_CALL_PROBE
+    const ap_uint<64> probe_base = ap_uint<64>(GDN_WS_PROBE_BEAT_OFF) +
+        ap_uint<64>(probe_call) * ap_uint<64>(GDN_PROBE_BEATS_PER_CALL);
+#pragma HLS bind_op variable=probe_base op=add impl=fabric latency=1
+tails_probe_tail: for (uint32_t b = 0; b < GDN_PROBE_BEATS_PER_CALL; ++b) {
+#pragma HLS pipeline II=1
+#ifdef __SYNTHESIS__
+        const Beat512 beat = probe_in.read();
+        const ap_uint<64> probe_index = probe_base + ap_uint<64>(b);
+        workspace[probe_index.to_uint64()] = beat;
+#else
+        Beat512 beat;
+        (void)probe_in.read_nb(beat); (void)probe_base;
+#endif
+    }
+#endif
+}
+
+/* Iter86: the layer's output-norm weight (8 packed beats) into a small array
+ * read by the region's norm/gate process. */
+static void gdn_load_onorm_w(Beat512 onorm_w[GDN_DV / 32], const Beat512 *weight) {
+#pragma HLS inline off
+onorm_w_load: for (uint32_t i = 0; i < GDN_DV / 32; ++i) {
+#pragma HLS loop_tripcount min=8 max=8
+#pragma HLS pipeline II=1
+        onorm_w[i] = weight[i];
+    }
+}
+
 static void gemv32_load_x_bcast(const Beat512 *x, const Beat512 *w0,
                                 size_t weight_base,
                                 hls::stream<Beat512> &xr,
@@ -5814,7 +6047,7 @@ static void gdn_ctrl_probe_counter(
     hls::stream<GDNProbeEvent> &ev_col, hls::stream<GDNProbeEvent> &ev_st,
     hls::stream<GDNProbeEvent> &ev_con, hls::stream<GDNProbeEvent> &ev_cv,
     hls::stream<GDNProbeEvent> &ev_at,
-    Beat512 *probe_ws, uint32_t probe_call, uint32_t row_groups, bool qkvg) {
+    hls::stream<Beat512> &out, uint32_t row_groups, bool qkvg) {
 #pragma HLS inline off
     ap_uint<64> rec[GDN_PROBE_RECORDS_PER_CALL];
 #pragma HLS array_partition variable=rec complete
@@ -5910,21 +6143,16 @@ probe_ctrl_pack_b: for (uint32_t b = 0; b < GDN_PROBE_BEATS_PER_CALL; ++b) {
         }
     }
 #ifdef __SYNTHESIS__
-    /* The state writers' address form (invariant 26): the raw base and a
-     * complete 64-bit index, the offset add registered. */
-    const ap_uint<64> probe_base = ap_uint<64>(GDN_WS_PROBE_BEAT_OFF) +
-        ap_uint<64>(probe_call) * ap_uint<64>(GDN_PROBE_BEATS_PER_CALL);
-#pragma HLS bind_op variable=probe_base op=add impl=fabric latency=1
+    /* Iter86: the region's mm0 writer (the tails writer) stores the records. */
 probe_ctrl_store: for (uint32_t b = 0; b < GDN_PROBE_BEATS_PER_CALL; ++b) {
 #pragma HLS pipeline II=1
-        const ap_uint<64> probe_index = probe_base + ap_uint<64>(b);
-        probe_ws[probe_index.to_uint64()] = beats[b];
+        (void)out.write_nb(beats[b]);
     }
 #else
-    (void)probe_ws; (void)probe_call;   /* native: the workspace has no tail */
+    (void)out;   /* native: nothing to store */
     if (seen != expected) {
-        fprintf(stderr, "ctrl probe counter: call %u saw %u events, expected %u\n",
-                (unsigned)probe_call, (unsigned)(uint32_t)seen, (unsigned)(uint32_t)expected);
+        fprintf(stderr, "ctrl probe counter: saw %u events, expected %u\n",
+                (unsigned)(uint32_t)seen, (unsigned)(uint32_t)expected);
         abort();
     }
 #endif
@@ -5944,7 +6172,7 @@ static void gdn_gemv_part_ctrl(
     uint32_t w_pack_off,
     uint32_t in_dim, uint32_t out_dim,
     bool qkvg_recurrent_mode,
-    Beat512 *attn_out, Beat512 *gate_out,
+    Beat512 *attn_out, const Beat512 onorm_w[GDN_DV / 32], Beat512 *workspace,
     const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 32],
     Beat512 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32],
     const float a[GDN_HEADS],
@@ -5953,7 +6181,7 @@ static void gdn_gemv_part_ctrl(
     const float layer_dt_bias[GDN_HEADS],
     uint32_t layer_index
 #ifdef GDN_CALL_PROBE
-    , Beat512 *probe_ws, uint32_t probe_call
+    , uint32_t probe_call
 #endif
 ) {
 #pragma HLS inline off
@@ -5996,7 +6224,15 @@ static void gdn_gemv_part_ctrl(
 #pragma HLS bind_storage variable=from_slr2 type=fifo impl=bram
 #pragma HLS bind_storage variable=result type=fifo impl=bram
 #pragma HLS bind_storage variable=conv_out type=fifo impl=bram
+    hls::stream<Beat512> gate_stream;      /* Iter86: consumer -> norm/gate, a whole layer */
+    hls::stream<Beat512> tails_stream;     /* Iter86: consumer -> tails writer, 72 beats per head */
+#pragma HLS stream variable=gate_stream depth=64
+#pragma HLS stream variable=tails_stream depth=128
+#pragma HLS bind_storage variable=gate_stream type=fifo impl=bram
+#pragma HLS bind_storage variable=tails_stream type=fifo impl=bram
 #ifdef GDN_CALL_PROBE
+    hls::stream<Beat512> probe_beats_ctrl;  /* counter -> tails writer */
+#pragma HLS stream variable=probe_beats_ctrl depth=8
     hls::stream<GDNProbeEvent> ev_ld, ev_tx2, ev_rx0, ev_rx2, ev_col, ev_st, ev_con, ev_cv, ev_at;
 #pragma HLS stream variable=ev_ld depth=16
 #pragma HLS stream variable=ev_tx2 depth=16
@@ -6041,7 +6277,7 @@ static void gdn_gemv_part_ctrl(
                            GDN_PROBE_ARG(ev_col));
     gemv32_store_or_qkvg_conv_stream(result, conv_out, out, logits_stream,
                                      rows_per_ch, opacks_per_ch, row_groups,
-                                     qkvg_recurrent_mode, gate_out,
+                                     qkvg_recurrent_mode, gate_stream, tails_stream,
                                      conv_weights, conv_tails
                                      GDN_PROBE_ARG(ev_st) GDN_PROBE_ARG(ev_con));
 #ifdef GDN_CALL_PROBE
@@ -6050,13 +6286,17 @@ static void gdn_gemv_part_ctrl(
     gdn_axis_send512(conv_out, conv_to_slr2, qkv_beats);
 #endif
     gdn_scalars_send(a, b, layer_a_log, layer_dt_bias, scalars_to_slr2, qkvg_recurrent_mode);
-    gdn_attn_recv(attn_from_slr2, attn_out, qkvg_recurrent_mode GDN_PROBE_ARG(ev_at));
+    gdn_attn_norm_gate(attn_from_slr2, gate_stream, onorm_w, attn_out, qkvg_recurrent_mode,
+                       GDN_NORM_EPS GDN_PROBE_ARG(ev_at));
 #ifdef GDN_CALL_PROBE
-    /* Last in program order: the C model runs the region's processes in
-     * sequence, so the counter must find every event already queued. */
+    /* The counter runs before the writer in program order: the C model runs
+     * the region's processes in sequence, so the counter must find every
+     * event already queued (the native writer stores nothing). */
     gdn_ctrl_probe_counter(ev_ld, ev_tx2, ev_rx0, ev_rx2, ev_col, ev_st, ev_con, ev_cv, ev_at,
-                           probe_ws, probe_call, row_groups, qkvg_recurrent_mode);
+                           probe_beats_ctrl, row_groups, qkvg_recurrent_mode);
 #endif
+    gdn_tails_writer(tails_stream, workspace, layer_index, qkvg_recurrent_mode
+                     GDN_PROBE_CTRL_WR_ARGS(probe_beats_ctrl, probe_call));
 }
 
 /* ---- K_slr0: ports 2-17, clusters 1-8 ---- */
@@ -6141,7 +6381,8 @@ static void gdn_call_probe_counter(
     hls::stream<GDNProbeEvent> &ev_read0, hls::stream<GDNProbeEvent> &ev_read1,
     hls::stream<GDNProbeEvent> &ev_upd0, hls::stream<GDNProbeEvent> &ev_upd1,
     hls::stream<Beat512> &out0, hls::stream<Beat512> &out1,
-    hls::stream<Beat512> &out2, hls::stream<Beat512> &out3, bool qkvg) {
+    hls::stream<Beat512> &out2, hls::stream<Beat512> &out3,
+    uint32_t expected_events, hls::stream<ap_uint<1> > &go) {
 #pragma HLS inline off
     ap_uint<64> rec[GDN_PROBE_RECORDS_PER_CALL];
 #pragma HLS array_partition variable=rec complete
@@ -6149,13 +6390,30 @@ probe_init: for (uint32_t i = 0; i < GDN_PROBE_RECORDS_PER_CALL; ++i) {
 #pragma HLS unroll
         rec[i] = 0;
     }
-    /* non-QKVG: xr x2, ys x2, weights x4; QKVG: + prefetch x4, qkv x2,
-     * attn x2, writers x4, islands 2 x 5 */
-    const ap_uint<10> expected = qkvg ? 30u : 8u;
+    /* expected_events is a scalar DERIVED in the region (not a raw region
+     * argument): HLS then gates this process's start on the entry process's
+     * per-call channel for it, like the relays' trip counts -- one iteration
+     * per call.  With the raw `qkvg` flag (a stable port) HLS made the
+     * counter free-running (sticky ap_start) and its QKVG iterations entered
+     * ~21K cycles late (Iter84 dumps, two-call cosim); the control kernel's
+     * counter, fed the derived row_groups, never had the problem. */
+    const ap_uint<10> expected = (ap_uint<10>)expected_events;
     /* The count lags one cycle (pending): the FIFO reads, the 18-flag sum and
      * the exit compare would otherwise chain in one cycle (csynth 4.18 ns). */
     ap_uint<10> seen = 0, pending = 0;
     ap_uint<40> cyc = 0;
+    /* One BLOCKING read of the x relay's start token: it makes this a
+     * start-synced process instead of the free-running one HLS makes of an
+     * all-non-blocking body (sticky ap_start; the two-call cosim showed its
+     * QKVG iteration entered ~21K cycles late, after the previous call's
+     * done/continue handshake), so each iteration begins with its call.
+     * Slot 30 marks the token's arrival (cycle 0 of this iteration). */
+    (void)go.read();
+    {
+        GDNProbeEvent e = 0;
+        e.range(23, 16) = (ap_uint<8>)GDN_PROBE_EV_COUNTER_GO;
+        rec[30] = gdn_probe_record(e, cyc);
+    }
 probe_poll: while (seen < expected && cyc < (ap_uint<40>)0x4000000u) {
 #pragma HLS pipeline II=1
         GDNProbeEvent e0 = 0, e1 = 0, e2 = 0, e3 = 0, e4 = 0, e5 = 0, e6 = 0, e7 = 0, e8 = 0,
@@ -6253,6 +6511,11 @@ static void gdn_gemv_part_slr2(
     const uint32_t row_groups = rows_per_ch / 8;
     const uint32_t qkv_beats = qkvg_recurrent_mode ? (uint32_t)GDN_P_QKV_BEATS : 0u;
     const uint32_t attn_beats = qkvg_recurrent_mode ? (uint32_t)GDN_P_ATTN_BEATS : 0u;
+#ifdef GDN_CALL_PROBE
+    /* non-QKVG: xr x2, ys x2, weights x4; QKVG: + prefetch x4, qkv x2,
+     * attn x2, writers x4, islands 2 x 5 (a derived scalar, see the counter) */
+    const uint32_t probe_expected = qkvg_recurrent_mode ? 30u : 8u;
+#endif
     const Beat512 *state_in28 = w28 + GDN_COMPILED_WEIGHT_SHARD_BEATS;
     const Beat512 *state_in29 = w29 + GDN_COMPILED_WEIGHT_SHARD_BEATS;
     const Beat512 *state_in30 = w30 + GDN_COMPILED_WEIGHT_SHARD_BEATS;
@@ -6272,6 +6535,8 @@ static void gdn_gemv_part_slr2(
     hls::stream<GDNProbeEvent> ev_xr, ev_ys, ev_attn, ev_qkv;
     hls::stream<GDNProbeEvent> ev_rd[4], ev_wr[4];
     hls::stream<GDNProbeEvent> ev_prep[2], ev_read[2], ev_upd[2];
+    hls::stream<ap_uint<1> > probe_go;
+#pragma HLS stream variable=probe_go depth=2
     hls::stream<Beat512> probe_beats[4];
 #pragma HLS array_partition variable=probe_beats complete
 #pragma HLS stream variable=probe_beats depth=8
@@ -6327,7 +6592,7 @@ static void gdn_gemv_part_slr2(
 #pragma HLS bind_storage variable=state_wr3 type=fifo impl=uram
 #pragma HLS dataflow disable_start_propagation
 #ifdef GDN_CALL_PROBE
-    gdn_axis_recv512_probe<GDN_PROBE_EV_XR_FIRST, GDN_PROBE_EV_XR_LAST>(xr_in, xr[0], k_packs, ev_xr, 0);
+    gdn_axis_recv512_probe_go<GDN_PROBE_EV_XR_FIRST, GDN_PROBE_EV_XR_LAST>(xr_in, xr[0], k_packs, ev_xr, 0, probe_go);
 #else
     gdn_axis_recv512(xr_in, xr[0], k_packs);
 #endif
@@ -6378,7 +6643,7 @@ static void gdn_gemv_part_slr2(
                            ev_wr[0], ev_wr[1], ev_wr[2], ev_wr[3],
                            ev_prep[0], ev_prep[1], ev_read[0], ev_read[1], ev_upd[0], ev_upd[1],
                            probe_beats[0], probe_beats[1], probe_beats[2], probe_beats[3],
-                           qkvg_recurrent_mode);
+                           probe_expected, probe_go);
 #endif
 }
 
@@ -6470,23 +6735,25 @@ gdn_k_slr2_calls: for (uint32_t call = 0; call < GDN_P_CALLS; ++call) {
 
 #ifdef GDN_SLR2_REGION_COSIM
 /* Iter84: RTL cosim top for the SLR2 GEMV region, one QKVG call of layer 0
- * (diagnostics/iter84_deferred_wb/cosim; the source copy scales the shard
- * constant so a port holds 16,384 weight beats, the state stripe and the
- * probe tail). Never part of a build. */
+ * (slr2_region_cosim/; the source copy scales the shard constant to 16,384
+ * beats: the call's weights at [0, 16,384), layer 0's state at [16,384,
+ * 20,480), and -- with GDN_CALL_PROBE -- the writers' record tail at
+ * GDN_PROBE_BEAT_OFF = 16,384 + the 24-layer stripe of 98,304 = beat 114,688,
+ * hence the 115,200-beat ports). Never part of a build. */
 void gdn_slr2_region_cosim_top(
     const Beat512 *w24, const Beat512 *w25, const Beat512 *w26, const Beat512 *w27,
     Beat512 *w28, Beat512 *w29, Beat512 *w30, Beat512 *w31,
     hls::stream<GDNAxisBeat> &xr_in, hls::stream<GDNAxisBeat> &conv_in,
     hls::stream<GDNAxisBeat> &scalars_in,
     hls::stream<GDNAxisWord> &ys_out, hls::stream<GDNAxisBeat> &attn_out) {
-#pragma HLS interface m_axi port=w24 depth=20992 offset=slave bundle=mem_weights_mm24 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
-#pragma HLS interface m_axi port=w25 depth=20992 offset=slave bundle=mem_weights_mm25 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
-#pragma HLS interface m_axi port=w26 depth=20992 offset=slave bundle=mem_weights_mm26 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
-#pragma HLS interface m_axi port=w27 depth=20992 offset=slave bundle=mem_weights_mm27 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
-#pragma HLS interface m_axi port=w28 depth=20992 offset=slave bundle=mem_weights_mm28 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
-#pragma HLS interface m_axi port=w29 depth=20992 offset=slave bundle=mem_weights_mm29 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
-#pragma HLS interface m_axi port=w30 depth=20992 offset=slave bundle=mem_weights_mm30 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
-#pragma HLS interface m_axi port=w31 depth=20992 offset=slave bundle=mem_weights_mm31 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+#pragma HLS interface m_axi port=w24 depth=115200 offset=slave bundle=mem_weights_mm24 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w25 depth=115200 offset=slave bundle=mem_weights_mm25 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w26 depth=115200 offset=slave bundle=mem_weights_mm26 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w27 depth=115200 offset=slave bundle=mem_weights_mm27 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w28 depth=115200 offset=slave bundle=mem_weights_mm28 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+#pragma HLS interface m_axi port=w29 depth=115200 offset=slave bundle=mem_weights_mm29 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+#pragma HLS interface m_axi port=w30 depth=115200 offset=slave bundle=mem_weights_mm30 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+#pragma HLS interface m_axi port=w31 depth=115200 offset=slave bundle=mem_weights_mm31 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
 #pragma HLS interface axis port=xr_in
 #pragma HLS interface axis port=conv_in
 #pragma HLS interface axis port=scalars_in
@@ -6496,6 +6763,96 @@ void gdn_slr2_region_cosim_top(
     gdn_gemv_part_slr2(w24, w25, w26, w27, w28, w29, w30, w31,
                        xr_in, conv_in, scalars_in, ys_out, attn_out,
                        0u, GDN_HIDDEN, 4u * GDN_HIDDEN, true, 0u GDN_PROBE_ARG(0u));
+}
+/* Two calls in sequence, as the production kernel runs them: a down-shaped
+ * call (176-beat x, 11,264 weight beats, no state) followed by the QKVG call,
+ * both reading weights from offset 0; probe_call 0 and 1. For the probe's
+ * inter-call behaviour (the Iter84 dumps' late QKVG stamps). */
+void gdn_slr2_region_cosim_top2(
+    const Beat512 *w24, const Beat512 *w25, const Beat512 *w26, const Beat512 *w27,
+    Beat512 *w28, Beat512 *w29, Beat512 *w30, Beat512 *w31,
+    hls::stream<GDNAxisBeat> &xr_in, hls::stream<GDNAxisBeat> &conv_in,
+    hls::stream<GDNAxisBeat> &scalars_in,
+    hls::stream<GDNAxisWord> &ys_out, hls::stream<GDNAxisBeat> &attn_out) {
+#pragma HLS interface m_axi port=w24 depth=115200 offset=slave bundle=mem_weights_mm24 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w25 depth=115200 offset=slave bundle=mem_weights_mm25 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w26 depth=115200 offset=slave bundle=mem_weights_mm26 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w27 depth=115200 offset=slave bundle=mem_weights_mm27 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w28 depth=115200 offset=slave bundle=mem_weights_mm28 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+#pragma HLS interface m_axi port=w29 depth=115200 offset=slave bundle=mem_weights_mm29 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+#pragma HLS interface m_axi port=w30 depth=115200 offset=slave bundle=mem_weights_mm30 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+#pragma HLS interface m_axi port=w31 depth=115200 offset=slave bundle=mem_weights_mm31 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4 max_write_burst_length=64 num_write_outstanding=8
+#pragma HLS interface axis port=xr_in
+#pragma HLS interface axis port=conv_in
+#pragma HLS interface axis port=scalars_in
+#pragma HLS interface axis port=ys_out
+#pragma HLS interface axis port=attn_out
+#pragma HLS interface s_axilite port=return
+cosim2_calls: for (uint32_t call = 0; call < 2; ++call) {
+#pragma HLS loop_tripcount min=2 max=2
+        const bool qkvg = (call == 1);
+        gdn_gemv_part_slr2(w24, w25, w26, w27, w28, w29, w30, w31,
+                           xr_in, conv_in, scalars_in, ys_out, attn_out,
+                           0u, qkvg ? GDN_HIDDEN : GDN_INTER, qkvg ? 4u * GDN_HIDDEN : GDN_HIDDEN,
+                           qkvg, 0u GDN_PROBE_ARG(call));
+    }
+}
+#endif
+
+#ifdef GDN_CTRL_REGION_COSIM
+/* Iter86: RTL cosim top for the control kernel's GEMV region, one QKVG call of
+ * layer 0 (slr2_region_cosim/ctrl; the workspace port covers the real layout
+ * incl. the probe tail; the testbench drives zero activations and remote ys
+ * words so every transcendental is exact).  Never part of a build. */
+void gdn_ctrl_region_cosim_top(
+    Beat512 out[2 * GDN_INTER / 32], hls::stream<Beat512> &logits_stream, const Beat512 in[GDN_HIDDEN / 32],
+    const Beat512 *w0, const Beat512 *w1,
+    const Beat512 *w18, const Beat512 *w19, const Beat512 *w20, const Beat512 *w21,
+    const Beat512 *w22, const Beat512 *w23,
+    Beat512 *workspace,
+    hls::stream<GDNAxisBeat> &xr_to_slr0, hls::stream<GDNAxisBeat> &xr_to_slr2,
+    hls::stream<GDNAxisWord> &ys_from_slr0, hls::stream<GDNAxisWord> &ys_from_slr2,
+    hls::stream<GDNAxisBeat> &conv_to_slr2, hls::stream<GDNAxisBeat> &attn_from_slr2,
+    hls::stream<GDNAxisBeat> &scalars_to_slr2,
+    Beat512 attn_out[GDN_HIDDEN / 32], const Beat512 onorm_w[GDN_DV / 32],
+    const Beat512 conv_weights[3][(GDN_HIDDEN * GDN_CONV) / 32],
+    Beat512 conv_tails[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32],
+    const float a[GDN_HEADS], const float b[GDN_HEADS],
+    const float layer_a_log[GDN_HEADS], const float layer_dt_bias[GDN_HEADS]) {
+#pragma HLS interface ap_memory port=out
+#pragma HLS interface ap_memory port=in
+#pragma HLS interface ap_memory port=attn_out
+#pragma HLS interface ap_memory port=onorm_w
+#pragma HLS interface ap_memory port=conv_weights
+#pragma HLS interface ap_memory port=conv_tails
+#pragma HLS interface ap_memory port=a
+#pragma HLS interface ap_memory port=b
+#pragma HLS interface ap_memory port=layer_a_log
+#pragma HLS interface ap_memory port=layer_dt_bias
+#pragma HLS interface m_axi port=w0 depth=16384 offset=slave bundle=mem_weights_mm0 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=64 max_write_burst_length=64 num_write_outstanding=64
+#pragma HLS interface m_axi port=workspace depth=818176 offset=slave bundle=mem_weights_mm0 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=64 max_write_burst_length=64 num_write_outstanding=64
+#pragma HLS interface m_axi port=w1 depth=16384 offset=slave bundle=mem_weights_mm1 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w18 depth=16384 offset=slave bundle=mem_weights_mm18 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w19 depth=16384 offset=slave bundle=mem_weights_mm19 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w20 depth=16384 offset=slave bundle=mem_weights_mm20 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w21 depth=16384 offset=slave bundle=mem_weights_mm21 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w22 depth=16384 offset=slave bundle=mem_weights_mm22 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface m_axi port=w23 depth=16384 offset=slave bundle=mem_weights_mm23 max_widen_bitwidth=512 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS interface axis port=xr_to_slr0
+#pragma HLS interface axis port=xr_to_slr2
+#pragma HLS interface axis port=ys_from_slr0
+#pragma HLS interface axis port=ys_from_slr2
+#pragma HLS interface axis port=conv_to_slr2
+#pragma HLS interface axis port=attn_from_slr2
+#pragma HLS interface axis port=scalars_to_slr2
+#pragma HLS interface ap_fifo port=logits_stream
+#pragma HLS interface s_axilite port=return
+    gdn_gemv_part_ctrl(out, logits_stream, in, w0, w1, w18, w19, w20, w21, w22, w23,
+                       xr_to_slr0, xr_to_slr2, ys_from_slr0, ys_from_slr2,
+                       conv_to_slr2, attn_from_slr2, scalars_to_slr2,
+                       0u, GDN_HIDDEN, 4u * GDN_HIDDEN, true,
+                       attn_out, onorm_w, workspace, conv_weights, conv_tails,
+                       a, b, layer_a_log, layer_dt_bias, 0u GDN_PROBE_ARG(0u));
 }
 #endif
 
@@ -6579,6 +6936,7 @@ int gdn_forward_p(
     const uint32_t hidden = GDN_HIDDEN;
     const uint32_t num_heads = GDN_HEADS;
     const uint32_t head_dim = GDN_HEAD_DIM;
+    (void)num_heads; (void)head_dim;   /* Iter86: the output norm moved into the region */
     const uint32_t intermediate = GDN_INTER;
     const uint32_t num_tokens = 1;
     uint32_t layer_index;
@@ -6607,7 +6965,7 @@ int gdn_forward_p(
      * activation-packing pass. */
     Beat512 gemv_in_storage[GDN_INTER / 32];
     Beat512 q_mlp_gate_storage[GDN_INTER / 32];
-    Beat512 gate_storage[GDN_HIDDEN / 32];
+    Beat512 onorm_w_storage[GDN_DV / 32];     /* Iter86: the layer's output-norm weight for the region */
     Beat512 gemv_out_storage[(2 * GDN_INTER) / 32];
     Beat512 conv_weight_storage[3][(GDN_HIDDEN * GDN_CONV) / 32];
     Beat512 conv_tail_storage[3][((GDN_CONV - 1) * GDN_HIDDEN) / 32];
@@ -6619,7 +6977,6 @@ int gdn_forward_p(
 #pragma HLS bind_storage variable=x_alt_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=gemv_in_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=q_mlp_gate_storage type=ram_2p impl=bram
-#pragma HLS bind_storage variable=gate_storage type=ram_2p impl=bram
 #pragma HLS bind_storage variable=gemv_out_storage type=ram_2p impl=bram
 
     /* Iter61: LM-head logit queue. Deep enough to hold the whole GDN_VOCAB
@@ -6729,29 +7086,27 @@ int gdn_forward_p(
         /* q_mlp_gate_storage is dead until the later GU projection, so reuse
          * it for the recurrent attention result. Keeping the fixed GEMV input
          * and recurrent output in distinct BRAMs is required by HLS dataflow. */
+        gdn_load_onorm_w(onorm_w_storage, layer_o_norm);
         gdn_gemv_part_ctrl(gemv_out_storage, logits_stream, gemv_in_storage,
                  GDN_GEMV_P_ARGUMENTS,
                  (uint32_t)soff, hidden, 4 * hidden,
                  true,
-                 q_mlp_gate_storage, gate_storage,
+                 q_mlp_gate_storage, onorm_w_storage, workspace,
                  conv_weight_storage, conv_tail_storage,
                  a, b, a_log_storage, dt_bias_storage, layer_index
-                 GDN_PROBE_ARG(workspace) GDN_PROBE_ARG(4u * layer_index + 0u));
-        gdn_store_qkvg_conv_tails(q_tail, k_tail, v_tail,
-                                  conv_tail_storage);
+                 GDN_PROBE_ARG(4u * layer_index + 0u));
+        /* Iter86: the tails were written and the output norm/gate applied
+         * inside the region; its result waits in the attention buffer. */
+        gdn_copy_beats_local(gemv_in_storage, q_mlp_gate_storage, GDN_HIDDEN / 32);
         soff += shard_qkvg;
-        gdn_output_norm_and_gate(gemv_in_storage, q_mlp_gate_storage,
-                                 gate_storage,
-                                 layer_o_norm, num_tokens, num_heads,
-                                 head_dim, GDN_NORM_EPS);
         gdn_gemv_part_ctrl(gemv_out_storage, logits_stream, gemv_in_storage,
                  GDN_GEMV_P_ARGUMENTS,
                  (uint32_t)soff, hidden, hidden,
                  false,
-                 q_mlp_gate_storage, gate_storage,
+                 q_mlp_gate_storage, onorm_w_storage, workspace,
                  conv_weight_storage, conv_tail_storage,
                  a, b, a_log_storage, dt_bias_storage, layer_index
-                 GDN_PROBE_ARG(workspace) GDN_PROBE_ARG(4u * layer_index + 1u));
+                 GDN_PROBE_ARG(4u * layer_index + 1u));
         /* Iter85 (B3): residual add fused with the MLP norm. */
         gdn_residual_rmsnorm_bf16(gemv_in_storage, x_alt_storage, x_storage,
                                   gemv_out_storage, layer_mlp_norm, GDN_NORM_EPS);
@@ -6761,10 +7116,10 @@ int gdn_forward_p(
                  GDN_GEMV_P_ARGUMENTS,
                  (uint32_t)soff, hidden, 2 * intermediate,
                  false,
-                 q_mlp_gate_storage, gate_storage,
+                 q_mlp_gate_storage, onorm_w_storage, workspace,
                  conv_weight_storage, conv_tail_storage,
                  a, b, a_log_storage, dt_bias_storage, layer_index
-                 GDN_PROBE_ARG(workspace) GDN_PROBE_ARG(4u * layer_index + 2u));
+                 GDN_PROBE_ARG(4u * layer_index + 2u));
         /* Iter85 (B4): the SwiGLU result left the GU store in down-projection
          * input order; copy it to the engine's input (the store cannot write
          * the array the loader reads). */
@@ -6774,10 +7129,10 @@ int gdn_forward_p(
                  GDN_GEMV_P_ARGUMENTS,
                  (uint32_t)soff, intermediate, hidden,
                  false,
-                 q_mlp_gate_storage, gate_storage,
+                 q_mlp_gate_storage, onorm_w_storage, workspace,
                  conv_weight_storage, conv_tail_storage,
                  a, b, a_log_storage, dt_bias_storage, layer_index
-                 GDN_PROBE_ARG(workspace) GDN_PROBE_ARG(4u * layer_index + 3u));
+                 GDN_PROBE_ARG(4u * layer_index + 3u));
         /* Iter85 (B3): the MLP-down residual fused with the next layer's
          * attention norm (the final norm after layer 23). */
         gdn_residual_rmsnorm_bf16(gemv_in_storage, x_storage, x_alt_storage,
@@ -6807,10 +7162,10 @@ int gdn_forward_p(
                  GDN_GEMV_P_ARGUMENTS,
                  (uint32_t)lm_soff, hidden, GDN_VOCAB,
                  false,
-                 q_mlp_gate_storage, gate_storage,
+                 q_mlp_gate_storage, onorm_w_storage, workspace,
                  conv_weight_storage, conv_tail_storage,
                  a, b, a_log_storage, dt_bias_storage, layer_index
-                 GDN_PROBE_ARG(workspace) GDN_PROBE_ARG((uint32_t)(GDN_PROBE_CALLS - 1u)));
+                 GDN_PROBE_ARG((uint32_t)(GDN_PROBE_CALLS - 1u)));
     }
 
     /* Iter67: the on-chip argmax is back, so hand the host a token id again.
