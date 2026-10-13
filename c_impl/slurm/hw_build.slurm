@@ -30,8 +30,9 @@ mkdir -p "${SHARED_DIAG}"
 printf '%s\n' "preflight" > "${SHARED_DIAG}/build.phase"
 trap 'rc=$?; test -s "${SHARED_DIAG}/build.exit" || printf "%s\n" "$rc" > "${SHARED_DIAG}/build.exit"' EXIT
 
-if [ "${SLURM_CPUS_PER_TASK:-0}" -lt 48 ] || [ "${JOBS}" -gt 48 ]; then
-    echo "FATAL: production build requires 48 allocated CPUs and JOBS<=48" >&2
+# BUILD_MIN_CPUS comes from the launcher's BUILD_CPUS (48 unless overridden).
+if [ "${SLURM_CPUS_PER_TASK:-0}" -lt "${BUILD_MIN_CPUS:-48}" ] || [ "${JOBS}" -gt 48 ]; then
+    echo "FATAL: production build requires ${BUILD_MIN_CPUS:-48} allocated CPUs and JOBS<=48" >&2
     exit 2
 fi
 if [ "$(hostname -s)" = "acclhead1" ]; then

@@ -6,7 +6,7 @@
 #   knobs:  JOBS HLS_FREQ LINK_FREQ (200 default) HW_CFG_TEMPLATE (hw_f200_p.cfg default)
 #           VIVADO_SYNTH_JOBS VIVADO_IMPL_JOBS
 #           BUILD_CONSTRAINT BUILD_EXCLUDE BUILD_NODE (optional exceptional pin)
-#           BUILD_MEM BUILD_TIME ONCARD_TIME SKIP_ONCARD
+#           BUILD_CPUS (48 default) BUILD_MEM BUILD_TIME ONCARD_TIME SKIP_ONCARD
 #   data:   WEIGHTS DECODE_STATE DECODE_FIXTURE DECODE_GOLDEN LOGITS_REFERENCE
 #           GPU_LOGITS_REFERENCE
 #           exported here and forwarded to make by the on-card job. A packed-BF16
@@ -76,6 +76,11 @@ BUILD_NODE="${BUILD_NODE:-}"
 # --exclusive is not possible under the build QoS (it would allocate all 128 CPUs
 # against the 48-CPU per-job cap); =user was accepted at 48.
 BUILD_EXCLUSIVE="${BUILD_EXCLUSIVE:-}"
+# BUILD_CPUS: the build job's allocation. The links use ~3 cores on average
+# (builds 8188/8236: 22-24 CPU-hours over 7.5-8.5 h; Vivado impl 8 threads,
+# synth 16 runs) and peak at ~74 GiB RSS, so a smaller request fits a busy
+# node; JOBS stays as set (it names the build directory).
+BUILD_CPUS="${BUILD_CPUS:-48}"
 BUILD_MEM="${BUILD_MEM:-192G}"
 BUILD_TIME="${BUILD_TIME:-2-00:00:00}"
 ONCARD_TIME="${ONCARD_TIME:-4:00:00}"
@@ -104,6 +109,7 @@ printf '%s\n' "PENDING: Slurm build has not started; live tool output will repla
 echo "tag        : ${TAG}"
 echo "knobs      : JOBS=${JOBS} HLS_FREQ=${HLS_FREQ} LINK_FREQ=${LINK_FREQ}"
 echo "vivado     : SYNTH_JOBS=${VIVADO_SYNTH_JOBS} IMPL_JOBS=${VIVADO_IMPL_JOBS}"
+echo "allocation : ${BUILD_CPUS} CPUs, ${BUILD_MEM}"
 echo "constraint : ${BUILD_CONSTRAINT:-<none>}"
 echo "exclude    : ${BUILD_EXCLUDE:-<none>} (build); ${ONCARD_EXCLUDE:-<none>} (card)"
 echo "build node : ${BUILD_NODE:-scheduler-selected}"
@@ -238,11 +244,11 @@ build_id="$("$SBATCH_BIN" --parsable \
     --job-name="${TAG}_build" \
     --chdir="$C_IMPL" \
     "${build_placement_args[@]}" \
-    --cpus-per-task=48 \
+    --cpus-per-task="$BUILD_CPUS" \
     --mem="$BUILD_MEM" \
     --time="$BUILD_TIME" \
     --output="${C_IMPL}/${DIAG}/build.slurm-%j.log" \
-    --export=ALL,TAG="$TAG",JOBS="$JOBS",HLS_FREQ="$HLS_FREQ",LINK_FREQ="$LINK_FREQ",SUBMIT_C_IMPL="$C_IMPL",SNAPSHOT_PATH="$SNAPSHOT_PATH" \
+    --export=ALL,TAG="$TAG",JOBS="$JOBS",BUILD_MIN_CPUS="$BUILD_CPUS",HLS_FREQ="$HLS_FREQ",LINK_FREQ="$LINK_FREQ",SUBMIT_C_IMPL="$C_IMPL",SNAPSHOT_PATH="$SNAPSHOT_PATH" \
     "$DIAG/hw_build.slurm")"
 printf '%s\n' "$build_id" > "$DIAG/build.job_id"
 echo
