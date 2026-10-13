@@ -19830,3 +19830,149 @@ minutes in its "bitstream generation" phase. XCLBIN
   acclnode01's card, 0.593 J/token. Documents updated in the same series (`architecture.md`, the
   READMEs, `cycle_optimization_roadmap.md`, the CLAUDE.md status block). Merging `recur_balance`
   into `main` is the user's step.
+
+## Iter87 — conv-tail writes deferred until port 0's weights are read (opened 2026-10-12, branch `recur_balance`)
+
+**Why (user request, 2026-10-12: "apply the fix").** Iter86's tails writer stores the layer's 576
+conv-tail beats on `mem_weights_mm0` while port 0 still streams its 16,384 QKVG weight beats, so
+reads and writes share HBM pseudo-channel 0 — the interference Iter84 removed from ports 28–31.
+The Iter86 probe (job 8190): port 0's QKVG stream ends at 17,036 control cycles (Iter85: 16,688),
+436 cycles after ports 28–31 (16,600); the collector's last word moves 16,938 → 17,230, and the
+whole QKVG tail (ingest, convolution, SLR2's Q/K/V, the islands' last head) follows it. SLR2's
+QKVG region ends with the islands' last update (`upd_end` 25,624, `wr_done` 25,628 in SLR2 time).
+
+**Hypothesis.** Iter84's pattern applied to the tails: the writer drains a queue that holds a
+whole call's 576 beats only after a one-token go from the loader (`gemv32_load_x_bcast`), written
+after its port-0 weight loop. Port 0 then reads at the Iter85 rate (≈ −348 cycles of stream) and
+the tails go out in the ≈ 3,100 idle cycles after port 0's last weight beat. **Expected gain is
+capped by the state write-back:** in Iter84/85 the four writers needed 4,224–4,229 cycles after
+their weight loops to drain 4,096 beats (`wr_done` − `wt_done` in the probe dumps
+`diagnostics/iter84_deferred_wb/probe/` and `iter85_residual_swiglu/probe/`), so after the fix SLR2's QKVG end
+becomes max(islands' `upd_end` ≈ 25,624 − 292 ≈ 25,332, ports 28/29's `wt_done` 21,281 + 4,224 ≈
+25,505) ≈ 25,507: **≈ −120 cycles per layer, ≈ −2.9K cycles per token (≈ −0.17 %, ≈ −0.015 ms
+kernel)**. SLR2 is the late kernel at the QKVG → o_proj boundary (Iter86: it enters o_proj 634
+cycles after the control), so the control region's own ≈ −300 does not reach the token. (An earlier
+estimate in conversation, ≈ −250 per layer, took the drain at 1 beat per cycle; the measured rate
+is 0.97.) Below the roadmap's Stage 6 bar (0.05M); built at the user's request.
+
+**Deadlock condition.** The consumer writes 72 tail beats per head while the loader streams
+weights; with the writer held back, a queue shallower than one call's tails would stop the
+consumer, then the collector, cluster 0 and the loader's `ws[0]` writes, so the go would never
+come. The queue must hold all 576 beats: `tails_stream` depth 1,024 in URAM (8 URAM, the same
+blocks as 576; was 128 deep in BRAM). The C model cannot see this (unbounded streams); the
+control-region RTL cosim can.
+
+**Protocol (12-hour target, user question).** Native gates (partitioned fast and 32-step, monolith
+fast, probe-enabled), csynth of `gdn_forward_p` (200-656 list empty, II, clock, mm0 writer count,
+resources), the control-region RTL cosim (`slr2_region_cosim/ctrl/`), then one **probe-free** link
+with `make run_hw` (one link fits in 12 hours; a probe-free image is promotable and compares
+directly with the production 8.369 ms on acclnode01's card); the build job runs the XO, address and
+tails gates; card gates; the qualification chained behind the card job as for the promotion.
+
+**Implementation (2026-10-12).** `gemv32_load_x_bcast` takes `tails_go` and `tails_mode`
+(`qkvg_recurrent_mode`) and writes one token after its `gemv32_w0_bcast` loop; `gdn_tails_writer`
+reads it before its 576-beat loop; in `gdn_gemv_part_ctrl` `tails_go` is `hls::stream<ap_uint<1>>`
+depth 4 and `tails_stream` depth 1,024 in URAM (was 128 in BRAM). No arithmetic change; the monolith
+(A/B only) drains its tails and is untouched. Source `gdn_model.cpp`
+b21f9b94d2993d5eb64fdc0ede43374c5b64fca31799138cb3a9a58f2ff195d4, `gdn_model.h` 337d7bc5… and
+`host.cpp` def56de3… unchanged.
+- *Native gates:* partitioned fast and monolith fast **PASS bit-exact** (`exact_ref_mismatch=0`
+  against `decode_native_bf16_product_native_64.gdnlog`); the probe-enabled partitioned binary
+  (`-DGDN_CALL_PROBE=1`, 6 steps) PASS bit-exact with no counter abort.
+- *csynth (job 8380, probe-free, `diagnostics/iter87_tails_defer/csynth/`):* HLS 200-656 list empty;
+  `gemv32_lx_bcast` / `gemv32_w0_bcast` / the flattened tails loop at II=1 (576 trips, 646 cycles);
+  estimated clock 3.650 ns in every module (none above 5.0 ns); `tails_stream_U` 1,024 × 512 in
+  **8 URAM**, `tails_go_U` depth 4 in flops. `gdn_forward_p` 604 BRAM18K / 1,030 DSP / 256.1K FF /
+  251.4K LUT / **64 URAM** (production XO: 619 / 1,030 / 256.0K / 251.3K / 56). One new advisory:
+  HLS 200-1018 suggests depth 9 for `tails_go` — the static estimate; one token is written and read
+  per region call and the region's calls do not overlap, so one slot suffices (kept at 4; the cosim
+  below runs this exact source). The tails address gate on this HLS verilog: **PASS, 72 cases at HLS
+  RTL, post-`synth_design` and post-`opt_design`**.
+- *Control-region RTL cosim (job 8382, 4 CPUs / 24 GB, 40 m, `iter87_tails_defer/cosim/`):* **PASS**,
+  deadlock detector silent; the checksums equal Iter86's exactly (`conv_xor=81b28179025f85e2`,
+  `attn_xor=0000800000008000`, `tails_xor=804a004a81d7011b`, `tails_nonzero=384`), and so does the
+  region's simulated latency, 187,532 cycles. The cosim's AXI model does not share a channel between
+  reads and writes, so it cannot show the gain; it shows the held-back writer neither deadlocks nor
+  lengthens the region. Native 32-step partitioned gate **PASS bit-exact** (`exact_ref_mismatch=0`).
+
+**Launch (2026-10-12 19:10 UTC).** Command: `BUILD_CPUS=32 BUILD_MEM=96G BUILD_EXCLUSIVE=
+BUILD_EXCLUDE=acclnode03,acclnode04,acclnode05,harrier make run_hw` (tag
+`hw_20261012_190815_2149169`, build 8383 / card 8384) pended for **Resources** with a planned start
+at 03:05: the `build` partition caps a node at **MaxCPUsPerNode=96**, and other users' build jobs
+held 82 of acclnode01's (plus 4 for the cosim). Cancelled before it started and relaunched with
+`BUILD_CPUS=10` (tag **`hw_20261012_191035_2149955`, build 8396, card 8397**, running 19:10:35 on
+acclnode01; frozen `gdn_model.cpp` b21f9b94…). The 48-CPU request had been hard-coded in
+`run_hw_sbatch.sh` and in the build job's guard; both now read `BUILD_CPUS` (default 48), because
+the links use ~3 cores on average (builds 8188/8236: 22–24 CPU-hours over 7.5–8.5 h) and peak at
+74 GiB RSS — `BUILD_MEM=96G` keeps 22 GiB of headroom. JOBS stays 48 (the build directory name);
+Vivado synth/impl jobs 16/8 as before. Chained behind the card job, as for the promotion:
+robustness 8398 (512-token drift, WikiText-2), paired power 8399 (fp32 arm) → 8400 (bf16 arm),
+`--kill-on-invalid-dep=yes`, harrier and acclnode03 excluded.
+
+**Build result (build 8396, acclnode01, shared node, 10 CPUs, 8 h 48 m; MaxRSS 76.7 GB of the 96 GB
+request, 27.4 CPU-hours): closed and gated.** Every pre-link gate 0 (native, XO, state address, state
+reader, tails, island names); routed **0 routing errors**; clocks **kernel +0.027 / +0.010 ns at
+5.000 ns, DMA +0.003 / +0.009, hbm_aclk −0.040 / +0.010** (accepted by the 440 MHz floor; vpl
+programmed **442.0 MHz** — the coin's eleventh draw and its worst; production runs at 446.4); the
+post-route AggressiveExplore pass ran its full 43 m 36 s search against the negative HBM slack.
+XCLBIN **`e3e88f966acb80bd30ef10c81a7c7a08b8d3b09057ad36cd6685c1889b261998`**, DATA_CLK 200
+(`diagnostics/hw_20261012_191035_2149955/`). Routed per SLR: CLB **91.34 / 92.46 / 93.22 %**
+(production 91.12 / 92.41 / 91.49), LUTs 202,378 / 233,264 / 255,388 (46.03 / 54.00 / 59.12 %), DSP
+2,154 / 1,547 / 2,134, BRAM tiles 429 / **541.5** / 299 (production 429 / 549 / 299: the 128-deep
+BRAM queue left), URAM 0 / **64** / 96, SLLs 24,843 (SLR2↔SLR1 50.37 %, SLR1↔SLR0 57.45 %).
+- *Card gates (job 8397, acclnode01, the production image's card):* exact 8- and 64-token
+  trajectories; vector gate over 2,016,000 logits NRMSE 0.00466270, worst step 0.011908, cosine
+  0.999989, min step cosine 0.999946, top-5 5/5, 0 argmax mismatches, 0 tolerance failures — the
+  production figures to the last digit, as an arithmetic-free change requires. **Kernel 8.361 ms
+  median (mean 8.362, 8.353–8.413), TPOT 8.484 ms** (mean 8.486) = **1,672,120 kernel cycles**.
+- *Against production on the same card (job 8237, 64-token run, 63 steps each):* kernel median
+  8.3687 → 8.3606 ms; quartiles 8.3664–8.3703 → 8.3580–8.3625 (no overlap); Mann–Whitney z = 7.54;
+  Hodges–Lehmann shift **−8.2 µs per token = −1.64K cycles (−0.10 %), ≈ −68 cycles per layer** —
+  57 % of the predicted −120 per layer. Not separable from this image's lower HBM clock (442.0 vs
+  446.4 MHz, −1 %), which can slow the HBM-bound state drain that caps the gain; separating them
+  needs a probe build or a second draw. The two runs are two days apart on one card; the production
+  image's own repeat measurements agree to ≈ 2 µs (8.369 card gates, 8.371 over the WikiText run), so
+  the shift is ≈ 4× that spread. The qualification's WikiText run (314,843 tokens) gives the second,
+  larger comparison.
+- *Robustness (job 8398, 54 m):* 512-token drift fork at step **447**, ratio **1.063**, slope
+  **2.133e-06**, `TREND_VERDICT=BOUNDED` (production's three numbers); WikiText-2 on the identical
+  workload: word perplexity **16.774839771** (production's, to every printed digit; byte perplexity
+  1.6944051 likewise), −0.0077 % vs GPU — and **8.3648 ms/token kernel over the 314,843 tokens against
+  production's 8.3709 (job 8238): −6.1 µs (−0.073 %)**, the second light-duty comparison in the same
+  direction as the card gates.
+- *Paired power (jobs 8399 fp32 arm 13 m 32 s, 8400 bf16 arm 11 m 41 s):* gates pass; the card reads
+  back hbm_aclk **442 MHz** (production 446). But the sustained benchmark runs **slower** than
+  production's: 7,030 steps per 60-s interval against 7,076, kernel median **8.3968 ms against 8.3752**
+  (+21.6 µs, the same in all six intervals), TPOT 8.533 / 8.532 against 8.478 / 8.475 ms; active 70.0 /
+  69.6 W, **0.5975 / 0.5938 J/token gross** (production 0.5929 / 0.5888), 0.3265 / 0.3281 idle-subtracted
+  (0.3240 / 0.3255); A100 ratios 3.68x / 3.71x faster, 5.02x / 4.57x gross, 2.72x / 1.78x idle-subtracted.
+  Every host-side time in these runs is slower than in production's runs: launch 0.012 → 0.024 ms, the
+  embedding upload 0.043 → 0.052, the token read-back 0.046 → 0.055, the embedding write 0.7 → 1.0 µs —
+  a slower host during this job (node load; the A100 arm's device time also moved, 30.92 → 31.32 ms
+  fp32). `kernel_ms` is measured by the host from `run.start()` to `run.wait()`, so it carries host
+  latency too; this image's fastest steps (8.349–8.363) are no slower than production's (8.357–8.360).
+  Not attributable from these runs: the host changed between the two jobs. A same-job, same-card A/B
+  (job 8419: production and Iter87 alternating A B B A A B, one host binary, the power benchmark's
+  4,096-token context and teacher stream, 2 × 30 s per run) separates the device from the host.
+- *Same-job A/B (job 8419, acclnode01, 9 m, `iter87_tails_defer/ab/`):* the host-side times are equal
+  for both images (launch 0.0245, embedding upload 0.052, read-back 0.055–0.059 ms), the card reads
+  back hbm_aclk 446 MHz for production and 442 MHz for Iter87 at every load. Kernel medians per 30-s
+  interval (≈ 3,510 steps each): production **8.4063–8.4085** (runs 1, 4, 5), Iter87 **8.3907–8.3999**
+  (runs 2, 3, 6) — every Iter87 interval below every production interval; median of interval medians
+  **8.4076 → 8.3915 ms: −16.1 µs per token = −3.2K cycles (−0.19 %)**, the predicted −14.4 µs
+  (−120 cycles per layer). Production's own kernel median rose 32 µs between its 2026-10-11 power run
+  (8.3752) and this job (8.4076) on the same card: `kernel_ms` carries tens of µs of host latency that
+  moves between jobs, so a change below ≈ 0.5 % must be measured in one job, alternating the images.
+  The earlier cross-job figures (−8.2 µs card gates, −6.1 µs WikiText, +21.6 µs power) are each a
+  device difference plus a host difference; the A/B is the controlled one. Iter87's run 6 (8.400, the
+  last run, after ≈ 7 minutes of load) sat 9 µs above its runs 2–3 — noted, still 8 µs under production.
+
+**Verdict: RETAINED AND PROMOTED (2026-10-13).** On card, same card and same job as the reference:
+−16 µs per token (−0.19 %) at identical gates (exact 8/64-token trajectories, the production vector
+gate to the last digit, bounded 512-token drift with production's fork step, ratio and slope,
+WikiText-2 perplexity identical to every printed digit). Closes no roadmap stage (a sub-threshold
+item of the Iter86 entry's bundle, built at the user's request). Production image: build 8396,
+XCLBIN `e3e88f96…`, source `gdn_model.cpp` b21f9b94…; card gates 8.484 ms TPOT / 8.361 ms kernel (job
+8397). The qualification's paired power ran under a slower host (above) and is recorded as measured;
+the device comparison is the A/B. Flow change committed separately: `BUILD_CPUS` (launcher and build
+guard, default 48).

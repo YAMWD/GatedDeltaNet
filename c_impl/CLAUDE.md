@@ -3,10 +3,11 @@
 Loads only when working under `c_impl/`. Project-wide guidance (the real-data principle, build
 commands, the iteration workflow, commit discipline, current status) stays in the root `CLAUDE.md`.
 `doc/architecture.md` is the authoritative spec (currently the **200 MHz three-kernel image of the
-Iter82–86 series**, promoted 2026-10-11: the Iter81 balanced-island image plus the packed aux image,
-the deferred state write-back, the fused residual + RMSNorm and SwiGLU-in-the-store, and the per-head
-output norm and convolution-tail writer in the QKVG region; 8.486 ms/token production TPOT / 8.369 ms
-kernel on acclnode01's card. The Iter81 image, 10.470 / 10.347 ms on harrier's card, is the predecessor). `README.md`
+Iter82–87 series**, promoted 2026-10-13: the Iter81 balanced-island image plus the packed aux image,
+the deferred state write-back, the fused residual + RMSNorm and SwiGLU-in-the-store, the per-head
+output norm and convolution-tail writer in the QKVG region, and the tail writes held until port 0's
+weights are read (Iter87); 8.484 ms/token production TPOT / 8.361 ms kernel on acclnode01's card.
+The Iter82–86 image, 8.486 / 8.369 ms on the same card, is the predecessor). `README.md`
 in this directory is current — it was rewritten for the decode-only design; the earlier note calling it
 stale was wrong.
 

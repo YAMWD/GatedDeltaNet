@@ -1,5 +1,13 @@
 # Cycle-First Optimization Roadmap After Iter67c
 
+> **Update 2026-10-13 (Iter87, promoted 2026-10-13; closes no stage).** At the user's
+> request, one item of the Iter86 entry's sub-threshold bundle: the conv-tail writes
+> wait until port 0's QKVG weights are read. Measured in a same-job A/B on
+> acclnode01's card: **−16 µs per token (−3.2K cycles, −0.19 %)**, as predicted —
+> capped by the four state ports' write-back drain, so Stage 6's stop condition
+> stands. Card gates 8.361 ms kernel (1,672,120 cycles); cross-job comparisons cannot
+> resolve changes this small (`kernel_ms` carries tens of µs of host latency).
+
 > **Update 2026-10-11 (Iter82–86, promoted 2026-10-11; the cycle reference is now 1.6738M at 200 MHz, 8.369 ms kernel on acclnode01's card).** The dual-kernel
 > probe (Iter82) and four schedule iterations took the token from 2,053,983 to
 > **1,684,509 cycles** on acclnode01's card (8.423 ms kernel; −18.0 %): the packed

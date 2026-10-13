@@ -1,7 +1,7 @@
 # GatedDeltaNet Decode Accelerator Architecture
 
 **Status:** Current production architecture: the **200 MHz three-kernel image
-of the Iter82–86 series**, promoted 2026-10-11 after the full qualification
+of the Iter82–87 series**, promoted 2026-10-13 after the full qualification
 (drift, WikiText-2 and paired power, § *Correctness and On-Card Performance*).
 It is the Iter81 image — the same three kernels, one per die of the U55C:
 `gdn_forward_p` (control: ports 0/1/18–23, store, convolution, norms,
@@ -16,31 +16,35 @@ projections in one fused II=1 loop (Iter83), the state write-back deferred
 until each reader's QKVG weight loop has ended (Iter84), the residual add fused
 with the following RMSNorm and the SwiGLU evaluated inside the GU store
 (Iter85), and the per-head output norm/gate and the convolution-tail writer as
-processes of the QKVG region (Iter86). Every change is element-wise or
+processes of the QKVG region (Iter86), the tail writes held until port 0's QKVG
+weights are read (Iter87). Every change is element-wise or
 order-preserving: native bit-exact and the production figures on card. The
 image is HLS-synthesized and linked at **200 MHz** under **Vitis 2024.2**,
-routed with zero routing errors, and closes the kernel clock at **+0.041 /
+routed with zero routing errors, and closes the kernel clock at **+0.027 /
 +0.010 ns at 5.000 ns** and the fixed 250 MHz DMA clock at +0.003 / +0.009 ns;
-the 450 MHz HBM AXI clock missed by 0.018 ns on the shell's own SLR-crossing
-paths and runs at **446.4 MHz** under the flow's 440 MHz floor. The 64-token
-card run measures **8.486 ms/token production TPOT / 8.369 ms kernel =
-1,673,800 cycles** by median over 63 generated tokens (build 8236 / job 8237,
+the 450 MHz HBM AXI clock missed by 0.040 ns on the shell's own SLR-crossing
+paths and runs at **442.0 MHz** under the flow's 440 MHz floor. The 64-token
+card run measures **8.484 ms/token production TPOT / 8.361 ms kernel =
+1,672,120 cycles** by median over 63 generated tokens (build 8396 / job 8397,
 acclnode01's card), with an exact token trajectory and the production
 vector-gate figures over 2,016,000 logits. Against Iter81 on the same card
-(10.256 ms kernel over the WikiText run) that is **−18.4 % kernel time**; the
-dual-kernel call probe (Iter82, compiled out of production) measured every
-step (`optimization_log.md`, Iter82–86). After Iter86 the four state ports'
+(10.256 ms kernel over the WikiText run) that is **−18.5 % kernel time**;
+against the Iter82–86 image in one job on the same card, the two images
+alternating, Iter87 is **16 µs per token faster (−0.19 %)**. The dual-kernel
+call probe (Iter82, compiled out of production) measured every step
+(`optimization_log.md`, Iter82–87). After Iter86 the four state ports'
 traffic — 4,096 beats read before and 4,096 written after each layer's QKVG
 weights per port — bounds the QKVG call: the floor is ≈ 62.5K cycles per layer
 (≈ 1.564M per token).
 
 Production XCLBIN SHA-256
-`6ee780219d7e3909d7d5fb71eacb7a47336c241f4552e834a4e612a1021f6e2c` (build
-8236, `diagnostics/hw_20261011_120857_1867100/`), host `4f8050c3c3fe5879…`,
+`e3e88f966acb80bd30ef10c81a7c7a08b8d3b09057ad36cd6685c1889b261998` (build
+8396, `diagnostics/hw_20261012_191035_2149955/`), host `3e16bb0fc77e485d…`,
 from `gdn_model.cpp`
-`c43688007ef6e2962317c43d165ee1a7cefb65fcc9a947bf824733748e1c0755` (commit
-`56622ec53`). The Iter81 image `a95b9a8a…` (build 7370, 10.470 ms/token on
-harrier's card) is the immediate predecessor. The
+`b21f9b94d2993d5eb64fdc0ede43374c5b64fca31799138cb3a9a58f2ff195d4` (commit
+`42959cfcf`). The Iter82–86 image `6ee78021…` (build 8236, 8.486 ms/token,
+source `56622ec53`) is the immediate predecessor, and the Iter81 image
+`a95b9a8a…` (build 7370, 10.470 ms/token on harrier's card) the one before. The
 Iter79 image `0326f01be04ff628…` (build 6548, 12.350 ms/token; reproduced by
 builds 6568 and 6642) is the recorded predecessor in § *Correctness and
 On-Card Performance*, with the 150 MHz Iter76 image (`b2a0a478…`, 16.255 ms)
@@ -114,12 +118,12 @@ token per `gdn_forward` invocation. The successful design combines:
 
 The architecture routes every routable net with zero routing errors and
 preserves the exact 64-token trajectory. The in-link closure sequence closes
-the 200 MHz kernel clock at **+0.041 ns WNS / +0.010 ns WHS** and the fixed
+the 200 MHz kernel clock at **+0.027 ns WNS / +0.010 ns WHS** and the fixed
 250 MHz DMA clock at **+0.003 / +0.009 ns**; the HBM AXI clock is programmed at
-446.4 MHz (its shell-pipe endpoints miss 2.222 ns by ≤ 0.018 ns). The
-production image runs **18.4 % faster by kernel time** than the Iter81 image on
-the same card (8.369 against 10.256 ms; 1,673,800 cycles per token), and
-**14.3x** the 121.4 ms eight-port baseline by production TPOT (8.486 ms).
+442.0 MHz (its shell-pipe endpoints miss 2.222 ns by ≤ 0.040 ns). The
+production image runs **18.5 % faster by kernel time** than the Iter81 image on
+the same card (8.361 against 10.256 ms; 1,672,120 cycles per token), and
+**14.3x** the 121.4 ms eight-port baseline by production TPOT (8.484 ms).
 
 ## Fixed Model Shape
 
@@ -374,7 +378,9 @@ local x
             stream the head's gate to the norm/gate process
             run one shared head-local convolution actor for Q, K, and V
             stream the old tail rows 1-2 and the new raw row to the
-            tails writer (mm0, 8-beat bursts; Iter86)
+            tails writer (mm0, 8-beat bursts; Iter86), which holds them in
+            a 1,024-deep URAM queue until port 0's QKVG weights are read
+            (one-token go from the loader; Iter87)
             stream convolved Q/K/V directly to recurrence
        -> on ports 28--31, before the call's first weight beat:
             stream the layer's four 4,096-beat old-state stripes into
@@ -599,8 +605,11 @@ loop; measured −55.2K, the serial work outside the control regions 278.2K →
 output norm/gate and the conv-tail writer inside the QKVG region (**Iter86, done:**
 `gdn_attn_norm_gate`, `gdn_tails_writer`; measured −37.4K: the post-QKVG serial
 work 3.2K → 0.13K per layer, partly returned as the islands' tail now exposed at
-the o_proj boundary and the tails writes slowing port 0), the islands' last
-head, and the per-call fill/drain; see `optimization_log.md`, Iter82–86.
+the o_proj boundary and the tails writes slowing port 0 — **Iter87, done:** the
+writer drains a 1,024-deep URAM queue only after a one-token go from port 0's
+loader, written after its weight loop; −3.2K cycles per token in a same-job A/B,
+capped by the state ports' write-back drain), the islands' last head, and the
+per-call fill/drain; see `optimization_log.md`, Iter82–87.
 **Measured structure after Iter86 (1,684,509 cycles on acclnode01's card, probe
 build):** per layer on the SLR2 kernel 67.4K = weights 54.3K + state prefetch
 4.4K + the QKVG tail 4.3K (the islands' last head and the deferred write-back) +
@@ -1126,7 +1135,52 @@ on-card-validated 115.7 MHz result, not a 130 MHz closure result.
 
 ## Correctness and On-Card Performance
 
-### Iter82–86 series image, 200 MHz (current)
+### Iter82–87 series image, 200 MHz (current)
+
+Iter87 changes one thing in the control kernel: the convolution-tail writer's
+576 writes per QKVG call wait for a one-token go that the port-0 loader writes
+after its weight loop, so they no longer share HBM pseudo-channel 0 with the
+weight reads. The image passed the same production chain (native gates, XO
+gate, the state writer/reader and convolution-tail address gates, the island
+gate, the in-link exact-clock gate, route/DRC/bus-skew, clock metadata, card
+gates; build 8396, job 8397, 2026-10-13, acclnode01's card), with a new
+pre-link control-region RTL cosim (no deadlock, checksums equal to Iter86's):
+
+| Metric | build 8396, job 8397 (production) | Iter82–86 image, build 8236 / job 8237 |
+|---|---:|---:|
+| Production TPOT, median of 63 | **8.484 ms/token** | 8.486 ms/token |
+| Kernel execution, median of 63 | **8.361 ms/token** (mean 8.362, 8.353–8.413) | 8.369 (mean 8.370, 8.360–8.424) |
+| Effective kernel cycles at 200 MHz | **1,672,120** | 1,673,800 |
+| Same-job A/B, sustained decode (job 8419) | **8.3915 ms** (6 intervals, 8.3907–8.3999) | 8.4076 (8.4063–8.4085) |
+| 8- and 64-token trajectories | exact | exact |
+| CUDA vector gate, 2,016,000 logits | NRMSE 0.004663, worst step 0.011908, cosine 0.999989, 0 argmax mismatches | identical |
+| Kernel / DMA / HBM clocks | +0.027 / +0.003 / −0.040 ns (HBM at 442.0 MHz) | +0.041 / +0.003 / −0.018 ns (HBM at 446.4 MHz) |
+
+The A/B row is the controlled comparison: one card job, one host binary, the
+two images alternating A B B A A B over the power benchmark's 4,096-token
+context, every Iter87 interval below every predecessor interval — **−16 µs per
+token (−0.19 %)**, the predicted −14 µs. `kernel_ms` is timed by the host and
+carries tens of microseconds of host latency that moves between jobs (the
+predecessor's own median moved 32 µs between its power run and this job), so
+cross-job figures cannot resolve a change this small.
+
+Qualification on this image, 2026-10-13: 512-token free-running drift
+**BOUNDED**, fork at step 447, ratio 1.063, slope 2.133e-06 per step (job 8398);
+WikiText-2 word perplexity **16.774839771** against GPU 16.776123769 on the
+verified-identical workload, **−0.0077 %**, identical to the predecessor's to
+every printed digit, kernel 8.365 ms/token over the run (8.371 for the
+predecessor, cross-job); paired power (jobs 8399 fp32 / 8400 bf16 arms): 70.0 /
+69.6 W active, 31.7 / 31.1 W idle, **0.598 / 0.594 J/token gross, 0.327 / 0.328
+J idle-subtracted** at a sustained 8.53 ms TPOT, against the paired A100 eager
+runs' 31.32 ms / 95.4 W / 2.998 J (FP32) and 31.57 ms / 85.6 W / 2.711 J (BF16):
+3.68x / 3.71x faster, 5.02x / 4.57x gross and 2.72x / 1.78x idle-subtracted
+energy efficiency. These power runs met a slower host than the predecessor's
+(every host-side time 20–100 % longer, the A100 arm's device time too), so their
+TPOT and energy per token are higher than the predecessor's by host time, not
+device time (the A/B above). The card reads back DATA_CLK 200 MHz and hbm_aclk
+442 MHz.
+
+### Iter82–86 series image, 200 MHz (predecessor)
 
 The image passed the production chain — the native trajectory gates on the
 three-thread C model, the XO architecture gate, the synthesized address gates on

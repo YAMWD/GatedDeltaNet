@@ -209,9 +209,9 @@ diagnostic reports are generated artifacts and are intentionally not committed.
 
 - `c_impl/doc/README.md` — **start here**; says which document is current.
 - `c_impl/doc/architecture.md` — current top-level architecture and ABI
-  (the 200 MHz three-kernel image of the Iter82–86 series: 8.486 ms/token
-  production TPOT and 8.369 ms kernel on card, −18.4 % kernel time versus the
-  Iter81 image on the same card; 0.593 J/token gross; promoted 2026-10-11).
+  (the 200 MHz three-kernel image of the Iter82–87 series: 8.484 ms/token
+  production TPOT and 8.361 ms kernel on card, −18.5 % kernel time versus the
+  Iter81 image on the same card; promoted 2026-10-13).
 - `c_impl/doc/gpu_latency_energy_evaluation.md` — the GPU latency and energy
   arm, from a fresh clone.
 - `c_impl/doc/decode_disaggregated_gemv.md` — 32-port GEMV engine.
