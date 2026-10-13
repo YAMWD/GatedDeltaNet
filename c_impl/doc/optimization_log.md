@@ -19976,3 +19976,26 @@ XCLBIN `e3e88f96…`, source `gdn_model.cpp` b21f9b94…; card gates 8.484 ms TP
 8397). The qualification's paired power ran under a slower host (above) and is recorded as measured;
 the device comparison is the A/B. Flow change committed separately: `BUILD_CPUS` (launcher and build
 guard, default 48).
+
+**Update 2026-10-13 — same-job power A/B (job 8470, 19 m, `iter87_tails_defer/power_ab/`): the gain
+depends on the run.** Run for the results slide: the FPGA arm of the paired-power protocol (60 s
+idle, 30 s warm-up, 3 × 60 s, 1-s power samples) on both images, order A B B A, one host binary,
+summarized with `aggregate_power_eval.py`'s own `summarize_device`. Kernel medians per 60-s
+interval: production 8.4091 / 8.4093 / 8.4087 (run 1) and 8.4076 / 8.4077 / 8.4072 (run 4); Iter87
+8.4061 / 8.4053 / 8.4052 (run 2) and 8.4064 / 8.4066 / 8.4059 (run 3) — Iter87 below in every
+interval, but by **2.5 µs (−0.03 %)**, not job 8419's 16 µs. Device-time means 8.4163 → 8.4067
+(−0.11 %, production's run 1 carries host outliers: mean 8.4258 vs median 8.4091); TPOT means
+8.5682 → 8.5395 (host-dominated). Energy: gross 0.5907 / 0.5989 (production) and 0.5977 / 0.6025
+(Iter87) J/token — means 0.5948 → 0.6001 (+0.9 %), but production's own two runs differ by 1.4 %
+and the idle power rose through the job (30.96 W in run 1, 32.3–32.9 W after; static power with
+the card warming); idle-subtracted 0.3225 → 0.3217 (−0.2 %): **energy unchanged within noise.**
+Across both A/B jobs Iter87's kernel time moves by up to 15 µs between runs (8.391 in job 8419's
+runs 2–3, 8.400 in its run 6, 8.406 in job 8470) while production stays at 8.406–8.409; within a
+run Iter87's intervals agree to 1 µs. The fast runs were the first ones in a job, before minutes
+of load. Not attributed: a candidate is card temperature with this image's 442 MHz HBM clock
+(less pseudo-channel margin when HBM refresh rises), not tested. **Revised statement of the gain:
+−2.5 to −16 µs per token (−0.03 % to −0.19 %), faster in every same-job run; the short-run figure
+is the predicted −120 cycles per layer, the power-protocol figure about a fifth of it.** The
+verdict stands (faster in all 5 same-job runs, identical gates). Slide 2 of the Iter81 deck shows
+Iter87 at the third bar's values (8.48 ms, 0.593 J), because under its protocol the change rounds
+away.

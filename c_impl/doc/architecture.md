@@ -30,7 +30,9 @@ acclnode01's card), with an exact token trajectory and the production
 vector-gate figures over 2,016,000 logits. Against Iter81 on the same card
 (10.256 ms kernel over the WikiText run) that is **−18.5 % kernel time**;
 against the Iter82–86 image in one job on the same card, the two images
-alternating, Iter87 is **16 µs per token faster (−0.19 %)**. The dual-kernel
+alternating, Iter87 is faster in every run: **by 16 µs per token in short runs
+and by 2.5 µs under the 4.5-minute power protocol (−0.19 % to −0.03 %)**;
+energy per token is unchanged within noise. The dual-kernel
 call probe (Iter82, compiled out of production) measured every step
 (`optimization_log.md`, Iter82–87). After Iter86 the four state ports'
 traffic — 4,096 beats read before and 4,096 written after each layer's QKVG
@@ -607,8 +609,8 @@ output norm/gate and the conv-tail writer inside the QKVG region (**Iter86, done
 work 3.2K → 0.13K per layer, partly returned as the islands' tail now exposed at
 the o_proj boundary and the tails writes slowing port 0 — **Iter87, done:** the
 writer drains a 1,024-deep URAM queue only after a one-token go from port 0's
-loader, written after its weight loop; −3.2K cycles per token in a same-job A/B,
-capped by the state ports' write-back drain), the islands' last head, and the
+loader, written after its weight loop; −0.5K to −3.2K cycles per token in
+same-job A/Bs, capped by the state ports' write-back drain), the islands' last head, and the
 per-call fill/drain; see `optimization_log.md`, Iter82–87.
 **Measured structure after Iter86 (1,684,509 cycles on acclnode01's card, probe
 build):** per layer on the SLR2 kernel 67.4K = weights 54.3K + state prefetch
@@ -1151,18 +1153,28 @@ pre-link control-region RTL cosim (no deadlock, checksums equal to Iter86's):
 | Production TPOT, median of 63 | **8.484 ms/token** | 8.486 ms/token |
 | Kernel execution, median of 63 | **8.361 ms/token** (mean 8.362, 8.353–8.413) | 8.369 (mean 8.370, 8.360–8.424) |
 | Effective kernel cycles at 200 MHz | **1,672,120** | 1,673,800 |
-| Same-job A/B, sustained decode (job 8419) | **8.3915 ms** (6 intervals, 8.3907–8.3999) | 8.4076 (8.4063–8.4085) |
+| Same-job A/B, short runs (job 8419: no idle, 10 s warm-up, 2 × 30 s) | **8.3915 ms** (6 intervals, 8.3907–8.3999) | 8.4076 (8.4063–8.4085) |
+| Same-job A/B, power protocol (job 8470: 60 s idle, 30 s warm-up, 3 × 60 s) | **8.4059 ms** kernel median (runs 8.4053 / 8.4064) | 8.4083 (8.4091 / 8.4076) |
+| Same-job energy, power protocol (job 8470) | 0.600 J gross, 0.3217 J idle-subtracted | 0.595 J gross (runs 0.591 / 0.599), 0.3225 |
 | 8- and 64-token trajectories | exact | exact |
 | CUDA vector gate, 2,016,000 logits | NRMSE 0.004663, worst step 0.011908, cosine 0.999989, 0 argmax mismatches | identical |
 | Kernel / DMA / HBM clocks | +0.027 / +0.003 / −0.040 ns (HBM at 442.0 MHz) | +0.041 / +0.003 / −0.018 ns (HBM at 446.4 MHz) |
 
-The A/B row is the controlled comparison: one card job, one host binary, the
-two images alternating A B B A A B over the power benchmark's 4,096-token
-context, every Iter87 interval below every predecessor interval — **−16 µs per
-token (−0.19 %)**, the predicted −14 µs. `kernel_ms` is timed by the host and
-carries tens of microseconds of host latency that moves between jobs (the
-predecessor's own median moved 32 µs between its power run and this job), so
-cross-job figures cannot resolve a change this small.
+The A/B rows are the controlled comparisons: one card job each, one host
+binary, the two images alternating over the power benchmark's 4,096-token
+context. Iter87 is faster in every run of both jobs, but by a margin that
+depends on the run: **−16 µs per token (−0.19 %, the predicted −14 µs) in the
+short runs, −2.5 µs (−0.03 %) under the 4.5-minute power protocol**. Its kernel
+time moves by up to 15 µs between runs (8.391 in the first runs of job 8419,
+8.400 in its last, 8.406 in job 8470) while the predecessor's stays within
+3 µs (8.406–8.409); the faster runs came first in a job, before minutes of load
+— cause not identified (candidate: card temperature with this image's lower
+442 MHz HBM clock). Energy per token is unchanged within noise: the two
+predecessor runs of job 8470 differ by 1.4 % in gross energy, more than the
+images do. `kernel_ms` is timed by the host and carries tens of microseconds of
+host latency that moves between jobs (the predecessor's own median moved 32 µs
+between its power run and job 8419), so cross-job figures cannot resolve a
+change this small.
 
 Qualification on this image, 2026-10-13: 512-token free-running drift
 **BOUNDED**, fork at step 447, ratio 1.063, slope 2.133e-06 per step (job 8398);

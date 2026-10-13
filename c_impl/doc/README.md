@@ -34,7 +34,7 @@ The production image routes with zero routing errors and closes a true
 kernel (1,672,120 cycles)** on acclnode01's card with an exact 64-token
 trajectory and the production vector-gate figures, **−18.5 % kernel time**
 against the Iter81 image on the same card (10.256 ms) with order-preserving
-arithmetic, **−0.19 %** against the Iter82–86 image in a same-job A/B, or
+arithmetic, **−0.03 % to −0.19 %** against the Iter82–86 image in same-job A/Bs, or
 **14.3x** the 121.4 ms eight-port baseline. Paired power is about 70 W active,
 0.59–0.60 J/token gross, 3.7x faster than an A100 running eager PyTorch. The flow is one
 command (`make run_hw`); see

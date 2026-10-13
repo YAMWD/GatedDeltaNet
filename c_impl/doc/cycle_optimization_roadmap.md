@@ -2,8 +2,9 @@
 
 > **Update 2026-10-13 (Iter87, promoted 2026-10-13; closes no stage).** At the user's
 > request, one item of the Iter86 entry's sub-threshold bundle: the conv-tail writes
-> wait until port 0's QKVG weights are read. Measured in a same-job A/B on
-> acclnode01's card: **−16 µs per token (−3.2K cycles, −0.19 %)**, as predicted —
+> wait until port 0's QKVG weights are read. Measured in same-job A/Bs on
+> acclnode01's card: **−16 µs per token (−3.2K cycles, −0.19 %, as predicted) in short
+> runs, −2.5 µs (−0.5K, −0.03 %) under the power protocol**, energy unchanged —
 > capped by the four state ports' write-back drain, so Stage 6's stop condition
 > stands. Card gates 8.361 ms kernel (1,672,120 cycles); cross-job comparisons cannot
 > resolve changes this small (`kernel_ms` carries tens of µs of host latency).
