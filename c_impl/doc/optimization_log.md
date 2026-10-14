@@ -19999,3 +19999,263 @@ is the predicted −120 cycles per layer, the power-protocol figure about a fift
 verdict stands (faster in all 5 same-job runs, identical gates). Slide 2 of the Iter81 deck shows
 Iter87 at the third bar's values (8.48 ms, 0.593 J), because under its protocol the change rounds
 away.
+
+## Iter88 — the production three-kernel source linked at 225 MHz (opened 2026-10-13, branch `recur_balance`)
+
+**Why (user request, 2026-10-13: "try to raise the freq to 225").** At 225 MHz a 512-bit port asks
+for 14.4 GB/s, one HBM pseudo-channel's peak at 450 MHz, so 225 is the highest clock the weight
+stream could use at all.
+
+**Data before the attempt.**
+- *Timing:* build 8396 closes the kernel clock at **+0.027 ns at 5.000 ns over 1,475,090
+  endpoints**; its 20 worst paths all sit within 0.051 ns, each 60–65 % route delay (2.7–3.1 ns of
+  4.2–4.7 ns, 3–5 logic levels): the mm0 read-data FIFO (`buff_rdata`) into control-kernel
+  registers (`mem_weights_mm0` read register, `gdn_read_qkvg_conv_context`, `gdn_load_onorm_w`) and
+  an island read stage's FP32 multiplier with −0.53 ns clock skew. 225 MHz needs every such path
+  0.556 ns shorter. History: the 150 → 200 MHz step closed only after the three-kernel redesign
+  (Iter77 missed by −2.375 ns on the monolith); placer variance between draws of one recipe was
+  ≥ 1.3 ns (Iter71/72); hbm_aclk already misses 450 MHz on the shell's own pipes (−0.018…−0.040).
+- *Bandwidth:* port demand 14.4 GB/s = 100 % of the 450-MHz peak, 102 % at the 442 MHz the last
+  image's HBM clock got. Today's weight streams reach ≈ 12.6 GB/s per port (0.985 beats/cycle,
+  ≈ 89 % of peak); the HBM's highest sustained rate is not measured. Expected kernel time if timing
+  closes: **≈ 7.9–8.25 ms (−1 % to −6 %)**, the range set by that unknown rate; 7.43 ms only if the
+  memory kept up.
+
+**Hypothesis.** The unchanged source, synthesized at 4.444 ns (`HLS_FREQ=225`, HLS re-times the
+logic it sees) and linked at 4.444 ns with the production physical recipe, either closes the kernel
+clock exactly or misses; the link measures by how much and which endpoint classes fail.
+
+**Recipe.** `hw_f225_p.cfg` = `hw_f200_p.cfg` with only its header changed (the hooks take the
+period and the x9/4 MMCM ratio from `GDN_KERNEL_TARGET_MHZ` = `LINK_FREQ`); the launcher's
+recipe/frequency guard gains `hw_f225_p.cfg → 225`. The exact-clock gate is unchanged: kernel and DMA
+exact (4.444 / 4.000 ns), hbm_aclk within the 440 MHz floor. A kernel miss aborts the link and keeps
+its reports; no scaled-kernel image is possible without a flow change, because
+`reconcile_exact_clock.py` would patch DATA_CLK back to the request. Source unchanged
+(`gdn_model.cpp` b21f9b94…, commit `42959cfcf`).
+
+**Acceptance.** Exact kernel/DMA closure; card gates identical (exact 8/64-token trajectories, the
+production vector gate); kernel time below Iter87's 8.361 ms, judged in one card job alternating
+with `e3e88f96…` if the difference is under 0.5 %.
+
+**Record: below.**
+
+**Link result (build 8786, tag `hw_20261013_114448_2322729`, acclnode01, 8 CPUs, 8 h 53 m, MaxRSS
+71.3 GB): STOPPED at the exact-clock gate on hbm_aclk — the kernel clock closed at 225 MHz.**
+Command: `HW_CFG_TEMPLATE=hw_f225_p.cfg HLS_FREQ=225 LINK_FREQ=225 BUILD_CPUS=8 BUILD_MEM=96G
+BUILD_EXCLUSIVE= BUILD_EXCLUDE=acclnode03,acclnode04,acclnode05,harrier make run_hw` (recipe
+`hw_f225_p.cfg` 859a6c00…, launcher dd03a552…, source b21f9b94…). Every pre-link gate 0: native,
+XO (HLS at 4.444 ns kept II=1 on every reader), state writer/reader and tails address gates at
+4.444 ns, island names. csynth at 4.444 ns: `gdn_forward_p` 604 BRAM18K / 1,032 DSP / 249.0K FF /
+251.6K LUT / 64 URAM, `gdn_k_slr0` 697 / 1,121 / 278.9K / 236.0K / 0, `gdn_k_slr2` 472 / 1,609 /
+335.8K / 319.8K / 96 — the 200 MHz figures within 1 % (FF −7K on the control kernel, +2.7K on SLR2).
+Routed: **0 routing errors**; per SLR CLB 91.18 / 92.31 / 93.10 %, LUTs 45.98 / 53.72 / 58.64 %,
+SLLs 24,869 (SLR2↔SLR1 50.35 %, SLR1↔SLR0 57.59 %) — the 200 MHz image's to within 0.2 points.
+After routing (signoff report): kernel **+0.016 / +0.010 ns at 4.444 ns, 0 of 1,481,174 endpoints
+failing**; DMA +0.003 / +0.009; hbm_aclk −0.068 ns, 45 failing endpoints. Post-route
+AggressiveExplore: hbm_aclk −0.061 ns, TNS −1.354 ns, **46 failing endpoints of 369,387**; the kernel
+was already positive, so the hook ran no further pass. Gate: the 440 MHz floor allows −0.051 ns;
+−0.061 ns means ≈ 438 MHz → `ITER75D: exact-clock timing failed: hbm_aclk`, link aborted, card job
+8787 cancelled by its dependency. All failing hbm_aclk paths in the post-route report are the
+shell's own `hmss_0` triple-SLR crossing pipes (`laguna_m_payload_i_reg` → `laguna_s_payload_d_reg`,
+0 logic levels, ≈ 95 % route, clock skew −0.19…−0.22 ns) on HBM ports 26, 29, 30 and 31 — the
+SLR2 masters' path to the HBM in SLR0, the same class as the Iter79–87 misses (−0.018…−0.040 at
+200 MHz; build 8396, the production image, also had 46 failing endpoints — see the diagnosis below). Checkpoints kept: `checkpoints/gdn_f150_final_candidate.dcp`
+(225 MHz, post-route) beside build 8396's (200 MHz).
+
+**User instruction (2026-10-13): "if the HBM freq is below 440, try to do a detailed diagnosis, and
+propose some architectural changes while keeping the cycle count unchanged to restore timing."**
+The condition holds (≈ 438 MHz). Diagnosis job 9330 (`iter88_f225/hbm_diag/`) opens both
+checkpoints: per-endpoint hbm_aclk paths within 0.1 ns of failing (sites, SLR, clock region, skew,
+port, channel), every HMSS triple-SLR pipe register's site, the used LAGUNA sites by owner, clock
+roots and congestion.
+
+**Diagnosis, part 1 (job 9330, 45 m, both checkpoints).** Per-clock: f225 kernel +0.016 at 4.444 ns,
+hbm_aclk −0.061; f200 (build 8396) kernel +0.027 at 5.000 ns, hbm_aclk **−0.040 on 46 endpoints** — the
+production image fails the same count of HBM endpoints; 225 MHz moved the worst by 0.021 ns, not the
+class.
+- *Where:* all failing endpoints are in `hmss_0`'s triple-SLR crossing pipes of HBM ports 25–31
+  (plus 2 on port 21), at the **SLR0↔SLR1 boundary, clock-region column X6** (X6Y3 ↔ X6Y4): f225 31
+  failing SLR0→SLR1 (read-data `r15.r` returning from the HBM) and 14 SLR1→SLR0 (`w15.w`, `ar15.ar`,
+  `b15.b`); f200 43 SLR0→SLR1 and 3 SLR1→SLR0. Crossings in columns X1–X5 sit at +0.05…+0.10 ns.
+- *What each failing hop is:* a SLICE flop → SLL → SLICE flop (`laguna_m_payload_i_reg` →
+  `laguna_s_payload_d_reg`), 0 logic levels, route 1.59–1.88 ns (median 1.70), RPM distance ≈ 126
+  (the shortest possible across the gap). **All 20,159 HMSS pipe registers sit in SLICEL/SLICEM sites;
+  none uses a LAGUNA register** (both builds).
+- *Clock:* the worst path (port 26, W, SLR1→SLR0) spends its 2.222 ns as 1.697 route + 0.081 logic +
+  **0.220 skew** (source clock delay 8.626, destination 8.436, CPR only −0.030) + 0.062 uncertainty +
+  **0.248 inter-SLR compensation** ((DCD 8.436 − CCD 6.782) × 0.15). The hbm_aclk BUFGCE (BUFGCE_X0Y11,
+  region X4Y0) drives 156,075 loads in 82 clock regions from a **clock root at X3Y5** (SLR1, left of
+  centre); launch and capture flops at X6Y3/X6Y4 share little clock path, so pessimism removal is
+  small and the prorated inter-SLR term large: ≈ 0.5 ns of the period is clock.
+- *Kernel involvement:* no failing hbm_aclk path touches a kernel cell. The placer's congested windows
+  (levels 5–6) are inside `gdn_k_slr0_1` low in SLR0 (CLE rows 11–170), not at the boundary. SLR net
+  crossings: each state port (28–31) puts ≈ 639 nets across each boundary, each weight port (24–27)
+  ≈ 342 (the read side at the HBM's 256-bit width; the write channels of read-only ports mostly
+  optimized away).
+- *Why column X6 fails and X4/X5 do not (f225, near-critical SLR0↔SLR1 crossings):* X6 route median
+  **1.664 ns** (slack median +0.019, 45 of 121 failing) against X4 1.542 / X5 1.558 ns (slack +0.084…
+  +0.092, none failing) at the same minimum RPM distance; X4/X5 have the worse clock skew (−0.25…
+  −0.28) and still pass. Column X6 at the boundary is shared with the **static shell** (PCIe/DMA):
+  `blp` holds 6,856 cells of region X6Y3 and 9,173 of X6Y4 (X7Y3/X7Y4 are all `blp`), and drives 857
+  SLR0↔SLR1 crossing nets from X6 and 3,462 from X7 (≈ 2,880 SLLs per clock-region column), so the
+  HMSS crossings in X6 compete with the shell's for the column's SLLs. The kernels drive only 580
+  SLR0↔SLR1 crossing nets, all in X2–X3; HMSS drives 7,988 (X4 2,680, X5 2,173, X6 1,105, X0–X3 2,030).
+**Diagnosis, part 2 (job 9345, 20 m, the 225 MHz checkpoint).**
+- *Laguna registers:* **26,018 cells carry `USER_SLL_REG = TRUE`** (the HMSS pipe flops ask for the
+  SLL registers) and **0 cells are placed in LAGUNA sites**, although every boundary clock region has
+  480. The platform's partial-reconfiguration constraints explain it: `[Constraints 18-4421] A LAGUNA
+  range, without usable sites, was added to DERIVED_RANGES for purposes of keeping the Programmable
+  Unit together within the reconfigurable pblock [impl.alt.pblocks.xdc:174]`; the pre-route
+  `SLR Crossing Optimization` then re-places the crossing flops among SLICEs (`Physopt 32-663`).
+- *Clock root:* hbm_aclk `CLOCK_ROOT = X3Y5`, `USER_CLOCK_ROOT` empty (Vivado's choice), its BUFGCE
+  (`BUFGCE_X0Y11`) not LOC-fixed — both are in the dynamic region and can be set by a hook.
+- *Host:* every buffer takes its bank from the image's connectivity (`group_id`), so an `sp=` re-map
+  needs no host change.
+
+**Proposals (cycle-neutral: no change to the kernels' schedules; ranked by evidence).**
+1. *Re-map the HBM channels so no die-crossing master uses the channels whose shell paths cross in
+   column X6* (by the path names, the SLR2 masters' channels 26–31): give those channels to `gdn_k_slr0`
+   ports, whose paths stay in SLR0, and give the die-crossing masters channels whose paths cross in
+   X1–X5, where the 225 MHz crossings measure +0.05…+0.10 ns. Connectivity only (`sp=` lines of the
+   recipe), same one-master-per-channel map, same bandwidth. Expected: the X6 class (all 46 failing
+   endpoints at both clocks) leaves. Risks: the SLR0 kernel's masters reach the far-right channels
+   inside SLR0 (single-SLR shell paths at 450 MHz, none failing today); placement of `gdn_k_slr0`
+   shifts.
+2. *Set the hbm_aclk clock root next to the crossings* (`USER_CLOCK_ROOT` X5Y3 or X5Y4 in the
+   OPT_DESIGN.PRE hook): the clock takes ≈ 0.45 ns of every crossing (skew + prorated inter-SLR
+   term), and the root now sits at X3Y5. Effect not predictable from the checkpoint; it may shift
+   margin away from the SLR1↔SLR2 crossings (+0.05…+0.08 today).
+3. *Laguna registers for the HMSS pipes* — the designed fix (the flops already request them), but
+   the platform's reconfigurable pblock leaves no usable LAGUNA sites; it needs a different
+   platform, not available in this flow.
+4. *Heavier:* move the four SLR2 state ports' HBM masters (each 639 crossing nets per boundary at
+   450 MHz) to a lower die and carry the state over kernel-clock AXI-Stream links (4.444 ns instead of
+   2.222 ns per hop, ≈ 4K more SLLs per boundary) — a re-partition; only if 1 and 2 fail.
+Each needs one 225 MHz link (≈ 9 h) to measure; one variable per link: 1 first, then 2.
+
+**Proposal 1 launched (2026-10-14 07:39 UTC, user: "do the proposal sequence").** Recipe
+`hw_f225_p_remap.cfg` (b3c02a0b…) = `hw_f225_p.cfg` with the `sp=` lines swapped: `gdn_k_slr2`'s
+mm24–31 → HBM[2..9], `gdn_k_slr0`'s mm2–9 → HBM[24..31]; everything else, including the source
+(b21f9b94…), the physical recipe, the hooks and the 440 MHz floor, unchanged — one variable. Basis
+from the pipe census (`f225_hmss_pipes.tsv`): the only kernel masters with SLR-crossing shell pipes
+are the SLR2 kernel's eight (paths 24–31; `path_12` is the shell DMA's own triple-SLR path), their
+SLR0-side registers sit in columns X3–X6 (e.g. path_31: X3 14, X4 301, X5 143, X6 177) and the X6
+share fails; the SLR0 kernel's masters have no crossing pipes at all, so giving them the right-hand
+channels creates none. The left columns have the free SLLs (SLR0↔SLR1 used: X0 547, X1 364, X2 956,
+X3 822 of 2,880 each). Launcher guard: `hw_f225_p_remap.cfg → 225`. Command:
+`HW_CFG_TEMPLATE=hw_f225_p_remap.cfg HLS_FREQ=225 LINK_FREQ=225 BUILD_CPUS=8 BUILD_MEM=96G
+BUILD_EXCLUSIVE= BUILD_EXCLUDE=acclnode03,acclnode04,acclnode05,harrier make run_hw` → tag
+`hw_20261014_073923_2548162`, build **10168**, card **10169** (acclnode01). Expected: the X6 class
+(all 46 failing endpoints at both clocks) gone; risks: `gdn_k_slr0`'s placement shifts (its clusters
+5–8's port adapters move right, next to the static shell), the kernel clock's +0.016 ns margin.
+Proposal 2 (hbm_aclk `USER_CLOCK_ROOT`) follows only if hbm_aclk still misses the floor.
+
+**Record: below.**
+
+**Proposal 1 result (build 10168, acclnode01, 8 CPUs, 8 h 41 m): CLOSED — all three clocks exact,
+the first image to close hbm_aclk at 450 MHz with margin since Iter79.** Every pre-link gate 0 at
+4.444 ns; routed **0 routing errors**; **kernel +0.035 / +0.010 ns at 4.444 ns (0 of 1,480,574
+endpoints failing), DMA +0.003 / +0.009, hbm_aclk +0.039 / +0.010 at 2.222 ns (0 of 369,390)**;
+`GDN_F150_FINAL_PASS` with no finishing pass needed; vpl's own scaling advisory says the clocks could
+run at 458.0 / 226.8 MHz and keeps the specified 450 / 225. The pre-route `SLR Crossing
+Optimization` re-placed no crossing flop (0 `Physopt 32-663` lines; build 8786 had hundreds) and
+post-route phys_opt took 13 m (43 m 36 s in build 8786 and 46 m in 8236, which fought the HBM
+slack). XCLBIN **`74c8ec59605d3b81…`**, host `3e16bb0fc77e485d…` (the production host binary:
+`host.cpp` unchanged), source b21f9b94…, recipe `hw_f225_p_remap.cfg` b3c02a0b…
+(`diagnostics/hw_20261014_073923_2548162/`). Routed per SLR: CLB 91.74 / 91.80 / 92.46 %, LUTs
+45.97 / 53.72 / 58.48 %, BRAM tiles 429 / 541.5 / 298.5, URAM 0 / 64 / 96, DSP 2,157 / 1,549 /
+2,137, SLLs 24,869 (SLR2↔SLR1 50.34 %, SLR1↔SLR0 57.60 %) — build 8786's numbers to within 0.3
+points: the re-map moved the crossings, it did not add any. Compared with build 8786 (same source,
+same recipe except the eight `sp=` pairs): hbm_aclk −0.061 → **+0.039 ns** (+0.100), kernel
++0.016 → +0.035. Where the SLR2 kernel's crossings landed is being read from the checkpoint (job
+10400, `hbm_diag/f225r_*`).
+- *Card job 10169 pending (Resources):* the `light` partition's `MaxCPUsPerNode=16` on acclnode01
+  is held by job 8348 (another user, 8 CPUs, 3-day limit to 2026-10-15 11:55) and the user's own GPU
+  job 10166 (`qrs_a4`, 8 CPUs, 3-day limit from 2026-10-14 10:17); harrier is excluded (its
+  libstdc++ lacks `GLIBCXX_3.4.30` for a host built on acclnode01). Slurm's planned start: 2026-10-15
+  11:55 UTC. Status: **routed, timing-closed at 225 MHz; not yet on card.**
+- *Card gates on harrier (job 10401, 47 s, host built on harrier from the identical `host.cpp`,
+  `452897723f551ba6…`; `on_card_harrier/`):* **exact 8- and 64-token trajectories; vector gate over
+  2,016,000 logits NRMSE 0.00466270, worst step 0.011908, cosine 0.999989, min step cosine 0.999946,
+  top-5 5/5, 0 argmax mismatches, 0 tolerance failures** — the production figures to the last digit
+  (the image changes no arithmetic). **Kernel 8.230 ms median (mean 8.230), TPOT 8.348 ms** = 1,851,750
+  cycles at 225 MHz; the card reads back DATA_CLK **225 MHz**, hbm_aclk **450 MHz**. Against production
+  (Iter87, 8.361 ms on acclnode01's card, which runs ≈ 0.8 % faster than harrier's) that is ≈ −1.6 %
+  cross-card, ≈ −2.4 % card-corrected; in cycles +10.7 % (1,672,120 → 1,851,750): the weight stream
+  does not scale with the clock because the HBM pseudo-channels deliver < 1 beat per 4.444 ns cycle,
+  as the bandwidth model said (port demand 14.4 GB/s = 100 % of the 450 MHz peak). The same-card
+  comparison runs on harrier (A/B, the production image with the same harrier-built host).
+- *Same-card A/B on harrier (job 10402, 9 m, `iter88_f225/ab_harrier/`; the production image
+  `e3e88f96…` and the re-mapped 225 MHz image `74c8ec59…` alternating A B B A A B, one harrier-built
+  host, the power benchmark's 4,096-token context, 10 s warm-up, 2 × 30 s per run):* kernel medians per
+  interval — production **8.4697–8.5061** (6 intervals), 225 MHz **8.2392–8.2705** (6); median of
+  interval medians **8.4879 → 8.2533 ms: −234.6 µs per token (−2.76 %)**, every new-image interval
+  below every production interval; TPOT medians 8.59–8.64 → 8.36–8.40. The card read back hbm_aclk 442
+  MHz under the production image and 450 MHz under the new one. Host-side times equal for both
+  (launch 0.027, upload 0.050, read-back 0.058 ms). This card runs the production image at 8.47–8.51
+  ms where acclnode01's runs it at 8.36–8.41 (cross-card offset ≈ 1.2 %, host included), so the
+  relative gain is the figure to carry: **≈ −2.8 % kernel time for +12.5 % clock**, the HBM-bound
+  weight stream absorbing the rest (cycles per token +10.7 %).
+- *Where the crossings went (job 10400, the re-mapped checkpoint, `hbm_diag/f225r_*`):* the SLR2
+  kernel's eight triple-SLR shell paths are now HMSS paths 2–7, 10 and 11, with their SLR0-side
+  registers in **columns X0–X4 only** (e.g. path_6: X0 160, X1 393, X2 5, X3 44, X4 34; path_11: X1
+  65, X2 409, X3 84, X4 76) — none in X5 or X6; the only pipes left in X6 are 6 of the shell DMA's own
+  path_12. hbm_aclk endpoints within 0.1 ns of failing: **49** (289 in build 8786, 235 in the 200 MHz
+  production build), worst **+0.039**; every near-critical die crossing now sits in columns X0–X2 at
+  +0.066…+0.100 ns. The column-X6 class — all 46 failing endpoints of builds 8786 and 8396 — is gone,
+  which is what proposal 1 predicted. **Proposal 2 (hbm_aclk `USER_CLOCK_ROOT`) is not needed and
+  was not built.** Open consequence for the 200 MHz production recipe: the same `sp=` swap should
+  give `hw_f200_p.cfg` a positive hbm_aclk too (it has failed −0.018…−0.040 on every 200 MHz draw);
+  not built — the 225 MHz image supersedes it if promoted.
+
+**Achieved-bandwidth diagnosis (user request, 2026-10-14 19:4x UTC: "do a diagnosis to see the actual
+bw we achieved").** Two instruments, both launched:
+1. *The probe build of the re-mapped 225 MHz image* — the same source with `GDN_CALL_PROBE=1`, the same
+   `hw_f225_p_remap.cfg`: the Iter82 call probe stamps every port's weight loop end, so the dump gives
+   each port's beats per cycle during the stream (the achieved rate while streaming, not the token
+   average) at 4.444 ns, and the SLR2 counter the state ports' prefetch/write-back rates. Command:
+   `GDN_KERNEL_WAIT_TIMEOUT_MS=120000 VPP_DEFINES="-D GDN_CALL_PROBE=1" HOST_DEFINES=-DGDN_CALL_PROBE=1
+   HW_CFG_TEMPLATE=hw_f225_p_remap.cfg HLS_FREQ=225 LINK_FREQ=225 BUILD_CPUS=8 BUILD_MEM=96G
+   BUILD_EXCLUSIVE= BUILD_EXCLUDE=acclnode03,acclnode04,acclnode05,harrier make run_hw`. The probe adds
+   logic, so the 225 MHz closure is not guaranteed (at 200 MHz every probe build closed). The dump runs
+   on harrier with a harrier-built probe host.
+2. *AMD's own HBM bandwidth test* (`xbutil validate --run mem-bw`, the platform's `bandwidth.xclbin`:
+   a 512-bit copy kernel at 300 MHz, per bank) on harrier's card — the memory's sustained throughput per
+   pseudo-channel with no kernel of ours involved, i.e. the ceiling the 14.4 GB/s peak reduces to. Its
+   counting rule (read, write or both) is read from its log before any comparison.
+Reference points already measured: at 200 MHz the weight ports streamed at 0.985 beats/cycle = 12.6
+GB/s (Iter82–86 probes, 89 % of the 450 MHz peak); at 225 MHz the token takes 1,851,750 cycles
+(+10.7 %), which implies ≈ 0.9 beats/cycle ≈ 12.9 GB/s if the non-stream work scaled with the clock —
+an inference the probe replaces with a measurement.
+- *Robustness on harrier (job 10404, 54 m, harrier-built host; `iter88_f225/qual/robustness/`):*
+  512-token free-running drift vs the GPU 512 reference: fork at step **447**, 6 of 8 windows
+  comparable, window NRMSE 0.005305 → 0.005638 (ratio **1.063**), slope **2.133e-06** per step,
+  `TREND_VERDICT=BOUNDED` — the same three numbers as every image since Iter66n. WikiText-2
+  teacher-forced on the verified-identical workload (62 documents, 183 windows, 314,843 scored
+  tokens): FPGA word perplexity **16.774839771** vs GPU **16.776123769** = **−0.0077 %** (gate 5 %),
+  identical to production's to every printed digit (no arithmetic change); **8.237 ms/token kernel over
+  the run** on harrier's card (production's WikiText run on acclnode01's card: 8.365 ms). The card read
+  back DATA_CLK 225 MHz, hbm_aclk 450 MHz throughout.
+- *Power A/B on harrier (job 10406, 19 m, `iter88_f225/power_ab_harrier/`; the paired-power protocol's
+  FPGA arm, 60 s idle / 30 s warm-up / 3 × 60 s, both images A B B A, one harrier-built host,
+  `summarize_device` of `aggregate_power_eval.py`):* production (200 MHz) kernel median 8.4688 ms,
+  TPOT 8.609, **69.57 W active, 32.52 W idle, 0.5991 J/token gross, 0.3190 idle-subtracted**; 225 MHz
+  kernel 8.2289 ms, TPOT 8.368, **71.47 W active, 33.62 W idle, 0.5983 J gross, 0.3168 idle-subtracted**.
+  Ratios 225/200: time 0.972, active power 1.027, gross energy 0.999, idle-subtracted 0.993 — **the
+  clock buys 2.8 % time at 2.7 % more power; energy per token unchanged within noise** (the idle
+  power also rose 3.4 % through the job: the card warming, order A B B A). The A100 arm is not re-run:
+  the GPU side does not depend on the image (jobs 8399/8400 stand); the A100 on acclnode01 is held by
+  the user's own `qrs_*` queue.
+- *AMD's HBM bandwidth test (job 10419, `iter88_f225/hbm_bw/`): NOT RUNNABLE on this node.* `xbutil
+  validate --run mem-bw` starts its OpenCL host `kernel_bw.exe`, which enumerates devices by index;
+  harrier's index 0 is a card outside the allocation (`[XRT] WARNING: dev_init failed: -1`, `ERROR:
+  Operation not permitted Device index 0`) and the test fails at `xcl2.cpp:71` before loading the
+  xclbin — the by-index trap CLAUDE.md documents for acclnode01. Its kernel is also a read+write copy
+  (turnarounds included), a pessimistic reference for the read-only weight streams; not pursued. The
+  probe build (10417) is the instrument for the achieved rate.
+
+**Verdict so far: RETAINED (on-card, same card as its reference; gates identical; drift bounded;
+WikiText identical; energy per token unchanged).** Committed: `hw_f225_p_remap.cfg` and the launcher
+guard entry; the plain `hw_f225_p.cfg` (stopped at the hbm_aclk gate) is reverted per the rule and its
+hash kept here (859a6c00…). The production default stays 200 MHz until the user decides on promotion
+(the 225 MHz image: −2.8 % time, +2.7 % power, equal energy; the probe build's per-port rate pending).

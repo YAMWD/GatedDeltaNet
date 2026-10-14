@@ -48,6 +48,7 @@ case "$HW_CFG_TEMPLATE" in
     hw_f150.cfg) want_link=150 ;;
     hw_f200.cfg) want_link=200 ;;
     hw_f200_p.cfg) want_link=200 ;;
+    hw_f225_p_remap.cfg) want_link=225 ;;
     *) want_link= ;;
 esac
 if [ -n "$want_link" ] && [ "$LINK_FREQ" != "$want_link" ]; then
