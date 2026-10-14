@@ -20259,3 +20259,34 @@ WikiText identical; energy per token unchanged).** Committed: `hw_f225_p_remap.c
 guard entry; the plain `hw_f225_p.cfg` (stopped at the hbm_aclk gate) is reverted per the rule and its
 hash kept here (859a6c00…). The production default stays 200 MHz until the user decides on promotion
 (the 225 MHz image: −2.8 % time, +2.7 % power, equal energy; the probe build's per-port rate pending).
+3. *A read-only streaming microbenchmark for the DRAM ceiling* (user: "Build it", 2026-10-14 20:3x
+   UTC; `c_impl/microbench/hbm_rd/`): kernel `hbm_rd` — one 512-bit m_axi read port (4 KB bursts, 32
+   outstanding), `reps` sequential passes over `n_beats`, a 64-bit two-lane sum the host checks —
+   four compute units on SLR0 on HBM[0], [12], [20], [31], linked at **300 MHz** (64 B × 300 MHz =
+   19.2 GB/s demand per port, above the 14.4 GB/s pin-rate peak, so the memory sets the rate); the
+   kernel-clock override hook forces the 300 MHz period (Vitis 2024.2's 1:1 bug) and a post-route
+   hook dumps per-clock slack without a gate. Host (XRT native, card by BDF): 256 MiB × 16 passes per
+   run, three rounds per CU alone and three with all four concurrent; GB/s from host wall time
+   (≈ 0.3 s per run, launch overhead < 0.1 %). Build job 10430 (acclnode01, build partition); the card
+   job follows on harrier with a harrier-built host. Not part of the production flow.
+- *Card gates on acclnode01 (job 10169, the chained card job; ran 2026-10-14T21:02:26 UTC once a light slot
+  freed; `hw_20261014_073923_2548162/on_card/`):* exact 8- and 64-token trajectories, the production
+  vector-gate figures; **kernel 8.147 ms median (mean 8.148), TPOT 8.253 ms** on the card the
+  production figure was measured on: against Iter87's 8.361 / 8.484 ms (job 8397) **−214 µs kernel
+  (−2.56 %), −231 µs TPOT**, cross-job on one card — consistent with the harrier same-job A/B's −2.76 %.
+  Cycles at 225 MHz: 1,833,075 per token (+9.6 % over the 200 MHz image's 1,672,120).
+   **Result (build 10430, 1 h 34 m; card job 10435 on harrier, 9 s; `microbench/hbm_rd/card-10435.log`).**
+   Link: kernel **+0.461 ns at 3.333 ns**, hbm_aclk +0.001, DMA +0.003; the card reads back DATA_CLK
+   **300 MHz**, hbm_aclk **450 MHz**; data check passed on every run (a warm-up check bug in the host,
+   job 10434, was mine and is fixed). **Each channel alone: 12.869–12.871 GB/s** (HBM[0], [12], [20],
+   [31], three rounds each, spread 0.02 %); **all four concurrently: 12.865–12.869 GB/s each**, no
+   interference, aggregate 51.48 GB/s. With the port asking 19.2 GB/s, the memory sets the rate:
+   **the sustained sequential-read ceiling of one HBM pseudo-channel on this card is 12.87 GB/s = 89.4 %
+   of the 14.4 GB/s pin-rate peak**, and 32 channels would sustain 411.8 GB/s (peak 460.8).
+   Consequences: (a) the production weight streams at 200 MHz (0.985 beats/cycle = 12.61 GB/s) run at
+   **98 % of that ceiling**; (b) a 512-bit port's demand (64 B × f) meets the ceiling at **f = 201 MHz**
+   — 200 MHz sat exactly at the knee, so from there every extra MHz converts into stalled beats:
+   at 225 MHz the stream can run at most 0.894 beats/cycle, 1,366,528 beats → 1,528.6K cycles = 6.79 ms
+   (6.94 ms at 200 MHz), a 0.14 ms gain, plus the clock-scaled non-stream work ≈ 0.1–0.16 ms — the
+   measured −0.21…−0.24 ms per token; (c) the probe build (10417) will show the per-port rate in the real
+   workload, expected ≈ 0.89 beats/cycle. Weight bytes per token remain the only lever on the stream.
