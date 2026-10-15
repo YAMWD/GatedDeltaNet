@@ -1,5 +1,16 @@
 # Cycle-First Optimization Roadmap After Iter67c
 
+> **Update 2026-10-15 (Iter88, promoted; closes no stage; changes the reference).** The
+> production image now runs at 225 MHz with the HBM channels re-mapped: **8.147 ms kernel
+> = 1,833,075 cycles at 4.444 ns** on acclnode01's card (−2.6 % time, +9.6 % cycles against
+> the 200 MHz Iter87 image's 1,672,120). The cycle count rose because the weight ports are
+> memory-bound: the HBM sustains 12.87 GB/s per pseudo-channel (89.4 % of the pin rate,
+> measured), a 512-bit port meets that at 201 MHz, and the 225 MHz probe shows every
+> weight port at 0.876–0.893 beats/cycle. **From here, cycles are no longer a clean
+> measure of schedule work** — ≈ 84 % of the token is a stream that cannot go faster per
+> cycle — so this roadmap's remaining stages are judged in milliseconds on one card, and
+> the only lever on the stream is bytes per token (§ 13).
+
 > **Update 2026-10-13 (Iter87, promoted 2026-10-13; closes no stage).** At the user's
 > request, one item of the Iter86 entry's sub-threshold bundle: the conv-tail writes
 > wait until port 0's QKVG weights are read. Measured in same-job A/Bs on

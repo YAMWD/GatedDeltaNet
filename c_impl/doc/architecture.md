@@ -1,6 +1,15 @@
 # GatedDeltaNet Decode Accelerator Architecture
 
-**Status:** Current production architecture: the **200 MHz three-kernel image
+**Status:** Current production architecture: the **225 MHz three-kernel image
+with the re-mapped HBM channels (Iter88)**, promoted 2026-10-15 after the full
+qualification (card gates on both cards, drift, WikiText-2, same-card A/B and
+power; § *Correctness and On-Card Performance*). It is the Iter82–87 datapath
+and schedule, unchanged, synthesized and linked at a true 4.444 ns, with one
+connectivity change: the SLR2 kernel's eight HBM masters sit on channels 2–9
+and the SLR0 kernel's ports 2–9 on channels 24–31, so that no die-crossing
+master uses the channels whose shell pipes cross the SLR0/SLR1 boundary in
+clock-region column X6 — which is what lets the shell's HBM AXI clock close at
+its full 450 MHz. The Iter82–87 image is the **200 MHz three-kernel image
 of the Iter82–87 series**, promoted 2026-10-13 after the full qualification
 (drift, WikiText-2 and paired power, § *Correctness and On-Card Performance*).
 It is the Iter81 image — the same three kernels, one per die of the U55C:
@@ -20,19 +29,24 @@ processes of the QKVG region (Iter86), the tail writes held until port 0's QKVG
 weights are read (Iter87). Every change is element-wise or
 order-preserving: native bit-exact and the production figures on card. The
 image is HLS-synthesized and linked at **200 MHz** under **Vitis 2024.2**,
-routed with zero routing errors, and closes the kernel clock at **+0.027 /
-+0.010 ns at 5.000 ns** and the fixed 250 MHz DMA clock at +0.003 / +0.009 ns;
-the 450 MHz HBM AXI clock missed by 0.040 ns on the shell's own SLR-crossing
-paths and runs at **442.0 MHz** under the flow's 440 MHz floor. The 64-token
-card run measures **8.484 ms/token production TPOT / 8.361 ms kernel =
-1,672,120 cycles** by median over 63 generated tokens (build 8396 / job 8397,
-acclnode01's card), with an exact token trajectory and the production
-vector-gate figures over 2,016,000 logits. Against Iter81 on the same card
-(10.256 ms kernel over the WikiText run) that is **−18.5 % kernel time**;
-against the Iter82–86 image in one job on the same card, the two images
-alternating, Iter87 is faster in every run: **by 16 µs per token in short runs
-and by 2.5 µs under the 4.5-minute power protocol (−0.19 % to −0.03 %)**;
-energy per token is unchanged within noise. The dual-kernel
+routed with zero routing errors. **The Iter88 image closes the kernel clock at
++0.035 / +0.010 ns at 4.444 ns, the fixed 250 MHz DMA clock at +0.003 / +0.009
+ns and the 450 MHz HBM AXI clock at +0.039 / +0.010 ns** (the Iter82–87 image:
++0.027 at 5.000 ns, +0.003, and −0.040 on the HBM clock, run at 442.0 MHz under
+the flow's 440 MHz floor). The 64-token card run measures **8.253 ms/token
+production TPOT / 8.147 ms kernel = 1,833,075 cycles at 225 MHz** by median
+over 63 generated tokens (build 10168 / job 10169, acclnode01's card; the
+Iter82–87 image: 8.484 / 8.361 ms = 1,672,120 cycles at 200 MHz), with an exact
+token trajectory and the production vector-gate figures over 2,016,000 logits.
+Against the Iter82–87 image in one job on harrier's card, the two images
+alternating A B B A A B, Iter88 is **2.8 % faster** (8.488 → 8.253 ms), every
+interval separated, at +2.7 % power and unchanged energy per token. The clock
+rose 12.5 % but the token takes 9.6 % more cycles: the weight ports already
+run at the HBM's sustained ceiling (§ *Physical Implementation*). Against
+Iter81 on the same card (10.256 ms kernel over the WikiText run) the Iter82–87
+image was **−18.5 % kernel time**; against the Iter82–86 image Iter87 was faster
+by 16 µs per token in short runs and by 2.5 µs under the 4.5-minute power
+protocol. The dual-kernel
 call probe (Iter82, compiled out of production) measured every step
 (`optimization_log.md`, Iter82–87). After Iter86 the four state ports'
 traffic — 4,096 beats read before and 4,096 written after each layer's QKVG
@@ -40,13 +54,16 @@ weights per port — bounds the QKVG call: the floor is ≈ 62.5K cycles per lay
 (≈ 1.564M per token).
 
 Production XCLBIN SHA-256
-`e3e88f966acb80bd30ef10c81a7c7a08b8d3b09057ad36cd6685c1889b261998` (build
-8396, `diagnostics/hw_20261012_191035_2149955/`), host `3e16bb0fc77e485d…`,
+`74c8ec59605d3b8193ae5de71e00c90f6a371673c8b1c937cc64fa96f179448d` (build
+10168, `diagnostics/hw_20261014_073923_2548162/`, recipe `hw_f225_p_remap.cfg`),
 from `gdn_model.cpp`
 `b21f9b94d2993d5eb64fdc0ede43374c5b64fca31799138cb3a9a58f2ff195d4` (commit
-`42959cfcf`). The Iter82–86 image `6ee78021…` (build 8236, 8.486 ms/token,
-source `56622ec53`) is the immediate predecessor, and the Iter81 image
-`a95b9a8a…` (build 7370, 10.470 ms/token on harrier's card) the one before. The
+`42959cfcf`, the Iter87 source) and the unchanged `host.cpp` `def56de3…`. The
+Iter82–87 image `e3e88f96…` (build 8396, 8.484 ms/token at 200 MHz, the same
+source with the original HBM map) is the immediate predecessor, the Iter82–86
+image `6ee78021…` (build 8236, 8.486 ms/token, source `56622ec53`) and the
+Iter81 image `a95b9a8a…` (build 7370, 10.470 ms/token on harrier's card) the
+ones before. The
 Iter79 image `0326f01be04ff628…` (build 6548, 12.350 ms/token; reproduced by
 builds 6568 and 6642) is the recorded predecessor in § *Correctness and
 On-Card Performance*, with the 150 MHz Iter76 image (`b2a0a478…`, 16.255 ms)
@@ -120,12 +137,12 @@ token per `gdn_forward` invocation. The successful design combines:
 
 The architecture routes every routable net with zero routing errors and
 preserves the exact 64-token trajectory. The in-link closure sequence closes
-the 200 MHz kernel clock at **+0.027 ns WNS / +0.010 ns WHS** and the fixed
-250 MHz DMA clock at **+0.003 / +0.009 ns**; the HBM AXI clock is programmed at
-442.0 MHz (its shell-pipe endpoints miss 2.222 ns by ≤ 0.040 ns). The
-production image runs **18.5 % faster by kernel time** than the Iter81 image on
-the same card (8.361 against 10.256 ms; 1,672,120 cycles per token), and
-**14.3x** the 121.4 ms eight-port baseline by production TPOT (8.484 ms).
+the 225 MHz kernel clock at **+0.035 ns WNS / +0.010 ns WHS**, the fixed
+250 MHz DMA clock at **+0.003 / +0.009 ns** and the 450 MHz HBM AXI clock at
+**+0.039 / +0.010 ns**. The production image runs **2.6 % faster by kernel
+time** than the Iter82–87 image on the same card (8.147 against 8.361 ms) and
+**20.6 % faster** than the Iter81 image (10.256 ms), and **14.7x** the
+121.4 ms eight-port baseline by production TPOT (8.253 ms).
 
 ## Fixed Model Shape
 
@@ -218,14 +235,26 @@ seven stream ports:
 They synthesize to exactly 32 AXI masters. `aux_weights`, `workspace`, and shard
 0 intentionally share `mem_weights_mm0`; shards 1-31 each have their own
 master. The host maps every buffer to the bank of the master that reads it
-(`port_group(c)`), and the host ABI, workspace offsets and the `.gdnstate`
-contract are unchanged from the monolith. The successful connectivity is:
+(`port_group(c)`, from the image's connectivity), and the host ABI, workspace
+offsets and the `.gdnstate` contract are unchanged from the monolith. The
+production connectivity (Iter88; link-only, the host follows the image) is:
 
 | AXI bundle | HBM bank | Contents |
 |---|---:|---|
 | `mem_weights_mm0` | HBM[0] | GEMV shard 0, compact auxiliary weights, workspace, convolution tails, embedding ingress, token egress |
-| `mem_weights_mm1` ... `mem_weights_mm27` | HBM[1] ... HBM[27] | One compact GEMV shard per bank, read-only during decode |
-| `mem_weights_mm28` ... `mem_weights_mm31` | HBM[28] ... HBM[31] | One GEMV shard plus one **6 MiB BF16** recurrent-state stripe per bank |
+| `mem_weights_mm1`, `mm10`–`mm23` | HBM[1], HBM[10]–[23] | One compact GEMV shard per bank, read-only during decode |
+| `mem_weights_mm2` ... `mem_weights_mm9` (SLR0 kernel) | HBM[24] ... HBM[31] | One compact GEMV shard per bank, read-only; the right-hand channels, reached without a die crossing |
+| `mem_weights_mm24` ... `mem_weights_mm27` (SLR2 kernel) | HBM[2] ... HBM[5] | One compact GEMV shard per bank, read-only; two die crossings on the shell's pipes |
+| `mem_weights_mm28` ... `mem_weights_mm31` (SLR2 kernel) | HBM[6] ... HBM[9] | One GEMV shard plus one **6 MiB BF16** recurrent-state stripe per bank |
+
+Why the SLR2 kernel's masters sit on the left-hand channels: the shell's
+SLR-crossing register pipes for a channel land near that channel's column, and
+columns X6–X7 at the SLR0/SLR1 boundary are shared with the static PCIe/DMA
+shell. With the SLR2 masters on channels 24–31 those pipes failed the 450 MHz
+HBM AXI clock on every draw (−0.018…−0.061 ns on the same 46 endpoints at 200
+and 225 MHz); on channels 2–9 they land in columns X0–X4 and close with margin
+(+0.039 and +0.069 ns on two draws). The original map (`weight_data_mmN` →
+`HBM[N]`) lives on in `hw_f200_p.cfg`.
 
 Every large matrix, including `lm_head`, is split across the 32 compact shards,
 with one total copy of every projection weight. Conventional O, MLP-down, and
@@ -896,18 +925,26 @@ which itself forks from the GPU at step 83 — see the drift measurement under
 
 ## Physical Implementation
 
-The production build compiles HLS at 200 MHz under Vitis 2024.2 and links at
-a true 200 MHz. All hardware work goes through Slurm as two chained jobs, and
-`make run_hw` on the login node is the submission:
+The production build compiles HLS at 225 MHz under Vitis 2024.2 and links at
+a true 225 MHz. All hardware work goes through Slurm as chained jobs, and
+`make run_hw` on the login node is the one command for the whole flow: the
+build, the `afterok` card gates, and the `afterok` qualification (512-token
+drift and WikiText-2, then the power protocol's FPGA arm):
 
 ```bash
 cd c_impl
-BUILD_EXCLUSIVE=user BUILD_EXCLUDE=acclnode04,acclnode05,harrier make run_hw
+make run_hw                                  # BUILD_CPUS=8 BUILD_MEM=96G on a busy node; QUAL=0 stops after the gates
 ```
 
-Every knob the design needs is already the default: `HW_CFG_TEMPLATE=hw_f200_p.cfg`,
-HLS and link at 200 MHz, the three kernels, the BF16 weight blob, the
-native-product `.gdnstate` and golden, and the GPU reference logits.
+Every knob the design needs is already the default: `HW_CFG_TEMPLATE=hw_f225_p_remap.cfg`,
+HLS and link at 225 MHz, the three kernels, the BF16 weight blob, the
+native-product `.gdnstate` and golden, the GPU reference logits, and the
+qualification's references (the 512-step GPU logit dump, the WikiText-2 GPU
+score, the 4,096-token power fixture — regenerable with the `scripts/`
+producers; the power job generates the fixture on a GPU if it is missing).
+Every card-side job builds its host on its own node from the frozen source
+snapshot (`slurm/build_host_on_node.sh`), so the card jobs run on any node
+with a free U55C.
 `LOGITS_REFERENCE` defaults to empty because the hardware/native comparison is
 a diagnostic, not a gate. `BUILD_EXCLUSIVE=user` keeps other users' jobs off the
 node for the whole link (Iter76 evidence: three quiet-node links of one netlist
@@ -921,12 +958,15 @@ exclusivity, so it is a recommendation, not a requirement.
 `hw_iter66e_frp_unpair_f100.cfg` (100 MHz) and `hw_f150_physical_islands.cfg`
 (pre-Iter66) are retained for A/B comparison only.
 
-The 200 MHz recipe lives in `hw_f200_p.cfg` and its hooks:
+The production recipe lives in `hw_f225_p_remap.cfg` and its hooks
+(`hw_f200_p.cfg`, the Iter79–87 recipe, differs only in the HBM map and the
+clock it is linked at):
 
 - `nk=` one compute unit per kernel, `slr=` pinning `gdn_forward_p_1` to SLR1,
   `gdn_k_slr0_1` to SLR0 and `gdn_k_slr2_1` to SLR2; one `sp=` line per master
-  with the one-bank-per-port HBM map (`aux_weights`/`workspace`/`mm0` on
-  HBM[0]); seven `stream_connect=` lines.
+  with the one-bank-per-port HBM map of § *Kernel Interface and HBM Mapping*
+  (`aux_weights`/`workspace`/`mm0` on HBM[0]; the SLR2 kernel on HBM[2..9],
+  the SLR0 kernel's ports 2–9 on HBM[24..31]); seven `stream_connect=` lines.
 - `apply_p_islands.tcl` (OPT_DESIGN.PRE): sets the floorplan hand-off and
   sources `apply_iter69_kernel_clock_f150.tcl`, which overrides the kernel-clock
   XDC that Vitis 2024.2 otherwise implements at 10.000 ns (target from
@@ -940,19 +980,33 @@ The 200 MHz recipe lives in `hw_f200_p.cfg` and its hooks:
   still negative, one `Explore` pass, then one focused kernel path-group pass;
   then `check_p_final_timing.tcl` — the exact-clock gate on all three clocks,
   route status, DRC and bus skew; any failure aborts the link. The HBM AXI
-  clock's closure at 450 MHz is a per-draw ±0.02 ns coin on the shell's own
-  SLR-crossing pipes, not a property of the netlist (Iter79 P6 +0.015 ns; the
-  Iter81 links +0.000, then −0.021 twice on identical inputs), so since Iter81
+  clock's closure at 450 MHz was, through Iter87, a per-draw ±0.02 ns coin on
+  the shell's own SLR-crossing pipes in clock-region column X6 (Iter79 P6
+  +0.015 ns; the Iter81 links +0.000, then −0.021 twice on identical inputs;
+  −0.018 and −0.040 on the Iter86/87 images) — the column the static shell
+  shares, and the shell's crossing flops cannot use the Laguna registers under
+  the platform's reconfigurable pblock (Iter88 diagnosis). Since Iter81
   `run_hw_sbatch.sh` defaults `GDN_HBM_MIN_MHZ=440`: the gate accepts a miss
   that a clock scaled to that floor absorbs, vpl programs the achieved
-  frequency (445.8 MHz on the production image, −0.9 % HBM peak) and the build
-  job derives the matching tolerance for the metadata reconciliation. An
-  explicit empty value demands exact 450 MHz.
+  frequency and the build job derives the matching tolerance for the metadata
+  reconciliation. Since Iter88 the re-mapped channels keep those pipes out of
+  column X6 and the clock closes at exactly 450 MHz (+0.039 and +0.069 ns on
+  two draws); the floor stays as the safety net. An explicit empty value
+  demands exact 450 MHz.
 - `reconcile_exact_clock.py` after the link, as before (a no-op on these
   images: vpl wrote DATA_CLK 200 natively because every clock closed).
 
-Routed utilization of the promoted image (build 6548, identical on 6568 and
-6642), beside the 150 MHz monolith (build 4022) like for like:
+Routed utilization of the Iter88 production image (build 10168): CLB slices
+50,422 / 49,571 / 49,930 (91.74 / 91.80 / 92.46 %), LUTs 202,119 / 232,073 /
+252,651 (45.97 / 53.72 / 58.48 %), DSP 2,157 / 1,549 / 2,137, BRAM tiles 429 /
+541.5 / 298.5, URAM 0 / 64 / 96 per SLR; SLLs 24,869 (SLR1↔SLR0 57.60 %,
+SLR2↔SLR1 50.34 %) — the Iter82–87 image's numbers within 0.3 points, the
+re-map having moved the shell's crossings without adding any. csynth at
+4.444 ns per kernel (`gdn_forward_p` / `gdn_k_slr0` / `gdn_k_slr2`): BRAM18
+604 / 697 / 472, DSP 1,032 / 1,121 / 1,609, FF 249K / 279K / 336K, LUT 252K /
+236K / 320K, URAM 64 / 0 / 96. For the record, the routed utilization of the
+first three-kernel image (build 6548, identical on 6568 and 6642), beside the
+150 MHz monolith (build 4022) like for like:
 
 | | SLR0 | SLR1 | SLR2 |
 |---|---:|---:|---:|
@@ -1137,7 +1191,47 @@ on-card-validated 115.7 MHz result, not a 130 MHz closure result.
 
 ## Correctness and On-Card Performance
 
-### Iter82–87 series image, 200 MHz (current)
+### Iter88 image, 225 MHz with the re-mapped HBM channels (current)
+
+The Iter87 source, synthesized at 4.444 ns and linked by `hw_f225_p_remap.cfg`
+(the Iter79 physical recipe with eight `sp=` pairs swapped). It passed the
+production chain — native gates, the XO gate (every reader II=1 at 4.444 ns),
+the state writer/reader and convolution-tail address gates, the island gate,
+the in-link exact-clock gate with every clock at its nominal period, route,
+DRC and bus skew, the clock-metadata check, the 8- and 64-token card gates —
+on both cards, and the qualification on harrier (build 10168, job 10169 on
+acclnode01, 2026-10-14; jobs 10401/10402/10404/10406 on harrier):
+
+| Metric | build 10168, job 10169 (production, acclnode01) | Iter82–87 image, build 8396 / job 8397 |
+|---|---:|---:|
+| Production TPOT, median of 63 | **8.253 ms/token** | 8.484 ms/token |
+| Kernel execution, median of 63 | **8.147 ms/token** (mean 8.149, 8.133–8.201) | 8.361 (mean 8.362, 8.353–8.413) |
+| Effective kernel cycles | **1,833,075 at 225 MHz** | 1,672,120 at 200 MHz |
+| Same-job A/B on harrier, short runs (job 10402) | **8.2533 ms** (6 intervals, 8.2392–8.2705) | 8.4879 (8.4697–8.5061) |
+| Same-job power on harrier (job 10406) | 71.5 W, **0.598 J/token gross**, 0.317 idle-subtracted | 69.6 W, 0.599 J, 0.319 J |
+| 8- and 64-token trajectories | exact | exact |
+| CUDA vector gate, 2,016,000 logits | NRMSE 0.004663, worst step 0.011908, cosine 0.999989, 0 argmax mismatches | identical |
+| Kernel / DMA / HBM clocks | +0.035 / +0.003 / **+0.039** ns (HBM at 450.0 MHz) | +0.027 / +0.003 / −0.040 ns (HBM at 442.0 MHz) |
+
+Qualification, 2026-10-14 on harrier with a host built there: 512-token
+free-running drift **BOUNDED**, fork at step 447, ratio 1.063, slope 2.133e-06
+per step (job 10404); WikiText-2 word perplexity **16.774839771** against GPU
+16.776123769, **−0.0077 %**, identical to the predecessor's to every printed
+digit, kernel 8.237 ms/token over the run. The A100 arms of the power protocol
+were not re-run (they do not depend on the image; jobs 8399/8400 stand).
+
+Why only 2.8 % for 12.5 % more clock: the achieved-bandwidth diagnosis (Iter88
+log entry) measured the HBM's sustained sequential-read ceiling at **12.87 GB/s
+per pseudo-channel** (`microbench/hbm_rd`, 89.4 % of the 14.4 GB/s pin rate)
+and, with the probe build of this image (10417), every weight port streaming at
+**0.876–0.893 beats per 4.444 ns cycle = 12.6–12.85 GB/s, 98–100 % of that
+ceiling** (at 200 MHz: 0.969–0.989 = 12.4–12.66 GB/s). A 512-bit port's demand
+meets the ceiling at 201 MHz; above it the clock turns into stalled beats, and
+only the non-stream work gets faster. The flow's one-command reproduction of
+this image (`make run_hw` with the new defaults: build, gates and the chained
+qualification) is recorded in the log entry.
+
+### Iter82–87 series image, 200 MHz (predecessor)
 
 Iter87 changes one thing in the control kernel: the convolution-tail writer's
 576 writes per QKVG call wait for a one-token go that the port-0 loader writes

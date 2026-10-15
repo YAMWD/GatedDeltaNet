@@ -1,4 +1,9 @@
-# Clean 200 MHz build and on-card validation
+# Clean 200 MHz build and on-card validation (Iter79–87 flow; superseded)
+
+> **Superseded 2026-10-15 by [reproduce_f225.md](reproduce_f225.md)**: the production
+> defaults are now 225 MHz and `hw_f225_p_remap.cfg`, and `make run_hw` chains the
+> qualification. `HLS_FREQ=200 LINK_FREQ=200 HW_CFG_TEMPLATE=hw_f200_p.cfg make run_hw`
+> still reproduces the 200 MHz image described here.
 
 From any host with the Slurm client (normally `acclhead1`; a running job may
 submit too), from the repository root (there is no root Makefile; the target

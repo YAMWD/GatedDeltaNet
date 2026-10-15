@@ -1,10 +1,11 @@
 # Accelerator Documentation
 
 **Current architecture:** the FPGA is a decode-only accelerator. The
-production image — the **200 MHz three-kernel image of the Iter82–87 series**,
-promoted 2026-10-13 (the Iter82–86 image of 2026-10-11 is its predecessor, the
-Iter81 balanced-island image, the Iter79 three-kernel image, the 150 MHz Iter76
-monolith and Iter67c before that) — forwards
+production image — the **225 MHz three-kernel image with the re-mapped HBM
+channels (Iter88)**, promoted 2026-10-15 (the 200 MHz Iter82–87 image of
+2026-10-13 is its predecessor, then the Iter82–86 image, the Iter81
+balanced-island image, the Iter79 three-kernel image, the 150 MHz Iter76
+monolith and Iter67c) — forwards
 one token at a time with 32 HBM weight
 readers and 16 two-port GEMV clusters split across three kernels, one per die:
 `gdn_forward_p` (control, SLR1), `gdn_k_slr0` (SLR0) and `gdn_k_slr2` (SLR2,
@@ -27,21 +28,23 @@ and a streamed full-vocabulary logit export. Prefill runs on the GPU and supplie
 recurrent and convolution state.
 
 The production image routes with zero routing errors and closes a true
-**200 MHz** kernel clock — setup +0.027 / hold +0.010 ns, with the fixed
-250 MHz DMA clock at +0.003 ns; the shell's 450 MHz HBM AXI clock missed by
-0.040 ns on its own crossing pipes and runs at 442.0 MHz under the flow's
-440 MHz floor. It measures **8.484 ms/token production TPOT / 8.361 ms
-kernel (1,672,120 cycles)** on acclnode01's card with an exact 64-token
-trajectory and the production vector-gate figures, **−18.5 % kernel time**
-against the Iter81 image on the same card (10.256 ms) with order-preserving
-arithmetic, **−0.03 % to −0.19 %** against the Iter82–86 image in same-job A/Bs, or
-**14.3x** the 121.4 ms eight-port baseline. Paired power is about 70 W active,
-0.59–0.60 J/token gross, 3.7x faster than an A100 running eager PyTorch. The flow is one
-command (`make run_hw`); see
-[reproduce_f200.md](reproduce_f200.md).
+**225 MHz** kernel clock — setup +0.035 / hold +0.010 ns, with the fixed
+250 MHz DMA clock at +0.003 ns and the shell's 450 MHz HBM AXI clock at
++0.039 ns, closed at its full rate because the SLR2 kernel's HBM channels were
+moved away from the column the static shell shares. It measures **8.253
+ms/token production TPOT / 8.147 ms kernel (1,833,075 cycles)** on
+acclnode01's card with an exact 64-token trajectory and the production
+vector-gate figures, **−2.6 %** against the 200 MHz Iter82–87 image on the
+same card (−2.8 % in a same-job A/B on harrier) at unchanged energy per
+token, or **14.7x** the 121.4 ms eight-port baseline. Its weight ports stream
+at 98–100 % of the HBM's measured 12.87 GB/s sequential-read ceiling, so the
+frequency lever is spent. Power is about 71 W active, 0.60 J/token gross,
+3.8x faster than an A100 running eager PyTorch. The flow is one command
+(`make run_hw`: build, card gates, drift, WikiText-2 and power, chained); see
+[reproduce_f225.md](reproduce_f225.md).
 
 Toolchain: **Vitis 2024.2** (the native BF16 multiplier requires its
-`ap_float`). Evidence: build 7370 with on-card 7371 (Iter81), qualification
+`ap_float`). Evidence: build 10168 with on-card 10169 and 10401 (Iter88, both cards), its same-card A/B 10402, qualification 10404 (drift, WikiText-2) and 10406 (power), the probe build 10417 / dump 10436 and the HBM-ceiling microbenchmark 10435; build 8396 / 8397 and qualification 8398–8400 (Iter87); build 7370 with on-card 7371 (Iter81), qualification
 jobs 7401 (drift, WikiText-2) and 7437/7438 (paired power); the Iter79 image's builds 6548/6568/6642 with on-card
 6549/6569/6643 and qualification 6570–6572. The two failed Iter81 links — a
 state reader whose address Vivado synthesis folded 128 MiB low (now covered by

@@ -72,13 +72,16 @@ BUILD_DIR="$(cat "diagnostics/${TAG}/build_dir.path" 2>/dev/null \
                   HLS_FREQ="$HLS_FREQ" LINK_FREQ="$LINK_FREQ" 2>/dev/null | tail -1)"
 DIAG="$(pwd)/diagnostics/${TAG}"
 XCLBIN="$(cat "$DIAG/xclbin.path")" || exit 2
-HOST_BIN="$(cat "$DIAG/host.path")" || exit 2
 FROZEN_MAKEFILE="$DIAG/reproduction.Makefile"
 echo "  image   : ${XCLBIN}"
 test -s "$XCLBIN" || { echo "FATAL: no image at ${XCLBIN}" >&2; exit 2; }
-test -x "$HOST_BIN" || { echo "FATAL: matching host executable missing" >&2; exit 2; }
 test -s "$FROZEN_MAKEFILE" || exit 2
-sha256sum -c "$DIAG/copied_artifacts.sha256" || exit 2
+# The image must be the one the build copied back; the host is rebuilt here from
+# the frozen snapshot (Iter88), so only the image line of the manifest is checked.
+grep -E 'gdn_p\.xclbin$|gdn_forward\.xclbin$' "$DIAG/copied_artifacts.sha256" | sha256sum -c - || exit 2
+HOST_BIN="$DIAG/on_card/host.$(hostname -s).exe"
+mkdir -p "$DIAG/on_card"
+bash "$DIAG/build_host_on_node.sh" "$DIAG" "$HOST_BIN" || { echo "FATAL: host build on $(hostname -s) failed" >&2; exit 2; }
 
 # Data knobs are forwarded explicitly rather than left to the Makefile default.
 # They matter: a kernel built for packed BF16 weights rejects the FP32 blob
