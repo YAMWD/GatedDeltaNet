@@ -72,9 +72,11 @@ first two.
 
 ## Evidence
 
-The Iter88 image closed on two independent draws of this recipe (builds 10168
-and 10417, the latter with the call probe compiled in), passed the card gates
-on both cards, and was qualified on harrier against the 200 MHz image in the
-same jobs; `optimization_log.md` (Iter88) carries every number, and the
-promotion entry records the first run of this one-command flow. The 200 MHz
-predecessor flow is described in `reproduce_f200.md`.
+The Iter88 recipe closed on three independent draws (builds 10168, 10417 with
+the call probe compiled in, and 10440), the first and third with identical
+slacks to the picosecond. Build 10440 is the first run of this one-command
+flow: 7 h 24 m link, gates 47 s, drift and WikiText-2 52 m, power 5 m, every
+stage passed on acclnode01, and its image is the production image (8.233 ms
+TPOT / 8.141 ms kernel, 0.5895 J/token). `optimization_log.md` (Iter88 and its
+promotion entry) carries every number. The 200 MHz predecessor flow is
+described in `reproduce_f200.md`.

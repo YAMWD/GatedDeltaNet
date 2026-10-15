@@ -212,7 +212,7 @@ diagnostic reports are generated artifacts and are intentionally not committed.
 - `c_impl/doc/README.md` — **start here**; says which document is current.
 - `c_impl/doc/architecture.md` — current top-level architecture and ABI
   (the 225 MHz three-kernel image with the re-mapped HBM channels, Iter88:
-  8.253 ms/token production TPOT and 8.147 ms kernel on card, −2.6 % versus the
+  8.233 ms/token production TPOT and 8.141 ms kernel on card, −2.6 % versus the
   200 MHz Iter82–87 image on the same card at unchanged energy per token;
   promoted 2026-10-15).
 - `c_impl/doc/gpu_latency_energy_evaluation.md` — the GPU latency and energy

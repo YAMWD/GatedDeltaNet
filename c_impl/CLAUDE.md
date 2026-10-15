@@ -8,7 +8,7 @@ the Iter81 balanced-island image plus the packed aux image, the deferred state w
 fused residual + RMSNorm and SwiGLU-in-the-store, the per-head output norm and convolution-tail
 writer in the QKVG region, the tail writes held until port 0's weights are read — linked at a true
 4.444 ns with the SLR2 kernel on HBM[2..9] and the SLR0 kernel's ports 2–9 on HBM[24..31];
-8.253 ms/token production TPOT / 8.147 ms kernel on acclnode01's card. The 200 MHz Iter82–87
+8.233 ms/token production TPOT / 8.141 ms kernel on acclnode01's card (build 10440, the one-command verification run). The 200 MHz Iter82–87
 image, 8.484 / 8.361 ms on the same card, is the predecessor). `README.md`
 in this directory is current — it was rewritten for the decode-only design; the earlier note calling it
 stale was wrong.

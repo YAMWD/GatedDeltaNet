@@ -241,7 +241,12 @@ if [ -n "${EXTRA_SNAPSHOT_FILES:-}" ]; then
         snapshot_files+=("${extra}")
     done
 fi
-snapshot_files+=("${HW_CFG_TEMPLATE}")
+# The chosen link template (skipped when the base list already names it).
+cfg_listed=0
+for existing in "${snapshot_files[@]}"; do
+    [ "$existing" = "${HW_CFG_TEMPLATE}" ] && { cfg_listed=1; break; }
+done
+[ "$cfg_listed" = 1 ] || snapshot_files+=("${HW_CFG_TEMPLATE}")
 # Every Tcl/Python hook the chosen link template names as @C_IMPL_DIR@/<file>
 # travels with it (Iter77 S2: the 200 MHz template's own hooks were missing
 # from the frozen snapshot and the link failed at OPT_DESIGN.TCL.PRE).

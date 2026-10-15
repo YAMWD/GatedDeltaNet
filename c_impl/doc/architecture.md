@@ -33,9 +33,10 @@ routed with zero routing errors. **The Iter88 image closes the kernel clock at
 +0.035 / +0.010 ns at 4.444 ns, the fixed 250 MHz DMA clock at +0.003 / +0.009
 ns and the 450 MHz HBM AXI clock at +0.039 / +0.010 ns** (the Iter82–87 image:
 +0.027 at 5.000 ns, +0.003, and −0.040 on the HBM clock, run at 442.0 MHz under
-the flow's 440 MHz floor). The 64-token card run measures **8.253 ms/token
-production TPOT / 8.147 ms kernel = 1,833,075 cycles at 225 MHz** by median
-over 63 generated tokens (build 10168 / job 10169, acclnode01's card; the
+the flow's 440 MHz floor). The 64-token card run measures **8.233 ms/token
+production TPOT / 8.141 ms kernel = 1,831,725 cycles at 225 MHz** by median
+over 63 generated tokens (build 10440 / job 10441, acclnode01's card; build
+10168, the first draw of the recipe, 8.253 / 8.147 on the same card; the
 Iter82–87 image: 8.484 / 8.361 ms = 1,672,120 cycles at 200 MHz), with an exact
 token trajectory and the production vector-gate figures over 2,016,000 logits.
 Against the Iter82–87 image in one job on harrier's card, the two images
@@ -54,8 +55,11 @@ weights per port — bounds the QKVG call: the floor is ≈ 62.5K cycles per lay
 (≈ 1.564M per token).
 
 Production XCLBIN SHA-256
-`74c8ec59605d3b8193ae5de71e00c90f6a371673c8b1c937cc64fa96f179448d` (build
-10168, `diagnostics/hw_20261014_073923_2548162/`, recipe `hw_f225_p_remap.cfg`),
+`497c87255a20b418…` (build 10440, `diagnostics/hw_20261015_121355_3074494/`,
+recipe `hw_f225_p_remap.cfg`, produced with its gates and qualification by the
+single command `make -C c_impl run_hw`; build 10168's `74c8ec59605d3b81…`,
+`diagnostics/hw_20261014_073923_2548162/`, is the first draw of the same
+recipe, implemented identically to the picosecond),
 from `gdn_model.cpp`
 `b21f9b94d2993d5eb64fdc0ede43374c5b64fca31799138cb3a9a58f2ff195d4` (commit
 `42959cfcf`, the Iter87 source) and the unchanged `host.cpp` `def56de3…`. The
@@ -142,7 +146,7 @@ the 225 MHz kernel clock at **+0.035 ns WNS / +0.010 ns WHS**, the fixed
 **+0.039 / +0.010 ns**. The production image runs **2.6 % faster by kernel
 time** than the Iter82–87 image on the same card (8.147 against 8.361 ms) and
 **20.6 % faster** than the Iter81 image (10.256 ms), and **14.7x** the
-121.4 ms eight-port baseline by production TPOT (8.253 ms).
+121.4 ms eight-port baseline by production TPOT (8.233 ms).
 
 ## Fixed Model Shape
 
@@ -1200,25 +1204,30 @@ the state writer/reader and convolution-tail address gates, the island gate,
 the in-link exact-clock gate with every clock at its nominal period, route,
 DRC and bus skew, the clock-metadata check, the 8- and 64-token card gates —
 on both cards, and the qualification on harrier (build 10168, job 10169 on
-acclnode01, 2026-10-14; jobs 10401/10402/10404/10406 on harrier):
+acclnode01, 2026-10-14; jobs 10401/10402/10404/10406 on harrier). Then the
+one-command flow reproduced it: `make -C c_impl run_hw` with no knob gave
+build 10440 — the same three slacks to the picosecond — and ran the gates and
+the qualification itself on acclnode01 (jobs 10441/10442/10443, 2026-10-15,
+8 h 22 m end to end); that image is the production image:
 
-| Metric | build 10168, job 10169 (production, acclnode01) | Iter82–87 image, build 8396 / job 8397 |
-|---|---:|---:|
-| Production TPOT, median of 63 | **8.253 ms/token** | 8.484 ms/token |
-| Kernel execution, median of 63 | **8.147 ms/token** (mean 8.149, 8.133–8.201) | 8.361 (mean 8.362, 8.353–8.413) |
-| Effective kernel cycles | **1,833,075 at 225 MHz** | 1,672,120 at 200 MHz |
-| Same-job A/B on harrier, short runs (job 10402) | **8.2533 ms** (6 intervals, 8.2392–8.2705) | 8.4879 (8.4697–8.5061) |
-| Same-job power on harrier (job 10406) | 71.5 W, **0.598 J/token gross**, 0.317 idle-subtracted | 69.6 W, 0.599 J, 0.319 J |
-| 8- and 64-token trajectories | exact | exact |
-| CUDA vector gate, 2,016,000 logits | NRMSE 0.004663, worst step 0.011908, cosine 0.999989, 0 argmax mismatches | identical |
-| Kernel / DMA / HBM clocks | +0.035 / +0.003 / **+0.039** ns (HBM at 450.0 MHz) | +0.027 / +0.003 / −0.040 ns (HBM at 442.0 MHz) |
+| Metric | build 10440, jobs 10441–10443 (production, acclnode01) | build 10168, first draw (acclnode01 / harrier) | Iter82–87 image, build 8396 / job 8397 |
+|---|---:|---:|---:|
+| Production TPOT, median of 63 | **8.233 ms/token** | 8.253 | 8.484 ms/token |
+| Kernel execution, median of 63 | **8.141 ms/token** (mean 8.143) | 8.147 (mean 8.149, 8.133–8.201) | 8.361 (mean 8.362, 8.353–8.413) |
+| Effective kernel cycles | **1,831,725 at 225 MHz** | 1,833,075 | 1,672,120 at 200 MHz |
+| Same-job A/B on harrier, short runs (job 10402) | — | **8.2533 ms** (6 intervals, 8.2392–8.2705) | 8.4879 (8.4697–8.5061) |
+| 512-token drift (fork, ratio, slope) | **BOUNDED**: 447, 1.063, 2.133e-06 (job 10442) | the same (job 10404, harrier) | the same (job 8398) |
+| WikiText-2 word perplexity, 314,843 tokens | **16.774839771** (−0.0077 %), 8.141 ms/token | 16.774839771, 8.237 ms/token (harrier) | 16.774839771, 8.365 ms/token |
+| Power, FPGA arm (same card as the column's gates) | **71.4 W, 33.2 W idle, 0.5895 J/token gross, 0.3154 idle-subtracted** (job 10443) | 71.5 W, 0.598 J, 0.317 J (job 10406, harrier, with the predecessor at 69.6 W, 0.599 J in the same job) | 69.9 W, 31.7 W, 0.5929 J, 0.3240 J (job 8239) |
+| 8- and 64-token trajectories | exact | exact | exact |
+| CUDA vector gate, 2,016,000 logits | NRMSE 0.004663, worst step 0.011908, cosine 0.999989, 0 argmax mismatches | identical | identical |
+| Kernel / DMA / HBM clocks | +0.035 / +0.003 / **+0.039** ns (HBM at 450.0 MHz) | +0.035 / +0.003 / +0.039 | +0.027 / +0.003 / −0.040 ns (HBM at 442.0 MHz) |
 
-Qualification, 2026-10-14 on harrier with a host built there: 512-token
-free-running drift **BOUNDED**, fork at step 447, ratio 1.063, slope 2.133e-06
-per step (job 10404); WikiText-2 word perplexity **16.774839771** against GPU
-16.776123769, **−0.0077 %**, identical to the predecessor's to every printed
-digit, kernel 8.237 ms/token over the run. The A100 arms of the power protocol
-were not re-run (they do not depend on the image; jobs 8399/8400 stand).
+Against the latest paired A100 eager arms (jobs 8399/8400, not re-run because
+they do not depend on the image: 31.32 ms / 95.4 W / 2.998 J gross / 0.890 J
+idle-subtracted in fp32, 31.57 ms / 85.6 W / 2.711 J / 0.585 J in bf16) the
+production image is **3.80x / 3.83x faster** and **5.09x / 4.60x** more
+efficient in gross energy (**2.82x / 1.85x** idle-subtracted).
 
 Why only 2.8 % for 12.5 % more clock: the achieved-bandwidth diagnosis (Iter88
 log entry) measured the HBM's sustained sequential-read ceiling at **12.87 GB/s
@@ -1227,9 +1236,8 @@ and, with the probe build of this image (10417), every weight port streaming at
 **0.876–0.893 beats per 4.444 ns cycle = 12.6–12.85 GB/s, 98–100 % of that
 ceiling** (at 200 MHz: 0.969–0.989 = 12.4–12.66 GB/s). A 512-bit port's demand
 meets the ceiling at 201 MHz; above it the clock turns into stalled beats, and
-only the non-stream work gets faster. The flow's one-command reproduction of
-this image (`make run_hw` with the new defaults: build, gates and the chained
-qualification) is recorded in the log entry.
+only the non-stream work gets faster. The one-command reproduction of this
+image is the table's first column; the log's promotion entry records the run.
 
 ### Iter82–87 series image, 200 MHz (predecessor)
 

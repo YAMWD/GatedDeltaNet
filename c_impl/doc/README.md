@@ -31,15 +31,16 @@ The production image routes with zero routing errors and closes a true
 **225 MHz** kernel clock — setup +0.035 / hold +0.010 ns, with the fixed
 250 MHz DMA clock at +0.003 ns and the shell's 450 MHz HBM AXI clock at
 +0.039 ns, closed at its full rate because the SLR2 kernel's HBM channels were
-moved away from the column the static shell shares. It measures **8.253
-ms/token production TPOT / 8.147 ms kernel (1,833,075 cycles)** on
+moved away from the column the static shell shares. It measures **8.233
+ms/token production TPOT / 8.141 ms kernel (1,831,725 cycles)** on
 acclnode01's card with an exact 64-token trajectory and the production
 vector-gate figures, **−2.6 %** against the 200 MHz Iter82–87 image on the
 same card (−2.8 % in a same-job A/B on harrier) at unchanged energy per
 token, or **14.7x** the 121.4 ms eight-port baseline. Its weight ports stream
 at 98–100 % of the HBM's measured 12.87 GB/s sequential-read ceiling, so the
-frequency lever is spent. Power is about 71 W active, 0.60 J/token gross,
-3.8x faster than an A100 running eager PyTorch. The flow is one command
+frequency lever is spent. Power is 71.4 W active,
+0.590 J/token gross on the same card, 3.8x faster than an A100 running
+eager PyTorch. The flow is one command
 (`make run_hw`: build, card gates, drift, WikiText-2 and power, chained); see
 [reproduce_f225.md](reproduce_f225.md).
 

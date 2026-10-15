@@ -20389,3 +20389,36 @@ partition being empty) → card gates **10441** → robustness **10442** and pow
 when they land. Until then the promoted image is build 10168's, fully qualified above.
 
 **Record: below.**
+
+**Verification result (2026-10-15, tag `hw_20261015_121355_3074494`, all from `make -C c_impl run_hw`
+with no knob): every stage PASSED on its own, on acclnode01, the production card.**
+- *Build 10440 (48 CPUs, 7 h 24 m, MaxRSS 79.1 GB, 21.6 CPU-hours):* every pre-link gate 0 (native, XO,
+  state address, state reader, tails, island names); routed 0 routing errors; **kernel +0.035 / +0.010
+  ns at 4.444 ns, DMA +0.003 / +0.009, hbm_aclk +0.039 / +0.010 at 2.222 ns — build 10168's slacks to
+  the picosecond** (the recipe reproduces its implementation, as the Iter81 links 7323/7370 did);
+  `GDN_F150_FINAL_PASS`, `EXACT_CLOCK_OK [225.0]`; XCLBIN **`497c87255a20b418…`** (the bitstream
+  differs from 10168's `74c8ec59…` only as bitstreams of one implementation do).
+- *Card gates (job 10441, 47 s, 2026-10-15 19:38 UTC):* the host built on acclnode01 from the frozen
+  snapshot hashes `3e16bb0f…`, identical to the build-copied host of 10168 (same source, same
+  compiler); exact 8- and 64-token trajectories; vector gate NRMSE 0.00466270, worst step 0.011908,
+  cosine 0.999989, min step cosine 0.999946, top-5 5/5, 0 argmax mismatches, 0 tolerance failures;
+  **kernel 8.141 ms median (mean 8.143), TPOT 8.233 ms** = **1,831,725 cycles at 225 MHz** (build
+  10168's card run: 8.147 / 8.253).
+- *Drift and WikiText-2 (job 10442, 52 m):* `TREND_VERDICT=BOUNDED` (fork 447, ratio 1.063, slope
+  2.133e-06); WikiText-2 **16.774839771** vs GPU 16.776123769 = **−0.0077 %**, identical workload,
+  **8.1405 ms/token kernel over the 314,843 tokens**.
+- *Power (job 10443, 5 m, acclnode01's card, the FPGA arm, 21,808 steps over 3 × 60 s):* **71.42 W
+  active, 33.20 W idle, 0.5895 J/token gross, 0.3154 J idle-subtracted**, TPOT 8.2525 ms, device
+  8.1489 ms, kernel median 8.1485 in all three intervals; hbm_aclk read back 450 MHz. Against the
+  Iter87 image on the same card (job 8239: 69.92 W, 31.75 W, 0.5929 J, 0.3240 J): **+2.1 % active
+  power, −0.6 % gross energy, −2.7 % idle-subtracted energy per token**. Against the latest paired A100
+  arms (jobs 8399/8400: 31.32 ms / 95.4 W / 2.998 J gross / 0.890 J idle-subtracted in fp32; 31.57 ms /
+  85.6 W / 2.711 J / 0.585 J in bf16): **3.80x / 3.83x faster, 5.09x / 4.60x gross and 2.82x / 1.85x
+  idle-subtracted energy efficiency**.
+
+**Verdict: PROMOTED AND VERIFIED (2026-10-15).** The production image is build 10440's XCLBIN
+`497c8725…` — produced, gated and qualified by the single command `make -C c_impl run_hw`, which is
+what the user asked the flow to do; build 10168 (`74c8ec59…`) is the first draw of the same recipe,
+with the identical implementation and the harrier A/B evidence. Documents and the status block carry
+build 10440's figures; the launcher's cosmetic duplicate of the recipe in the snapshot list is fixed
+in the same commit. Nothing is in flight.
