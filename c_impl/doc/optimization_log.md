@@ -20290,3 +20290,39 @@ hash kept here (859a6c00…). The production default stays 200 MHz until the use
    (6.94 ms at 200 MHz), a 0.14 ms gain, plus the clock-scaled non-stream work ≈ 0.1–0.16 ms — the
    measured −0.21…−0.24 ms per token; (c) the probe build (10417) will show the per-port rate in the real
    workload, expected ≈ 0.89 beats/cycle. Weight bytes per token remain the only lever on the stream.
+   *Probe build result (build 10417, acclnode01, 8 CPUs, 9 h 0 m; `hw_20261014_193745_2713923/`):*
+   **closed** — kernel **+0.024 / +0.010 ns at 4.444 ns** over 1,524,635 endpoints (the probe-free
+   re-mapped image had 1,480,574: the probe's counters and FIFOs), DMA +0.003, **hbm_aclk +0.069**
+   (placement variance on the same re-map: +0.039 in build 10168); 0 routing errors; XCLBIN
+   `539fa446dd8b0a9d…`, host `aff5acc2…` (probe-enabled, built on acclnode01). The chained card job
+   10418 pends on acclnode01's light slots (another user's job to 2026-10-15 11:55 and the user's own
+   `qrs_screen` GPU job); the dump runs on harrier with a harrier-built probe host (job 10436).
+   *Probe dump (job 10436, harrier, 46 s, probe host built on harrier `225fca7b…`;
+   `iter88_f225/probe/`): 248,535 records over 64 steps (154,161 control, 94,374 SLR2), gates with the
+   production vector-gate figures, DATA_CLK 225 / hbm_aclk 450 MHz read back. The analysis script
+   converts kernel_ms at an assumed 200 MHz ("1,652,306 cycles"); at 225 MHz the 8.262 ms token is
+   **1,858,837 cycles**, of which the control regions sum to 1,672,757 (90.0 %) and SLR2's to 1,813,730
+   (97.6 %). **Achieved weight-stream rate per port, 225 MHz (beats per 4.444 ns cycle, from the
+   port-0 loop stamps; 200 MHz figures from the Iter86 probe for comparison):**
+
+   | call | beats per port | 225 MHz: cycles, beats/cycle, GB/s | 200 MHz: beats/cycle, GB/s |
+   |---|---:|---:|---:|
+   | QKVG | 16,384 | 18,436 · **0.889** · 12.80 | 0.969 · 12.40 (with Iter86's tail writes) |
+   | o_proj | 4,096 | 4,677 · 0.876 · 12.61 | 0.971 · 12.43 |
+   | GU | 22,528 | 25,325 · 0.890 · 12.81 | 0.988 · 12.65 |
+   | down | 11,264 | 12,677 · 0.889 · 12.79 | 0.989 · 12.66 |
+   | lm_head | 64,000 | 71,707 · 0.893 · 12.85 | 0.987 · 12.64 |
+   | state ports 28–31, QKVG weights | 16,384 | 18,582 · 0.882 · 12.70 | 0.985 |
+   | state prefetch (reads) | 4,096 | 4,752 · 0.862 | 0.93 |
+   | state write-back (writes) | 4,096 | 4,356 · 0.940 | ≈ 0.97 |
+
+   **Every weight port runs at 12.6–12.85 GB/s = 98–99.9 % of the 12.87 GB/s sequential-read ceiling
+   the `hbm_rd` microbenchmark measured** (at 200 MHz the same ports drew 12.4–12.66 GB/s, 96–98 % of
+   it): the 225 MHz image is memory-bound on every call, and the clock converted into stalled beats
+   exactly as predicted (0.889 measured against the ceiling-derived 0.894). The islands keep pace at a
+   2,292-cycle head interval (2,105 at 200 MHz); SLR2's QKVG region 27,708 = prefetch 4,752 + weights
+   18,582 + the tail 4,356 (the write-back now paces the tail at 0.94 beats/cycle). Serial work outside
+   the control regions 186K cycles (10.0 %; 156K at 200 MHz: the HBM-bound aux reads and the fixed
+   host latency cost more cycles at the faster clock). **The achieved-bandwidth diagnosis is complete:
+   the memory ceiling (12.87 GB/s per channel, 89.4 % of pin rate) and the kernel's use of it (98–100 %)
+   are both measured; frequency above 201 MHz cannot shorten the weight stream.**
