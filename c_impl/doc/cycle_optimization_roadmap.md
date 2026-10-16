@@ -1,5 +1,62 @@
 # Cycle-First Optimization Roadmap After Iter67c
 
+> **Update 2026-10-15 (Iter88, promoted; closes no stage; changes the reference).** The
+> production image now runs at 225 MHz with the HBM channels re-mapped: **8.147 ms kernel
+> = 1,833,075 cycles at 4.444 ns** on acclnode01's card (−2.6 % time, +9.6 % cycles against
+> the 200 MHz Iter87 image's 1,672,120). The cycle count rose because the weight ports are
+> memory-bound: the HBM sustains 12.87 GB/s per pseudo-channel (89.4 % of the pin rate,
+> measured), a 512-bit port meets that at 201 MHz, and the 225 MHz probe shows every
+> weight port at 0.876–0.893 beats/cycle. **From here, cycles are no longer a clean
+> measure of schedule work** — ≈ 84 % of the token is a stream that cannot go faster per
+> cycle — so this roadmap's remaining stages are judged in milliseconds on one card, and
+> the only lever on the stream is bytes per token (§ 13).
+
+> **Update 2026-10-13 (Iter87, promoted 2026-10-13; closes no stage).** At the user's
+> request, one item of the Iter86 entry's sub-threshold bundle: the conv-tail writes
+> wait until port 0's QKVG weights are read. Measured in same-job A/Bs on
+> acclnode01's card: **−16 µs per token (−3.2K cycles, −0.19 %, as predicted) in short
+> runs, −2.5 µs (−0.5K, −0.03 %) under the power protocol**, energy unchanged —
+> capped by the four state ports' write-back drain, so Stage 6's stop condition
+> stands. Card gates 8.361 ms kernel (1,672,120 cycles); cross-job comparisons cannot
+> resolve changes this small (`kernel_ms` carries tens of µs of host latency).
+
+> **Update 2026-10-11 (Iter82–86, promoted 2026-10-11; the cycle reference is now 1.6738M at 200 MHz, 8.369 ms kernel on acclnode01's card).** The dual-kernel
+> probe (Iter82) and four schedule iterations took the token from 2,053,983 to
+> **1,684,509 cycles** on acclnode01's card (8.423 ms kernel; −18.0 %): the packed
+> aux image and fused tiny GEMV (Iter83, −10.2 %), the deferred state write-back
+> (Iter84, −3.6 %), the fused residual + RMSNorm and SwiGLU in the GU store (Iter85,
+> −3.1 %), the per-head output norm and the conv-tail writer in the QKVG region
+> (Iter86, −2.2 %). The fixed SLR2 counter shows the four state ports' traffic
+> now bounds the QKVG call (floor ≈ 62.5K cycles per layer); Stage 6 reached its
+> stop condition (§ 7).
+
+> **Update 2026-10-08 (Iter81, promoted).** The first cycle reduction since Iter67c: the recurrent
+> islands of the SLR2 kernel are now three-stage head pipelines (prep → read
+> → update) that hide under the QKVG weight stream, and ports 28–31 fetch the
+> layer's state in the pre-call gap instead of after every head's weights.
+> Measured on card: **2,069,400 cycles/token (10.347 ms kernel, 10.470 ms
+> TPOT at 200 MHz)** against the Iter79 image's 2,445,400 — **−15.4 %** —
+> with identical arithmetic (`architecture.md` § *Iter81*). It replaces
+> Iter67c's 2.4099M as this roadmap's cycle reference: **2.0694M at
+> 200 MHz**, 14.1 % below Iter67c. What it closes: Stage 4's recurrent-head
+> overlap, which Iter57 had only in the HLS minimum — the islands no longer
+> pace the call. What it opens: the stream now paces all 97 calls, so weight
+> compression (§ 13) shortens every call, which it could not do while the
+> islands paced QKVG. The Iter82 dual-kernel probe (build 7602, data-dependent
+> stamps; the Iter81 probe's "convolution actor back-pressures the stream"
+> reading was a stamp artifact) then measured where the token goes: the weight
+> stream 66.5 %; the **control kernel's serial work between regions 23.7 %**
+> (11,168 / 3,529 / 3,502 / 2,061 cycles per layer before QKVG / after QKVG /
+> after o_proj / after GU — Stage 6's target, now first); the QKVG region 7.0 %
+> beyond its stream (ports 28–31 at 0.833 beats/cycle under the state
+> write-back 3.8 %, the islands' last head 2.4 %, start-up 0.7 %); the other
+> calls' fill/drain 2.5 %; the model's −550K rested on a wrong "today" (the old
+> call was ≈ 50K on card, not 41.7K). Head-chunked output projection (the
+> Stage 4 remainder) and Stages 5–6 stand.
+> The HBM AXI clock runs at 445.8 MHz on this image (`GDN_HBM_MIN_MHZ=440`
+> is the flow default since Iter81), which trims the pseudo-channel peak by
+> 0.9 % and leaves the HBM floor model of § 10 otherwise unchanged.
+
 > **Update 2026-10-04 (Iter79 promotion).** The production image is now the
 > three-kernel 200 MHz image: **12.227 ms kernel / 12.350 ms TPOT = 2,445,400
 > cycles**, +1.06 % cycles over the 150 MHz image and **+1.47 % over Iter67c's
@@ -406,7 +463,7 @@ Approximate steady work per head is:
 |---|---:|
 | QKVG weight stream | 4,096 |
 | Three Q/K/V convolutions | 3,250 |
-| Recurrent attention | 3,416--3,442 |
+| Recurrent attention | 3,416--3,442 (Iter81: ~1,640 per head, hidden under the stream) |
 | Output norm and gate | 629 |
 | O-projection input-head chunk | 1,024 |
 
@@ -447,12 +504,33 @@ and integrated csynth prove exactness and a material schedule reduction.
 
 Retain only changes that shorten the measured critical schedule:
 
-- load RMSNorm weights as Pack16 rather than through scalar 2,048-cycle loops;
-- preload compact norm, convolution, and tiny-GEMV weights;
-- execute A/B tiny GEMVs when QKVG has the required local activation;
-- accumulate the next RMSNorm sum of squares during the preceding residual
-  production; and
-- overlap convolution-tail traffic through persistent port services.
+- ~~load RMSNorm weights as Pack16 rather than through scalar 2,048-cycle loops~~
+  **done, Iter83** (packed BF16 image: RMSNorm, output norm, conv kernels,
+  a/b in bursts; the two tiny GEMVs as one II=1 loop): measured on card
+  −209.7K cycles/token (−10.2 %), the control kernel's serial work
+  487.7K → 278.2K; the remaining serial work is 4,865 / 3,244 / 1,468 / 2,061
+  per layer before QKVG / after QKVG / after o_proj / after GU (Iter84–86);
+- ~~accumulate the next RMSNorm sum of squares during the preceding residual
+  production~~ **done, Iter85** (the residual add fused with the following
+  RMSNorm, one pass; and the SwiGLU evaluated inside the GU store's fill loop
+  with the write-out in the down projection's layout): measured on card
+  −55.2K cycles/token (−3.1 %), the serial work outside the control regions
+  278.2K → 222.6K; after o_proj ≈ 900 and after GU ≈ 180 per layer, the two
+  gaps around QKVG ≈ 8.1K per layer (Iter86 and Iter87 target them);
+- ~~overlap convolution-tail traffic~~ **done, Iter86** (the conv tails written by
+  a process of the QKVG region as each head finishes, and the output norm/gate per
+  head as its attention arrives): measured on card −37.4K cycles/token (−2.2 %),
+  below this stage's 0.05M retention bar (retained under the campaign protocol);
+- preload compact norm, convolution, and tiny-GEMV weights; and
+- execute A/B tiny GEMVs when QKVG has the required local activation — **capped**
+  (Iter86 probe): the four state ports' prefetch (4,401 cycles) sits inside the
+  pre-QKVG wait it would shorten, so this gains ≤ 0.3–0.5K cycles per layer.
+
+**Stop condition reached (2026-10-11, Iter86 probe).** Every remaining Stage 6
+item and the per-call fill/drain levers are projected below 0.05M cycles/token
+with four state ports; Stage 7 (eight state ports, then the pre-QKVG cut)
+projects ≈ 60K, below its 0.15M bar. The four-port floor is ≈ 62.5K cycles per
+layer (≈ 1.564M per token); the measured token is 1.685M.
 
 Expected additional saving: **0.10--0.20M cycles/token**. Do not widen norm,
 convolution, output-gate, or SwiGLU arithmetic without a measured actor-stall

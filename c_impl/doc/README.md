@@ -1,9 +1,12 @@
 # Accelerator Documentation
 
 **Current architecture:** the FPGA is a decode-only accelerator. The
-production image — the **200 MHz three-kernel image of the Iter79 campaign**,
-promoted 2026-10-04 (the 150 MHz Iter76 monolith is its predecessor, Iter67c
-the 100 MHz one before that) — forwards one token at a time with 32 HBM weight
+production image — the **225 MHz three-kernel image with the re-mapped HBM
+channels (Iter88)**, promoted 2026-10-15 (the 200 MHz Iter82–87 image of
+2026-10-13 is its predecessor, then the Iter82–86 image, the Iter81
+balanced-island image, the Iter79 three-kernel image, the 150 MHz Iter76
+monolith and Iter67c) — forwards
+one token at a time with 32 HBM weight
 readers and 16 two-port GEMV clusters split across three kernels, one per die:
 `gdn_forward_p` (control, SLR1), `gdn_k_slr0` (SLR0) and `gdn_k_slr2` (SLR2,
 with the recurrent islands and the state writers), joined by seven registered
@@ -12,28 +15,43 @@ is unchanged: free-running cluster pipelines, a native `ap_float<16,8>` BF16
 multiplier feeding FP32 reduction trees, packed-BF16 weights, transient
 activations resident in local BRAM, four-port packed **BF16** recurrent state
 behind full-window 4,096-deep URAM queues, two concurrent 16-column recurrent
-islands, a five-phase II=1 recurrent read schedule, head-streamed Q/K/V
-convolution and recurrence, an on-chip strict LM-head argmax, and a streamed
-full-vocabulary logit export. Prefill runs on the GPU and supplies persistent
+islands — since Iter81 each a three-stage head pipeline (prep → read →
+update) that hides under the QKVG weight stream, with the layer's state
+fetched before the call's weights and written back after them (Iter84) — a
+five-phase II=1 recurrent read schedule, head-streamed Q/K/V convolution and
+recurrence with the output norm/gate and the convolution-tail write done per
+head inside the QKVG call (Iter86; the tail writes wait until port 0's weights
+are read, Iter87), a packed BF16 aux-weight image with one
+fused tiny a/b GEMV (Iter83), the residual add fused with the following RMSNorm
+and the SwiGLU inside the GU store (Iter85), an on-chip strict LM-head argmax,
+and a streamed full-vocabulary logit export. Prefill runs on the GPU and supplies persistent
 recurrent and convolution state.
 
-The production image routes with zero routing errors (1,671,899 nets) and
-closes a true **200 MHz** kernel clock — setup +0.029 / hold +0.010 ns, with
-the fixed 250 MHz DMA clock at +0.003 and the 450 MHz HBM clock at +0.015, no
-exceptions and no automatic scaling. It measures **12.350 ms/token production
-TPOT / 12.227 ms kernel (2,445,400 cycles)** with an exact 64-token trajectory,
-or **9.8x** the 121.4 ms eight-port baseline; paired power is 57.8 W,
-0.717 J/token gross (−24 % time and −8 % energy per token versus the 150 MHz
-image). The link reproduced itself to the picosecond (builds 6548 and 6568,
-on-card jobs 6549 and 6569) and the flow is one command; see
-[reproduce_f200.md](reproduce_f200.md).
+The production image routes with zero routing errors and closes a true
+**225 MHz** kernel clock — setup +0.035 / hold +0.010 ns, with the fixed
+250 MHz DMA clock at +0.003 ns and the shell's 450 MHz HBM AXI clock at
++0.039 ns, closed at its full rate because the SLR2 kernel's HBM channels were
+moved away from the column the static shell shares. It measures **8.233
+ms/token production TPOT / 8.141 ms kernel (1,831,725 cycles)** on
+acclnode01's card with an exact 64-token trajectory and the production
+vector-gate figures, **−2.6 %** against the 200 MHz Iter82–87 image on the
+same card (−2.8 % in a same-job A/B on harrier) at unchanged energy per
+token, or **14.7x** the 121.4 ms eight-port baseline. Its weight ports stream
+at 98–100 % of the HBM's measured 12.87 GB/s sequential-read ceiling, so the
+frequency lever is spent. Power is 71.4 W active,
+0.590 J/token gross on the same card, 3.8x faster than an A100 running
+eager PyTorch. The flow is one command
+(`make run_hw`: build, card gates, drift, WikiText-2 and power, chained); see
+[reproduce_f225.md](reproduce_f225.md).
 
 Toolchain: **Vitis 2024.2** (the native BF16 multiplier requires its
-`ap_float`). Evidence: builds 6548/6568 with on-card 6549/6569, the
-`make run_hw` verification build 6642 with on-card 6643, qualification
-jobs 6570 (drift, WikiText-2) and 6571/6572 (paired power); the hang that the
-first 200 MHz link shipped with, and its one-line fix, are recorded in
-`architecture.md` and `optimization_log.md`.
+`ap_float`). Evidence: build 10168 with on-card 10169 and 10401 (Iter88, both cards), its same-card A/B 10402, qualification 10404 (drift, WikiText-2) and 10406 (power), the probe build 10417 / dump 10436 and the HBM-ceiling microbenchmark 10435; build 8396 / 8397 and qualification 8398–8400 (Iter87); build 7370 with on-card 7371 (Iter81), qualification
+jobs 7401 (drift, WikiText-2) and 7437/7438 (paired power); the Iter79 image's builds 6548/6568/6642 with on-card
+6549/6569/6643 and qualification 6570–6572. The two failed Iter81 links — a
+state reader whose address Vivado synthesis folded 128 MiB low (now covered by
+a reader address gate) and an HBM-clock refusal — and the hang the first
+200 MHz link shipped with are recorded in `architecture.md` and
+`optimization_log.md`.
 
 ## Current References
 
@@ -49,13 +67,15 @@ first 200 MHz link shipped with, and its one-line fix, are recorded in
   production image with `make run_hw`, what the flow checks, measured wall
   times, and its evidence boundary. [reproduce_f150.md](reproduce_f150.md) is
   the historical 150 MHz monolith recipe.
-- [recurrent_attention.md](recurrent_attention.md): the recurrent block — the
-  largest identifiable cycle consumer at ~41% of the token, now hosted by the
-  SLR2 kernel and fed over the stream links — its BF16 state transport,
-  per-head schedule, and measured per-loop cycles.
+- [recurrent_attention.md](recurrent_attention.md): the recurrent block —
+  through Iter79 the pacing item of the QKVG call at ~41 % of the token, since
+  Iter81 a three-stage head pipeline hidden under the weight stream — its
+  BF16 state transport, the pipeline's per-stage cycles, timing and resources,
+  and the historical serial schedule.
 - [cycle_optimization_roadmap.md](cycle_optimization_roadmap.md): remaining
-  cycle targets, rebased on the Iter67c measurement, with the levers ranked by
-  measured share of the token rather than by share of bytes.
+  cycle targets (reference 2.0694M cycles at 200 MHz since Iter81; Iter67c's
+  2.4099M before), with the levers ranked by measured share of the
+  token rather than by share of bytes.
 - [frequency_250mhz_roadmap.md](frequency_250mhz_roadmap.md): the record of
   the Iter68 frequency-locality redesign (closed 2026-09-05 as
   stopped/inconclusive; 250 MHz is no longer a target) and the HBM-aware

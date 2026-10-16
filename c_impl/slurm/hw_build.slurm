@@ -30,8 +30,9 @@ mkdir -p "${SHARED_DIAG}"
 printf '%s\n' "preflight" > "${SHARED_DIAG}/build.phase"
 trap 'rc=$?; test -s "${SHARED_DIAG}/build.exit" || printf "%s\n" "$rc" > "${SHARED_DIAG}/build.exit"' EXIT
 
-if [ "${SLURM_CPUS_PER_TASK:-0}" -lt 48 ] || [ "${JOBS}" -gt 48 ]; then
-    echo "FATAL: production build requires 48 allocated CPUs and JOBS<=48" >&2
+# BUILD_MIN_CPUS comes from the launcher's BUILD_CPUS (48 unless overridden).
+if [ "${SLURM_CPUS_PER_TASK:-0}" -lt "${BUILD_MIN_CPUS:-48}" ] || [ "${JOBS}" -gt 48 ]; then
+    echo "FATAL: production build requires ${BUILD_MIN_CPUS:-48} allocated CPUs and JOBS<=48" >&2
     exit 2
 fi
 if [ "$(hostname -s)" = "acclhead1" ]; then
@@ -75,6 +76,7 @@ echo "  memory     : ${SLURM_MEM_PER_NODE:-?} MiB"
 echo "  vivado     : synth=${VIVADO_SYNTH_JOBS} impl=${VIVADO_IMPL_JOBS}"
 echo "  freqs      : HLS=${HLS_FREQ} LINK=${LINK_FREQ}"
 echo "  stage      : ${STAGE_C_IMPL}"
+echo "  hbm clock  : ${GDN_HBM_MIN_MHZ:+bounded auto-scaling, floor }${GDN_HBM_MIN_MHZ:-exact 450} MHz"
 echo "  snapshot   : ${SNAPSHOT_PATH}"
 printf '%s\n' "${STAGE_C_IMPL}" > "${SHARED_DIAG}/stage_dir.path"
 sha256sum "${SNAPSHOT_PATH}" > "${SHARED_DIAG}/source_snapshot.sha256"
@@ -180,13 +182,63 @@ if [ "$xo_rc" -eq 0 ] && [ "$gate_rc" -eq 0 ] && [ "${STATE_ADDRESS_GATE:-0}" = 
     source "/tools/Xilinx/Vitis/${VITIS_VERSION}/settings64.sh"
     set -u
     set +e
+    # A GDN_CALL_PROBE diagnostic build gives the writers two extra stream/scalar
+    # arguments, after which HLS passes the pointer and layer index as plain ports
+    # instead of FIFO copies; the gate has a switch for that isolated form.
+    writer_gate_args=()
+    case " ${VPP_DEFINES:-} " in *GDN_CALL_PROBE*) writer_gate_args+=(--diagnostic-direct-inputs);; esac
     python3 "${STAGE_C_IMPL}/check_state_writer_addresses.py" \
         "${STAGE_BUILD}/gdn_k_slr2.xo" "${SHARED_DIAG}/state_address_gate" \
-        --clock-ns "$(python3 -c "print(1000.0/${LINK_FREQ})")" \
+        --clock-ns "$(python3 -c "print(1000.0/${LINK_FREQ})")" "${writer_gate_args[@]}" \
         2>&1 | tee "${SHARED_DIAG}/state_address_gate.live.log"
     gate_rc="${PIPESTATUS[0]}"
     set -e
     printf '%s\n' "$gate_rc" > "${SHARED_DIAG}/state_address_gate.exit"
+fi
+
+# Iter81: the state READER's address, the writer gate's twin (same three stages:
+# HLS RTL, post-synthesis, post-opt; 24 layers x 2 bases x ports 28-31). Iter81 v2
+# passed every other gate and read every state beat 128 MiB low on card.
+if [ "$xo_rc" -eq 0 ] && [ "$gate_rc" -eq 0 ] && [ "${STATE_ADDRESS_GATE:-0}" = 1 ]; then
+    printf '%s\n' "state_reader_gate" > "${SHARED_DIAG}/build.phase"
+    set +e
+    python3 "${STAGE_C_IMPL}/check_state_reader_addresses.py" \
+        "${STAGE_BUILD}/gdn_k_slr2.xo" "${SHARED_DIAG}/state_reader_gate" \
+        --clock-ns "$(python3 -c "print(1000.0/${LINK_FREQ})")" \
+        2>&1 | tee "${SHARED_DIAG}/state_reader_gate.live.log"
+    gate_rc="${PIPESTATUS[0]}"
+    set -e
+    printf '%s\n' "$gate_rc" > "${SHARED_DIAG}/state_reader_gate.exit"
+fi
+
+# Iter86: the control kernel's conv-tail writer on mm0 (gdn_tails_writer), checked
+# with the state writers' three-stage method on gdn_forward_p.xo: HLS RTL,
+# post-synthesis, post-opt; 24 layers x three bases, 576 (+4 probe) beats per call.
+if [ "$xo_rc" -eq 0 ] && [ "$gate_rc" -eq 0 ] && [ "${STATE_ADDRESS_GATE:-0}" = 1 ]; then
+    printf '%s\n' "tails_gate" > "${SHARED_DIAG}/build.phase"
+    set +e
+    python3 "${STAGE_C_IMPL}/check_tails_writer_addresses.py" \
+        "${STAGE_BUILD}/gdn_forward_p.xo" "${SHARED_DIAG}/tails_gate" \
+        --c-impl "${STAGE_C_IMPL}" --clock-ns "$(python3 -c "print(1000.0/${LINK_FREQ})")" \
+        2>&1 | tee "${SHARED_DIAG}/tails_gate.live.log"
+    gate_rc="${PIPESTATUS[0]}"
+    set -e
+    printf '%s\n' "$gate_rc" > "${SHARED_DIAG}/tails_gate.exit"
+fi
+
+# Iter81: island cell names and HLS 200-656, checked on this XO before the link.
+# The floorplan hook needs exactly one gdn_recurrent_attention_island_p_{0,1}_U0
+# cell each (a mismatch errors out ~50 min into the link), and a new 200-656
+# (invariant 24) would hang on card while every simulation passes.
+if [ "$xo_rc" -eq 0 ] && [ "$gate_rc" -eq 0 ]; then
+    printf '%s\n' "island_name_gate" > "${SHARED_DIAG}/build.phase"
+    set +e
+    python3 "${STAGE_C_IMPL}/check_island_names.py" "${STAGE_BUILD}" 2>&1 \
+        | tee "${SHARED_DIAG}/island_name_gate.log" \
+        | tee -a "${SHARED_DIAG}/build.live.log"
+    gate_rc="${PIPESTATUS[0]}"
+    set -e
+    printf '%s\n' "$gate_rc" > "${SHARED_DIAG}/island_name_gate.exit"
 fi
 
 if [ "${xo_rc}" -ne 0 ]; then
@@ -286,6 +338,12 @@ if [ "$rc" -eq 0 ] && [ "${REQUIRE_EXACT_CLOCK:-0}" = 1 ]; then
     # Reconcile the metadata with the hook's own gate evidence; the tool patches
     # only when every clock is non-negative at the requested period, never
     # touches the bitstream, and fails closed otherwise.
+    # GDN_HBM_MIN_MHZ (the documented escape hatch, Iter79 option 1) must reach both
+    # gates: the in-link hook reads it directly; the reconciliation reads the
+    # equivalent GDN_SCALED_CLOCKS, derived here as iter79/build_p.slurm did, so one
+    # knob in the launching environment is enough (Iter81 link 2 showed hbm_aclk
+    # closure is per-draw: +0.000, then -0.021 ns on the same recipe).
+    export GDN_SCALED_CLOCKS="${GDN_SCALED_CLOCKS:-${GDN_HBM_MIN_MHZ:+hbm_aclk:$GDN_HBM_MIN_MHZ}}"
     set +e
     gate_tsv="$(find "${STAGE_BUILD}" -path '*/gdn_final_qor/exact_clock_gate.tsv' \
         -print -quit 2>/dev/null)"

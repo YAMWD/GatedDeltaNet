@@ -2,11 +2,16 @@
 #
 # Submit the hardware flow to Slurm as two chained jobs.
 #
-#   usage:  bash run_hw_sbatch.sh [TAG]
-#   knobs:  JOBS HLS_FREQ LINK_FREQ (200 default) HW_CFG_TEMPLATE (hw_f200_p.cfg default)
+#   usage:  bash run_hw_sbatch.sh [TAG]        (or: make run_hw)
+#   chain:  build job -> (afterok) 8/64-token card gates -> (afterok) qualification:
+#           drift + WikiText-2 (slurm/hw_robustness.slurm) and power/energy
+#           (slurm/hw_power.slurm); QUAL=0 stops after the card gates.
+#   knobs:  JOBS HLS_FREQ LINK_FREQ (225 default) HW_CFG_TEMPLATE (hw_f225_p_remap.cfg default)
+#           QUAL QUAL_TIME POWER_TIME POWER_GPU_ARMS ("float32 bfloat16" adds the paired A100
+#           arms; empty = FPGA arm only) QUAL_GPU512 QUAL_WIKITEXT_GPU POWER_FIXTURE_DIR
 #           VIVADO_SYNTH_JOBS VIVADO_IMPL_JOBS
 #           BUILD_CONSTRAINT BUILD_EXCLUDE BUILD_NODE (optional exceptional pin)
-#           BUILD_MEM BUILD_TIME ONCARD_TIME SKIP_ONCARD
+#           BUILD_CPUS (48 default) BUILD_MEM BUILD_TIME ONCARD_TIME SKIP_ONCARD
 #   data:   WEIGHTS DECODE_STATE DECODE_FIXTURE DECODE_GOLDEN LOGITS_REFERENCE
 #           GPU_LOGITS_REFERENCE
 #           exported here and forwarded to make by the on-card job. A packed-BF16
@@ -39,15 +44,16 @@ test -x "$SBATCH_BIN" || { echo "FATAL: ${SBATCH_BIN} not found; submit from a h
 TAG="${1:-hw_$(date +%Y%m%d_%H%M%S)_$$}"
 [[ "$TAG" =~ ^[A-Za-z0-9_-]+$ ]] || { echo 'FATAL: invalid job tag'; exit 2; }
 JOBS="${JOBS:-48}"
-HLS_FREQ="${HLS_FREQ:-200}"
-LINK_FREQ="${LINK_FREQ:-200}"
-HW_CFG_TEMPLATE="${HW_CFG_TEMPLATE:-hw_f200_p.cfg}"
+HLS_FREQ="${HLS_FREQ:-225}"
+LINK_FREQ="${LINK_FREQ:-225}"
+HW_CFG_TEMPLATE="${HW_CFG_TEMPLATE:-hw_f225_p_remap.cfg}"
 STATE_ADDRESS_GATE="${STATE_ADDRESS_GATE:-1}"
 REQUIRE_EXACT_CLOCK="${REQUIRE_EXACT_CLOCK:-1}"
 case "$HW_CFG_TEMPLATE" in
     hw_f150.cfg) want_link=150 ;;
     hw_f200.cfg) want_link=200 ;;
     hw_f200_p.cfg) want_link=200 ;;
+    hw_f225_p_remap.cfg) want_link=225 ;;
     *) want_link= ;;
 esac
 if [ -n "$want_link" ] && [ "$LINK_FREQ" != "$want_link" ]; then
@@ -76,9 +82,36 @@ BUILD_NODE="${BUILD_NODE:-}"
 # --exclusive is not possible under the build QoS (it would allocate all 128 CPUs
 # against the 48-CPU per-job cap); =user was accepted at 48.
 BUILD_EXCLUSIVE="${BUILD_EXCLUSIVE:-}"
+# BUILD_CPUS: the build job's allocation. The links use ~3 cores on average
+# (builds 8188/8236: 22-24 CPU-hours over 7.5-8.5 h; Vivado impl 8 threads,
+# synth 16 runs) and peak at ~74 GiB RSS, so a smaller request fits a busy
+# node; JOBS stays as set (it names the build directory).
+BUILD_CPUS="${BUILD_CPUS:-48}"
 BUILD_MEM="${BUILD_MEM:-192G}"
 BUILD_TIME="${BUILD_TIME:-2-00:00:00}"
 ONCARD_TIME="${ONCARD_TIME:-4:00:00}"
+# Since Iter88 every card-side job builds its host on its own node from the
+# frozen source snapshot (slurm/build_host_on_node.sh), so a host built on
+# acclnode01 (GLIBCXX_3.4.30) no longer bars harrier: ONCARD_EXCLUDE defaults
+# to empty and the card jobs take any node with a free U55C.
+ONCARD_EXCLUDE="${ONCARD_EXCLUDE-}"
+# Qualification chained after the card gates (Iter88: one command for the whole
+# flow).  QUAL=0 stops after the gates.  The drift and WikiText-2 job needs the
+# two GPU references (the 512-step logit dump of Iter66n and the WikiText-2 GPU
+# score of Iter66o, both regenerable with the scripts/ producers); the power job
+# needs the 4,096-token fixture (prepare_steady_decode_fixture.py +
+# export_fpga_handoff_state.py on a GPU) -- if it is missing, the power job
+# requests a GPU and generates it.  POWER_GPU_ARMS="float32 bfloat16" adds the
+# paired A100 arms (one GPU per user: they compete with other GPU jobs).
+QUAL="${QUAL:-1}"
+QUAL_TIME="${QUAL_TIME:-3:00:00}"
+POWER_TIME="${POWER_TIME:-1:30:00}"
+POWER_GPU_ARMS="${POWER_GPU_ARMS:-}"
+QUAL_GPU512="${QUAL_GPU512:-diagnostics/iter66n_long_horizon/gpu512.gdnlog}"
+QUAL_WIKITEXT_GPU="${QUAL_WIKITEXT_GPU:-diagnostics/iter66o_wikitext/wikitext_gpu_reference.json}"
+QUAL_WIKITEXT_FIXTURE="${QUAL_WIKITEXT_FIXTURE:-fixtures_full/wikitext.gdnreq}"
+POWER_FIXTURE_DIR="${POWER_FIXTURE_DIR:-diagnostics/power_fixture_4096}"
+export QUAL_GPU512 QUAL_WIKITEXT_GPU QUAL_WIKITEXT_FIXTURE POWER_FIXTURE_DIR POWER_GPU_ARMS
 WEIGHTS="${WEIGHTS:-artifacts/gdn-1.3b-bf16w.gdnw}"
 DECODE_FIXTURE="${DECODE_FIXTURE:-fixtures_decode/decode.gdnreq}"
 DECODE_STATE="${DECODE_STATE:-fixtures_decode/decode_ex0_native_bf16_product.gdnstate}"
@@ -99,10 +132,19 @@ printf '%s\n' "PENDING: Slurm build has not started; live tool output will repla
 echo "tag        : ${TAG}"
 echo "knobs      : JOBS=${JOBS} HLS_FREQ=${HLS_FREQ} LINK_FREQ=${LINK_FREQ}"
 echo "vivado     : SYNTH_JOBS=${VIVADO_SYNTH_JOBS} IMPL_JOBS=${VIVADO_IMPL_JOBS}"
+echo "allocation : ${BUILD_CPUS} CPUs, ${BUILD_MEM}"
 echo "constraint : ${BUILD_CONSTRAINT:-<none>}"
-echo "exclude    : ${BUILD_EXCLUDE:-<none>}"
+echo "exclude    : ${BUILD_EXCLUDE:-<none>} (build); ${ONCARD_EXCLUDE:-<none>} (card)"
+echo "qualify    : ${QUAL} (drift+WikiText-2: ${QUAL_GPU512}, ${QUAL_WIKITEXT_GPU}; power fixture ${POWER_FIXTURE_DIR}; GPU arms: ${POWER_GPU_ARMS:-<none>})"
 echo "build node : ${BUILD_NODE:-scheduler-selected}"
 echo "exclusive  : ${BUILD_EXCLUSIVE:-<shared node>}"
+# Iter81 (user decision 2026-10-08): the production reproduction accepts the shell's
+# HBM AXI clock scaled down to 440 MHz (the Iter79 option-1 hatch): closure at 450 is a
+# per-draw +-0.02 ns coin on the shell's own crossing pipes, not a property of the
+# netlist (links 7261 +0.000, 7323/7370 -0.021). GDN_HBM_MIN_MHZ= (empty) demands exact.
+GDN_HBM_MIN_MHZ="${GDN_HBM_MIN_MHZ-440}"
+export GDN_HBM_MIN_MHZ
+echo "hbm clock  : ${GDN_HBM_MIN_MHZ:+bounded auto-scaling, floor }${GDN_HBM_MIN_MHZ:-exact 450} MHz"
 echo "weights    : ${WEIGHTS}"
 echo "state      : ${DECODE_STATE}"
 echo "golden     : ${DECODE_GOLDEN}"
@@ -126,6 +168,22 @@ done
 if [ -n "${LOGITS_REFERENCE}" ] && [ ! -s "${LOGITS_REFERENCE}" ]; then
     echo "FATAL: LOGITS_REFERENCE set but missing: ${LOGITS_REFERENCE}" >&2
     exit 2
+fi
+POWER_NEEDS_GPU=0
+if [ "${QUAL}" = 1 ] && [ "${SKIP_ONCARD:-0}" != 1 ]; then
+    for required in "${QUAL_GPU512}" "${QUAL_WIKITEXT_GPU}" "${QUAL_WIKITEXT_FIXTURE}"; do
+        if [ ! -s "${required}" ]; then
+            echo "FATAL: qualification reference missing: ${required} (QUAL=0 skips the qualification)" >&2
+            exit 2
+        fi
+    done
+    for f in prompt_4096.gdnstate fpga_stream_4097.tokens prompt_4096.tokens teacher_4096.tokens; do
+        [ -s "${POWER_FIXTURE_DIR}/${f}" ] || POWER_NEEDS_GPU=1
+    done
+    [ -n "${POWER_GPU_ARMS}" ] && POWER_NEEDS_GPU=1
+    if [ "${POWER_NEEDS_GPU}" = 1 ]; then
+        echo "note: the power job will request an A100 (fixture to generate and/or GPU arms requested)"
+    fi
 fi
 
 # Pre-flight: the user is capped at one FPGA across all jobs at once. An idle
@@ -152,16 +210,19 @@ snapshot_files=(
     hw_f150_physical_islands.cfg apply_f150_physical_islands.tcl
     apply_iter54_dma_timing.tcl apply_iter35_dma_w15_fifoaddr_fanout.tcl
     apply_iter23_dma_fanout.tcl check_f150_physical_islands.tcl
-    report_final_qor.tcl check_native_bf16_xo.py reconcile_exact_clock.py
+    report_final_qor.tcl check_native_bf16_xo.py check_island_names.py reconcile_exact_clock.py
     hw_f150.cfg apply_iter69_kernel_clock_f150.tcl
     hw_a200.cfg hw_a200_r2.cfg apply_a200_islands.tcl apply_a200_pinned_cut.tcl
     hw_a200_r3.cfg apply_a200_control_fanout.tcl
     apply_iter75d_control_fanout.tcl check_iter75d_final_timing.tcl
     finish_f150_timing.tcl run_hw_sbatch.sh slurm/hw_build.slurm slurm/hw_oncard.slurm
+    slurm/build_host_on_node.sh slurm/hw_robustness.slurm slurm/hw_power.slurm
     # Iter79 production recipe (three kernels, 200 MHz): the link template, its
     # OPT_DESIGN.PRE / TCL.POST hooks and the files those hooks source.
     hw_f200_p.cfg apply_p_islands.tcl apply_p_islands_body.tcl
     finish_p_timing.tcl check_p_final_timing.tcl
+    # Iter88 production recipe: the same hooks, the HBM channels re-mapped.
+    hw_f225_p_remap.cfg
 )
 if [ -n "${REUSE_XO:-}" ]; then
     test -s "$REUSE_XO" && test -d "${REUSE_XO_REFERENCE:-}" || {
@@ -171,7 +232,7 @@ if [ -n "${REUSE_XO:-}" ]; then
     snapshot_files+=(prepare_reused_xo.py)
 fi
 if [ "${STATE_ADDRESS_GATE:-0}" = 1 ]; then
-    snapshot_files+=(gdn_eval.cpp all_bf16_layout_test.cpp check_state_writer_addresses.py)
+    snapshot_files+=(gdn_eval.cpp all_bf16_layout_test.cpp check_state_writer_addresses.py check_state_reader_addresses.py check_tails_writer_addresses.py)
 fi
 # A variant build (HW_CFG_TEMPLATE=... and/or extra hook Tcl) must freeze its
 # extra inputs too: EXTRA_SNAPSHOT_FILES="fileA fileB" appends to the list.
@@ -180,7 +241,12 @@ if [ -n "${EXTRA_SNAPSHOT_FILES:-}" ]; then
         snapshot_files+=("${extra}")
     done
 fi
-snapshot_files+=("${HW_CFG_TEMPLATE}")
+# The chosen link template (skipped when the base list already names it).
+cfg_listed=0
+for existing in "${snapshot_files[@]}"; do
+    [ "$existing" = "${HW_CFG_TEMPLATE}" ] && { cfg_listed=1; break; }
+done
+[ "$cfg_listed" = 1 ] || snapshot_files+=("${HW_CFG_TEMPLATE}")
 # Every Tcl/Python hook the chosen link template names as @C_IMPL_DIR@/<file>
 # travels with it (Iter77 S2: the 200 MHz template's own hooks were missing
 # from the frozen snapshot and the link failed at OPT_DESIGN.TCL.PRE).
@@ -203,7 +269,8 @@ tar -cf "${SNAPSHOT_PATH}" "${snapshot_files[@]}"
 sha256sum "${snapshot_files[@]}" > "${DIAG}/source_hashes.txt"
 sha256sum "${SNAPSHOT_PATH}" > "${DIAG}/source_snapshot.sha256"
 # Freeze job scripts as well: sbatch captures each script when submitted.
-cp slurm/hw_build.slurm slurm/hw_oncard.slurm "$DIAG/"
+cp slurm/hw_build.slurm slurm/hw_oncard.slurm slurm/hw_robustness.slurm slurm/hw_power.slurm \
+   slurm/build_host_on_node.sh "$DIAG/"
 cp ../scripts/check_gdn_c_parity.py "$DIAG/check_gdn_c_parity.py"
 sha256sum "$DIAG/check_gdn_c_parity.py" >> "$DIAG/source_hashes.txt"
 export SNAPSHOT_PATH
@@ -226,11 +293,11 @@ build_id="$("$SBATCH_BIN" --parsable \
     --job-name="${TAG}_build" \
     --chdir="$C_IMPL" \
     "${build_placement_args[@]}" \
-    --cpus-per-task=48 \
+    --cpus-per-task="$BUILD_CPUS" \
     --mem="$BUILD_MEM" \
     --time="$BUILD_TIME" \
     --output="${C_IMPL}/${DIAG}/build.slurm-%j.log" \
-    --export=ALL,TAG="$TAG",JOBS="$JOBS",HLS_FREQ="$HLS_FREQ",LINK_FREQ="$LINK_FREQ",SUBMIT_C_IMPL="$C_IMPL",SNAPSHOT_PATH="$SNAPSHOT_PATH" \
+    --export=ALL,TAG="$TAG",JOBS="$JOBS",BUILD_MIN_CPUS="$BUILD_CPUS",HLS_FREQ="$HLS_FREQ",LINK_FREQ="$LINK_FREQ",SUBMIT_C_IMPL="$C_IMPL",SNAPSHOT_PATH="$SNAPSHOT_PATH" \
     "$DIAG/hw_build.slurm")"
 printf '%s\n' "$build_id" > "$DIAG/build.job_id"
 echo
@@ -246,11 +313,42 @@ else
         --time="$ONCARD_TIME" \
         --dependency="afterok:${build_id}" \
         --kill-on-invalid-dep=yes \
+        ${ONCARD_EXCLUDE:+--exclude="${ONCARD_EXCLUDE}"} \
         --output="${C_IMPL}/${DIAG}/oncard.slurm-%j.log" \
         --export=ALL,TAG="$TAG",JOBS="$JOBS",HLS_FREQ="$HLS_FREQ",LINK_FREQ="$LINK_FREQ" \
         "$DIAG/hw_oncard.slurm")"
     printf '%s\n' "$oncard_id" > "$DIAG/oncard.job_id"
     echo "oncard job ${oncard_id}  -> ${DIAG}/oncard.slurm-${oncard_id}.log   (afterok:${build_id})"
+    if [ "${QUAL}" = 1 ]; then
+        mkdir -p "$DIAG/qual"
+        robust_id="$("$SBATCH_BIN" --parsable \
+            --job-name="${TAG}_robustness" \
+            --chdir="$C_IMPL" \
+            --time="$QUAL_TIME" \
+            --dependency="afterok:${oncard_id}" \
+            --kill-on-invalid-dep=yes \
+            ${ONCARD_EXCLUDE:+--exclude="${ONCARD_EXCLUDE}"} \
+            --output="${C_IMPL}/${DIAG}/robustness.slurm-%j.log" \
+            --export=ALL,TAG="$TAG",SUBMIT_C_IMPL="$C_IMPL" \
+            "$DIAG/hw_robustness.slurm")"
+        printf '%s\n' "$robust_id" > "$DIAG/robustness.job_id"
+        echo "qual   job ${robust_id}  -> ${DIAG}/robustness.slurm-${robust_id}.log   (afterok:${oncard_id}; drift + WikiText-2)"
+        power_gres="fpga:u55c:1"
+        [ "${POWER_NEEDS_GPU}" = 1 ] && power_gres="gpu:a100:1,fpga:u55c:1"
+        power_id="$("$SBATCH_BIN" --parsable \
+            --job-name="${TAG}_power" \
+            --chdir="$C_IMPL" \
+            --time="$POWER_TIME" \
+            --gres="$power_gres" \
+            --dependency="afterok:${oncard_id}" \
+            --kill-on-invalid-dep=yes \
+            ${ONCARD_EXCLUDE:+--exclude="${ONCARD_EXCLUDE}"} \
+            --output="${C_IMPL}/${DIAG}/power.slurm-%j.log" \
+            --export=ALL,TAG="$TAG",SUBMIT_C_IMPL="$C_IMPL" \
+            "$DIAG/hw_power.slurm")"
+        printf '%s\n' "$power_id" > "$DIAG/power.job_id"
+        echo "power  job ${power_id}  -> ${DIAG}/power.slurm-${power_id}.log   (afterok:${oncard_id}; gres ${power_gres})"
+    fi
 fi
 
 echo

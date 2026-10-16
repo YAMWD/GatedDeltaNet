@@ -51,7 +51,11 @@ def testbench(top, ports, port, allow_direct=False):
     for direction, _, name in ports:
         if direction != "input" or name == "ap_clk":
             continue
-        value = "1" if name.endswith(("_empty_n", "_TVALID", "_AWREADY", "_WREADY", "_BVALID")) or name == "ap_continue" else "0"
+        # Input FIFOs always hold data, output FIFOs (scalar copies HLS threads
+        # through the writer in a diagnostic wrapper, Iter81 probe builds) are
+        # never full, AXI slaves are always ready; the production writer has no
+        # output FIFO, so this changes nothing for it.
+        value = "1" if name.endswith(("_empty_n", "_full_n", "_TVALID", "_AWREADY", "_WREADY", "_BVALID")) or name == "ap_continue" else "0"
         if name.endswith(("_num_data_valid", "_fifo_cap")):
             value = "4096" if name.startswith("state_wr") else "1"
         initialize.append(f"{name} = {value};")

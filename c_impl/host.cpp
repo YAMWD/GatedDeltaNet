@@ -186,6 +186,10 @@ struct Options {
      * token offline. A worst-step aggregate is a maximum and is blind to a
      * slow upward trend, which is exactly the question at 512 tokens. */
     std::string logits_dump_path;
+#ifdef GDN_CALL_PROBE
+    /* Iter81 call-timeline probe: per-step records from the SLR2 kernel's probe tail. */
+    std::string probe_dump_path;
+#endif
     /* Teacher-forced scoring mode (WikiText perplexity). Selected by
      * --score; the fixture must be kind=3. */
     bool score_mode = false;
@@ -287,6 +291,13 @@ static Options parse_options(int argc, char **argv) {
                 throw std::runtime_error("--dump-state requires a path");
             }
             opts.state_dump_path = argv[++arg_index];
+#ifdef GDN_CALL_PROBE
+        } else if (arg == "--dump-probe") {
+            if (arg_index + 1 >= argc) {
+                throw std::runtime_error("--dump-probe requires a path");
+            }
+            opts.probe_dump_path = argv[++arg_index];
+#endif
         } else if (arg == "--score") {
             opts.score_mode = true;
         } else if (arg == "--score-doc-limit") {
@@ -785,6 +796,10 @@ static bool gdn_wait_run(xrt::run &r, const char *what) {
     return false;
 }
 
+#ifdef GDN_CALL_PROBE
+static FILE *gdn_probe_dump_file = nullptr;
+#endif
+
 class HwRunner {
 public:
     HwRunner(xrt::device &device, const xrt::uuid &uuid, const ModelData &model)
@@ -811,8 +826,8 @@ public:
         const size_t state_stripe_bytes =
             static_cast<size_t>(GDN_RECURRENT_STATE_STRIPE_BF16_BEATS) *
             sizeof(Beat512);
-        const size_t aux_floats = gdn_aux_weight_floats(&model.config);
-        const size_t aux_bytes = aux_floats * sizeof(float);
+        const size_t aux_beats = gdn_aux_image_beats(&model.config);
+        const size_t aux_bytes = aux_beats * sizeof(Beat512);
         // step 4 Stage B arg order: 0=aux_weights, 1=workspace, 2..33=weight_mm0..31.
         weight_bos_.reserve(GEMV_CHANNELS);
         for (int c = 0; c < GEMV_CHANNELS; ++c) {
@@ -821,6 +836,11 @@ public:
                 c < GDN_RECURRENT_STATE_FIRST_PORT + GDN_RECURRENT_STATE_PORTS) {
                 extra_bytes = state_stripe_bytes;
             }
+#ifdef GDN_CALL_PROBE
+            if (c >= GDN_RECURRENT_STATE_FIRST_PORT &&
+                c < GDN_RECURRENT_STATE_FIRST_PORT + GDN_RECURRENT_STATE_PORTS)
+                extra_bytes += (size_t)GDN_PROBE_ALLOC_BEATS * sizeof(Beat512);
+#endif
             weight_bos_.emplace_back(device, shard_bytes + extra_bytes,
                                      port_group(c));
         }
@@ -842,7 +862,13 @@ public:
             throw std::runtime_error("loaded model shape != compiled-in GDN-1.3B kernel shape");
         }
         workspace_bo_ = xrt::bo(device,
-            static_cast<size_t>(GDN_WS_FLOATS) * sizeof(float), kernel_.group_id(1));
+            static_cast<size_t>(GDN_WS_FLOATS) * sizeof(float)
+#ifdef GDN_CALL_PROBE
+            /* Iter82: the control kernel's probe records live in a tail
+             * after the workspace proper (GDN_WS_PROBE_BEAT_OFF). */
+            + (size_t)GDN_PROBE_ALLOC_BEATS * sizeof(Beat512)
+#endif
+            , kernel_.group_id(1));
 
         /* Evaluation-only branch snapshots. Keep each backup beside the
          * corresponding live state allocation so xrt::bo::copy can use the
@@ -883,8 +909,11 @@ public:
                 sync_bo_chunked(weight_bos_[c], XCL_BO_SYNC_BO_TO_DEVICE,
                                 shard_bytes, 0);
             }
-            std::vector<float> aux(aux_floats);
-            gdn_build_aux_weights(model.weight_data.data(), &model.config, aux.data());
+            std::vector<Beat512> aux(aux_beats);
+            gdn_build_aux_image(model.weight_data.data(), &model.config, aux.data());
+            if (gdn_validate_aux_image(aux.data(), model.weight_data.data(),
+                                       &model.config) != 0)
+                throw std::runtime_error("packed aux-weight image failed validation");
             aux_weight_bo_.write(aux.data(), aux_bytes, 0);
             sync_bo_chunked(aux_weight_bo_, XCL_BO_SYNC_BO_TO_DEVICE, aux_bytes, 0);
         }
@@ -1281,6 +1310,47 @@ public:
         std::cerr << "[state_dump] wrote " << path << "\n";
     }
 
+#ifdef GDN_CALL_PROBE
+    /* Iter81/82: read both kernels' per-call probe records after a step and
+     * append them as text: step kernel call record event port tag cycle
+     * (kernel 1 = control, from the workspace tail; 2 = SLR2, from port
+     * 31's tail).  A record is event[63:56] port[55:48] tag[47:40]
+     * cycle[39:0]; the counter-end record (event 7) carries the number of
+     * events seen in [55:40], printed in the port column. */
+    static void dump_probe_words(FILE *out, uint32_t step, unsigned kernel,
+                                 const std::vector<uint64_t> &words) {
+        for (uint32_t call = 0; call < GDN_PROBE_CALLS; ++call) {
+            for (uint32_t r = 0; r < GDN_PROBE_RECORDS_PER_CALL; ++r) {
+                const uint64_t v = words[(size_t)call * GDN_PROBE_RECORDS_PER_CALL + r];
+                if (v == 0) continue;
+                const unsigned event = (unsigned)(v >> 56);
+                unsigned port = (unsigned)((v >> 48) & 0xffu);
+                unsigned tag = (unsigned)((v >> 40) & 0xffu);
+                if (event == 7u) { port = (unsigned)((v >> 40) & 0xffffu); tag = 0; }
+                std::fprintf(out, "%u %u %u %u %u %u %u %llu\n", step, kernel, call, r,
+                             event, port, tag,
+                             (unsigned long long)(v & 0xffffffffffULL));
+            }
+        }
+    }
+    void dump_call_probe(FILE *out, uint32_t step) {
+        const size_t bytes = (size_t)GDN_PROBE_BEATS * sizeof(Beat512);
+        std::vector<uint64_t> words(bytes / sizeof(uint64_t));
+        {
+            const size_t off = (size_t)GDN_WS_PROBE_BEAT_OFF * sizeof(Beat512);
+            sync_bo_chunked(workspace_bo_, XCL_BO_SYNC_BO_FROM_DEVICE, bytes, off);
+            workspace_bo_.read(words.data(), bytes, off);
+            dump_probe_words(out, step, 1u, words);
+        }
+        {
+            const size_t off = (size_t)GDN_PROBE_BEAT_OFF * sizeof(Beat512);
+            sync_bo_chunked(weight_bos_[31], XCL_BO_SYNC_BO_FROM_DEVICE, bytes, off);
+            weight_bos_[31].read(words.data(), bytes, off);
+            dump_probe_words(out, step, 2u, words);
+        }
+        std::fflush(out);
+    }
+#endif
     // Full pre-argmax logit vector the kernel streamed out this step.
     const float *device_logits() const { return logits_host_.data(); }
     bool logits_valid() const { return logits_valid_; }
@@ -1668,6 +1738,9 @@ static std::vector<DecodeExample> run_decode_hw(
         result.launch_ms[step] = timing.launch_seconds * 1000.0;
         result.kernel_ms[step] = ksec * 1000.0;
         result.token_d2h_ms[step] = timing.token_d2h_seconds * 1000.0;
+#ifdef GDN_CALL_PROBE
+        if (gdn_probe_dump_file != nullptr) runner.dump_call_probe(gdn_probe_dump_file, step);
+#endif
         if (!logits_reference_path.empty() && logits_parity != nullptr) {
             const float *reference = logits_reference.values.data() +
                 static_cast<size_t>(step - 1) * model.config.vocab_size;
@@ -2591,6 +2664,14 @@ int main(int argc, char **argv) {
             LogitsParity *gpu_logits_parity_ptr =
                 opts.gpu_logits_reference_path.empty()
                     ? nullptr : &gpu_logits_parity;
+#ifdef GDN_CALL_PROBE
+            if (!opts.probe_dump_path.empty()) {
+                gdn_probe_dump_file = std::fopen(opts.probe_dump_path.c_str(), "w");
+                if (gdn_probe_dump_file == nullptr)
+                    throw std::runtime_error("cannot create probe dump: " + opts.probe_dump_path);
+                std::fprintf(gdn_probe_dump_file, "# step kernel call record event port tag cycle\n");
+            }
+#endif
             std::vector<DecodeExample> results =
                 run_decode_hw(model, runner, fixture, opts.decode_len,
                               opts.state_path, opts.logits_reference_path,

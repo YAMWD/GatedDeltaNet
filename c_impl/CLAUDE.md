@@ -2,12 +2,14 @@
 
 Loads only when working under `c_impl/`. Project-wide guidance (the real-data principle, build
 commands, the iteration workflow, commit discipline, current status) stays in the root `CLAUDE.md`.
-`doc/architecture.md` is the authoritative spec (currently the **200 MHz three-kernel image of the Iter79
-campaign**, promoted 2026-10-04: the Iter76 datapath — all-BF16 weights and state, a native `ap_float<16,8>`
-product, free-running cluster pipelines, on-chip strict argmax, five-phase II=1 recurrent read, the Iter73b2/75b
-state-writer and cluster-emit changes — compiled into three kernels, one per SLR, joined by seven data-only
-AXI-Stream links; 12.350 ms/token production TPOT / 12.227 ms kernel on card. The 150 MHz Iter76 monolith,
-16.255 / 16.131 ms, is the predecessor). `README.md`
+`doc/architecture.md` is the authoritative spec (currently the **225 MHz three-kernel image with
+the re-mapped HBM channels, Iter88**, promoted 2026-10-15: the Iter82–87 datapath and schedule —
+the Iter81 balanced-island image plus the packed aux image, the deferred state write-back, the
+fused residual + RMSNorm and SwiGLU-in-the-store, the per-head output norm and convolution-tail
+writer in the QKVG region, the tail writes held until port 0's weights are read — linked at a true
+4.444 ns with the SLR2 kernel on HBM[2..9] and the SLR0 kernel's ports 2–9 on HBM[24..31];
+8.233 ms/token production TPOT / 8.141 ms kernel on acclnode01's card (build 10440, the one-command verification run). The 200 MHz Iter82–87
+image, 8.484 / 8.361 ms on the same card, is the predecessor). `README.md`
 in this directory is current — it was rewritten for the decode-only design; the earlier note calling it
 stale was wrong.
 
@@ -50,9 +52,44 @@ stale was wrong.
     **Invariant 24 (`doc/architecture.md`):** no `disable_start_propagation` on a region whose single-loop
     processes write a stream that leaves the region — HLS auto-rewinds the loop and the region never
     reports done. `WARNING: [HLS 200-656]` is a build blocker; csim cannot see this class.
-  - Other submodules: `gdn_rmsnorm_rows`, `gdn_gemv_tiny` (the two tiny a/b gate projections),
+    **Invariant 26:** every `m_axi` address built from a runtime layer offset uses the state writer's form (the
+    original base plus a complete `ap_uint<64>` index, the offset add registered); Vivado synthesis folds a
+    narrower signed offset 128 MiB low on both the write (Iter75) and the read side (Iter81), with correct HLS
+    RTL, so `check_state_writer_addresses.py` and `check_state_reader_addresses.py` gate it before every link.
+  - **Iter81 (SLR2 kernel only):** the islands are `gdn_recurrent_attention_island_p<I>` — three dataflow
+    processes `gdn_island_prep` / `gdn_island_read` / `gdn_island_update` with an 8,192-word URAM replay FIFO,
+    non-blocking reads of the full-window state queues, the update products bound `maxdsp latency=4` and the
+    delta loop `II=4 style=frp` — and the state readers `gemv32_mm2s_with_state_p<28..31>` prefetch the layer's
+    4,096 state beats before the call's 16,384 weight beats; **Iter84:** each state writer drains its 4,096-deep
+    URAM queue only after a one-token `wr_go` stream from its reader's weight loop (the write-back no longer shares
+    ports 28–31 with the weight stream). `slr2_region_cosim/` is the one-call RTL cosim of that region (deadlock
+    detector + bit-exact C/RTL compare) to run before any link that changes its process graph. The monolith keeps `gdn_recurrent_attention_island`
+    and `gemv32_mm2s_with_state`. `-DGDN_CALL_PROBE=1` (`VPP_DEFINES="-D GDN_CALL_PROBE=1"
+    HOST_DEFINES=-DGDN_CALL_PROBE=1 make run_hw`) adds the Iter82 dual-kernel call probe: data-dependent event
+    stamps (a tag byte of the beat they mark, so the scheduler cannot hoist them — `check_stamp_schedule.py`
+    verifies the csynth schedule) from the processes of both GEMV regions, one counter per kernel (32 records
+    per call in four beats: the SLR2 kernel's through the state writers' tails on ports 28–31, the control
+    kernel's through the workspace tail at `GDN_WS_PROBE_BEAT_OFF`), read back by `host.exe --dump-probe` and
+    decomposed by `analyze_call_probe.py`; it is compiled out of every production build (token-identical
+    preprocessed source) and `gdn_eval` never gets it.
+  - Other submodules: `gdn_rmsnorm_rows_bf16` (layer 0's attention norm of the embedding row),
+    `gdn_residual_rmsnorm_bf16` (the residual add fused with the following RMSNorm — one pass forms the
+    rounded sum beats and their sum of squares, then the scale pass; after o_proj and after MLP-down, the
+    final norm after layer 23; Iter85), `gdn_gemv_tiny_ab` (both tiny a/b gate projections in one II=1
+    loop over the packed image; Iter83),
     `gdn_depthwise_conv_silu`, `gdn_recurrent_attention` (gated delta rule, head-local fused state
-    buffer), `gdn_output_norm_and_gate`, `gdn_swiglu_inplace`.
+    buffer), `gdn_output_norm_and_gate` (monolith only since Iter86); the SwiGLU is evaluated inside
+    `gemv32_store`'s fill loop for the GU shape and written out in the down projection's layout (Iter85;
+    the separate SwiGLU and unpack passes are gone).
+  - **Iter86 (control kernel's QKVG region):** `gdn_attn_norm_gate` normalizes and gates each head as its
+    attention arrives from the SLR2 kernel (gate beats from the consumer's `gate_stream`, the layer's o_norm
+    weight from an 8-beat array loaded before the call) into `attn_out`, copied into the engine's input after
+    the region; `gdn_tails_writer` is the region's only mm0 writer — the consumer streams each head's old tail
+    rows 1–2 and new raw row (72 beats) and the writer stores them at the tails' addresses with the
+    invariant-26 form (and, in probe builds, the control counter's four record beats).
+    `slr2_region_cosim/ctrl/` is the one-call RTL cosim of the control region (zero activations so every
+    output compares bit-exactly); `check_tails_writer_addresses.py` gates the writer's synthesized addresses
+    (HLS RTL, post-synth, post-opt) in every `make run_hw` build (`tails_gate.exit`).
   - **No embedding-lookup or argmax module exists, by design.** The 32000×2048 embedding table stays
     in *host* memory and `host.cpp` writes the selected row straight into `workspace[X]`. The greedy
     argmax is *fused into the LM-head store stage* (`gemv32_argmax_*` labels inside `gemv32_store`),
@@ -70,7 +107,7 @@ stale was wrong.
   falls back to the monolith `gdn_forward`), maps each weight buffer to the bank of the master that reads it
   (`port_group`), starts the two GEMV kernels before the control kernel and waits for all three;
   `GDN_KERNEL_WAIT_TIMEOUT_MS` (diagnostic, default off) bounds the wait and reads the recurrent-state
-  stripes back to name the last layer written. It builds the 32 compact weight shards and the compact aux-weight image from
+  stripes back to name the last layer written. It builds the 32 compact weight shards and the packed-BF16 aux-weight image (Iter83, `gdn_build_aux_image` + `gdn_validate_aux_image`, 2.97 MB) from
   the flat blob, allocates one `xrt::bo` per kernel arg on disjoint HBM banks, uploads the 32 packed-BF16 shards (2.799 GB, exactly the dense weight bytes with no padding) plus the aux image via
   `sync_bo_chunked`, loads the `.gdnstate` into the resident state BOs, then decodes token-by-token,
   emitting the same JSON schema as `gdn_eval`. **`kSyncChunk` is 8 MiB**: a 16 MiB `bo.sync()` at a

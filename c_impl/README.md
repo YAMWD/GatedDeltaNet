@@ -27,7 +27,7 @@ them first; everything else in the chain is committed.
 python scripts/export_gdn_c.py weights            # 5.87 GB BF16-exact .gdnw
 sbatch scripts/export_all_bf16_reference.slurm    # GPU logits + .gdnstate handoff
 sbatch scripts/run_all_bf16_native_reference.slurm  # optional: native diagnostic
-cd c_impl && bash run_hw_sbatch.sh <tag>          # build + on-card, two chained jobs
+cd c_impl && make run_hw                          # ONE command: build -> card gates -> drift + WikiText-2 -> power (chained Slurm jobs)
 ```
 
 `GPU_LOGITS_REFERENCE` is a required on-card gate input; `LOGITS_REFERENCE`
@@ -42,13 +42,15 @@ clone*.
 | `gdn_model.cpp`, `gdn_model.h` | Synthesizable kernel and native support code |
 | `gdn_eval.cpp` | Decode-only native correctness driver |
 | `host.cpp` | XRT host and on-card full-logit validation |
-| `Makefile` | Native, the three kernel XOs, XCLBIN, host, and complete `run_hw` flow (`xo_mono`/`xclbin_mono` for the retired monolith) |
+| `Makefile` | Native, the three kernel XOs, XCLBIN, host, and the complete `run_hw` flow — build, card gates and the chained qualification from one command (`xo_mono`/`xclbin_mono` for the retired monolith) |
 | `test.tcl` | Integrated HLS synthesis entry point |
 | `hls_gdn_forward.tcl` | HLS interface and RTL configuration |
-| `hw_f200_p.cfg` | Production 200 MHz three-kernel connectivity and physical hooks (`apply_p_islands.tcl`, `finish_p_timing.tcl`, `check_p_final_timing.tcl`); `hw_f150.cfg` is the retired 150 MHz monolith recipe for A/B |
+| `hw_f225_p_remap.cfg` | Production 225 MHz three-kernel connectivity (the SLR2 kernel on HBM[2..9], the SLR0 kernel's ports 2–9 on HBM[24..31]) and physical hooks (`apply_p_islands.tcl`, `finish_p_timing.tcl`, `check_p_final_timing.tcl`); `hw_f200_p.cfg` is the 200 MHz Iter79–87 recipe with the original map, `hw_f150.cfg` the retired 150 MHz monolith recipe, both for A/B |
 | `reconcile_exact_clock.py` | Fail-closed DATA_CLK metadata reconciliation after the link |
-| `run_hw_sbatch.sh` | Slurm build/test submission wrapper |
-| `slurm/` | Build and U55C test job definitions |
+| `check_state_writer_addresses.py`, `check_state_reader_addresses.py` | Fail-closed synthesized-address gates on the SLR2 state writers and readers (HLS RTL, post-synthesis, post-opt) |
+| `check_island_names.py` | Fail-closed pre-link gate: the floorplan's island cell names and any new HLS 200-656 |
+| `run_hw_sbatch.sh` | Slurm submission wrapper: build → card gates → qualification, chained with `afterok` (`QUAL=0` stops after the gates) |
+| `slurm/` | `hw_build.slurm`, `hw_oncard.slurm` (gates), `hw_robustness.slurm` (512-token drift, WikiText-2), `hw_power.slurm` (power/energy), `build_host_on_node.sh` (each card-side job builds its host on its own node from the frozen snapshot) |
 
 ## Native verification
 

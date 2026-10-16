@@ -194,11 +194,13 @@ cd c_impl
 bash run_hw_sbatch.sh
 ```
 
-The wrapper freezes a source snapshot, creates separate build and FPGA jobs
-and chains the test with `afterok`; `make -C c_impl run_hw` on the login node
-invokes the same wrapper. The flow builds the three kernels of the production
-image, closes them at 200 MHz and validates the image on the card (see
-`c_impl/doc/reproduce_f200.md`). Run
+The wrapper freezes a source snapshot and submits the whole flow as chained
+Slurm jobs: the build, the `afterok` card gates, and the `afterok`
+qualification (512-token drift, WikiText-2 perplexity, and the power/energy
+run); `make -C c_impl run_hw` on the login node is the one command that does
+all of it. The flow builds the three kernels of the production image, closes
+them at a true 225 MHz with the HBM channels re-mapped, validates the image on
+the card and qualifies it (see `c_impl/doc/reproduce_f225.md`). Run
 `make -C c_impl help` for the current weight, state, logit-reference, clock,
 device, and output options.
 
@@ -209,8 +211,10 @@ diagnostic reports are generated artifacts and are intentionally not committed.
 
 - `c_impl/doc/README.md` — **start here**; says which document is current.
 - `c_impl/doc/architecture.md` — current top-level architecture and ABI
-  (the 200 MHz three-kernel production image: 12.350 ms/token production
-  TPOT and 12.227 ms kernel on card, 0.717 J/token gross).
+  (the 225 MHz three-kernel image with the re-mapped HBM channels, Iter88:
+  8.233 ms/token production TPOT and 8.141 ms kernel on card, −2.6 % versus the
+  200 MHz Iter82–87 image on the same card at unchanged energy per token;
+  promoted 2026-10-15).
 - `c_impl/doc/gpu_latency_energy_evaluation.md` — the GPU latency and energy
   arm, from a fresh clone.
 - `c_impl/doc/decode_disaggregated_gemv.md` — 32-port GEMV engine.

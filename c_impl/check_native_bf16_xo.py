@@ -318,7 +318,9 @@ def main() -> int:
     )
     state_owner_reports = reports(
         dirs,
-        r"gemv32_mm2s_with_state_\d+_Pipeline_gemv32_state_owner_"
+        # Iter81: the three-kernel build uses the prefetch-first owner
+        # gemv32_mm2s_with_state_p; the monolith keeps gemv32_mm2s_with_state.
+        r"gemv32_mm2s_with_state(?:_p)?_\d+_Pipeline_gemv32_state_owner_"
         r"(?:weight|weight_only|prefetch)_csynth\.xml",
     )
     reader_reports = port0_reports + ordinary_reports + state_owner_reports
@@ -374,15 +376,23 @@ def main() -> int:
     }
     summary["state_prefetch_trip_counts"] = prefetch_trips
     summary["qkvg_weight_trip_counts"] = qkvg_weight_trips
-    if len(prefetch_trips) != 4 or any(value != [512] for value in prefetch_trips.values()):
+    # Iter81 Stage A: the three-kernel owner fetches the whole layer's state
+    # (8 heads x 512 = 4096 beats) before all 16384 QKVG weight beats; the
+    # monolith keeps the per-head interleave (512 state after 2048 weights).
+    # Iter81: the three-kernel owner fetches the layer's 4,096 state beats in one
+    # loop with the state writer's 64-bit address form, then 16,384 weight beats;
+    # the monolith keeps 512 state beats after each head's 2,048 weight beats.
+    want_prefetch, want_weight = ([4096], [16384]) if partitioned else ([512], [2048])
+    summary["state_owner_schedule"] = "layer-prefetch-first" if partitioned else "per-head"
+    if len(prefetch_trips) != 4 or any(value != want_prefetch for value in prefetch_trips.values()):
         failures.append(
-            f"state prefetch is not exactly 512 beats/head/port: {prefetch_trips}"
+            f"state prefetch is not exactly {want_prefetch[0]} beats/port: {prefetch_trips}"
         )
     if len(qkvg_weight_trips) != 4 or any(
-        value != [2048] for value in qkvg_weight_trips.values()
+        value != want_weight for value in qkvg_weight_trips.values()
     ):
         failures.append(
-            f"QKVG state-owner weight phase is not exactly 2048 beats: {qkvg_weight_trips}"
+            f"QKVG state-owner weight phase is not exactly {want_weight[0]} beats: {qkvg_weight_trips}"
         )
 
     gemv_rpt = (

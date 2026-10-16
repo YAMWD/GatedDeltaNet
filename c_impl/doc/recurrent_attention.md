@@ -1,30 +1,38 @@
 # Optimised Recurrent Attention
 
-**Status:** Active decode compute block, current as of **Iter79**
-(2026-10-04): the block is unchanged since Iter66e/Iter73a in arithmetic and
-schedule, but it now lives in the SLR2 kernel `gdn_k_slr2` of the three-kernel
-production image. Its convolved Q/K/V arrive over the `conv_to_slr2` stream
-link (192 beats per QKVG call) and the per-head gate scalars over
-`scalars_to_slr2` (2 beats); the two islands' merged attention leaves over
-`attn_from_slr2` (64 beats) through `gdn_recurrent_merge_islands_stream`
-instead of a memory write. Because that merge writes a stream, HLS auto-rewinds
-its loop and counts it toward the region's completion, so the islands' dataflow
-region `gdn_recurrent_attention_islands_dataflow_p` runs **with start
-propagation on** — the one source change the partition needed; without it the
-first 200 MHz image hung after layer 0's state write-back (HLS warning
-200-656, `architecture.md` invariant 24). The prefill and v1--v7 synthesis
-discussions later in this document are historical.
+**Status:** Active decode compute block, current as of **Iter81**
+(promoted 2026-10-08): the block lives in the SLR2 kernel
+`gdn_k_slr2` of the three-kernel 200 MHz image, where its convolved Q/K/V
+arrive over the `conv_to_slr2` stream link (192 beats per QKVG call), the
+per-head gate scalars over `scalars_to_slr2` (2 beats), and the two islands'
+merged attention leaves over `attn_from_slr2` (64 beats). Since Iter81 each
+island is a **three-stage head pipeline** — `gdn_island_prep`,
+`gdn_island_read`, `gdn_island_update` inside
+`gdn_recurrent_attention_island_p<ISLAND>` — whose stages overlap across
+heads, and the four state readers fetch the layer's state before the call's
+weights. The arithmetic is unchanged since Iter66e/Iter73a (every value is the
+original expression with the original operands in the original order; native
+A/B over 819,200 state beats, RTL against RTL and the on-card vector gate all
+agree bit for bit). The islands' dataflow region keeps start propagation on
+(`architecture.md` invariant 24).
 
-**This block is now the second-largest consumer of the token and the largest
-one that did not shrink when the weights went BF16.** At 43,427 cycles per
-layer x 24 layers = **1.042M cycles, it is 40.7% of the measured 2.5625M-cycle
-token.** While weights were FP32 it was ~25%; halving the weight bytes did not
-touch it, so its share grew. Any further optimisation campaign should cost
-levers against this number, not against the block's share of HBM bytes.
+**The block no longer paces the token.** Through Iter79 the serial island ran
+4,887 cycles per head = 39,100 per QKVG call against a 16,384-beat weight
+stream (43,427 cycles per layer with the state copy; 1.042M cycles, 40.7 % of
+the 2.5625M-cycle Iter66e token). The pipelined island's csynth interval is
+13,244 cycles per call (RTL cosim 14,883–18,556), under the stream, and the
+state prefetch left the weight ports; the measured token fell from 2,445,400
+to **2,069,400 cycles (−15.4 %)**, the first cycle reduction since Iter67c.
+What remains of the block in the token is the last head's tail after the
+stream ends (about 2.2K cycles per layer in the model) plus an unlocated
+~7K cycles per layer that an instrumented build is measuring.
 
-**Location:** `gdn_model.cpp` (`gdn_recurrent_attention_islands` and its two
-island actors). The retired monolithic `gdn_recurrent_attention` helper is
-available through Git history.
+**Location:** `gdn_model.cpp` (`gdn_recurrent_attention_islands_dataflow_p`,
+`gdn_recurrent_attention_island_p<ISLAND>` and its three processes;
+`gemv32_mm2s_with_state_p` for the prefetch-first readers). The serial island
+`gdn_recurrent_attention_island` and the interleaving reader stay in the file
+for the retired monolith; the prefill-era `gdn_recurrent_attention` helper is
+in Git history.
 
 ## Overview
 
@@ -47,7 +55,47 @@ upload; the kernel updates that striped representation in place across decode
 calls. The public file format is unchanged by the BF16 move — only the device
 representation is.
 
-## Measured per-head schedule (Iter66e csynth)
+## Iter81 head pipeline (current)
+
+One island call processes 8 heads through three dataflow processes, each with
+its own head loop, so head h's read overlaps head h+1's prep and head h−1's
+update:
+
+| Process | Cycles per call (csynth) | Per head | What it does |
+|---|---:|---:|---|
+| `gdn_island_prep` | 9,793 | ~1,224 | 24 Q/K/V packs in; `q_sq`/`k_sq` tree reductions; one merged normalize-and-alpha loop; sends normalized q/k (64-bit words, depth-512 FIFO), the 8 raw V beats (depth 16) and `{beta, decay, alpha}` (depth 4) |
+| `gdn_island_read` | 13,129 | ~1,641 | q/k into BRAM copies; the five-phase II=1 read pass straight off the two state queues (`read_nb`, phases 0/2 take a beat and cache its upper half); one 576-bit replay word per phase (16 lo + 16 hi state values, k, k_b) into an 8,192-deep URAM FIFO; the II=4 free-running delta loop; 8 output beats; 8 delta beats + decay to the update |
+| `gdn_island_update` | 8,409 | ~1,051 | 1,024 trips at II=1: replay word in (`read_nb`), decay × old + k × delta per lane, BF16 RNE, joined beats to the write-back queues on odd trips (`write_nb`) |
+| island (dataflow) | **13,244** interval | ~1,656 | RTL cosim: 14,883 / 15,291 / 18,556 min/avg/max per call; the serial island: 39,033 / 39,441 / 42,706 |
+
+Why it is safe without blocking reads: the Stage A reader queues the layer's
+4,096 state beats per port before any weight of ports 28–31, the final
+collector releases a head's Q/K/V only after clusters 12–15 consumed those
+weights, and the replay FIFO holds exactly one call (8,192 words), so `read_nb`
+on the state queues and on the replay never finds them empty and `write_nb` on
+the replay and the 4,096-deep write-back queues never finds them full — the
+native model asserts `size()` bounds on every such access.
+
+Timing, from an endpoint census of the island placed and routed out of
+context in its quarter-SLR pblock (5.000 ns): the first version lost 0.17 ns to
+one class — the update loop's 64 `fmul`s, 32 of which take `decay` and 16 each
+`k`/`k_b`, whose merged input registers fan out to 64 unregistered DSP inputs.
+Binding the four update products one stage deeper (`bind_op op=fmul
+impl=maxdsp latency=4`, a five-stage core) removed that class; the II=4 delta
+loop as `style=frp` removed its clock-enable cone. Result **+0.429 ns**
+against the serial island's +0.434 (with the link's repair passes +0.489 /
++0.626). Binding the read products the same way moved them to three-DSP cores
+and made timing worse (rejected). Vivado resources per island: LUT 76,893
+(69,705), FF 65,745 (54,778), DSP 526 (353), BRAM 32 (46), URAM 16 (16).
+
+The four state readers (`gemv32_mm2s_with_state_p<28..31>`) fetch the layer's
+whole state in one 4,096-trip loop with the state writer's 64-bit address form
+before the 16,384-beat weight loop; the first Iter81 link used the per-head
+index form, which Vivado synthesis folded 128 MiB low, and
+`check_state_reader_addresses.py` now gates the reader at HLS RTL,
+post-synthesis and post-opt (`architecture.md` invariant 26).
+
+## Measured per-head schedule (Iter66e csynth, historical)
 
 The `recur_island_head` loop runs 8 heads at **5,428 cycles per iteration**,
 43,424 per island; the two islands run concurrently so the wrapper is 43,427.
@@ -342,16 +390,20 @@ plus a few control-path BRAMs ⇒ 258 total). The state matrix (8 × 256 × 256 
 
 ## Known Limitations
 
-1. **Single-head sequential processing** — heads are processed sequentially.
-   Multi-head parallelism would require replicating the state BRAM (2 MB per
-   head), exceeding single-SLR BRAM capacity for 8 heads.
+1. **Heads are pipelined, not parallel** — since Iter81 the three stages of
+   consecutive heads overlap, so an island's throughput is its slowest stage
+   (~1,640 cycles per head), under the 2,048-cycle weight pace. Processing
+   heads in parallel would replicate the state scratch per head and exceed
+   the SLR's memory; it is not needed while the stream paces the call.
 2. **HLS pragma macro limitation** — Vitis HLS pragmas do not expand C
    preprocessor macros, so `factor=16` is hardcoded as a literal in all
    `array_partition` and `unroll` pragmas. The `GDN_PK` define is still used
    in C code for loop bounds and stride.
-3. **State traffic is serialized with the rest of the layer.** Every token
-   restores and saves 2 MiB per layer through the state master. Spreading or
-   overlapping this traffic is the main non-GEMV architectural opportunity.
+3. **State traffic is hidden, not removed.** Since Iter81 the layer's state is
+   fetched in the pre-call gap and written back as the update stage produces
+   it; what the token still pays is the last head's tail after the weight
+   stream ends (~2.2K cycles per layer in the model). On-chip residency would
+   now buy only that tail, not the 15.4 % the earlier documents quoted.
 
 ## Parity Verification
 

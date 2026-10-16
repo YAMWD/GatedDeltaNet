@@ -88,6 +88,23 @@ typedef struct {
 #define GDN_RECURRENT_STATE_STRIPE_BF16_BEATS \
     (GDN_RECURRENT_STATE_STRIPE_FLOATS / 32u)
 #define GDN_COMPILED_WEIGHT_SHARD_BEATS 1366528u
+/* Iter81/82 call-timeline probe (diagnostic -DGDN_CALL_PROBE=1 builds only).
+ * SLR2 kernel: four 512-bit beats of records per call in a tail of each of
+ * weight ports 28-31, after the state stripe, written by that port's state
+ * writer; the host allocates GDN_PROBE_ALLOC_BEATS extra beats on those
+ * ports and reads 31's.  Control kernel (Iter82): four beats per call in a
+ * tail of the workspace after its GDN_WS_FLOATS, written by the control
+ * region's own counter.  A record is event[63:56] port[55:48] tag[47:40]
+ * cycle[39:0], the cycle counted from the region's start; the counter-end
+ * record carries the number of events seen in [55:40]. */
+#define GDN_PROBE_CALLS            (4u * 24u + 1u)
+#define GDN_PROBE_RECORDS_PER_CALL 32u
+#define GDN_PROBE_BEATS_PER_CALL   4u
+#define GDN_PROBE_BEATS            (GDN_PROBE_CALLS * GDN_PROBE_BEATS_PER_CALL)
+#define GDN_PROBE_ALLOC_BEATS      512u
+#define GDN_PROBE_BEAT_OFF \
+    ((uint64_t)GDN_COMPILED_WEIGHT_SHARD_BEATS + (uint64_t)GDN_RECURRENT_STATE_STRIPE_BF16_BEATS)
+#define GDN_WS_PROBE_BEAT_OFF      ((uint64_t)GDN_WS_FLOATS / 16u)
 #define GDN_COMPILED_WEIGHT_SHARD_BYTES \
     ((size_t)GDN_COMPILED_WEIGHT_SHARD_BEATS * sizeof(Beat512))
 
@@ -139,7 +156,7 @@ typedef struct {
     float *recurrent_state;
     float *head_buffer;
     Beat512 *weight_shards[GEMV_CHANNELS]; /* packed-BF16 GEMV shards */
-    float *aux_weights;                   /* compact per-layer non-GEMV weights */
+    Beat512 *aux_weights;                 /* packed BF16 aux-weight image (Iter83) */
 } GDNRunState;
 
 typedef struct {
@@ -161,9 +178,15 @@ void gdn_build_weight_shards(const float *weight_data, const GDNWeightHeader *co
 int gdn_validate_weight_shards(const float *weight_data,
                                const GDNWeightHeader *config,
                                Beat512 *const shards[]);
-size_t gdn_aux_weight_floats(const GDNWeightHeader *config);
-void gdn_build_aux_weights(const float *weight_data, const GDNWeightHeader *config,
-                           float *aux_weights);
+/* Iter83: the non-GEMV weights as a packed image of 512-bit beats -- BF16
+ * lanes for the norms, the a/b projections and the conv kernels, one FP32
+ * beat per layer for a_log/dt_bias (layout GDN_AUXB_* in gdn_model.cpp).
+ * Host-only builder and lane-exact validator against the blob. */
+size_t gdn_aux_image_beats(const GDNWeightHeader *config);
+void gdn_build_aux_image(const float *weight_data, const GDNWeightHeader *config,
+                         Beat512 *aux_image);
+int gdn_validate_aux_image(const Beat512 *aux_image, const float *weight_data,
+                           const GDNWeightHeader *config);
 int gdn_scatter_recurrent_state(Beat512 *const state_stripes[],
                                 const float *recurrent_state,
                                 size_t recurrent_state_floats);
@@ -199,7 +222,7 @@ void gdn_run_state_free(GDNRunState *state);
  * export). The state is restored at each layer's start and saved at its end —
  * there is no prefill / no GEMM / no mode flag. */
 int gdn_forward(
-    const float *aux_weights,
+    const Beat512 *aux_weights,
     Beat512 *workspace,
     const Beat512 *weight_data_mm0,
     const Beat512 *weight_data_mm1,

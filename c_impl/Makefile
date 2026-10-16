@@ -61,8 +61,8 @@ VITIS_SETTINGS := $(XILINX_VITIS)/settings64.sh
 # different schedule.
 PLATFORM       ?= xilinx_u55c_gen3x16_xdma_3_202210_1
 TARGET         ?= hw
-FREQ           ?= 200
-HLS_FREQ       ?= 200
+FREQ           ?= 225
+HLS_FREQ       ?= 225
 LINK_FREQ      ?= $(FREQ)
 JOBS           ?= 48
 # HLS and Vivado have very different per-worker memory footprints. The Slurm
@@ -92,11 +92,15 @@ XCLBIN         := $(BUILD_DIR)/gdn_p.xclbin
 # xo_mono / xclbin_mono with HW_CFG_TEMPLATE=hw_f150.cfg for A/B comparison only.
 XO_MONO        := $(BUILD_DIR)/$(KERNEL).xo
 XCLBIN_MONO    := $(BUILD_DIR)/$(KERNEL).xclbin
-# Exact 200 MHz recipe: one kernel per SLR, two quarter-SLR island pblocks on
-# SLR2, SSI_SpreadLogic_high + AlternateCLBRouting, then the finishing ladder
-# (AggressiveExplore -> Explore -> focused kernel pass) and the fail-closed
-# exact-clock gate on all three clocks.
-HW_CFG_TEMPLATE ?= hw_f200_p.cfg
+# Production recipe (Iter88, promoted 2026-10-15): the three kernels at an exact
+# 225 MHz with the HBM channels re-mapped so that no die-crossing master uses the
+# channels whose shell pipes cross in clock-region column X6 (gdn_k_slr2 on
+# HBM[2..9], gdn_k_slr0's ports 2-9 on HBM[24..31]); one kernel per SLR, two
+# quarter-SLR island pblocks on SLR2, SSI_SpreadLogic_high + AlternateCLBRouting,
+# the finishing ladder (AggressiveExplore -> Explore -> focused kernel pass) and
+# the fail-closed exact-clock gate on all three clocks.  hw_f200_p.cfg is the
+# Iter79-87 200 MHz recipe (HLS_FREQ=200 LINK_FREQ=200), kept for A/B.
+HW_CFG_TEMPLATE ?= hw_f225_p_remap.cfg
 ifeq ($(HW_CFG_TEMPLATE),hw_f150.cfg)
 HW_RECIPE_FILES := $(HW_CFG_TEMPLATE) apply_iter69_kernel_clock_f150.tcl \
     apply_iter75d_control_fanout.tcl apply_iter66e_unpair.tcl \
@@ -125,6 +129,12 @@ VPP_FLAGS      += --hls.jobs $(JOBS)
 # synthesize HLS at 150 MHz, then request the independently chosen physical
 # DATA_CLK during link (150 MHz by default).
 VPP_COMPILE_FLAGS := $(VPP_FLAGS) --kernel_frequency $(HLS_FREQ)
+# Diagnostic defines for a probe build (VPP_DEFINES="-D GDN_CALL_PROBE=1"
+# HOST_DEFINES=-DGDN_CALL_PROBE=1); empty for production. gdn_eval never gets
+# them, so the native gate always models the production kernel.
+VPP_DEFINES    ?=
+HOST_DEFINES   ?=
+VPP_COMPILE_FLAGS += $(VPP_DEFINES)
 VPP_LINK_FLAGS    := $(VPP_FLAGS) --kernel_frequency $(LINK_FREQ)
 
 VPP_LDFLAGS    := --config $(abspath $(HW_CFG))
@@ -192,7 +202,9 @@ help:
 	@echo "  xo          v++ compile  → $(XO_P)"
 	@echo "  xclbin      v++ link     → $(XCLBIN)"
 	@echo "  host        XRT host    → $(HOST_BIN)"
-	@echo "  run_hw      submit a fresh 200 MHz three-kernel Slurm build and dependent 8/64-token card tests"
+	@echo "  run_hw      ONE command for the whole hardware flow: a fresh 225 MHz three-kernel Slurm build,"
+	@echo "              then (afterok) the 8/64-token card gates, then the qualification -- 512-token drift,"
+	@echo "              WikiText-2 perplexity and the power/energy run (QUAL=0 skips the last two)"
 	@echo "  xo_mono / xclbin_mono   the retired monolithic kernel (A/B only, HW_CFG_TEMPLATE=hw_f150.cfg)"
 	@echo "              run on acclhead1; no DCP, XO or RQS input is required"
 	@echo "  clean       remove host-tb binaries"
@@ -330,7 +342,7 @@ host: $(HOST_BIN)
 # (gdn_build_weight_shards / gdn_weight_shard_floats). gdn_model.cpp needs the
 # Vitis HLS include for hls_stream.h; -lm for the libm calls it pulls in.
 $(HOST_BIN): $(HOST_SRC) gdn_model.cpp gdn_model.h
-	$(CXX) -O2 -std=c++17 -Wall -Wno-unknown-pragmas -Wno-unused-label \
+	$(CXX) -O2 -std=c++17 -Wall -Wno-unknown-pragmas -Wno-unused-label $(HOST_DEFINES) \
 	    $(HOST_INC) -I$(XILINX_HLS_INC) -o $@ $(HOST_SRC) gdn_model.cpp $(HOST_LIB) -lm
 
 

@@ -6,11 +6,15 @@
 # queues and writers stay free in the lower half of SLR2 (Y8-9, beside the
 # SLR1 boundary).  Instance names from the gdn_k_slr2 XO's RTL:
 #   .../gdn_k_slr2_1/inst/grp_gdn_gemv_part_slr2_fu_*/gdn_recurrent_attention_islands_p_U0/
-#       grp_gdn_recurrent_attention_islands_dataflow_p_fu_*/gdn_recurrent_attention_island_{0,1}_U0
+#       grp_gdn_recurrent_attention_islands_dataflow_p_fu_*/gdn_recurrent_attention_island_p_{0,1}_U0
+# Iter81: the islands are the head-pipelined gdn_recurrent_attention_island_p
+# (prep/read/update processes nested under each _U0 cell, so one cell still
+# carries the whole island into its pblock); the pre-link name gate in
+# slurm/hw_build.slurm checks these names in the XO RTL before the link.
 # Fail-closed on names.
 set p_islands [list \
-    [list pb_p_island0 {^.*/gdn_k_slr2_1/.*/gdn_recurrent_attention_island_0_U0$} CLOCKREGION_X0Y10:CLOCKREGION_X3Y11] \
-    [list pb_p_island1 {^.*/gdn_k_slr2_1/.*/gdn_recurrent_attention_island_1_U0$} CLOCKREGION_X4Y10:CLOCKREGION_X7Y11]]
+    [list pb_p_island0 {^.*/gdn_k_slr2_1/.*/gdn_recurrent_attention_island_p_0_U0$} CLOCKREGION_X0Y10:CLOCKREGION_X3Y11] \
+    [list pb_p_island1 {^.*/gdn_k_slr2_1/.*/gdn_recurrent_attention_island_p_1_U0$} CLOCKREGION_X4Y10:CLOCKREGION_X7Y11]]
 foreach spec $p_islands {
     lassign $spec name pattern range
     set cells [get_cells -hierarchical -regexp -quiet $pattern]
