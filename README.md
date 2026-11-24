@@ -8,7 +8,7 @@ the evaluation scripts provide the PyTorch/Triton golden reference.
 The model is based on [Gated Delta Networks: Improving Mamba2 with Delta
 Rule](https://openreview.net/forum?id=r8H7xhYPwz).
 
-**DATE 2027 paper:** the code for *A Streaming FPGA Accelerator for Linear Attention Gated Delta Network Decoding* (150 MHz single-kernel design) is release [`date2027`](https://github.com/YAMWD/GatedDeltaNet/releases/tag/date2027); `main` holds later work.
+**DATE 2027 paper:** the code for *A Streaming FPGA Accelerator for Linear Attention Gated Delta Network Decoding* (150 MHz single-kernel design) is release [`date2027`](https://github.com/accl-kaust/GatedDeltaNet/releases/tag/date2027); `main` holds later work.
 
 ## Repository layout
 
