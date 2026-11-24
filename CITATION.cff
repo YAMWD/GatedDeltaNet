@@ -1,0 +1,52 @@
+cff-version: 1.2.0
+message: >-
+  If you use this accelerator, please cite the DATE 2027 paper below.
+  The Gated DeltaNet model it runs is from Yang, Kautz and Hatamizadeh (ICLR 2025).
+type: software
+title: "GatedDeltaNet HLS Accelerator"
+authors:
+  - family-names: Yao
+    given-names: Zhiyan
+    affiliation: "Department of Computer Science, KAUST"
+  - family-names: Fahmy
+    given-names: Suhaib A.
+    affiliation: "Department of Computer Science, KAUST"
+repository-code: "https://github.com/accl-kaust/GatedDeltaNet"
+license-url: "https://github.com/accl-kaust/GatedDeltaNet/blob/main/LICENSE"
+keywords:
+  - FPGA
+  - HLS
+  - linear attention
+  - Gated DeltaNet
+  - LLM decoding
+  - Alveo U55C
+preferred-citation:
+  type: conference-paper
+  title: "A Streaming FPGA Accelerator for Linear Attention Gated Delta Network Decoding"
+  authors:
+    - family-names: Yao
+      given-names: Zhiyan
+      affiliation: "Department of Computer Science, KAUST"
+    - family-names: Fahmy
+      given-names: Suhaib A.
+      affiliation: "Department of Computer Science, KAUST"
+  collection-title: "Design, Automation and Test in Europe Conference (DATE)"
+  conference:
+    name: "Design, Automation and Test in Europe Conference (DATE 2027)"
+    city: Dresden
+    country: DE
+  year: 2027
+  status: in-press
+references:
+  - type: conference-paper
+    title: "Gated Delta Networks: Improving Mamba2 with Delta Rule"
+    authors:
+      - family-names: Yang
+        given-names: Songlin
+      - family-names: Kautz
+        given-names: Jan
+      - family-names: Hatamizadeh
+        given-names: Ali
+    collection-title: "The Thirteenth International Conference on Learning Representations (ICLR)"
+    year: 2025
+    url: "https://openreview.net/forum?id=r8H7xhYPwz"

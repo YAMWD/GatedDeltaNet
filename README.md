@@ -226,6 +226,20 @@ diagnostic reports are generated artifacts and are intentionally not committed.
 
 ## Citation
 
+If you use this accelerator, please cite:
+
+```bibtex
+@inproceedings{yao2027streaming,
+  title     = {A Streaming {FPGA} Accelerator for Linear Attention Gated Delta Network Decoding},
+  author    = {Zhiyan Yao and Suhaib A. Fahmy},
+  booktitle = {Design, Automation and Test in Europe Conference (DATE)},
+  year      = {2027},
+  note      = {To appear}
+}
+```
+
+The Gated DeltaNet model is from:
+
 ```bibtex
 @inproceedings{yang2025gated,
   title     = {Gated Delta Networks: Improving Mamba2 with Delta Rule},
