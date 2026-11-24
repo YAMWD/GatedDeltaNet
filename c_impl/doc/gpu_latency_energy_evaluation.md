@@ -21,7 +21,7 @@ PyTorch CUDA 12.6 build. Use an exclusively allocated whole GPU for board
 energy measurements; MIG-instance energy attribution is not supported.
 
 ```bash
-git clone --depth 1 --branch main https://github.com/YAMWD/GatedDeltaNet.git
+git clone --depth 1 --branch main https://github.com/accl-kaust/GatedDeltaNet.git
 cd GatedDeltaNet
 conda create -y -n gdn-gpu-eval python=3.11 pip
 conda activate gdn-gpu-eval
